@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, s
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { authorizeDispatchTrusted, createCapability, issueCurrentTrustedMappingProof, validateCheckpointAskSelected } from "../src/engine/durable.js";
+import { authorizeDispatchTrusted, createCapability, issueCurrentTrustedMappingProof, resumeNativeSpecificationValidationFromPersisted, validateCheckpointAskSelected } from "../src/engine/durable.js";
 import { resolveState, setStateTransactionTestHooks, writeState } from "../src/engine/state.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { resolveConfig } from "../src/engine/config.js";
@@ -18,8 +18,7 @@ import {
   NATIVE_SPECIFICATION_TASK_INTENT,
 } from "../src/gates/native-specification.js";
 import { TEST_CONTEXT, TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
-import { registerTeamWorkflow } from "../src/index.js";
-import { openTestRegistry, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { openTestRegistry } from "./fixtures/registry-activation.js";
 import { registerTestWorkflowTools, registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import { workflowOwnerFor } from "../src/registry/owner.js";
 import { specificationPhaseSchemaForConstitution } from "../src/engine/artifact-contract.js";
@@ -544,7 +543,12 @@ test("registered native hook binds gates and auth to the authoritative session c
   const f = fixture();
   try {
     const mounted = registeredToolCallHandler(f.root);
-    const manager = { getCwd: () => f.root };
+    const manager = {
+      getCwd: () => f.root,
+      getSessionId: () => "native-gate-session",
+      getSessionFile: () => join(f.root, "native-gate-session.jsonl"),
+      getSessionGeneration: () => "native-gate-generation",
+    };
     const exact = { type: "tool_call", toolCallId: "manager-cwd-exact", toolName: "task", input: envelope(f.item) };
     assert.equal(
       mounted(exact, { sessionManager: manager }),
@@ -792,7 +796,7 @@ test("native gate admits only engine-owned workflow devices and re-evaluates nat
         toolName: device,
         input: {},
       };
-      assert.equal(mounted(mountedEvent, { cwd: f.root }), undefined, device + " must remain available after host mounting");
+      assert.equal(mounted(mountedEvent, TEST_CONTEXT(f.root)), undefined, device + " must remain available after host mounting");
     }
     for (const spoof of [
       "workflow_prepare_extra",
@@ -802,11 +806,11 @@ test("native gate admits only engine-owned workflow devices and re-evaluates nat
       assert.equal(nativeSpecificationTaskGate(event(spoof, {}), { cwd: f.root })?.block, true, spoof + " must not be admitted as a mounted workflow tool");
     }
     assert.equal(nativeSpecificationTaskGate(event("workflow_finalize_native_specification_phase", []), { cwd: f.root })?.block, true, "mounted workflow tools require object input");
-    const unknown = mounted({ type: "tool_call", toolCallId: "unknown-device", toolName: "write", input: { path: "xd://workflow_third_party", content: "{}" } }, { cwd: f.root }) as { block?: boolean; reason?: string } | undefined;
+    const unknown = mounted({ type: "tool_call", toolCallId: "unknown-device", toolName: "write", input: { path: "xd://workflow_third_party", content: "{}" } }, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
     assert.equal(unknown?.block, true, "unknown mounted workflow devices must be denied");
 
     const malformedTask = { type: "tool_call", toolCallId: "native-race", toolName: "task", input: { ...envelope(f.item), tasks: [] } };
-    const active = mounted(malformedTask, { cwd: f.root }) as { block?: boolean; reason?: string } | undefined;
+    const active = mounted(malformedTask, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
     assert.equal(active?.block, true);
     assert.match(active?.reason ?? "", /native specification/iu);
 
@@ -821,7 +825,7 @@ test("native gate admits only engine-owned workflow devices and re-evaluates nat
       },
     }, { featureSlug: current.specification.feature_id });
     assert.equal(nativeSpecificationGenerationActive(f.root), false, "gate must leave native mode when the phase is no longer generating");
-    const exited = mounted(malformedTask, { cwd: f.root }) as { block?: boolean; reason?: string } | undefined;
+    const exited = mounted(malformedTask, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
     assert.equal(exited?.block, true, "closed native envelope must remain blocked after native mode exits");
     assert.match(exited?.reason ?? "", /native specification/iu);
 
@@ -836,7 +840,7 @@ test("native gate admits only engine-owned workflow devices and re-evaluates nat
       },
     }, { featureSlug: exitedState.specification.feature_id });
     assert.equal(nativeSpecificationGenerationActive(f.root), true, "gate must re-enter native mode from current state");
-    const reentered = mounted(malformedTask, { cwd: f.root }) as { block?: boolean; reason?: string } | undefined;
+    const reentered = mounted(malformedTask, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
     assert.equal(reentered?.block, true);
     assert.match(reentered?.reason ?? "", /native specification/iu);
   } finally {
@@ -848,7 +852,7 @@ test("registered native hook uses the exact task payload shape and rejects count
   const f = fixture();
   const handler = registeredToolCallHandler(f.root);
   try {
-    const context = { cwd: f.root };
+    const context = TEST_CONTEXT(f.root);
     const exactEvent = {
       type: "tool_call",
       toolCallId: "native-task-call",
@@ -1780,7 +1784,11 @@ test("plan dispatch embeds verified upstream artifact and projection content", (
       advance_secret: "plan-advance-secret",
       policy_hash: digestOf(profile.stages.find((candidate) => candidate.id === "plan")?.roster_policy ?? {}),
     });
-    writeState(f.root, { ...current, stage_cursor: "plan", cursor_epoch: issued.state.issued_for!.cursor_epoch, dispatch_capability: issued.state, specification: planWorkspace }, { featureSlug: prepared.specification!.feature_id });
+    writeState(f.root, { ...current, stage_cursor: "plan", cursor_epoch: issued.state.issued_for!.cursor_epoch, dispatch_capability: issued.state, specification: planWorkspace, preparation_start: undefined }, { featureSlug: prepared.specification!.feature_id });
+    const planState = resolveState(f.root, "main", { feature_id: prepared.specification!.feature_id, run_key: prepared.run_key! }).state;
+    assert.ok(planState, "plan preparation fixture state must be readable");
+    if (!planState) throw new Error("plan preparation fixture state unavailable");
+    attachPreparationHandoff(f.root, planState);
     const capabilityId = issued.capability_id;
     const taskId = dispatchTaskId(capabilityId, prepared.run_key!, "main", "spec-preparation", "plan", "specification-architect");
     const planProof = issueCurrentTrustedMappingProof(f.root);
@@ -2114,6 +2122,28 @@ test("native finalizer resumes each durable boundary without duplicating dispatc
       assert.equal(injected, true, `${boundary} seam must run`);
       setSpecificationPhaseFailureInjector(null);
       if (boundary === "after_materialize") {
+        const materializedBeforePoison = resolveState(f.root, "main", { feature_id: f.workspace.feature_id, run_key: prepared.run_key! }).state;
+        assert.ok(materializedBeforePoison?.dispatch_capability?.dispatches?.[0]?.work_identity, "materialized retry must retain the generation identity");
+        if (materializedBeforePoison?.dispatch_capability?.dispatches?.[0]?.work_identity) {
+          const generation = materializedBeforePoison.dispatch_capability.dispatches[0]!;
+          const identity = generation.work_identity;
+          const poison = (outcome: "failed" | "succeeded", evidence: string) => {
+            const artifact_ids = ["specify_draft"];
+            const terminal_signal = "provider_terminal" as const;
+            const reconciliation = { identity, outcome, evidence, artifact_ids, terminal_signal, result_digest: digestOf({ identity, outcome, evidence, artifact_ids, terminal_signal }), updated_at: "1970-01-01T00:00:00.000Z" };
+            const poisoned = { ...materializedBeforePoison, dispatch_capability: { ...materializedBeforePoison.dispatch_capability!, dispatches: materializedBeforePoison.dispatch_capability!.dispatches.map((record) => record.id === generation.id ? { ...record, pending: { ...record.pending!, reconciliation } } : record) } };
+            writeState(f.root, poisoned, { featureSlug: f.workspace.feature_id });
+          };
+          for (const [outcome, evidence, expected] of [["failed", "provider failure", /terminal without a successful result|failed/iu], ["succeeded", "forged completion", /worker result|digest|reconciliation/iu]] as const) {
+            poison(outcome, evidence);
+            const beforePoisonRetry = readFileSync(join(f.root, ".work-state", "features", f.workspace.feature_id, "state.json"), "utf8");
+            const poisonedRetry = finalizeNativeSpecificationPhase(f.root, finalizeInput(started.value.handoff, workerResult));
+            assert.equal(poisonedRetry.ok, false, `${outcome} reconciliation must not converge an unverified generation`);
+            assert.match(poisonedRetry.ok ? "" : poisonedRetry.error, expected);
+            assert.equal(readFileSync(join(f.root, ".work-state", "features", f.workspace.feature_id, "state.json"), "utf8"), beforePoisonRetry, `${outcome} reconciliation rejection must not mutate state`);
+            writeState(f.root, materializedBeforePoison, { featureSlug: f.workspace.feature_id });
+          }
+        }
         const beforeRejected = resolveState(f.root, "main", { feature_id: f.workspace.feature_id, run_key: prepared.run_key! }).state;
         const forged = structuredClone(workerResult) as Record<string, any>;
         forged.sections = { ...(forged.sections as Record<string, unknown>), problem: "forged result" };
@@ -2152,6 +2182,7 @@ test("native task result selector requires the authorization root and session id
       getSessionGeneration: () => "generation-a",
     };
     const context = { sessionManager: manager };
+    handlers.get("session_start")?.({}, context);
     const call = { type: "tool_call", toolCallId: "native-task-call", toolName: "task", input: envelope(f.item) };
     assert.equal(handlers.get("tool_call")?.(call, context), undefined, "same-session native dispatch remains admitted");
     const statePath = join(f.root, ".work-state", "features", f.workspace.feature_id, "state.json");
@@ -2234,16 +2265,7 @@ test("team shutdown ignores stale session generations and closes each exact rebi
         if (["session_start", "session_shutdown"].includes(name)) handlers.set(name, handler);
       },
     };
-    writeTestRegistryMarker(f.root);
-    const seed = openTestRegistry(f.root, ["workflow_profiles", "constitution_gate", "runtime_config"], "dynamic-shutdown", ["workflow_registration", "config_writer"]);
-    const owner = seed.owner;
-    seed.finish(false);
-    registerTeamWorkflow(pi as never, {
-      owner: () => owner,
-      resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
-      rebindSessions: true,
-      observability: false,
-    });
+    registerTestTeamWorkflow(f.root, pi as never, { rebindSessions: true, observability: false });
     const initialSessionStart = handlers.get("session_start");
     assert.ok(initialSessionStart);
     if (!initialSessionStart) return;
@@ -2311,6 +2333,7 @@ test("native task selectors clear on session rebind and reject stale reused ids"
     const contextA = { sessionManager: managerA };
     const contextB = { sessionManager: managerB };
     const call = { type: "tool_call", toolCallId: "native-task-call", toolName: "task", input: envelope(f.item) };
+    handlers.get("session_start")?.({}, contextA);
     assert.equal(handlers.get("tool_call")?.(call, contextA), undefined);
     const statePath = join(f.root, ".work-state", "features", f.workspace.feature_id, "state.json");
     const beforeRebind = readFileSync(statePath, "utf8");

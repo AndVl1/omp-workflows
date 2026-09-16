@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { resolveConfig } from "../src/engine/config.js";
-import { registerTestConstitutionGate, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import { TEST_CONTEXT } from "./fixtures/registrar-host.js";
 import { resolveState, writeState } from "../src/engine/state.js";
@@ -107,7 +107,6 @@ function setupRoot(): string {
   writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { "specification-analyst": "specification-worker" } }) + "\n");
   const config = resolveConfig(root);
   writeTestRegistryMarker(root);
-  registerTestConstitutionGate(root, "core-test-team-workflow");
   writeAgentMapping(root, buildAgentMapping({
     roles: config.roles,
     availableAgents: ["specification-worker"],

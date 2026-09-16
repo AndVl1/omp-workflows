@@ -5497,15 +5497,16 @@ export function finalizeNativeSpecificationPhase(
     const policyHash = cap?.policy_hash;
     const configHash = state?.config_hash;
     if (!state || !cap || !cap.capability_id || !cap.issued_for || !generationRecord?.work_identity
-      || generationRecord.status !== "succeeded"
-      || !generationRecord.completion || generationRecord.completion.outcome !== "succeeded"
+      || (generationRecord.status === "succeeded" && (!generationRecord.completion || generationRecord.completion.outcome !== "succeeded"))
       || canonicalJson(generationRecord.work_identity) !== canonicalJson(handoff.work_identity)
       || generationRecord.role !== handoff.role || generationRecord.agent !== handoff.agent
       || !configHash || !policyHash) {
       return fail("SPEC_PHASE_STALE", "native materialized phase resume authority is unavailable or generation identity is stale");
     }
-    if (canonicalJson(persisted.value.version.work_identity) !== canonicalJson(generationRecord.work_identity)
-      || !generationRecord.completion.artifact_ids.includes(persisted.value.version.source_artifact_id)) {
+    if (canonicalJson(persisted.value.version.work_identity) !== canonicalJson(generationRecord.work_identity)) {
+      return fail("SPEC_PHASE_STALE", "native materialized phase artifact is not bound to its authenticated generation postimage");
+    }
+    if (generationRecord.completion && !generationRecord.completion.artifact_ids.includes(persisted.value.version.source_artifact_id)) {
       return fail("SPEC_PHASE_STALE", "native materialized phase artifact is not bound to its authenticated generation postimage");
     }
     const validatorProof = issueCurrentTrustedMappingProof(projectRoot);
@@ -5521,19 +5522,21 @@ export function finalizeNativeSpecificationPhase(
       generation_dispatch_id: handoff.dispatch_id,
       request_id: `native-validation-${handoff.phase}-${handoff.feature_id}-${handoff.version}`,
       generation: {
-        capability_id: cap.capability_id,
-        run_key: state.run_key ?? handoff.run_key,
+        feature_id: handoff.feature_id,
+        capability_id: generationRecord.work_identity.capability_id,
+        run_key: generationRecord.work_identity.run_id,
         branch: state.branch,
-        workflow: handoff.workflow,
+        workflow: generationRecord.work_identity.workflow,
         profile_hash: handoff.profile_hash,
-        stage_cursor: handoff.phase,
-        cursor_epoch: cap.issued_for.cursor_epoch,
+        stage_cursor: generationRecord.work_identity.stage_id,
+        cursor_epoch: generationRecord.work_identity.capability_epoch,
         config_hash: configHash,
         policy_hash: policyHash,
         dispatch_id: generationRecord.id,
         role: generationRecord.role,
         slot_id: generationRecord.work_identity.slot_id,
         task_id: generationRecord.work_identity.task_id,
+        tool_call_id: generationRecord.tool_call_id,
         agent: generationRecord.agent,
         work_identity: generationRecord.work_identity,
       },

@@ -2336,7 +2336,86 @@ export type NativeSpecificationValidationObservation =
     state?: TeamState;
   };
 
-/**
+type NativeValidatorSelection = { record?: DispatchRecord; error?: string };
+
+function exactNativeValidatorRecord(
+  record: DispatchRecord,
+  capability: ActiveCapability,
+  binding: ActiveCapability["issued_for"],
+  phase: "specify" | "plan" | "tasks",
+  version: number,
+  requestId: string,
+): boolean {
+  return record.phase_version === version
+    && record.tool_call_id === requestId
+    && record.role === "validator"
+    && record.agent === "validator"
+    && record.work_identity?.run_id === binding.run_key
+    && record.work_identity?.workflow === binding.workflow
+    && record.work_identity?.stage_id === phase
+    && record.work_identity?.stage_cursor === phase
+    && record.work_identity?.capability_id === capability.capability_id
+    && record.work_identity?.capability_epoch === binding.cursor_epoch
+    && record.work_identity?.dispatch_id === record.id
+    && record.work_identity?.attempt === record.attempt;
+}
+
+function selectNativeValidatorRecord(
+  capability: ActiveCapability,
+  phase: "specify" | "plan" | "tasks",
+  version: number,
+  requestId: string,
+): NativeValidatorSelection {
+  const binding = capability.issued_for;
+  const validators = capability.dispatches.filter((record) => record.purpose === "validation");
+  if (validators.some((record) => !exactNativeValidatorRecord(record, capability, binding, phase, version, requestId))) {
+    return { error: "native validator dispatch is not bound to the exact current phase, artifact, and request" };
+  }
+  const record = validators.reduce<DispatchRecord | undefined>(
+    (latest, candidate) => latest === undefined || candidate.attempt >= latest.attempt ? candidate : latest,
+    undefined,
+  );
+  return { record };
+}
+
+function nativeValidatorSuccessPostimageError(
+  record: DispatchRecord,
+  artifact: PersistedPhaseResultEnvelope,
+  validation: Record<string, unknown> | null,
+  binding: ActiveCapability["issued_for"],
+  phase: "specify" | "plan" | "tasks",
+  pinnedRoot: PinnedProjectRoot,
+): string | null {
+  const expectedEvidence = "phase '" + phase + "' validation passed for '" + artifact.artifact_id + "'";
+  if (record.status !== "succeeded"
+    || !record.work_identity
+    || record.work_identity.run_id !== binding.run_key
+    || record.work_identity.workflow !== binding.workflow
+    || record.work_identity.stage_id !== phase
+    || record.work_identity.stage_cursor !== phase
+    || record.work_identity.capability_epoch !== binding.cursor_epoch
+    || record.work_identity.dispatch_id !== record.id
+    || record.work_identity.attempt !== record.attempt
+    || !record.completion
+    || record.completion.outcome !== "succeeded"
+    || record.completion.dispatch_id !== record.id
+    || record.completion.cursor_epoch !== binding.cursor_epoch
+    || !sameIdentity(record.completion.work_identity, record.work_identity)
+    || record.completion.evidence !== expectedEvidence
+    || record.completion.artifact_ids.length !== 0
+    || !record.completion_envelope
+    || record.completion_envelope.outcome !== "succeeded"
+    || !sameIdentity(record.completion_envelope.identity, record.work_identity)
+    || record.completion_envelope.artifact_refs.length !== 0
+    || !validation
+    || validation.status !== "pass"
+    || !deterministicValidationMatchesArtifact(artifact, validation, pinnedRoot)) {
+    return "native validator terminal postimage is stale or not bound to the current artifact";
+  }
+  return null;
+}
+
+/***
  * Observe or safely resume one exact native validator postimage. This helper
  * never creates a dispatch: active validator records receive a fresh bearer
  * for the existing capability/dispatch, while succeeded records return their
@@ -2400,14 +2479,11 @@ export function observeNativeSpecificationValidation(
       if ((generation && generation.status !== "succeeded") || (!generation && phaseArtifact?.dispatch_id !== input.generation_dispatch_id)) {
         return { ok: false, code: "stale", error: "native validator generation postimage is missing or stale", state };
       }
-      const validators = cap.dispatches.filter((record) => record.purpose === "validation" && record.phase_version === input.version);
-      const record = validators.find((candidate) => candidate.tool_call_id === input.request_id);
-      if (!record) {
-        return validators.length > 0
-          ? { ok: false, code: "mismatch", error: "native validator dispatch request does not match the exact persisted validator", state }
-          : { ok: false, code: "not_found", error: "exact native validator dispatch is not persisted", state };
-      }
-      if (record.role !== "validator" || record.agent !== "validator" || !record.work_identity || record.work_identity.capability_id !== cap.capability_id || record.work_identity.capability_epoch !== binding.cursor_epoch) {
+      const validatorSelection = selectNativeValidatorRecord(cap, input.phase, input.version, input.request_id);
+      if (validatorSelection.error) return { ok: false, code: "mismatch", error: validatorSelection.error, state };
+      const record = validatorSelection.record;
+      if (!record) return { ok: false, code: "not_found", error: "exact native validator dispatch is not persisted", state };
+      if (!record.work_identity || record.work_identity.run_id !== binding.run_key || record.work_identity.workflow !== binding.workflow || record.work_identity.stage_id !== input.phase || record.work_identity.stage_cursor !== input.phase || record.work_identity.dispatch_id !== record.id || record.work_identity.attempt !== record.attempt) {
         return { ok: false, code: "stale", error: "native validator dispatch identity is stale", state };
       }
       if (record.status === "succeeded") {
@@ -2461,8 +2537,14 @@ export function resumeNativeSpecificationValidationFromPersisted(
   input: NativeSpecificationValidationResumeInput,
   options: { pinnedRoot?: PinnedProjectRoot; trustedMappingProof?: TrustedMappingProof } = {},
 ): NativeSpecificationValidationObservation {
+  const generationEvidenceError = workflowCompletionInputError({ evidence: input.generation_evidence });
+  if (generationEvidenceError) return { ok: false, code: "mismatch", error: generationEvidenceError };
   if (!Array.isArray(input.generation_artifact_ids) || input.generation_artifact_ids.length === 0 || !input.generation_evidence.trim()) {
     return { ok: false, code: "mismatch", error: "persisted native generation result is missing bounded artifacts or evidence" };
+  }
+  const expectedValidationRequestId = "native-validation-" + input.phase + "-" + input.feature_id + "-" + input.version;
+  if (input.request_id !== expectedValidationRequestId) {
+    return { ok: false, code: "mismatch", error: "native validator request is not bound to the exact phase artifact" };
   }
   const suppliedPinnedRoot = options.pinnedRoot;
   const pinnedRoot = suppliedPinnedRoot ?? PinnedProjectRoot.open(cwd);
@@ -2492,7 +2574,93 @@ export function resumeNativeSpecificationValidationFromPersisted(
       if (!artifact || artifact.dispatch_id !== input.generation_dispatch_id || artifact.version !== input.version || artifact.feature_id !== input.feature_id || artifact.run_key !== input.run_key) {
         return { ok: false, code: "stale", error: "persisted native phase result does not bind the exact generation dispatch/version", state: rawState };
       }
+      const generationArtifacts = stageProduces(stage);
+      if (canonicalJson(input.generation_artifact_ids) !== canonicalJson(generationArtifacts)
+        || !generationArtifacts.includes(artifact.source_artifact_id)) {
+        return { ok: false, code: "mismatch", error: "persisted native generation artifacts do not match the exact current phase outputs", state: rawState };
+      }
       const generation = cap.dispatches.find((record) => record.id === input.generation_dispatch_id && (record.purpose ?? "generation") === "generation");
+      if (!generation?.work_identity || !generation.tool_call_id || !artifact.work_identity || !sameIdentity(artifact.work_identity, generation.work_identity)) {
+        return { ok: false, code: "stale", error: "persisted native phase result does not bind the exact generation work identity", state: rawState };
+      }
+      const generationInput = input.generation;
+      if (!generationInput.work_identity
+        || generationInput.feature_id !== input.feature_id
+        || generationInput.capability_id !== generation.work_identity.capability_id
+        || generationInput.run_key !== generation.work_identity.run_id
+        || generationInput.branch !== binding.branch
+        || generationInput.workflow !== generation.work_identity.workflow
+        || generationInput.profile_hash !== binding.profile_hash
+        || generationInput.stage_cursor !== generation.work_identity.stage_id
+        || generationInput.cursor_epoch !== generation.work_identity.capability_epoch
+        || generationInput.dispatch_id !== generation.id
+        || generationInput.role !== generation.role
+        || generationInput.agent !== generation.agent
+        || generationInput.slot_id !== generation.work_identity.slot_id
+        || generationInput.task_id !== generation.work_identity.task_id
+        || generationInput.work_identity.attempt !== generation.attempt
+        || generationInput.tool_call_id !== generation.tool_call_id
+        || !sameIdentity(generationInput.work_identity, generation.work_identity)) {
+        return { ok: false, code: "mismatch", error: "persisted native generation postimage does not match the exact current dispatch identity", state: rawState };
+      }
+      const validatorSelection = selectNativeValidatorRecord(cap, input.phase, input.version, input.request_id);
+      if (validatorSelection.error) return { ok: false, code: "mismatch", error: validatorSelection.error, state: rawState };
+      const existing = validatorSelection.record;
+      if (existing?.status === "failed" || existing?.status === "cancelled") {
+        return { ok: false, code: "failed", error: "native validator dispatch is terminal without a successful receipt", state: rawState };
+      }
+      if (existing?.status === "succeeded") {
+        const validation = readArtifactPinned<Record<string, unknown>>(
+          transactionRoot,
+          join(".work-state", "features", input.feature_id, "artifacts"),
+          "validation." + input.phase + ".v" + input.version,
+        );
+        const expectedEvidence = "phase '" + input.phase + "' validation passed for '" + artifact.artifact_id + "'";
+        if (generation.status !== "succeeded"
+          || !generation.completion
+          || generation.completion.outcome !== "succeeded"
+          || !existing.completion
+          || existing.completion.outcome !== "succeeded"
+          || existing.completion.dispatch_id !== existing.id
+          || existing.completion.cursor_epoch !== binding.cursor_epoch
+          || !sameIdentity(existing.completion.work_identity, existing.work_identity)
+          || !existing.completion_envelope
+          || existing.completion_envelope.outcome !== "succeeded"
+          || !sameIdentity(existing.completion_envelope.identity, existing.work_identity)
+          || existing.completion.evidence !== expectedEvidence
+          || !validation
+          || validation.status !== "pass"
+          || !deterministicValidationMatchesArtifact(artifact, validation, transactionRoot)) {
+          return { ok: false, code: "stale", error: "native validator terminal postimage is stale or not bound to the current artifact", state: rawState };
+        }
+      }
+      const reconciliation = generation.pending?.reconciliation;
+      if (reconciliation) {
+        if (reconciliation.outcome === "failed" || reconciliation.outcome === "cancelled") {
+          return { ok: false, code: "failed", error: "native generation reconciliation is terminal without a successful result", state: rawState };
+        }
+        const expectedReconciliationDigest = nativeReconciliationDigest(
+          generation.work_identity!,
+          reconciliation.outcome,
+          input.generation_evidence,
+          input.generation_artifact_ids,
+          reconciliation.terminal_signal,
+          reconciliation.provider_id,
+        );
+        if (reconciliation.outcome !== "succeeded"
+          || !sameIdentity(reconciliation.identity, generation.work_identity)
+          || canonicalJson(reconciliation.artifact_ids) !== canonicalJson(input.generation_artifact_ids)
+          || reconciliation.evidence !== input.generation_evidence
+          || reconciliation.result_digest !== expectedReconciliationDigest) {
+          return { ok: false, code: "mismatch", error: "native generation reconciliation does not match the exact worker result postimage", state: rawState };
+        }
+        if (generation.completion && (generation.completion.outcome !== "succeeded"
+          || canonicalJson(generation.completion.artifact_ids) !== canonicalJson(input.generation_artifact_ids)
+          || generation.completion.evidence !== input.generation_evidence
+          || !sameIdentity(generation.completion.work_identity, generation.work_identity))) {
+          return { ok: false, code: "mismatch", error: "native generation completion conflicts with its reconciliation postimage", state: rawState };
+        }
+      }
       if (generation && generation.status !== "succeeded" && (generation.status === "failed" || generation.status === "cancelled")) {
         return { ok: false, code: "failed", error: "native generation dispatch is terminal without a successful result", state: rawState };
       }
@@ -2525,9 +2693,6 @@ export function resumeNativeSpecificationValidationFromPersisted(
         generationRecord = currentCap.dispatches.find((record) => record.id === input.generation_dispatch_id);
       }
       if (generationRecord && generationRecord.status !== "succeeded") return { ok: false, code: "stale", error: "native generation completion did not produce a succeeded postimage", state };
-      const validators = currentCap.dispatches.filter((record) => record.purpose === "validation" && record.phase_version === input.version);
-      const existing = validators.find((record) => record.tool_call_id === input.request_id);
-      if (validators.length > 0 && !existing) return { ok: false, code: "mismatch", error: "native validator request does not match the exact persisted validator", state };
       if (existing?.status === "succeeded") {
         if (!existing.completion || existing.completion.outcome !== "succeeded" || !existing.completion_envelope) return { ok: false, code: "stale", error: "native validator success receipt is incomplete", state };
         return { ok: true, status: "succeeded", state, record: existing, completion: existing.completion, completion_envelope: existing.completion_envelope, capability_id: currentCap.capability_id, capability_epoch: currentCap.issued_for.cursor_epoch, phase_version: input.version };
@@ -2583,6 +2748,39 @@ export type NativeSpecificationCheckpointCapabilityResult =
   | { ok: true; state: TeamState; capability_id: string; advance_token: string; cursor_epoch: string }
   | { ok: false; error: string; state?: TeamState; code?: "NATIVE_COMPOSITE_REQUIRED" };
 
+function nativePreparationStartExpectedRoster(capability: ActiveCapability): Array<{ role: string; agent: string }> {
+  const latestByRole = new Map<string, DispatchRecord>();
+  for (const record of capability.dispatches) {
+    if ((record.purpose ?? "generation") !== "generation") continue;
+    const prior = latestByRole.get(record.role);
+    if (!prior || record.attempt > prior.attempt) latestByRole.set(record.role, record);
+  }
+  return [...latestByRole.values()]
+    .sort((left, right) => left.attempt - right.attempt || left.created_at.localeCompare(right.created_at))
+    .map((record) => ({ role: record.role, agent: record.agent }));
+}
+
+function nativePreparationStartSnapshotDigest(state: TeamState, capability: ActiveCapability, marker: NativePreparationStartMarker, generation: DispatchRecord): string {
+  const originalGeneration: DispatchRecord = {
+    ...generation,
+    status: "authorized",
+    completed_at: undefined,
+    completion: undefined,
+    pending: undefined,
+    completion_envelope: undefined,
+  };
+  const originalCapability: ActiveCapability = {
+    ...capability,
+    capability_id: marker.capability_id,
+    status: "dispatched",
+    expected_roster: nativePreparationStartExpectedRoster(capability),
+    dispatches: capability.dispatches
+      .filter((record) => (record.purpose ?? "generation") === "generation")
+      .map((record) => record.id === marker.dispatch_id ? originalGeneration : record),
+  };
+  return preparationStartPostimageDigest({ ...state, dispatch_capability: originalCapability });
+}
+
 export function reissueNativeSpecificationCheckpointCapability(
   cwd: string,
   input: {
@@ -2624,7 +2822,10 @@ export function reissueNativeSpecificationCheckpointCapability(
       ? cap.dispatches.find((record) => record.id === marker.dispatch_id && (record.purpose ?? "generation") === "generation")
       : undefined;
     const generation = cap.dispatches.find((record) => record.id === input.generation_dispatch_id && (record.purpose ?? "generation") === "generation");
-    const validatorPostimage = [...cap.dispatches].reverse().find((record) => record.purpose === "validation" && record.phase_version === input.version);
+    const validatorRequestId = "native-validation-" + input.phase + "-" + input.feature_id + "-" + input.version;
+    const validatorSelection = selectNativeValidatorRecord(cap, input.phase, input.version, validatorRequestId);
+    const validatorPostimage = validatorSelection.record;
+    const originalExpectedRoster = nativePreparationStartExpectedRoster(cap);
     if (!handoff || !verifyPreparationHandoffDigest(handoff) || !verifyPreparationHandoffAuth(pinnedRoot, handoff)
       || handoff.source_kind !== "native" || handoff.feature_id !== input.feature_id || handoff.run_key !== input.run_key
       || handoff.branch !== input.branch || handoff.classification.workflow !== input.workflow) {
@@ -2635,25 +2836,57 @@ export function reissueNativeSpecificationCheckpointCapability(
       || marker.preparation_state_revision !== handoff.state_revision
       || marker.capability_id !== generationMarker?.work_identity?.capability_id
       || marker.capability_epoch !== generationMarker?.work_identity?.capability_epoch
-      || marker.profile_hash !== input.profile_hash) {
+      || !marker.expected_roster
+      || canonicalJson(marker.expected_roster) !== canonicalJson(originalExpectedRoster)
+      || marker.profile_hash !== input.profile_hash
+      || (marker.policy_hash !== undefined && marker.policy_hash !== cap.policy_hash)) {
       return { ok: false, code: "NATIVE_COMPOSITE_REQUIRED", error: "NATIVE_COMPOSITE_REQUIRED: native checkpoint reissue requires the exact composite start marker", state };
     }
+    const originalPreparationDigest = generation
+      ? nativePreparationStartSnapshotDigest(state, cap, marker, generation)
+      : null;
     if (!generationMarker || !generation
       || generation.id !== marker.dispatch_id
       || generation.id !== input.generation_dispatch_id
       || generationMarker.id !== generation.id
       || generationMarker.tool_call_id !== marker.request_id
+      || !originalExpectedRoster.some((entry) => entry.role === generation?.role && entry.agent === generation?.agent)
       || generationMarker.status !== "succeeded"
       || generation.status !== "succeeded"
       || !generationMarker.work_identity
       || !generation.work_identity
+      || generation.work_identity.run_id !== input.run_key
+      || generation.work_identity.workflow !== input.workflow
+      || generation.work_identity.stage_id !== input.phase
+      || generation.work_identity.stage_cursor !== input.phase
+      || generation.work_identity.capability_id !== marker.capability_id
+      || generation.work_identity.capability_epoch !== marker.capability_epoch
+      || generation.work_identity.dispatch_id !== generation.id
+      || generation.work_identity.attempt !== generation.attempt
       || !generationMarker.completion || generationMarker.completion.outcome !== "succeeded"
       || !generation.completion || generation.completion.outcome !== "succeeded"
+      || canonicalJson(generation.completion.work_identity) !== canonicalJson(generation.work_identity)
+      || !generation.completion_envelope
+      || generation.completion_envelope.outcome !== "succeeded"
+      || canonicalJson(generation.completion_envelope.identity) !== canonicalJson(generation.work_identity)
       || !generationMarker.completion.evidence.includes(`${input.phase}.v${input.version}`)
       || !generation.completion.evidence.includes(`${input.phase}.v${input.version}`)
       || !validatorPostimage || validatorPostimage.status !== "succeeded"
       || !validatorPostimage.completion || validatorPostimage.completion.outcome !== "succeeded"
-      || marker.start_postimage_digest !== preparationStartPostimageDigest(state)) {
+      || !validatorPostimage.work_identity
+      || validatorPostimage.work_identity.run_id !== binding.run_key
+      || validatorPostimage.work_identity.workflow !== binding.workflow
+      || validatorPostimage.work_identity.stage_id !== input.phase
+      || validatorPostimage.work_identity.stage_cursor !== input.phase
+      || validatorPostimage.work_identity.attempt !== validatorPostimage.attempt
+      || validatorPostimage.work_identity.capability_id !== cap.capability_id
+      || validatorPostimage.work_identity.capability_epoch !== cap.issued_for.cursor_epoch
+      || validatorPostimage.work_identity.dispatch_id !== validatorPostimage.id
+      || canonicalJson(validatorPostimage.completion.work_identity) !== canonicalJson(validatorPostimage.work_identity)
+      || !validatorPostimage.completion_envelope
+      || validatorPostimage.completion_envelope.outcome !== "succeeded"
+      || canonicalJson(validatorPostimage.completion_envelope.identity) !== canonicalJson(validatorPostimage.work_identity)
+      || marker.start_postimage_digest !== originalPreparationDigest) {
       return { ok: false, code: "NATIVE_COMPOSITE_REQUIRED", error: "NATIVE_COMPOSITE_REQUIRED: native checkpoint reissue requires complete generation and validator postimages", state };
     }
     if (!workspace || workspace.source_kind !== "native" || workspace.feature_id !== input.feature_id
@@ -2679,6 +2912,10 @@ export function reissueNativeSpecificationCheckpointCapability(
     if (!artifact || !validation || validation.status !== "pass" || !deterministicValidationMatchesArtifact(artifact, validation, pinnedRoot)) {
       return { ok: false, error: "native phase checkpoint artifact or validation postimage is unavailable", state };
     }
+    if (validatorSelection.error) return { ok: false, code: "NATIVE_COMPOSITE_REQUIRED", error: "NATIVE_COMPOSITE_REQUIRED: " + validatorSelection.error, state };
+    if (!validatorPostimage) return { ok: false, code: "NATIVE_COMPOSITE_REQUIRED", error: "NATIVE_COMPOSITE_REQUIRED: exact native validator postimage is unavailable", state };
+    const validatorTerminalError = nativeValidatorSuccessPostimageError(validatorPostimage, artifact, validation, binding, input.phase, pinnedRoot);
+    if (validatorTerminalError) return { ok: false, code: "NATIVE_COMPOSITE_REQUIRED", error: "NATIVE_COMPOSITE_REQUIRED: " + validatorTerminalError, state };
     if (!generationMarker?.work_identity || !generation?.work_identity
       || canonicalJson(artifact.work_identity) !== canonicalJson(generationMarker.work_identity)
       || canonicalJson(generationMarker.work_identity) !== canonicalJson(generation.work_identity)
@@ -2687,7 +2924,7 @@ export function reissueNativeSpecificationCheckpointCapability(
     }
     const constitutionError = phaseConstitutionError(pinnedRoot, workspace, artifact);
     if (constitutionError) return { ok: false, error: constitutionError, state };
-    const validator = [...cap.dispatches].reverse().find((record) => record.purpose === "validation" && record.phase_version === input.version);
+    const validator = validatorPostimage;
     if (!generation || generation.status !== "succeeded" || !validator || validator.status !== "succeeded") {
       return { ok: false, error: "native phase generation and validator postimages are not complete", state };
     }
@@ -2702,18 +2939,9 @@ export function reissueNativeSpecificationCheckpointCapability(
       dispatch_capability: reissued.state,
       updated_at: now(),
     };
-    const nextState: TeamState = marker
-      ? {
-        ...reissuedState,
-        preparation_start: {
-          ...marker,
-          start_postimage_digest: preparationStartPostimageDigest(reissuedState),
-        },
-      }
-      : reissuedState;
     return {
       ok: true,
-      state: nextState,
+      state: reissuedState,
       capability_id: reissued.capability_id,
       advance_token: reissued.advance_token,
       cursor_epoch: reissued.state.issued_for!.cursor_epoch,
