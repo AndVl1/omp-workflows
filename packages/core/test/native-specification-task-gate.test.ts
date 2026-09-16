@@ -18,7 +18,7 @@ import {
   NATIVE_SPECIFICATION_TASK_INTENT,
 } from "../src/gates/native-specification.js";
 import { TEST_CONTEXT, TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
-import { openTestRegistry } from "./fixtures/registry-activation.js";
+import { closeRetainedTestRegistrations, openTestRegistry } from "./fixtures/registry-activation.js";
 import { registerTestWorkflowTools, registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import { workflowOwnerFor } from "../src/registry/owner.js";
 import { specificationPhaseSchemaForConstitution } from "../src/engine/artifact-contract.js";
@@ -29,6 +29,7 @@ import {
   bindWorkspaceConstitution,
   createFeatureWorkspace,
 } from "../src/specification/workspace.js";
+import type { TeamSessionBindingController } from "../src/index.js";
 import type { TeamState } from "../src/engine/types.js";
 import type { FeatureWorkspace } from "../src/specification/types.js";
 import { validConstitutionBinding, sha256 } from "./fixtures/specification-fixtures.js";
@@ -58,7 +59,7 @@ function fixture(language = "en-US"): NativeGateFixture {
   writeFileSync(join(root, "CONSTITUTION.md"), constitution);
   mkdirSync(join(root, ".work-state"), { recursive: true });
   mkdirSync(join(root, ".omp"), { recursive: true });
-  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { "specification-analyst": "specification-worker" } }) + "\n");
+  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { "specification-analyst": "specification-worker", "specification-architect": "specification-worker" } }) + "\n");
   const config = resolveConfig(root);
   writeAgentMapping(root, buildAgentMapping({
     roles: config.roles,
@@ -539,7 +540,7 @@ test("bounded context scan stays inactive when all entries are non-generating", 
   }
 });
 
-test("registered native hook binds gates and auth to the authoritative session cwd", () => {
+test("registered native hook binds gates and auth to the authoritative session cwd", async () => {
   const f = fixture();
   try {
     const mounted = registeredToolCallHandler(f.root);
@@ -551,18 +552,18 @@ test("registered native hook binds gates and auth to the authoritative session c
     };
     const exact = { type: "tool_call", toolCallId: "manager-cwd-exact", toolName: "task", input: envelope(f.item) };
     assert.equal(
-      mounted(exact, { sessionManager: manager }),
+      await mounted(exact, { sessionManager: manager }),
       undefined,
       "a missing raw cwd must use the authoritative session manager cwd",
     );
     assert.equal(
-      mounted({ ...exact, toolCallId: "manager-cwd-stale", }, { cwd: join(tmpdir(), "stale-context"), sessionManager: manager }),
+      await mounted({ ...exact, toolCallId: "manager-cwd-stale", }, { cwd: join(tmpdir(), "stale-context"), sessionManager: manager }),
       undefined,
       "a stale raw cwd must not override the authoritative session manager cwd",
     );
     const statePath = join(f.root, ".work-state", "features", f.workspace.feature_id, "state.json");
     const before = JSON.parse(readFileSync(statePath, "utf8")) as { stage_cursor?: string };
-    const blocked = mounted(
+    const blocked = await mounted(
       { ...exact, toolCallId: "manager-cwd-throws" },
       { cwd: f.root, sessionManager: { getCwd: () => { throw new Error("manager unavailable"); } } },
     ) as { block?: boolean; reason?: string } | undefined;
@@ -766,7 +767,7 @@ test("native gate reports typed exact-marker diagnostics without exposing state 
   }
 });
 
-test("native gate admits only engine-owned workflow devices and re-evaluates native entry and exit", () => {
+test("native gate admits only engine-owned workflow devices and re-evaluates native entry and exit", async () => {
   const f = fixture();
   try {
     const engineDevices = [
@@ -796,7 +797,7 @@ test("native gate admits only engine-owned workflow devices and re-evaluates nat
         toolName: device,
         input: {},
       };
-      assert.equal(mounted(mountedEvent, TEST_CONTEXT(f.root)), undefined, device + " must remain available after host mounting");
+      assert.equal(await mounted(mountedEvent, TEST_CONTEXT(f.root)), undefined, device + " must remain available after host mounting");
     }
     for (const spoof of [
       "workflow_prepare_extra",
@@ -806,11 +807,11 @@ test("native gate admits only engine-owned workflow devices and re-evaluates nat
       assert.equal(nativeSpecificationTaskGate(event(spoof, {}), { cwd: f.root })?.block, true, spoof + " must not be admitted as a mounted workflow tool");
     }
     assert.equal(nativeSpecificationTaskGate(event("workflow_finalize_native_specification_phase", []), { cwd: f.root })?.block, true, "mounted workflow tools require object input");
-    const unknown = mounted({ type: "tool_call", toolCallId: "unknown-device", toolName: "write", input: { path: "xd://workflow_third_party", content: "{}" } }, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
+    const unknown = await mounted({ type: "tool_call", toolCallId: "unknown-device", toolName: "write", input: { path: "xd://workflow_third_party", content: "{}" } }, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
     assert.equal(unknown?.block, true, "unknown mounted workflow devices must be denied");
 
     const malformedTask = { type: "tool_call", toolCallId: "native-race", toolName: "task", input: { ...envelope(f.item), tasks: [] } };
-    const active = mounted(malformedTask, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
+    const active = await mounted(malformedTask, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
     assert.equal(active?.block, true);
     assert.match(active?.reason ?? "", /native specification/iu);
 
@@ -825,7 +826,7 @@ test("native gate admits only engine-owned workflow devices and re-evaluates nat
       },
     }, { featureSlug: current.specification.feature_id });
     assert.equal(nativeSpecificationGenerationActive(f.root), false, "gate must leave native mode when the phase is no longer generating");
-    const exited = mounted(malformedTask, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
+    const exited = await mounted(malformedTask, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
     assert.equal(exited?.block, true, "closed native envelope must remain blocked after native mode exits");
     assert.match(exited?.reason ?? "", /native specification/iu);
 
@@ -840,7 +841,7 @@ test("native gate admits only engine-owned workflow devices and re-evaluates nat
       },
     }, { featureSlug: exitedState.specification.feature_id });
     assert.equal(nativeSpecificationGenerationActive(f.root), true, "gate must re-enter native mode from current state");
-    const reentered = mounted(malformedTask, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
+    const reentered = await mounted(malformedTask, TEST_CONTEXT(f.root)) as { block?: boolean; reason?: string } | undefined;
     assert.equal(reentered?.block, true);
     assert.match(reentered?.reason ?? "", /native specification/iu);
   } finally {
@@ -848,7 +849,7 @@ test("native gate admits only engine-owned workflow devices and re-evaluates nat
   }
 });
 
-test("registered native hook uses the exact task payload shape and rejects count or forged items", () => {
+test("registered native hook uses the exact task payload shape and rejects count or forged items", async () => {
   const f = fixture();
   const handler = registeredToolCallHandler(f.root);
   try {
@@ -859,7 +860,7 @@ test("registered native hook uses the exact task payload shape and rejects count
       toolName: "task",
       input: envelope(f.item),
     };
-    assert.equal(handler(exactEvent, context), undefined);
+    assert.equal(await handler(exactEvent, context), undefined);
 
     for (const input of [
       { ...envelope(f.item), extra: "forged" },
@@ -868,7 +869,7 @@ test("registered native hook uses the exact task payload shape and rejects count
       { ...envelope(f.item), tasks: [f.item, "schemaModeRequirement???", "schemaModeRequirement"] },
       { ...envelope(f.item), tasks: [{ ...f.item, name: "forged-worker" }] },
     ]) {
-      const result = handler({ ...exactEvent, input }, context) as { block?: boolean } | undefined;
+      const result = await handler({ ...exactEvent, input }, context) as { block?: boolean } | undefined;
       assert.equal(result?.block, true);
     }
   } finally {
@@ -1784,48 +1785,37 @@ test("plan dispatch embeds verified upstream artifact and projection content", (
       advance_secret: "plan-advance-secret",
       policy_hash: digestOf(profile.stages.find((candidate) => candidate.id === "plan")?.roster_policy ?? {}),
     });
-    writeState(f.root, { ...current, stage_cursor: "plan", cursor_epoch: issued.state.issued_for!.cursor_epoch, dispatch_capability: issued.state, specification: planWorkspace, preparation_start: undefined }, { featureSlug: prepared.specification!.feature_id });
+    const { preparation_start: _preparationStart, ...currentWithoutPreparationStart } = current;
+    writeState(f.root, { ...currentWithoutPreparationStart, stage_cursor: "plan", cursor_epoch: issued.state.issued_for!.cursor_epoch, dispatch_capability: issued.state, specification: planWorkspace }, { featureSlug: prepared.specification!.feature_id });
     const planState = resolveState(f.root, "main", { feature_id: prepared.specification!.feature_id, run_key: prepared.run_key! }).state;
     assert.ok(planState, "plan preparation fixture state must be readable");
     if (!planState) throw new Error("plan preparation fixture state unavailable");
-    attachPreparationHandoff(f.root, planState);
-    const capabilityId = issued.capability_id;
-    const taskId = dispatchTaskId(capabilityId, prepared.run_key!, "main", "spec-preparation", "plan", "specification-architect");
-    const planProof = issueCurrentTrustedMappingProof(f.root);
-    const authorized = authorizeDispatchTrusted(f.root, {
-      capability_id: capabilityId,
-      run_key: prepared.run_key!,
-      branch: "main",
-      workflow: "spec-preparation",
-      profile_hash: profileHash(profile),
-      stage_cursor: "plan",
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      role: "specification-architect",
-      slot_id: "specification-architect",
-      task_id: taskId,
-      agent: "specification-worker",
-      tool_call_id: "plan-task-call",
-      expected_count: 1,
-    }, planProof === undefined ? {} : { trustedMappingProof: planProof });
-    assert.equal(authorized.ok, true, authorized.ok ? "" : authorized.error);
-    if (!authorized.ok) throw new Error(authorized.error);
+    const planPrepared = attachPreparationHandoff(f.root, planState);
+    const planStarted = startNativeSpecificationPhase(f.root, {
+      feature_id: planPrepared.specification!.feature_id,
+      run_key: planPrepared.run_key!,
+      preparation_handoff: planPrepared.preparation_handoff!,
+    });
+    assert.equal(planStarted.ok, true, planStarted.ok ? "" : planStarted.error);
+    if (!planStarted.ok) throw new Error(planStarted.error);
+    const planHandoff = planStarted.value.handoff;
     return {
       fixture: f,
       dispatchInput: {
-        token: issued.dispatch_token,
-        capability_id: capabilityId,
-        feature_id: prepared.specification!.feature_id,
-        run_key: prepared.run_key!,
-        branch: "main",
-        workflow: "spec-preparation",
-        profile_hash: profileHash(profile),
-        phase: "plan",
-        cursor_epoch: issued.state.issued_for!.cursor_epoch,
-        request_id: "plan-task-call",
-        role: "specification-architect",
-        slot_id: "specification-architect",
-        agent: "specification-worker",
-        task_id: taskId,
+        token: planHandoff.token,
+        capability_id: planHandoff.capability_id,
+        feature_id: planHandoff.feature_id,
+        run_key: planHandoff.run_key,
+        branch: planHandoff.branch,
+        workflow: planHandoff.workflow,
+        profile_hash: planHandoff.profile_hash,
+        phase: planHandoff.phase,
+        cursor_epoch: planHandoff.cursor_epoch,
+        request_id: planHandoff.request_id,
+        role: planHandoff.role,
+        slot_id: planHandoff.slot_id,
+        agent: planHandoff.agent,
+        task_id: planHandoff.work_identity.task_id,
       },
       artifactPath: join(f.root, ".work-state", "features", prepared.specification!.feature_id, "artifacts", "specify.v1.json"),
     };
@@ -2170,7 +2160,7 @@ test("native finalizer resumes each durable boundary without duplicating dispatc
   }
 });
 
-test("native task result selector requires the authorization root and session identity", () => {
+test("native task result selector requires the authorization root and session identity", async () => {
   const f = fixture();
   const foreign = fixture();
   try {
@@ -2182,20 +2172,20 @@ test("native task result selector requires the authorization root and session id
       getSessionGeneration: () => "generation-a",
     };
     const context = { sessionManager: manager };
-    handlers.get("session_start")?.({}, context);
+    await handlers.get("session_start")?.({}, context);
     const call = { type: "tool_call", toolCallId: "native-task-call", toolName: "task", input: envelope(f.item) };
-    assert.equal(handlers.get("tool_call")?.(call, context), undefined, "same-session native dispatch remains admitted");
+    assert.equal(await handlers.get("tool_call")?.(call, context), undefined, "same-session native dispatch remains admitted");
     const statePath = join(f.root, ".work-state", "features", f.workspace.feature_id, "state.json");
     const beforeForeignRoot = readFileSync(statePath, "utf8");
     const foreignRoot = { sessionManager: { getCwd: () => foreign.root, getSessionId: () => "native-session-a", getSessionFile: () => join(foreign.root, "native-session-a.jsonl"), getSessionGeneration: () => "generation-a" } };
-    handlers.get("tool_result")?.({ toolName: "task", toolCallId: "native-task-call", content: [{ type: "text", text: "late foreign root" }], isError: false }, foreignRoot);
+    await handlers.get("tool_result")?.({ toolName: "task", toolCallId: "native-task-call", content: [{ type: "text", text: "late foreign root" }], isError: false }, foreignRoot);
     assert.equal(readFileSync(statePath, "utf8"), beforeForeignRoot, "a foreign-root late result must not mutate the authorized state");
     const beforeForeignSession = readFileSync(statePath, "utf8");
     const foreignSession = { sessionManager: { getCwd: () => f.root, getSessionId: () => "native-session-b", getSessionFile: () => join(f.root, "native-session-b.jsonl"), getSessionGeneration: () => "generation-b" } };
-    handlers.get("tool_result")?.({ toolName: "task", toolCallId: "native-task-call", content: [{ type: "text", text: "late foreign session" }], isError: false }, foreignSession);
+    await handlers.get("tool_result")?.({ toolName: "task", toolCallId: "native-task-call", content: [{ type: "text", text: "late foreign session" }], isError: false }, foreignSession);
     assert.equal(readFileSync(statePath, "utf8"), beforeForeignSession, "a foreign-session late result must not mutate the authorized state");
-    assert.equal(handlers.get("tool_call")?.(call, context), undefined, "the same id can be authorized again under the current session");
-    assert.equal(handlers.get("tool_result")?.({ toolName: "task", toolCallId: "native-task-call", content: [{ type: "text", text: "same session" }], isError: false }, context), undefined, "same-session result remains accepted");
+    assert.equal(await handlers.get("tool_call")?.(call, context), undefined, "the same id can be authorized again under the current session");
+    assert.equal(await handlers.get("tool_result")?.({ toolName: "task", toolCallId: "native-task-call", content: [{ type: "text", text: "same session" }], isError: false }, context), undefined, "same-session result remains accepted");
     const completed = JSON.parse(readFileSync(statePath, "utf8")) as { dispatch_capability?: { dispatches?: Array<{ status?: string }> } };
     assert.equal(completed.dispatch_capability?.dispatches?.[0]?.status, "pending", "same-session result enters the existing artifact-deferred reconciliation path");
   } finally {
@@ -2255,20 +2245,29 @@ test("failed session rebind releases its activation before retrying beyond the l
   }
 });
 
-test("team shutdown ignores stale session generations and closes each exact rebind", () => {
+test("team shutdown ignores stale session generations and closes each exact rebind", async () => {
   const f = fixture();
   try {
     const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    let controller: TeamSessionBindingController | undefined;
     const pi = {
       setLabel() {},
       on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
-        if (["session_start", "session_shutdown"].includes(name)) handlers.set(name, handler);
+        if (["session_start", "tool_call"].includes(name)) handlers.set(name, handler);
       },
     };
-    registerTestTeamWorkflow(f.root, pi as never, { rebindSessions: true, observability: false });
+    registerTestTeamWorkflow(f.root, pi as never, {
+      rebindSessions: true,
+      observability: false,
+      onSessionBindingController: (candidate) => { controller = candidate; },
+    });
+    // The helper retains its static registration for file teardown. Release
+    // that fixture lease before checking exact session-owner shutdown.
+    closeRetainedTestRegistrations(f.root);
     const initialSessionStart = handlers.get("session_start");
     assert.ok(initialSessionStart);
-    if (!initialSessionStart) return;
+    assert.ok(controller, "team registration exposes its current session binding controller");
+    if (!initialSessionStart || !controller) return;
     const manager = (id: string) => ({
       getCwd: () => f.root,
       getSessionId: () => id,
@@ -2278,43 +2277,46 @@ test("team shutdown ignores stale session generations and closes each exact rebi
     const contextA = { cwd: f.root, sessionManager: manager("shutdown-a") };
     const contextB = { cwd: f.root, sessionManager: manager("shutdown-b") };
     const contextC = { cwd: f.root, sessionManager: manager("shutdown-c") };
-    initialSessionStart({}, contextA);
+    await initialSessionStart({}, contextA);
     assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "initial A binds an owner claim");
+    const bindingA = controller.current(contextA);
+    assert.ok(bindingA, "initial A exposes an exact runtime binding");
     const sessionStart = handlers.get("session_start");
-    const sessionShutdown = handlers.get("session_shutdown");
-    assert.ok(sessionStart && sessionShutdown);
-    if (!sessionStart || !sessionShutdown) return;
-    sessionStart({}, contextB);
+    assert.ok(sessionStart);
+    if (!sessionStart || !bindingA) return;
+    await sessionStart({}, contextB);
     assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "replacement B binds an owner claim");
+    const bindingB = controller.current(contextB);
+    assert.ok(bindingB, "replacement B exposes an exact runtime binding");
+    if (!bindingB) return;
 
-    // The initial handler must not tear down the replacement B activation.
-    sessionShutdown({}, contextA);
-    assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "stale A shutdown preserves B owner claim");
+    // A stale A release must not tear down replacement B.
+    assert.equal(controller.release(bindingA), false, "stale A release is ignored");
+    assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "stale A release preserves B owner claim");
     const call = { type: "tool_call", toolCallId: "shutdown-call-b", toolName: "task", input: envelope(f.item) };
-    assert.equal(handlers.get("tool_call")?.(call, contextB), undefined, "stale A shutdown leaves B active");
+    assert.equal(await handlers.get("tool_call")?.(call, contextB), undefined, "stale A release leaves B active");
 
-    // The exact B shutdown closes B immediately and remains idempotent.
-    sessionShutdown({}, contextB);
-    assert.equal(workflowOwnerFor(f.root, "workflow_registration"), undefined, "exact B shutdown releases its owner claim immediately");
-    sessionShutdown({}, contextB);
-
-    // The mounted handler is reusable for a later exact generation. A stale
-    // B event cannot close C, while the exact C event can close it.
-    sessionStart({}, contextC);
+    // A later C rebind remains live while stale B is ignored.
+    await sessionStart({}, contextC);
     assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "C rebind restores a live owner claim");
+    const bindingC = controller.current(contextC);
+    assert.ok(bindingC, "C exposes an exact runtime binding");
+    if (!bindingC) return;
     const callC = { ...call, toolCallId: "shutdown-call-c" };
-    assert.equal(handlers.get("tool_call")?.(callC, contextC), undefined, "C activation is live after B shutdown");
-    sessionShutdown({}, contextB);
-    assert.equal(handlers.get("tool_call")?.({ ...callC, toolCallId: "shutdown-call-c-after-stale" }, contextC), undefined, "stale B shutdown leaves C active");
-    sessionShutdown({}, contextC);
-    assert.equal(workflowOwnerFor(f.root, "workflow_registration"), undefined, "exact C shutdown releases its owner claim immediately");
-    sessionShutdown({}, contextC);
+    assert.equal(await handlers.get("tool_call")?.(callC, contextC), undefined, "C activation remains live after rebind");
+    assert.equal(controller.release(bindingB), false, "stale B release is ignored");
+    assert.ok(workflowOwnerFor(f.root, "workflow_registration"), "stale B release preserves C owner claim");
+
+    // The exact C release closes C immediately and remains idempotent.
+    assert.equal(controller.release(bindingC), true, "exact C release closes its binding");
+    assert.equal(workflowOwnerFor(f.root, "workflow_registration"), undefined, "exact C release releases its owner claim immediately");
+    assert.equal(controller.release(bindingC), false, "an exact C release is idempotent");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
 });
 
-test("native task selectors clear on session rebind and reject stale reused ids", () => {
+test("native task selectors clear on session rebind and reject stale reused ids", async () => {
   const f = fixture();
   try {
     const handlers = registeredTaskLifecycleHandlers(f.root, true);
@@ -2333,14 +2335,14 @@ test("native task selectors clear on session rebind and reject stale reused ids"
     const contextA = { sessionManager: managerA };
     const contextB = { sessionManager: managerB };
     const call = { type: "tool_call", toolCallId: "native-task-call", toolName: "task", input: envelope(f.item) };
-    handlers.get("session_start")?.({}, contextA);
-    assert.equal(handlers.get("tool_call")?.(call, contextA), undefined);
+    await handlers.get("session_start")?.({}, contextA);
+    assert.equal(await handlers.get("tool_call")?.(call, contextA), undefined);
     const statePath = join(f.root, ".work-state", "features", f.workspace.feature_id, "state.json");
     const beforeRebind = readFileSync(statePath, "utf8");
-    handlers.get("session_start")?.({}, contextB);
+    await handlers.get("session_start")?.({}, contextB);
     const beforeLate = readFileSync(statePath, "utf8");
     assert.equal(beforeLate, beforeRebind, "session rebind does not mutate workflow state");
-    handlers.get("tool_result")?.({ toolName: "task", toolCallId: "native-task-call", content: [{ type: "text", text: "late old session" }], isError: false }, contextA);
+    await handlers.get("tool_result")?.({ toolName: "task", toolCallId: "native-task-call", content: [{ type: "text", text: "late old session" }], isError: false }, contextA);
     assert.equal(readFileSync(statePath, "utf8"), beforeLate, "late old-session result after rebind is dropped");
   } finally {
     rmSync(f.root, { recursive: true, force: true });
