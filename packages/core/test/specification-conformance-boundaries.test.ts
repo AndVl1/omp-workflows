@@ -29,6 +29,11 @@ const artifact = (): Json => ({ artifact_id: "artifact-1", path: "artifact-1.jso
 const evidence = (index = 0): Json => ({ evidence_id: `evidence-${index}`, kind: "implementation", subject_id: "FR-1", requirement_id: null, handoff_digest: digest, execution_claim_id: "claim-1", artifact: artifact() });
 const gate = (): Json => ({ gate_id: "execution-profile.hash", source: "execution_profile", status: "pass", evidence_refs: [], findings: [] });
 const base = (): Json => ({ feature_id: "feature-1", run_key: "run-1", evidence: [evidence()], quality_gates: [gate()] });
+const safeUnissuedBinding = (): string => [
+  "cto-conformance-v2",
+  ...["foreign-root", "unissued-run", "unissued-mapping", digest, digest, "checkpoint", "answer", digest, digest]
+    .map((value) => Buffer.from(value, "utf8").toString("base64url")),
+].join(".");
 
 function mountedSchema(): z.ZodTypeAny {
   const root = mkdtempSync(join(tmpdir(), "conformance-registrar-"));
@@ -151,7 +156,7 @@ test("CTO conformance persistence preserves deterministic invalid-binding reject
       mapping: { feature_ids: ["feature-1"] },
       handoffs: [],
       claims: [],
-      binding: { capability_id: "not-a-cto-conformance-token" },
+      binding: { capability_id: safeUnissuedBinding() },
     } as never, { runtimeAccess: opened.access, sessionId: "invalid-binding-session" });
     assert.equal(result.status, "blocked");
     assert.match(result.findings[0] ?? "", /binding is invalid|not issued by confirmed dispatch/i);

@@ -8,6 +8,8 @@ import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { advanceCursor, commitCheckpointAnswerSelected, issueCurrentTrustedMappingProof, validateCheckpointAskSelected } from "../src/engine/durable.js";
+import { issueTrustedCheckpointAnswerCapability, registerTrustedCheckpointHostBridge } from "../src/engine/checkpoints.js";
+import { randomUUID } from "node:crypto";
 import { prepareWorkflowState } from "../src/engine/run.js";
 import { resolveState } from "../src/engine/state.js";
 import { createFeatureWorkspace } from "../src/specification/workspace.js";
@@ -21,6 +23,70 @@ import type { FeatureWorkspace } from "../src/specification/types.js";
 const profile = loadProfile("spec-preparation");
 assert.ok(profile);
 const constitution = "# Project Constitution v1.0.0\n\n## I. Quality\n\nShip tested work.\n";
+
+const TEST_CHECKPOINT_BRIDGE = Object.freeze({});
+registerTrustedCheckpointHostBridge(TEST_CHECKPOINT_BRIDGE);
+
+function commitNativeCheckpointAnswer(
+  root: string,
+  ask: Record<string, unknown>,
+  decision: string,
+  feedback?: string,
+): ReturnType<typeof commitCheckpointAnswerSelected> {
+  const featureId = String(ask.feature_id);
+  const runKey = String(ask.run_key);
+  const selected = resolveState(root, "main", { feature_id: featureId, run_key: runKey });
+  assert.ok(selected.state && selected.statePath, "native continuation state must be persisted before the selected Ask");
+  if (!selected.state || !selected.statePath) {
+    return { ok: false, kind: "rejected", code: "state_invalid", error: "native continuation state is unavailable" };
+  }
+  const preflight = validateCheckpointAskSelected(root, ask as never);
+  assert.equal(preflight.ok, true, preflight.ok ? "" : preflight.error);
+  if (!preflight.ok) {
+    return { ok: false, kind: "rejected", code: "checkpoint_invalid", error: preflight.error };
+  }
+  const pinned = PinnedProjectRoot.open(root);
+  assert.ok(pinned, "native continuation root must pin for the trusted Ask");
+  if (!pinned) {
+    return { ok: false, kind: "rejected", code: "state_invalid", error: "native continuation root is unavailable" };
+  }
+  try {
+    const rootIdentity = { canonical_root: pinned.canonical_root, dev: pinned.dev, ino: pinned.ino };
+    const answerId = "continuation-answer/" + randomUUID();
+    const reference = "terminal:workflow_checkpoint_ask_selected:" + answerId;
+    const capability = issueTrustedCheckpointAnswerCapability(TEST_CHECKPOINT_BRIDGE, {
+      root: rootIdentity,
+      state: selected.state,
+      answer_id: answerId,
+      channel: "terminal",
+      reference,
+      stage_id: String(ask.stage_cursor),
+      checkpoint_id: String(ask.checkpoint_id),
+      decision,
+      feature_id: featureId,
+      loop_iteration: preflight.context.loop_iteration,
+      subject_binding: preflight.context.subject_binding,
+      subject_revision: preflight.context.state_revision + 1,
+      question: typeof ask.question === "string" ? ask.question : "Review the current native specification phase.",
+      options: ["approve_continue", "request_changes", "approve_stop"],
+      session_id: "native-continuation-test-session",
+      actor_ref: reference,
+      profile_hash: String(ask.profile_hash),
+      ...(feedback === undefined ? {} : { feedback }),
+    });
+    return commitCheckpointAnswerSelected(root, {
+      ...ask,
+      decision,
+      ...(feedback === undefined ? {} : { feedback }),
+    } as never, {
+      trusted_answer_capability: capability,
+      trusted_answer_id: answerId,
+      apply_decision: true,
+    });
+  } finally {
+    pinned.close();
+  }
+}
 
 type NativeBinding = NonNullable<FeatureWorkspace["constitution_binding"]>;
 interface ConstitutionIdentity { principle_id: string; title: string }
@@ -159,7 +225,7 @@ test("native request_changes continuation mints v2 authority and preserves v1 hi
     const askV1 = finalizeWithModel(root, featureId, runKey, startedV1.value);
     const selectedV1 = validateCheckpointAskSelected(root, askV1 as never);
     assert.equal(selectedV1.ok, true, selectedV1.ok ? "" : selectedV1.error);
-    const answeredV1 = commitCheckpointAnswerSelected(root, { ...askV1, decision: "request_changes", feedback: "Revise the specification evidence." } as never, { apply_decision: true });
+    const answeredV1 = commitNativeCheckpointAnswer(root, askV1, "request_changes", "Revise the specification evidence.");
     assert.equal(answeredV1.ok, true, answeredV1.ok ? "" : answeredV1.error);
     const advancedV1 = advanceWithCurrentProof(root, { ...askV1, token: askV1.advance_token, evidence: "request changes accepted" } as never);
     assert.equal(advancedV1.ok, true, advancedV1.ok ? "" : advancedV1.error);
@@ -195,7 +261,7 @@ test("native request_changes continuation mints v2 authority and preserves v1 hi
     assert.equal(askV2.checkpoint, "specification_phase_approval");
     const selectedV2 = validateCheckpointAskSelected(root, askV2 as never);
     assert.equal(selectedV2.ok, true, selectedV2.ok ? "" : selectedV2.error);
-    const answeredV2 = commitCheckpointAnswerSelected(root, { ...askV2, decision: "approve_continue" } as never, { apply_decision: true });
+    const answeredV2 = commitNativeCheckpointAnswer(root, askV2, "approve_continue");
     assert.equal(answeredV2.ok, true, answeredV2.ok ? "" : answeredV2.error);
     const terminal = resolveState(root, "main", { feature_id: featureId, run_key: runKey }).state!;
     assert.equal(terminal.history?.at(-1)?.feedback, feedback);
@@ -282,11 +348,7 @@ test("native checkpoint transitions re-mint current phase preparation authority"
       assert.equal(started.ok, true, started.ok ? "" : started.error);
       if (!started.ok) continue;
       const ask = finalizeWithModel(root, featureId, runKey, started.value);
-      const answered = commitCheckpointAnswerSelected(root, {
-        ...ask,
-        decision: selected.decision,
-        ...(selected.feedback === undefined ? {} : { feedback: selected.feedback }),
-      } as never, { apply_decision: true });
+      const answered = commitNativeCheckpointAnswer(root, ask, selected.decision, selected.feedback);
       assert.equal(answered.ok, true, answered.ok ? "" : answered.error);
       if (!answered.ok) continue;
       const advanced = advanceWithCurrentProof(root, {
@@ -337,7 +399,7 @@ test("native worker generation bindings reject retry, missing, and tampered resu
     const askV1 = askV1Result.value.required_next_tool.arguments as Record<string, unknown>;
     const selectedV1 = validateCheckpointAskSelected(root, askV1 as never);
     assert.equal(selectedV1.ok, true, selectedV1.ok ? "" : selectedV1.error);
-    const answeredV1 = commitCheckpointAnswerSelected(root, { ...askV1, decision: "request_changes", feedback: "Revise the generation binding." } as never, { apply_decision: true });
+    const answeredV1 = commitNativeCheckpointAnswer(root, askV1, "request_changes", "Revise the generation binding.");
     assert.equal(answeredV1.ok, true, answeredV1.ok ? "" : answeredV1.error);
     const advancedV1 = advanceWithCurrentProof(root, { ...askV1, token: askV1.advance_token, evidence: "request changes accepted" } as never);
     assert.equal(advancedV1.ok, true, advancedV1.ok ? "" : advancedV1.error);
@@ -390,17 +452,17 @@ test("native selected Ask exact applied replay is idempotent for every decision"
       assert.equal(started.ok, true, started.ok ? "" : started.error);
       if (!started.ok) continue;
       const ask = finalizeWithModel(root, featureId, runKey, started.value);
-      const first = commitCheckpointAnswerSelected(root, { ...ask, decision: selected.decision, ...(selected.feedback === undefined ? {} : { feedback: selected.feedback }) } as never, { apply_decision: true });
+      const first = commitNativeCheckpointAnswer(root, ask, selected.decision, selected.feedback);
       assert.equal(first.ok, true, first.ok ? "" : first.error);
       if (!first.ok) continue;
       const statePath = join(root, ".work-state", "features", featureId, "state.json");
       const beforeRetry = readFileSync(statePath, "utf8");
-      const retry = commitCheckpointAnswerSelected(root, { ...ask, decision: selected.decision, ...(selected.feedback === undefined ? {} : { feedback: selected.feedback }) } as never, { apply_decision: true });
+      const retry = commitNativeCheckpointAnswer(root, ask, selected.decision, selected.feedback);
       assert.equal(retry.ok, true, retry.ok ? "" : retry.error);
       if (retry.ok) assert.equal(retry.outcome, "already_recorded");
       assert.equal(readFileSync(statePath, "utf8"), beforeRetry, "exact replay must not mutate durable state");
 
-      const restartReplay = commitCheckpointAnswerSelected(root, { ...ask, decision: selected.decision, ...(selected.feedback === undefined ? {} : { feedback: selected.feedback }) } as never, { apply_decision: true });
+      const restartReplay = commitNativeCheckpointAnswer(root, ask, selected.decision, selected.feedback);
       assert.equal(restartReplay.ok, true, restartReplay.ok ? "" : restartReplay.error);
       if (restartReplay.ok) assert.equal(restartReplay.outcome, "already_recorded");
       assert.equal(readFileSync(statePath, "utf8"), beforeRetry, "restart replay must not mutate durable state");

@@ -534,14 +534,21 @@ test("lecture-research: approval gate completes only on approved or rejected dec
   assert.ok(gate, "approval stage declares a gate");
 
   const root = mkdtempSync(join(tmpdir(), "lecture-gate-"));
+  let pinnedRoot: PinnedProjectRoot | null = null;
   try {
     const artifactsDir = join(root, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
+    pinnedRoot = PinnedProjectRoot.open(root);
+    assert.ok(pinnedRoot, "approval gate fixture root must be pinnable");
+    if (!pinnedRoot) return;
+    const artifactsDirRelative = pinnedRoot.relativePath(artifactsDir);
+    assert.equal(artifactsDirRelative, "artifacts", "approval artifacts must stay under the pinned root");
+    const stageState = { ...minimalState(), stage_cursor: "approval", stages: [{ id: "approval", status: "in_progress" }] };
 
     for (const verdict of ["approved", "rejected"] as const) {
       writeFileSync(join(artifactsDir, "lecture_decision.json"), JSON.stringify({ verdict, rationale: "explicit human decision" }));
       assert.deepEqual(
-        evaluatePredicate(gate, { flags: FLAGS, artifactsDir, state: minimalState(), stage: approval }),
+        evaluatePredicate(gate, { flags: FLAGS, artifactsDir, artifactsDirRelative, pinnedRoot, state: stageState, stage: approval }),
         { ok: true, value: true },
         `gate must accept an explicit '${verdict}' decision`,
       );
@@ -549,15 +556,16 @@ test("lecture-research: approval gate completes only on approved or rejected dec
 
     writeFileSync(join(artifactsDir, "lecture_decision.json"), JSON.stringify({ verdict: "needs_rework" }));
     assert.deepEqual(
-      evaluatePredicate(gate, { flags: FLAGS, artifactsDir, state: minimalState(), stage: approval }),
+      evaluatePredicate(gate, { flags: FLAGS, artifactsDir, artifactsDirRelative, pinnedRoot, state: stageState, stage: approval }),
       { ok: true, value: false },
       "gate must not complete on a non-terminal verdict",
     );
 
     rmSync(join(artifactsDir, "lecture_decision.json"));
-    const missing = evaluatePredicate(gate, { flags: FLAGS, artifactsDir, state: minimalState(), stage: approval });
+    const missing = evaluatePredicate(gate, { flags: FLAGS, artifactsDir, artifactsDirRelative, pinnedRoot, state: stageState, stage: approval });
     assert.equal(missing.ok, false, "missing decision artifact fails closed");
   } finally {
+    pinnedRoot?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -631,6 +639,7 @@ test("lecture-research: fresh and amend CTO prompts keep the research-only human
       cwd: root,
       branch: "main",
       autonomous: false,
+      classification: lectureClassification(),
       sessionId: "main-session",
       teams: [{ team: "backend", slice: "s1" }],
       defs: {

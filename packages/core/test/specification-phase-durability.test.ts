@@ -85,11 +85,13 @@ const FAILURE_POINTS = [
 const phaseRaceDirectory = dirname(fileURLToPath(import.meta.url));
 const phaseRaceModule = join(phaseRaceDirectory, "../src/specification/phase.ts");
 const durableRaceModule = join(phaseRaceDirectory, "../src/engine/durable.ts");
+const agentMappingRaceModule = join(phaseRaceDirectory, "../src/engine/agent-mapping.ts");
 const phaseRaceChildScript = [
   "const [root, mode, payload, readyPath, releasePath, startedPath, donePath] = process.argv.slice(1);",
   "const { existsSync, writeFileSync } = await import(\"node:fs\");",
   "const phase = await import(" + JSON.stringify(phaseRaceModule) + ");",
   "const durable = await import(" + JSON.stringify(durableRaceModule) + ");",
+  "const agentMapping = await import(" + JSON.stringify(agentMappingRaceModule) + ");",
   "const input = JSON.parse(payload);",
   "let result;",
   "if (mode === \"phase\") {",
@@ -109,9 +111,14 @@ const phaseRaceChildScript = [
   "  phase.persistSpecificationPhaseResult(root, input);",
   "} else {",
   "  writeFileSync(startedPath, \"started\");",
-"  const dispatch = phase.dispatchSpecificationPhase(root, input.dispatch);",
+"  const currentMapping = agentMapping.readAgentMapping(root);",
+"  if (!currentMapping) throw new Error(\"race child cannot read the current agent mapping\");",
+"  agentMapping.writeAgentMapping(root, currentMapping);",
+"  const dispatchProof = durable.issueCurrentTrustedMappingProof(root);",
+"  const dispatch = phase.dispatchSpecificationPhase(root, input.dispatch, dispatchProof === undefined ? {} : { trustedMappingProof: dispatchProof });",
 "  const failure = durable.completeDispatch(root, input.failure);",
-  "  const retry = durable.authorizeSpecificationPhaseDispatch(root, input.retry);",
+"  const retryProof = durable.issueCurrentTrustedMappingProof(root);",
+  "  const retry = durable.authorizeSpecificationPhaseDispatch(root, input.retry, retryProof === undefined ? {} : { trustedMappingProof: retryProof });",
   "  result = { dispatch, failure, retry };",
   "}",
   "writeFileSync(donePath, JSON.stringify(result));",
@@ -195,6 +202,7 @@ function setup(): PhaseDurabilityRun {
     profile_hash: PROFILE_HASH,
     language,
     template_set: templates.value.selection,
+    constitution_gate_ref: constitution.value.gate_id,
     phases: base.phases.map((phase) => phase.phase === "specify" ? {
       ...phase,
       status: "generating" as const,
@@ -402,7 +410,9 @@ function alignNativeRuntimeProfile(run: ReturnType<typeof setup>): void {
     && currentWorkspace.template_set.content_hash === templateSet.content_hash
     && run.input.profile_hash === hash
     && run.input.language_hash === language.selection_hash
-    && run.input.template_hash === templateSet.content_hash) return;
+    && run.input.template_hash === templateSet.content_hash
+    && currentWorkspace?.constitution_gate_ref === gate.value.gate_id
+    && digestOf(currentWorkspace?.constitution_binding) === digestOf(gate.value.binding)) return;
   const semanticModel = run.input.source_artifact.semantic_model;
   run.input.profile_hash = hash;
   run.input.language_hash = language.selection_hash;
@@ -948,11 +958,11 @@ test("phase validation persists failure evidence, retries strict pass, and repla
     const failedState = resolveState(run.root, BRANCH, { feature_id: FEATURE_ID, run_key: RUN_KEY }).state!;
     assert.equal(failedState.specification?.phases.find((phase) => phase.phase === "specify")?.status, "revision_required");
     assert.equal(failedState.pending, undefined, "failed validation must not leave a top-level pending lifecycle");
-    const generationCapability = createCapability({ run_key: RUN_KEY, branch: BRANCH, workflow: "spec-preparation", profile_hash: PROFILE_HASH, stage_cursor: "specify", kind: "single", expected_roster: [{ role: "specification-analyst", agent: "specification-worker" }], dispatch_secret: "phase-revision-secret", advance_secret: "phase-revision-advance" });
+    const generationCapability = createCapability({ run_key: RUN_KEY, branch: BRANCH, workflow: "spec-preparation", profile_hash: PROFILE_HASH, stage_cursor: "specify", cursor_epoch: failedState.dispatch_capability?.issued_for?.cursor_epoch ?? failedState.cursor_epoch, capability_id: failedState.dispatch_capability?.capability_id ?? failedState.preparation_start?.capability_id, kind: "single", expected_roster: [{ role: "specification-analyst", agent: "specification-worker" }], dispatch_secret: "phase-revision-secret", advance_secret: "phase-revision-advance" });
     writeState(run.root, { ...failedState, cursor_epoch: generationCapability.state.issued_for!.cursor_epoch, dispatch_capability: { ...generationCapability.state, status: "ready" } }, { featureSlug: FEATURE_ID });
     const generation = dispatchSpecificationPhase(run.root, {
       token: generationCapability.dispatch_token, capability_id: generationCapability.capability_id, feature_id: FEATURE_ID, run_key: RUN_KEY, branch: BRANCH, workflow: "spec-preparation", profile_hash: PROFILE_HASH, phase: "specify", request_id: "phase-revision-request", cursor_epoch: generationCapability.state.issued_for!.cursor_epoch, role: "specification-analyst", slot_id: "specification-analyst", agent: "specification-worker",
-    });
+    }, { trustedMappingProof: currentTrustedMappingProof(run.root) });
     assert.equal(generation.ok, true);
     if (!generation.ok) throw new Error("generation authorization failed");
     const revisionModel = { ...(run.input.source_artifact.semantic_model as Record<string, unknown>), version: 2, worker: { ...(run.input.source_artifact.worker as Record<string, unknown>), dispatch_id: generation.value.dispatch_id } };
@@ -1021,7 +1031,7 @@ test("validation issuer rejects generation retry links and forged dispatch purpo
       retry_of: run.input.dispatch_id,
     });
     assert.equal(generationRetry.ok, false);
-    const readyCapability = createCapability({ run_key: RUN_KEY, branch: BRANCH, workflow: "spec-preparation", profile_hash: PROFILE_HASH, stage_cursor: "specify", kind: "single", expected_roster: [{ role: "specification-analyst", agent: "specification-worker" }], dispatch_secret: "phase-ready-secret", advance_secret: "phase-ready-advance" });
+    const readyCapability = createCapability({ run_key: RUN_KEY, branch: BRANCH, workflow: "spec-preparation", profile_hash: PROFILE_HASH, stage_cursor: "specify", cursor_epoch: state.dispatch_capability?.issued_for?.cursor_epoch ?? state.cursor_epoch, capability_id: state.dispatch_capability?.capability_id ?? state.preparation_start?.capability_id, kind: "single", expected_roster: [{ role: "specification-analyst", agent: "specification-worker" }], dispatch_secret: "phase-ready-secret", advance_secret: "phase-ready-advance" });
     writeState(run.root, { ...state, cursor_epoch: readyCapability.state.issued_for!.cursor_epoch, dispatch_capability: { ...readyCapability.state, status: "ready" } }, { featureSlug: FEATURE_ID });
     const readyValidation = authorizeSpecificationPhaseValidationDispatch(run.root, {
       token: readyCapability.dispatch_token,
@@ -1034,14 +1044,15 @@ test("validation issuer rejects generation retry links and forged dispatch purpo
       stage_cursor: "specify",
       cursor_epoch: readyCapability.state.issued_for!.cursor_epoch,
       request_id: "phase-validation-ready",
-    });
+    }, { trustedMappingProof: currentTrustedMappingProof(run.root) });
     assert.equal(readyValidation.ok, true);
     if (!readyValidation.ok) throw new Error("validation authorization failed");
+    const postValidationState = resolveState(run.root, BRANCH, { feature_id: FEATURE_ID, run_key: RUN_KEY }).state!;
     const forged = {
-      ...resolveState(run.root, BRANCH, { feature_id: FEATURE_ID, run_key: RUN_KEY }).state!,
+      ...postValidationState,
       dispatch_capability: {
-        ...state.dispatch_capability!,
-        dispatches: (state.dispatch_capability?.dispatches ?? []).map((record) => ({ ...record, purpose: "forged" as never })),
+        ...postValidationState.dispatch_capability!,
+        dispatches: (postValidationState.dispatch_capability?.dispatches ?? []).map((record) => ({ ...record, purpose: "forged" as never })),
       },
     };
     writeState(run.root, forged, { featureSlug: FEATURE_ID });
@@ -1481,7 +1492,8 @@ test("dispatch authorization rejects a replaced root without writing replacement
         mkdirSync(run.root);
       }
     });
-    const result = dispatchSpecificationPhase(run.root, { ...run.input, role: "specification-analyst", agent: "specification-worker" });
+    const dispatchProof = issueCurrentTrustedMappingProof(run.root);
+    const result = dispatchSpecificationPhase(run.root, { ...run.input, role: "specification-analyst", agent: "specification-worker" }, dispatchProof === undefined ? {} : { trustedMappingProof: dispatchProof });
     assert.equal(result.ok, false, "dispatch must fail closed after root replacement");
     assert.equal(existsSync(join(run.root, ".work-state")), false, "replacement root must not receive dispatch state");
     assert.equal(existsSync(join(run.root, "specs")), false, "replacement root must not receive dispatch projections");
@@ -2647,6 +2659,8 @@ test("mounted native checkpoint requires strict validation and invalidates stale
         stage_cursor: "specify",
         kind: "single",
         expected_roster: [{ role: "specification-analyst", agent: "specification-worker" }],
+        cursor_epoch: before.dispatch_capability?.issued_for?.cursor_epoch ?? before.cursor_epoch,
+        capability_id: before.dispatch_capability?.capability_id ?? before.preparation_start?.capability_id,
         dispatch_secret: "mounted-native-dispatch-secret",
         advance_secret: "mounted-native-advance-secret",
       });
@@ -3062,15 +3076,6 @@ function nativeRecoveryFixture(): { run: ReturnType<typeof setup>; advanceToken:
   assert.equal(validation.ok, true, validation.ok ? "" : validation.error);
   const postValidation = resolveState(run.root, BRANCH, { feature_id: FEATURE_ID, run_key: RUN_KEY }).state;
   assert.ok(postValidation?.preparation_start, "native recovery fixture must retain its composite marker");
-  if (postValidation?.preparation_start) {
-    writeState(run.root, {
-      ...postValidation,
-      preparation_start: {
-        ...postValidation.preparation_start,
-        start_postimage_digest: preparationStartPostimageDigest(postValidation),
-      },
-    }, { featureSlug: FEATURE_ID });
-  }
   return { run, advanceToken: validationDispatchResult.advance_token };
 }
 

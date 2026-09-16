@@ -97,6 +97,7 @@ function setup(custom: boolean): { root: string; workspace: FeatureWorkspace; to
     profile_hash: profileHash(profile),
     language: resolveSpecificationLanguage({ requestLanguage: "en-US" }),
     template_set: templateSet.selection,
+    constitution_gate_ref: constitution.value.gate_id,
     phases: base.phases.map((phase) => phase.phase === "specify" ? { ...phase, status: "generating" as const, current_version: null, approved_version: null, validation_ref: null, checkpoint_ref: null } : phase),
     next_action: { kind: "none", command: null, reason: "Specify worker is active." },
   };
@@ -132,12 +133,12 @@ function setup(custom: boolean): { root: string; workspace: FeatureWorkspace; to
     root_identity: { canonical_path: canonicalRoot, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
     source_kind: "native",
     constitution_binding: workspace.constitution_binding,
-    constitution_gate_ref: workspace.constitution_gate_ref,
+    constitution_gate_ref: constitution.value.gate_id,
     capacity: 1,
     authentication: {
       source_kind: "native",
       constitution_binding: workspace.constitution_binding,
-      constitution_gate_ref: workspace.constitution_gate_ref,
+      constitution_gate_ref: constitution.value.gate_id,
       capacity: 1,
       pinned_root: pinnedRoot,
     },
@@ -203,7 +204,7 @@ async function prepare(custom: boolean): Promise<{ root: string; input: AdapterI
     preparation_handoff: preparationHandoff,
   }, undefined, undefined, context);
   assert.equal(started.details.ok, true, JSON.stringify(started.details));
-  const dispatch = started.details.handoff as { dispatch_id: string; work_identity: WorkIdentity };
+  const dispatch = started.details.handoff as { dispatch_id: string; capability_id: string; request_id: string; cursor_epoch: string; token: string; work_identity: WorkIdentity };
   const workspace = fixture.workspace;
   const constitutionBinding = workspace.constitution_binding;
   assert.ok(constitutionBinding, "workspace constitution binding must exist");
@@ -251,16 +252,16 @@ async function prepare(custom: boolean): Promise<{ root: string; input: AdapterI
   if (!selected) throw new Error("specify template missing");
   const document = renderCanonicalPhaseDocument("specify", model as unknown as SpecificationSemanticModel, selected);
   const input = {
-    token: "phase-adapter-dispatch-secret",
-    capability_id: state.dispatch_capability?.capability_id,
+    token: dispatch.token,
+    capability_id: dispatch.capability_id,
     feature_id: FEATURE_ID,
     run_key: RUN_KEY,
     branch: BRANCH,
     workflow: "spec-preparation",
     profile_hash: profileHash(profile),
     phase: "specify",
-    request_id: "phase-adapter-request",
-    cursor_epoch: state.cursor_epoch,
+    request_id: dispatch.request_id,
+    cursor_epoch: dispatch.cursor_epoch,
     dispatch_id: dispatch.dispatch_id,
     version: 1,
     source_artifact: { schema_version: 1, feature_id: FEATURE_ID, run_key: RUN_KEY, version: 1, worker: model.worker, constitution_binding: constitutionBinding, semantic_model: model, document_sha256: sha256Hex(document), upstream_versions: [] },

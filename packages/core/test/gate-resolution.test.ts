@@ -28,7 +28,7 @@ function minimalState(branch = "feature/gates") {
   };
 }
 
-test("runtime registers the canonical tool-call gate chain in order", () => {
+test("runtime registers the canonical tool-call gate chain in order", async () => {
   const registrations: string[] = [];
   const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const pi = {
@@ -50,14 +50,14 @@ test("runtime registers the canonical tool-call gate chain in order", () => {
   assert.ok(handlers.length >= 1);
   // An unarmed workspace must retain normal task compatibility: all gates allow.
   try {
-    const result = handlers[0]!({ toolName: "task", input: { task: "ordinary task" } }, { cwd: root });
+    const result = await handlers[0]!({ toolName: "task", input: { task: "ordinary task" } }, { cwd: root });
     assert.equal(result, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("registered gate chain denies strict orchestrator Bash before command execution", () => {
+test("registered gate chain denies strict orchestrator Bash before command execution", async () => {
   const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const pi = {
     setLabel() {},
@@ -79,11 +79,11 @@ test("registered gate chain denies strict orchestrator Bash before command execu
         getSessionId: () => "gate-shell-session",
       },
     };
-    const blocked = handlers[0]!({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, mainContext) as { block?: boolean; reason?: string } | undefined;
+    const blocked = await handlers[0]!({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, mainContext) as { block?: boolean; reason?: string } | undefined;
     assert.equal(blocked?.block, true);
     assert.match(blocked?.reason ?? "", /shell-capable Bash execution/);
     const workerContext = { ...mainContext, hasUI: false, ui: undefined };
-    const worker = orchestratorWriteGate({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, workerContext) as { block?: boolean; reason?: string } | undefined;
+    const worker = await orchestratorWriteGate({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, workerContext) as { block?: boolean; reason?: string } | undefined;
     assert.equal(worker?.block, true);
     assert.match(worker?.reason ?? "", /shell-capable Bash execution/);
   } finally {
@@ -91,7 +91,7 @@ test("registered gate chain denies strict orchestrator Bash before command execu
   }
 });
 
-test("armed malformed state is rejected before dispatch can be authorized", () => {
+test("armed malformed state is rejected before dispatch can be authorized", async () => {
   const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const pi = { setLabel() {}, on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "tool_call") handlers.push(handler); } };
   const root = mkdtempSync(join(tmpdir(), "omp-gate-armed-"));
@@ -100,14 +100,14 @@ test("armed malformed state is rejected before dispatch can be authorized", () =
     mkdirSync(join(root, ".work-state"), { recursive: true });
     const armed = { ...minimalState(), policy: { strict_orchestrator: true } };
     writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(armed));
-    const result = handlers[0]!({ toolName: "task", input: { task: "prompt-only" } }, { cwd: root }) as { block?: boolean; reason?: string } | undefined;
+    const result = await handlers[0]!({ toolName: "task", input: { task: "prompt-only" } }, { cwd: root }) as { block?: boolean; reason?: string } | undefined;
     assert.equal(result?.block, true);
     assert.match(result?.reason ?? "", /classification|capability|dispatch/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
-test("malformed classification task is fail-closed through the actual gate chain", () => {
+test("malformed classification task is fail-closed through the actual gate chain", async () => {
   const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const pi = { setLabel() {}, on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "tool_call") handlers.push(handler); } };
   const root = mkdtempSync(join(tmpdir(), "omp-gate-malformed-classification-"));
@@ -120,7 +120,7 @@ test("malformed classification task is fail-closed through the actual gate chain
       policy: { strict_orchestrator: true },
     };
     writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(armed));
-    const result = handlers[0]!({ toolName: "task", input: { task: "prompt-only" } }, { cwd: root }) as { block?: boolean; reason?: string } | undefined;
+    const result = await handlers[0]!({ toolName: "task", input: { task: "prompt-only" } }, { cwd: root }) as { block?: boolean; reason?: string } | undefined;
     assert.equal(result?.block, true);
     assert.match(result?.reason ?? "", /malformed classification|workflow/i);
   } finally {

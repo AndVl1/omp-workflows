@@ -32,6 +32,7 @@ function taskResult(id: string): TaskResult {
 function fixtureState(branch: string, statuses: TeamState["stages"][number]["status"][]): TeamState {
   return {
     schema: 1,
+    state_revision: 0,
     branch,
     classification: {
       type: "FEATURE",

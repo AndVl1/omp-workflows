@@ -29,6 +29,7 @@ import {
 import { buildSessionReport } from "../src/report/assemble.js";
 import type { TeamState } from "../src/engine/types.js";
 import type { CtoState } from "../src/cto/types.js";
+import { newCtoState } from "../src/cto/state.js";
 
 function makeTeamState(overrides: Partial<TeamState> = {}): TeamState {
   return {
@@ -55,20 +56,15 @@ function makeTeamState(overrides: Partial<TeamState> = {}): TeamState {
 }
 
 function makeCtoState(overrides: Partial<CtoState> = {}): CtoState {
-  return {
-    schema: 2,
+  const state = newCtoState({
     id: "run-1",
     task: "Decompose the migration",
     branch: "feat/payments",
     autonomous: true,
     classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: true },
     plan: { id: "run-1", task: "Decompose the migration", teams: [], created_at: "2026-08-08T09:00:00.000Z" },
-    teams: [],
-    integration: { status: "pending" },
-    pause: { kind: "none", reason: "" },
-    updated_at: "2026-08-08T10:00:00.000Z",
-    ...overrides,
-  };
+  });
+  return { ...state, updated_at: "2026-08-08T10:00:00.000Z", ...overrides };
 }
 
 function tmpWorkspace(): string {

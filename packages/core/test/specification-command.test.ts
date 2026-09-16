@@ -12,7 +12,7 @@ import { parseImportReview, parseSpecificationCommand, parseSpecificationImportC
 import { createCompatibilitySupplement } from "../src/specification/import.js";
 import { validateArtifactStructure } from "../src/engine/artifacts.js";
 import { setCanonicalHandoffReadTestHooks } from "../src/specification/canonical-reader.js";
-import { registerTestConstitutionGate, registerTestFormatRecognizer, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { closeRetainedTestRegistrations, registerTestConstitutionGate, registerTestFormatRecognizer, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { registerTestWorkflowTools } from "./fixtures/host-tool-activation.js";
 import { normalizePersistedState, resolveState, setStateTransactionTestHooks, updateStateAtomically, writeState } from "../src/engine/state.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
@@ -120,6 +120,7 @@ function promoteImportToImplementationReady(
   handoff.import_document_language = snapshot.document_language;
   handoff.import_document_language_source = snapshot.document_language_source;
   handoff.import_source_revision = snapshot.source_revision;
+  if (snapshot.limits !== undefined) handoff.import_limits = snapshot.limits;
   handoff.handoff_digest = canonicalHandoffDigest(handoff);
   const handoffDir = join(artifactsDir, "implementation_handoff");
   mkdirSync(handoffDir, { recursive: true });
@@ -156,10 +157,7 @@ function mountedWorkflowParameters(name: string): { safeParse: (input: unknown) 
     rmSync(root, { recursive: true, force: true });
   }
 }
-let crossProviderRecognizerRegistered = false;
 function ensureCrossProviderRecognizer(root: string): void {
-  if (crossProviderRecognizerRegistered) return;
-  crossProviderRecognizerRegistered = true;
   writeTestRegistryMarker(root);
   registerTestFormatRecognizer(root, {
     recognizer_id: "test-review-cross-provider",
@@ -435,6 +433,13 @@ test("workflow preparation persists a maximum-length handoff task through state 
   const runKey = runKeyFor(featureId);
   try {
     createWorkspace(root, featureId);
+    writeUsableConstitution(root);
+    const gate = ensureProjectConstitution(root, {
+      origin_kind: "native_direct",
+      origin_run_key: runKey,
+      origin_stage: "specify",
+    }, { feature_id: featureId });
+    assert.equal(gate.ok, true, gate.ok ? "constitution gate resolves for preparation handoff fixture" : gate.error);
     const task = "x".repeat(MAX_PREPARATION_HANDOFF_TASK_BYTES);
     const prepared = prepareWorkflowState({
       task,
@@ -739,6 +744,14 @@ test("workflow_prepare hydrates the canonical constitution into the first native
 test("workflow instructions exposes the composite native preparation descriptor", async () => {
   const root = makeProject();
   try {
+    createWorkspace(root, "instruction-map");
+    writeUsableConstitution(root);
+    const gate = ensureProjectConstitution(root, {
+      origin_kind: "native_direct",
+      origin_run_key: runKeyFor("instruction-map"),
+      origin_stage: "specify",
+    }, { feature_id: "instruction-map" });
+    assert.equal(gate.ok, true, gate.ok ? "constitution gate resolves for native descriptor fixture" : gate.error);
     prepareWorkflowState({
       task: "Draft the native specification",
       cwd: root,
@@ -1903,7 +1916,7 @@ test("spec-import ready output keeps imported mapping inert and exposes one cano
       cwd: root,
       branch: "__omp_no_git__",
       autonomous: false,
-      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-import" },
+      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-preparation" },
       feature_id: "checkout",
       run_key: persisted.run_key as string,
     });
@@ -1914,7 +1927,7 @@ test("spec-import ready output keeps imported mapping inert and exposes one cano
       cwd: root,
       branch: "__omp_no_git__",
       autonomous: false,
-      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-import" },
+      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-preparation" },
       feature_id: "checkout",
       run_key: persisted.run_key as string,
     });
@@ -1932,7 +1945,7 @@ test("spec-import ready output keeps imported mapping inert and exposes one cano
       cwd: root,
       branch: "__omp_no_git__",
       autonomous: false,
-      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-import" },
+      classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-preparation" },
       feature_id: "checkout",
       run_key: persisted.run_key as string,
     }), /seed|artifact|compatibility/i, "tampered compatibility artifact must not reopen the imported workflow");
@@ -2214,15 +2227,25 @@ test("specification import seed rejects every cross-artifact identity mismatch w
     }],
   ];
 
+  const seed = (root: string, runKey: string) => {
+    const pinnedRoot = PinnedProjectRoot.open(root);
+    try {
+      return seedSpecificationImportWorkflowState({
+        cwd: root,
+        branch: "__omp_no_git__",
+        feature_id: "checkout",
+        run_key: runKey,
+        pinned_root: pinnedRoot,
+      });
+    } finally {
+      pinnedRoot.close();
+    }
+  };
+
   const control = await makeReadySeed();
   try {
     const replayBefore = control.stateBefore;
-    const replay = seedSpecificationImportWorkflowState({
-      cwd: control.root,
-      branch: "__omp_no_git__",
-      feature_id: "checkout",
-      run_key: control.runKey,
-    });
+    const replay = seed(control.root, control.runKey);
     assert.equal(replay.ok, true, replay.ok ? "exact seed replay is accepted" : replay.error);
     assert.equal(stateBytes(control.root, "checkout"), replayBefore, "exact seed replay is mutation-free");
   } finally {
@@ -2242,12 +2265,7 @@ test("specification import seed rejects every cross-artifact identity mismatch w
       const stateMutated = stateBytes(fixture.root, "checkout");
       const snapshotMutated = readFileSync(join(fixture.artifactsDir, "import_snapshot.json"), "utf8");
       const reportMutated = readFileSync(join(fixture.artifactsDir, "compatibility_report.json"), "utf8");
-      const rejected = seedSpecificationImportWorkflowState({
-        cwd: fixture.root,
-        branch: "__omp_no_git__",
-        feature_id: "checkout",
-        run_key: fixture.runKey,
-      });
+      const rejected = seed(fixture.root, fixture.runKey);
       assert.equal(rejected.ok, false, `${label} mismatch must be rejected`);
       assert.equal(stateBytes(fixture.root, "checkout"), stateMutated, `${label} mismatch must not mutate state`);
       assert.equal(readFileSync(join(fixture.artifactsDir, "import_snapshot.json"), "utf8"), snapshotMutated, `${label} mismatch must not rewrite snapshot`);
@@ -2308,6 +2326,15 @@ test("migrated resume routes each existing phase version without regenerating it
       availableAgents: ["specification-worker", "validator"],
       extraRoles: mappingConfig.scope_map.map((entry) => entry.dev_agent),
       genericFallbackRoles: ["validator"],
+      source: "specification-command-test",
+      scope_map: mappingConfig.scope_map,
+      flags: mappingConfig.flags,
+      roster: mappingConfig.roster_overrides,
+      config_path: mappingConfig.config_path,
+      config_source: mappingConfig.config_source,
+      config_hash: mappingConfig.config_hash,
+      config_version: mappingConfig.config_version,
+      config_provenance: mappingConfig.config_provenance,
     }));
     const sourceDir = join(root, "legacy-artifacts");
     const legacyDir = join(root, ".work-state", "specification", featureId);
@@ -2432,6 +2459,7 @@ test("migrated selected Ask persists exact identity before the legacy approve_st
   const featureId = "migrated-selected-stop";
   try {
     writeUsableConstitution(root);
+    writeTestRegistryMarker(root);
     registerTestConstitutionGate(root, "spec-command-migrated-selected-stop");
     mkdirSync(join(root, ".omp"), { recursive: true });
     writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { "specification-analyst": "specification-worker", "specification-architect": "specification-worker", validator: "validator" } }) + "\n", "utf8");
@@ -2441,6 +2469,15 @@ test("migrated selected Ask persists exact identity before the legacy approve_st
       availableAgents: ["specification-worker", "validator"],
       extraRoles: mappingConfig.scope_map.map((entry) => entry.dev_agent),
       genericFallbackRoles: ["validator"],
+      source: "specification-command-test",
+      scope_map: mappingConfig.scope_map,
+      flags: mappingConfig.flags,
+      roster: mappingConfig.roster_overrides,
+      config_path: mappingConfig.config_path,
+      config_source: mappingConfig.config_source,
+      config_hash: mappingConfig.config_hash,
+      config_version: mappingConfig.config_version,
+      config_provenance: mappingConfig.config_provenance,
     }));
     const sourceDir = join(root, "legacy-artifacts");
     const legacyDir = join(root, ".work-state", "specification", featureId);
@@ -2490,6 +2527,7 @@ test("migrated selected Ask persists exact identity before the legacy approve_st
     assert.equal(phase?.checkpoint_ref, "checkpoint.specify.v1");
     assert.equal(state.stages?.find((stage) => stage.id === "specify")?.status, "done");
   } finally {
+    closeRetainedTestRegistrations(root);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -2500,6 +2538,7 @@ test("spec-import mounted approve_stop resumes only through an exact command and
   const args = ". --framework generic --feature checkout";
   try {
     writeUsableConstitution(root);
+    writeTestRegistryMarker(root);
     registerTestConstitutionGate(root, "core-test-workflow-tools");
     writeFileSync(join(root, "requirements.md"), "### FR-1\nThe checkout flow accepts a card.\n### A-1 (observable)\nA card is accepted.\n", "utf8");
     writeFileSync(join(root, "decisions.md"), "### D-1 Use durable state\nFR-1 linked decision.\n", "utf8");
@@ -2634,6 +2673,7 @@ test("spec-import mounted approve_stop resumes only through an exact command and
     const stale = await output(specImportCommand, args, root);
     assert.match(stale, /SPEC_IMPORT_SOURCE_CHANGED|approval is stale/u);
   } finally {
+    closeRetainedTestRegistrations(root);
     rmSync(root, { recursive: true, force: true });
   }
 });

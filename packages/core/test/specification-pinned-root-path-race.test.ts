@@ -548,22 +548,23 @@ test("pinned state batches fail closed when the Darwin helper is unavailable", a
   }
 });
 
-test("Darwin helper timeout kills a sleeping child without leaving it behind", () => {
+test("Darwin helper timeout kills a sleeping child without leaving it behind", async () => {
   if (process.platform !== "darwin") return;
   const root = fs.mkdtempSync(join(tmpdir(), "spec-pinned-helper-timeout-"));
   try {
+    fs.writeFileSync(join(root, "target.txt"), "real target\n", "utf8");
     const pinned = PinnedProjectRoot.open(root, { helperSleepMs: 250, helperTimeoutMs: 50 });
     assert.ok(pinned);
     const started = Date.now();
     try {
       assert.throws(
-        () => pinned.readFile("missing.txt"),
+        () => pinned.readFile("target.txt"),
         (error: unknown) => error instanceof PinnedRootError
           && error.code === "unsupported"
           && /descriptor helper 'read' timed out/u.test(error.message),
       );
     } finally {
-      pinned.close();
+      await pinned.closeAsync();
     }
     assert.ok(Date.now() - started < 1000, "helper timeout must not wait for the injected sleep");
     let lingering = "";

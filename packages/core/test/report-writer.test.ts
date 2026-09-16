@@ -4,7 +4,7 @@
  * surface (generalized CTO redactor + byte caps).
  */
 
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import {
   existsSync,
@@ -22,10 +22,15 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+import { drainDarwinHelperClosePromisesForTesting, PinnedProjectRoot } from "../src/specification/pinned-root.js";
 import { MAX_REPORT_HTML_BYTES, ReportHtmlLimitError, writeReport, writeReportPinned } from "../src/report/assemble.js";
 import { redactText, redactReportBody, DEFAULT_REDACTION_CONFIG } from "../src/report/redact.js";
 
+// Standalone report writers close Darwin helpers asynchronously; drain them
+// between cases so the near-cap fixture cannot leave children or FIFOs behind.
+afterEach(async () => {
+  await drainDarwinHelperClosePromisesForTesting();
+});
 
 function replaceDirectory(path: string): string {
   const displaced = `${path}.displaced`;

@@ -73,16 +73,12 @@ import {
   type ConstitutionImpactResult,
 } from "../src/specification/constitution-impact.js";
 import { createCapability } from "../src/engine/durable.js";
-import { issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge } from "../src/engine/checkpoints.js";
 import { loadProfile, profileHash, resolveProfileControlPlane } from "../src/engine/profile.js";
 import { renderConstitutionToolContract } from "../src/commands/constitution.js";
 import { resolveState, setStateTransactionTestHooks, writeState } from "../src/engine/state.js";
 import { digestOf } from "../src/specification/validation.js";
 import { readPinnedCurrentConstitution } from "../src/specification/constitution-identities.js";
 import type { TeamState } from "../src/engine/types.js";
-
-const TEST_CHECKPOINT_BRIDGE = Object.freeze({});
-registerTrustedCheckpointHostBridge(TEST_CHECKPOINT_BRIDGE);
 
 const VALID_CONSTITUTION = [
   "# Project Constitution",
@@ -293,85 +289,41 @@ function trustedDecision(
   root: string,
   checkpointId: string,
   decision: "approve_continue" | "request_changes",
-  answerId = `constitution-answer/${checkpointId}/${decision}`,
   feedback = decision === "request_changes" ? "Add a security principle before approval." : undefined,
-): Pick<ConstitutionDecisionInput, "feature_id" | "run_key" | "authorization" | "actor_provenance"> & { feedback?: string } {
+): Pick<ConstitutionDecisionInput, "feature_id" | "run_key" | "authorization" | "actor_provenance"> & { feedback?: string; draft_sha256: string } {
   const selector = workspaceSelector();
   const selected = resolveState(root, undefined, selector);
-  const state = selected.state;
-  if (selected.invalid || !state || !selected.statePath || !selected.stateDir || !selected.artifactsDir) {
+  if (selected.invalid || !selected.state || !selected.statePath || !selected.stateDir || !selected.artifactsDir) {
     throw new Error("constitution test requires the exact persisted decision workspace");
   }
-  if (!state.checkpoint_policy || !state.specification) {
-    throw new Error("constitution test decision workspace lacks checkpoint context");
-  }
-
-  const workflow = state.classification.workflow;
-  const originKind: DecisionOriginKind = workflow === "spec-import" ? "external_import" : "native_direct";
-  const origin = decisionOrigin(originKind);
-  assert.equal(state.stage_cursor, origin.stage, "trusted answers use the profile stage bound to the persisted origin workflow");
-  const answerState: TeamState = {
-    ...state,
-    checkpoint_policy: constitutionBootstrapPolicy(checkpointId),
-    specification: { ...state.specification, constitution_gate_ref: checkpointId },
-  };
-  const reference = `terminal-answer/${answerId}`;
   const pinnedRoot = PinnedProjectRoot.open(root);
   assert.ok(pinnedRoot, "constitution checkpoint fixture root must pin");
   if (!pinnedRoot) throw new Error("constitution checkpoint fixture root is unavailable");
-  if (!answerState.profile_hash) {
-    pinnedRoot.close();
-    throw new Error("constitution checkpoint fixture profile is unavailable");
-  }
   try {
-    const rootIdentity = { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino };
-    const capability = issueTrustedCheckpointAnswerCapability(TEST_CHECKPOINT_BRIDGE, {
-      root: rootIdentity,
-      state: answerState,
-      answer_id: answerId,
-      channel: "terminal",
-      reference,
-      stage_id: origin.stage,
-      checkpoint_id: checkpointId,
-      decision,
-      question: "Authorize the constitution fixture checkpoint",
-      options: [decision],
-      session_id: "constitution-test-session",
-      actor_ref: reference,
+    const envelopeRead = readConstitutionGateEnvelopePinned(pinnedRoot);
+    assert.ok(envelopeRead.ok, envelopeRead.ok ? "" : envelopeRead.error);
+    if (!envelopeRead.ok || !envelopeRead.value) throw new Error("constitution checkpoint gate is unavailable");
+    const latestDraft = envelopeRead.value.drafts.at(-1);
+    assert.ok(latestDraft, "constitution checkpoint must have a current draft");
+    if (!latestDraft) throw new Error("constitution checkpoint draft is unavailable");
+    const answered = recordConstitutionCheckpointAnswer(root, {
+      gate_id: envelopeRead.value.gate_id,
       feature_id: selector.feature_id,
-      profile_hash: answerState.profile_hash,
-    });
-    const trusted = recordTrustedCheckpointAnswer(answerState, {
-      answer_id: answerId,
-      channel: "terminal",
-      reference,
-      stage_id: origin.stage,
+      run_key: selector.run_key,
       checkpoint_id: checkpointId,
+      draft_sha256: latestDraft.document_sha256,
       decision,
-      feature_id: selector.feature_id,
       ...(feedback !== undefined ? { feedback } : {}),
-    }, { capability, root: rootIdentity });
-    writeState(root, trusted.state, { target: selected });
-
-  const persisted = resolveState(root, undefined, selector);
-  const persistedAnswer = persisted.state?.trusted_checkpoint_answers?.find(
-    (answer) => answer.answer_id === trusted.answer.answer_id,
-  );
-  assert.deepEqual(persistedAnswer, trusted.answer, "the returned trusted answer is persisted without recreation or mutation");
-  assert.deepEqual(trusted.proof, {
-    answer_id: persistedAnswer!.answer_id,
-    nonce: persistedAnswer!.nonce,
-    channel: persistedAnswer!.channel,
-    reference: persistedAnswer!.reference,
-    binding: persistedAnswer!.binding,
-    ...(persistedAnswer!.feedback !== undefined ? { feedback: persistedAnswer!.feedback } : {}),
-  }, "the caller receives the exact proof projected from the persisted trusted answer");
-
+    });
+    assert.ok(answered.ok, answered.ok ? "constitution trusted Ask recorded" : answered.error);
+    if (!answered.ok) throw new Error(answered.error);
     return {
-      ...selector,
+      feature_id: selector.feature_id,
+      run_key: selector.run_key,
       authorization: "human",
       ...(feedback !== undefined ? { feedback } : {}),
-      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
+      draft_sha256: answered.value.answer.draft_sha256,
+      actor_provenance: { kind: "user", ref: answered.value.answer.reference, proof: answered.value.proof },
     };
   } finally {
     pinnedRoot.close();
@@ -386,7 +338,9 @@ const CONSTITUTION_CHILD_TIMEOUT_MS = 60_000;
 interface ConstitutionDecisionChild {
   promise: Promise<Record<string, unknown>>;
   ready: Promise<void>;
+  answerReady: Promise<void>;
   release: () => void;
+  releaseAnswer: () => void;
   cleanup: () => void;
 }
 
@@ -405,14 +359,14 @@ function runConstitutionOperationInChild(
     "  try {",
     `    const mod = await import(${JSON.stringify(moduleUrl)});`,
     ...(barrier ? [
-      "    process.stdout.write(JSON.stringify({ type: \"ready\" }) + \"\\n\");",
-      "    await new Promise((resolve, reject) => {",
+      "    const waitForRelease = () => new Promise((resolve, reject) => {",
       "      let buffer = \"\";",
       "      const onData = (chunk) => {",
       "        buffer += String(chunk);",
       "        if (!buffer.includes(\"\\n\")) return;",
       "        process.stdin.off(\"data\", onData);",
       "        process.stdin.off(\"end\", onEnd);",
+      "        process.stdin.pause();",
       "        resolve();",
       "      };",
       "      const onEnd = () => {",
@@ -425,8 +379,28 @@ function runConstitutionOperationInChild(
       "      process.stdin.once(\"end\", onEnd);",
       "      process.stdin.resume();",
       "    });",
+      "    process.stdout.write(JSON.stringify({ type: \"ready\" }) + \"\\n\");",
+      "    await waitForRelease();",
     ] : []),
-    `    const result = mod.${operation === "decision" ? "decideConstitutionCheckpoint" : "presentConstitutionDraft"}(process.env.PROJECT_ROOT, JSON.parse(process.env.CHILD_INPUT));`,
+    ...(operation === "decision" ? [
+      "    const rawInput = JSON.parse(process.env.CHILD_INPUT);",
+      "    const answered = mod.recordConstitutionCheckpointAnswer(process.env.PROJECT_ROOT, {",
+      "      gate_id: rawInput.gate_id,",
+      "      feature_id: rawInput.feature_id,",
+      "      run_key: rawInput.run_key,",
+      "      checkpoint_id: rawInput.checkpoint_id,",
+      "      draft_sha256: rawInput.draft_sha256,",
+      "      decision: rawInput.decision,",
+      "      ...(rawInput.feedback === undefined ? {} : { feedback: rawInput.feedback }),",
+      "    });",
+      "    if (!answered.ok || !answered.value) throw new Error('child canonical constitution Ask could not be persisted');",
+      "    const childInput = { ...rawInput, actor_provenance: { kind: 'user', ref: answered.value.answer.reference, proof: answered.value.proof } };",
+    ...(operation === "decision" && barrier ? [
+      "    process.stdout.write(JSON.stringify({ type: \"answered\" }) + \"\\n\");",
+      "    await waitForRelease();",
+    ] : []),
+    ] : []),
+    `    const result = mod.${operation === "decision" ? "decideConstitutionCheckpoint" : "presentConstitutionDraft"}(process.env.PROJECT_ROOT, ${operation === "decision" ? "childInput" : "JSON.parse(process.env.CHILD_INPUT)"});`,
     "    process.stdout.write(JSON.stringify({ type: \"result\", value: result }) + \"\\n\");",
     "  } catch (error) {",
     "    const detail = error instanceof Error ? error.stack ?? error.message : String(error);",
@@ -438,6 +412,7 @@ function runConstitutionOperationInChild(
   ].join("\n");
   const { promise, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
   const { promise: ready, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
+  const { promise: answerReady, resolve: answerReadyResolve, reject: answerReadyReject } = Promise.withResolvers<void>();
   const child = spawn(process.execPath, [...process.execArgv, "--input-type=module", "-e", script], {
     cwd: process.cwd(),
     env: { ...process.env, PROJECT_ROOT: root, CHILD_INPUT: JSON.stringify(input) },
@@ -447,6 +422,7 @@ function runConstitutionOperationInChild(
   let stderr = "";
   let protocolBuffer = "";
   let readySignalled = !barrier;
+  let answerSignalled = !barrier || operation !== "decision";
   let result: Record<string, unknown> | null = null;
   let released = !barrier;
   let failed = false;
@@ -455,7 +431,12 @@ function runConstitutionOperationInChild(
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let cleanup: () => void = () => undefined;
 
-  if (!barrier) readyResolve();
+  if (!barrier) {
+    readyResolve();
+    answerReadyResolve();
+  } else if (operation !== "decision") {
+    answerReadyResolve();
+  }
 
   const diagnostics = (): string => `stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`;
   const fail = (error: Error): void => {
@@ -463,6 +444,7 @@ function runConstitutionOperationInChild(
     failed = true;
     settled = true;
     if (!readySignalled) readyReject(error);
+    if (!answerSignalled) answerReadyReject(error);
     reject(error);
     cleanup();
   };
@@ -487,6 +469,15 @@ function runConstitutionOperationInChild(
       }
       readySignalled = true;
       readyResolve();
+      return;
+    }
+    if (record.type === "answered") {
+      if (!readySignalled || answerSignalled) {
+        fail(new Error(`constitution decision child emitted duplicate or out-of-order answer readiness (${diagnostics()})`));
+        return;
+      }
+      answerSignalled = true;
+      answerReadyResolve();
       return;
     }
     if (record.type === "result") {
@@ -524,6 +515,7 @@ function runConstitutionOperationInChild(
       settled = true;
       const error = new Error(`constitution decision child was cleaned up before completion (${diagnostics()})`);
       if (!readySignalled) readyReject(error);
+      if (!answerSignalled) answerReadyReject(error);
       reject(error);
     }
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -570,12 +562,20 @@ function runConstitutionOperationInChild(
     if (released || failed || settled) return;
     released = true;
     try {
-      child.stdin.end("release\n");
+      child.stdin.write("release\n");
     } catch (error) {
       fail(new Error(`constitution decision child barrier release failed: ${String(error)} (${diagnostics()})`));
     }
   };
-  return { promise, ready, release, cleanup };
+  const releaseAnswer = (): void => {
+    if (!barrier || operation !== "decision" || failed || settled) return;
+    try {
+      child.stdin.write("release\n");
+    } catch (error) {
+      fail(new Error(`constitution decision child Ask barrier release failed: ${String(error)} (${diagnostics()})`));
+    }
+  };
+  return { promise, ready, answerReady, release, releaseAnswer, cleanup };
 }
 
 
@@ -1742,7 +1742,7 @@ test("discovered deletion never clears a newer origin workspace constitution bin
 });
 
 
-test("cross-process constitution decisions commit one durable decision and consume one proof", { timeout: CONSTITUTION_CHILD_TIMEOUT_MS + 5_000 }, async () => {
+test("cross-process constitution decisions repeat canonical Ask and consume one gate proof", { timeout: CONSTITUTION_CHILD_TIMEOUT_MS + 5_000 }, async () => {
   const root = makeProject();
   try {
     const ensured = ensureProjectConstitution(root, originDescriptor());
@@ -1770,11 +1770,14 @@ test("cross-process constitution decisions commit one durable decision and consu
       children.push(runConstitutionDecisionInChild(root, input, true));
       await Promise.all(children.map((child) => child.ready));
       for (const child of children) child.release();
-      const [first, second] = await Promise.all(children.map((child) => child.promise));
-      assert.equal(first.ok, true, "the first contender failed: " + JSON.stringify(first));
-      assert.equal(second.ok, true, "the second contender failed: " + JSON.stringify(second));
-      assert.deepEqual(first, second, "both contenders observe one identical durable decision projection");
-      const approvedProjection = first.value as Record<string, unknown>;
+      await Promise.all(children.map((child) => child.answerReady));
+      for (const child of children) child.releaseAnswer();
+      const outcomes = await Promise.all(children.map((child) => child.promise));
+      const successes = outcomes.filter((candidate) => candidate.ok);
+      assert.equal(successes.length, outcomes.length, "canonical Ask contenders converge through idempotent success: " + JSON.stringify(outcomes));
+      assert.deepEqual(outcomes[0], outcomes[1], "canonical Ask contenders observe one identical durable decision projection");
+      const approvedProjection = successes[0]!.value as Record<string, unknown>;
+
       assert.equal(approvedProjection.checkpoint_ref, null, "approved callers do not retain an open checkpoint");
       assert.equal(approvedProjection.resume_marker, ensured.value.gate_id + ".resume.v1", "approved callers receive the one resume marker identity");
       assert.deepEqual(approvedProjection.resume, { origin_kind: "native_direct", origin_run_key: RUN_KEY, resume_target: "specify" });
@@ -1792,30 +1795,37 @@ test("cross-process constitution decisions commit one durable decision and consu
       assert.equal(envelope.gate.checkpoint_ref, null);
       assert.equal(envelope.decisions.length, 1, "the cross-process race records exactly one durable decision");
       const durableDecision = envelope.decisions[0];
-      assert.deepEqual(
-        { ...durableDecision, at: "<committed-at>" },
-        {
-          checkpoint_id: presented.value.checkpoint_ref,
-          decision: "approve_continue",
-          feedback: null,
-          authorization: "human",
-          actor_provenance: trusted.actor_provenance,
-          at: "<committed-at>",
-        },
-        "the sole durable decision preserves the exact trusted actor proof",
-      );
+      assert.equal(durableDecision?.checkpoint_id, presented.value.checkpoint_ref);
+      assert.equal(durableDecision?.decision, "approve_continue");
+      assert.equal(durableDecision?.feedback, null);
+      assert.equal(durableDecision?.authorization, "human");
+      const winnerProof = durableDecision?.actor_provenance && typeof durableDecision.actor_provenance === "object"
+        ? (durableDecision.actor_provenance as { proof?: { answer_id?: string } }).proof
+        : undefined;
+      assert.ok(winnerProof?.answer_id, "the durable winner records the canonical gate proof");
+      assert.equal(winnerProof?.answer_id, trusted.actor_provenance.proof?.answer_id, "repeated canonical Asks may converge on one durable gate proof");
       assert.ok(durableDecision && Number.isFinite(Date.parse(durableDecision.at)), "the durable decision timestamp is valid");
       assert.equal(envelope.gate.resume_marker, ensured.value.gate_id + ".resume.v1", "exactly one resume marker remains as the consumed decision identity");
       assert.equal(envelope.resume_marker_consumed, true, "the one resume marker is durably consumed");
 
-      const selected = resolveState(root, undefined, workspaceSelector());
-      assert.ok(selected.state);
-      if (selected.state) {
-        const answerId = trusted.actor_provenance.proof?.answer_id;
-        assert.ok(answerId);
-        const answers = selected.state.trusted_checkpoint_answers?.filter((answer) => answer.answer_id === answerId);
-        assert.equal(answers?.length, 1, "the durable proof ledger contains one answer record");
-        assert.ok(answers?.[0]?.consumed_at, "the one trusted proof is durably consumed");
+      const pinned = PinnedProjectRoot.open(root);
+      assert.ok(pinned, "the final gate proof must be read through a pinned root");
+      if (pinned) {
+        try {
+          const gateRead = readConstitutionGateEnvelopePinned(pinned);
+          assert.ok(gateRead.ok, gateRead.ok ? "" : gateRead.error);
+          if (gateRead.ok && gateRead.value) {
+            const answerId = trusted.actor_provenance.proof?.answer_id;
+            assert.ok(answerId);
+            const answers = gateRead.value.trusted_answers?.filter((answer) => answer.answer_id === answerId);
+            assert.equal(answers?.length, 1, "the canonical gate ledger contains one repeated-Ask proof");
+            assert.ok(answers?.[0]?.consumed_at, "the one canonical gate proof is durably consumed");
+            const consumedAnswers = gateRead.value.trusted_answers?.filter((answer) => answer.consumed_at !== undefined) ?? [];
+            assert.equal(consumedAnswers.length, 1, "exactly one canonical gate proof is durably consumed");
+          }
+        } finally {
+          pinned.close();
+        }
       }
     } finally {
       for (const child of children) child.cleanup();
@@ -2055,7 +2065,7 @@ test("constitution decisions reject fabricated, cross-context, mismatched, and n
     writeState(root, primaryWorkspace.state, { target: primaryWorkspace });
 
     const checkpointId = presented.value.checkpoint_ref;
-    const trusted = trustedDecision(root, checkpointId, "approve_continue", "constitution-answer/security");
+    const trusted = trustedDecision(root, checkpointId, "approve_continue");
     const base = {
       ...trusted,
       gate_id: ensured.value.gate_id,
@@ -2096,8 +2106,8 @@ test("constitution decisions reject fabricated, cross-context, mismatched, and n
     });
     assert.equal(mismatchedDecision.ok, false, "the immutable answer is bound to its exact decision");
 
-    const wrongCheckpointProof = trustedDecision(root, `${checkpointId}.other`, "approve_continue", "constitution-answer/wrong-checkpoint");
-    const wrongCheckpoint = decideConstitutionCheckpoint(root, { ...base, ...wrongCheckpointProof });
+    const wrongCheckpointProof = trustedDecision(root, checkpointId, "approve_continue");
+    const wrongCheckpoint = decideConstitutionCheckpoint(root, { ...base, ...wrongCheckpointProof, checkpoint_id: `${checkpointId}.other` });
     assert.equal(wrongCheckpoint.ok, false, "an answer issued for another checkpoint cannot be reused");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -2179,6 +2189,28 @@ test("request_changes re-dispatches the same draft stage with feedback and a new
         feedback: trustedRevision.feedback,
       });
       assert.equal(replayedAcrossRevision.ok, false, "a consumed proof cannot authorize a new checkpoint version");
+
+      const freshRevision = trustedDecision(
+        root,
+        revisedRecord.checkpoint_ref as string,
+        "request_changes",
+        "Revise the current constitution draft before approval.",
+      );
+      const freshRevisionDecision = decideConstitutionCheckpoint(root, {
+        ...freshRevision,
+        gate_id: gateId,
+        checkpoint_id: revisedRecord.checkpoint_ref as string,
+        decision: "request_changes",
+        feedback: freshRevision.feedback,
+      });
+      assert.ok(freshRevisionDecision.ok, freshRevisionDecision.ok ? "fresh current-state host Ask authorizes revision" : freshRevisionDecision.error);
+      if (freshRevisionDecision.ok) {
+        assert.equal(
+          (freshRevisionDecision.value as Record<string, unknown>).status,
+          "constitution_required",
+          "fresh request_changes keeps the same draft stage open for another revision",
+        );
+      }
     }
   } finally {
     rmSync(root, { recursive: true, force: true });

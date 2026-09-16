@@ -637,6 +637,53 @@ function consumedAnswer(state: TeamState, answerId: string) {
   return (state.trusted_checkpoint_answers ?? []).find((candidate) => candidate.answer_id === answerId);
 }
 
+function recordSyntheticPhaseAnswer(
+  state: TeamState,
+  answerId: string,
+  decision: string,
+  feedback?: string,
+): ReturnType<typeof recordTrustedCheckpointAnswer> {
+  const workspace = state.specification;
+  assert.ok(workspace, "synthetic phase answer requires a specification workspace");
+  if (!workspace) throw new Error("synthetic phase answer workspace is unavailable");
+  const pinned = PinnedProjectRoot.open(workspace.project_root);
+  assert.ok(pinned, "synthetic phase answer root must pin");
+  if (!pinned) throw new Error("synthetic phase answer root is unavailable");
+  try {
+    const root = { canonical_root: pinned.canonical_root, dev: pinned.dev, ino: pinned.ino };
+    const reference = "terminal-answer/" + answerId;
+    const capability = issueTrustedCheckpointAnswerCapability(TEST_CHECKPOINT_BRIDGE, {
+      root,
+      state,
+      answer_id: answerId,
+      channel: "terminal",
+      reference,
+      stage_id: ORIGIN_STAGE,
+      checkpoint_id: PHASE_CHECKPOINT,
+      decision,
+      feature_id: workspace.feature_id,
+      ...(feedback === undefined ? {} : { feedback }),
+      question: "Authorize the synthetic specification phase checkpoint",
+      options: [...EXACT_DECISIONS],
+      session_id: "checkpoint-test-session",
+      actor_ref: reference,
+      profile_hash: state.profile_hash ?? specPreparationProfileHash(),
+    });
+    return recordTrustedCheckpointAnswer(state, {
+      answer_id: answerId,
+      channel: "terminal",
+      reference,
+      stage_id: ORIGIN_STAGE,
+      checkpoint_id: PHASE_CHECKPOINT,
+      decision,
+      feature_id: workspace.feature_id,
+      ...(feedback === undefined ? {} : { feedback }),
+    }, { capability, root });
+  } finally {
+    pinned.close();
+  }
+}
+
 /**
  * Record one trusted terminal answer for the current durable context and
  * persist it, returning the user actor provenance carrying its proof.
@@ -668,7 +715,7 @@ function recordPhaseAnswer(
       checkpoint_id: checkpointId,
       decision,
       feature_id: state.specification.feature_id,
-      ...(subject.ok ? { subject_binding: subject.subject.subject_binding, subject_revision: subject.subject.state_revision } : {}),
+      ...(subject.ok ? { subject_binding: subject.subject.subject_binding, subject_revision: subject.subject.state_revision + 1 } : {}),
       ...(decision === "request_changes" ? { feedback: feedback ?? REVISION_FEEDBACK } : {}),
       question: "Authorize the current specification phase",
       options: EXACT_DECISIONS,
@@ -684,7 +731,7 @@ function recordPhaseAnswer(
       checkpoint_id: checkpointId,
       decision,
       feature_id: state.specification.feature_id,
-      ...(subject.ok ? { subject_binding: subject.subject.subject_binding, subject_revision: subject.subject.state_revision } : {}),
+      ...(subject.ok ? { subject_binding: subject.subject.subject_binding, subject_revision: subject.subject.state_revision + 1 } : {}),
       ...(decision === "request_changes" ? { feedback: feedback ?? REVISION_FEEDBACK } : {}),
     }, { capability, root: stat });
     writeState(root, trusted.state, { target: selected });
@@ -1141,16 +1188,7 @@ test("checkpoint ledger keeps revision epochs distinct and projects only the act
   const root = makeProject();
   try {
     const initial = phaseState(root, specifyRecord());
-    const v1Answer = recordTrustedCheckpointAnswer(initial, {
-      answer_id: "phase-answer/epoch-v1/request_changes",
-      channel: "terminal",
-      reference: "terminal-answer/epoch-v1/request_changes",
-      stage_id: ORIGIN_STAGE,
-      checkpoint_id: PHASE_CHECKPOINT,
-      decision: "request_changes",
-      feature_id: FEATURE_ID,
-      feedback: REVISION_FEEDBACK,
-    });
+    const v1Answer = recordSyntheticPhaseAnswer(initial, "phase-answer/epoch-v1/request_changes", "request_changes", REVISION_FEEDBACK);
     const v1Actor: CheckpointActor = {
       kind: "user",
       ref: v1Answer.proof.reference,
@@ -1173,15 +1211,7 @@ test("checkpoint ledger keeps revision epochs distinct and projects only the act
       cursor_epoch: rotated.state.issued_for!.cursor_epoch,
       dispatch_capability: rotated.state,
     };
-    const v2Answer = recordTrustedCheckpointAnswer(v2State, {
-      answer_id: "phase-answer/epoch-v2/approve_continue",
-      channel: "terminal",
-      reference: "terminal-answer/epoch-v2/approve_continue",
-      stage_id: ORIGIN_STAGE,
-      checkpoint_id: PHASE_CHECKPOINT,
-      decision: "approve_continue",
-      feature_id: FEATURE_ID,
-    });
+    const v2Answer = recordSyntheticPhaseAnswer(v2State, "phase-answer/epoch-v2/approve_continue", "approve_continue");
     const v2Actor: CheckpointActor = {
       kind: "user",
       ref: v2Answer.proof.reference,
@@ -1214,15 +1244,7 @@ test("checkpoint ledger keeps revision epochs distinct and projects only the act
     const replayed = appendCheckpointDecision(withV2, v2Decision);
     assert.deepEqual(replayed, withV2, "exact v2 replay is idempotent");
 
-    const conflictingAnswer = recordTrustedCheckpointAnswer(withV2, {
-      answer_id: "phase-answer/epoch-v2/approve_stop",
-      channel: "terminal",
-      reference: "terminal-answer/epoch-v2/approve_stop",
-      stage_id: ORIGIN_STAGE,
-      checkpoint_id: PHASE_CHECKPOINT,
-      decision: "approve_stop",
-      feature_id: FEATURE_ID,
-    });
+    const conflictingAnswer = recordSyntheticPhaseAnswer(withV2, "phase-answer/epoch-v2/approve_stop", "approve_stop");
     const conflictingActor: CheckpointActor = {
       kind: "user",
       ref: conflictingAnswer.proof.reference,

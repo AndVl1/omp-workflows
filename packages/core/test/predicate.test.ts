@@ -270,7 +270,7 @@ test("predicate: over-budget artifact values fail closed before comparison", () 
     let deep: unknown = { iterations: 1 };
     for (let depth = 0; depth < 65; depth += 1) deep = { next: deep };
     writeFileSync(join(artifactsDir, "debug.json"), JSON.stringify(deep));
-    const result = evaluatePredicate("debug.iterations == 1", { flags: FLAGS, artifactsDir, state: state() });
+    const result = evaluatePinned("debug.iterations == 1", root, artifactsDir, { flags: FLAGS, state: state() });
     assert.equal(result.ok, false);
     if (!result.ok) assert.match(result.error, /cannot be evaluated safely: artifact structure limit exceeded/);
   } finally {

@@ -386,7 +386,28 @@ test("migrated state runs validator failure, native v2 revision, checkpoint, and
       return found!;
     };
     sessionStart?.({}, { mode: "rpc", hasUI: true, cwd: root, sessionManager, ui: { askDialog: async () => ({ kind: "submit", results: [] }) } });
-    const context = { cwd: root, mode: "rpc", sessionManager, hasUI: true, ui: { askDialog: async () => ({ kind: "submit", results: [{ id: "checkpoint:" + featureId + ":" + checkpointId, question: "", options: ["approve_continue", "request_changes", "approve_stop"], multi: false, selectedOptions: ["approve_continue"] }] }) } };
+    const context = {
+      cwd: root,
+      mode: "rpc" as const,
+      sessionManager,
+      hasUI: true,
+      ui: {
+        askDialog: async (questions: Array<{ id: string; question: string; options: Array<{ label: string }>; multi?: boolean }>) => {
+          const question = questions[0];
+          if (!question) return undefined;
+          return {
+            kind: "submit" as const,
+            results: [{
+              id: question.id,
+              question: question.question,
+              options: question.options.map((option) => option.label),
+              multi: false,
+              selectedOptions: ["approve_continue"],
+            }],
+          };
+        },
+      },
+    };
     const begin = await tool("workflow_begin").execute("test", { feature_id: featureId, run_key: runKey }, undefined, undefined, context);
     assert.equal(begin.details.ok, true, begin.details.error ?? "workflow_begin accepted migrated state");
     const generation = begin.details.handoff;
@@ -497,6 +518,8 @@ test("migrated state runs validator failure, native v2 revision, checkpoint, and
     assert.equal(presented.ok, true, presented.ok ? "" : presented.error);
     if (!presented.ok) return;
     const checkpointId = presented.value.checkpoint_id;
+    assert.equal(checkpointId, "specification_phase_approval", "migration must present the canonical bounded phase checkpoint identity");
+    assert.match(checkpointId, /^[A-Za-z0-9._:-]{1,128}$/u, "selected checkpoint identity must stay bounded and line-inert");
     const checkpointState = resolveState(root, undefined, { feature_id: featureId, run_key: runKey });
     assert.ok(checkpointState.state);
     if (!checkpointState.state || !checkpointState.state.dispatch_capability) return;
@@ -514,6 +537,7 @@ test("migrated state runs validator failure, native v2 revision, checkpoint, and
       checkpoint: checkpointId,
       checkpoint_id: checkpointId,
       checkpoint_kind: checkpointId,
+      loop_iteration: 1,
     }, undefined, undefined, context);
     assert.equal(asked.details.ok, true, JSON.stringify(asked.details));
     restarted = resolveState(root, undefined, { feature_id: featureId, run_key: runKey });
