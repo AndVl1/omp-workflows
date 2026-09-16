@@ -62,7 +62,7 @@ import { readSessionInfo, startTestSession, type TestSession } from '../src/serv
 import { acquireExecutionClaim, readExecutionClaimStore } from '../../core/src/specification/claims.js';
 import { canonicalHandoffDigest, evaluateHandoffReadiness } from '../../core/src/specification/handoff.js';
 import { materializeImplementationHandoff } from '../../core/src/specification/materialize.js';
-import { bindWorkspaceConstitution, createFeatureWorkspace, persistFeatureWorkspace, resolveFeatureWorkspace, applyManualEdits, featureArtifactsDir } from '../../core/src/specification/workspace.js';
+import { createFeatureWorkspace, persistFeatureWorkspace, resolveFeatureWorkspace, applyManualEdits, featureArtifactsDir } from '../../core/src/specification/workspace.js';
 import { writeArtifact } from '../../core/src/engine/artifacts.js';
 import { readProjectConstitutionGate } from '../../core/src/specification/prerequisite.js';
 import { PinnedProjectRoot } from '../../core/src/specification/pinned-root.js';
@@ -800,36 +800,6 @@ function seedReadyFeature(
   assert.equal(readiness.ok, true, featureId + " passes the production handoff readiness API before launch");
   const snapshot = snapshotWorkspace(scratch.root, featureId);
   return { workspace: loaded.value, handoff, snapshot };
-}
-
-function syncSeededFeatureConstitution(root: string, seeded: SeededFeature, binding: ConstitutionBinding, gateRef: string): void {
-  const resolved = resolveFeatureWorkspace(root, { feature_id: seeded.workspace.feature_id, run_key: seeded.snapshot.runKey });
-  assert.ok(resolved.ok, resolved.ok ? "" : resolved.error);
-  if (!resolved.ok) throw new Error(resolved.error);
-  const reboundWorkspace = bindWorkspaceConstitution(resolved.value, binding, gateRef);
-  const persisted = persistFeatureWorkspace(root, reboundWorkspace, undefined, {
-    expected_workspace_digest: canonicalDigestOf(resolved.value),
-  });
-  assert.ok(persisted.ok, persisted.ok ? "" : persisted.error);
-  if (!persisted.ok) throw new Error(persisted.error);
-
-  const handoff: ImplementationHandoff = {
-    ...seeded.handoff,
-    constitution_binding: { ...binding },
-  };
-  handoff.handoff_digest = canonicalHandoffDigest(handoff);
-  const handoffDir = join(featureArtifactsDir(root, seeded.workspace.feature_id), "implementation_handoff");
-  writeArtifact(handoffDir, handoff.handoff_id, handoff);
-  const projection = materializeImplementationHandoff(root, handoff, strictHandoffProjectionOptions(root, handoff));
-  assert.ok(projection.ok, projection.ok ? "" : projection.error);
-  if (!projection.ok) throw new Error(projection.error);
-
-  const loaded = resolveFeatureWorkspace(root, { feature_id: seeded.workspace.feature_id, run_key: seeded.snapshot.runKey });
-  assert.ok(loaded.ok, loaded.ok ? "" : loaded.error);
-  if (!loaded.ok) throw new Error(loaded.error);
-  seeded.workspace = loaded.value;
-  seeded.handoff = handoff;
-  seeded.snapshot = snapshotWorkspace(root, seeded.workspace.feature_id);
 }
 
 function materializePassingFixture(root: string, featureId: string): void {
@@ -1743,6 +1713,8 @@ test('passing fixture: readable specification refs and executable deliverable ar
   const scratch = makeScratch();
   try {
     const featureId = 'readable-cto-passing';
+    const constitutionPath = join(scratch.root, 'CONSTITUTION.md');
+    if (!existsSync(constitutionPath)) writeFileSync(constitutionPath, VALID_BOOTSTRAP_CONSTITUTION);
     const seeded = seedReadyFeature(scratch, featureId, 'fixture-passing-run', bootstrapBinding());
     assertPassingFixture(scratch.root, featureId, seeded.handoff);
   } finally {
@@ -1862,21 +1834,11 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
   assert.equal(param("expected_admitted_task_count"), String(PASSING_TASK_GRAPH.length + 1), "scenario dispatch count covers passing graph plus blocked task");
   const ctoRequest = `/cto --spec ${passingId} --run-key ${passingRun} --spec ${blockedId} --run-key ${blockedRun} --spec ${staleId} --run-key ${staleRun} --spec ${claimedId} --run-key ${claimedRun} Execute the selected handoffs in one resident CTO wave. Preserve this exact immutable full selector array in the selector-only cto_prepare request; let the engine derive canonical task, DoD, and TeamDef candidates, obtain the mapping confirmation, and emit the eligible-only preflight descriptor. Keep stale and claimed selectors selected for readiness exclusion, report their blocked findings verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor without reconstructing selectors or repeating excluded rows. Report blocked findings and complete each admitted worker with real evidence before closing. The blocked handoff intentionally has no concrete observable contract and its src/blocked/** prerequisite is absent; do not invent behavior or repair that fixture. Give its implementation/QA workers one bounded attempt, record the unresolved blocker under FR-1/AC-1, and return one terminal blocked summary without rewriting DoD or re-dispatching repair workers. The admitted passing slices T-AUDIT-LOG and T-METRICS are independent and must dispatch in parallel; T-SCHEMA-VALIDATOR depends on T-LOADER; T-SHARED-DEFAULTS-A and T-SHARED-DEFAULTS-B share src/passing/shared-defaults.json and must serialize. Preserve every original FR-1/AC-1/V-1 task mapping, and require each lead to produce implementation and QA evidence before returning.`;
   const scratch = makeScratch();
-  const binding = bootstrapBinding();
-  const passing = seedReadyFeature(scratch, passingId, passingRun, binding);
-  const blocked = seedReadyFeature(scratch, blockedId, blockedRun, binding);
-  assertPassingFixture(scratch.root, passingId, passing.handoff);
-  assertTypedConformanceEvidenceTask(passing.handoff, passingId);
-  assertTypedConformanceEvidenceTask(blocked.handoff, blockedId);
-  const stale = seedReadyFeature(scratch, staleId, staleRun, binding);
-  const claimed = seedReadyFeature(scratch, claimedId, claimedRun, binding);
-  const staleRevision = applyManualEdits(stale.workspace, { feature_id: staleId, phase: 'plan', version: 1, documents: { 'plan.md': { expected_sha256: fixtureSha256('plan.v1'), actual_sha256: fixtureSha256('plan.edited'), matches: false } } }, 'approved Plan changed after handoff');
-  assert.ok(staleRevision.stale_artifacts.length > 0);
-  const staleSnapshot = stale.snapshot;
-  assert.equal(persistWorkspace(scratch.root, staleRevision.workspace, staleRun).status, 'stale');
-  const live = acquireExecutionClaim(scratch.root, claimedId, { handoff: claimed.handoff, run_key: claimedRun, owner_kind: 'do_work', owner_run_id: 'fixture-do-work-claimed' });
-  assert.ok(live.ok, live.ok ? '' : live.error);
-  if (!live.ok) throw new Error(live.error);
+  let passing!: SeededFeature;
+  let blocked!: SeededFeature;
+  let stale!: SeededFeature;
+  let claimed!: SeededFeature;
+  let staleSnapshot!: WorkspaceSnapshot;
   let open: OpenSession | null = null;
   let testFailureObserved = false;
   try {
@@ -1916,8 +1878,21 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
     assert.ok(gate.ok, gate.ok ? "" : gate.error);
     if (!gate.ok || gate.value.binding === null) throw new Error(gate.ok ? "constitution gate has no approved binding" : gate.error);
     removeConstitutionBootstrapWorkspace(scratch.root);
-    syncSeededFeatureConstitution(scratch.root, passing, gate.value.binding, gate.value.gate_id);
-    syncSeededFeatureConstitution(scratch.root, blocked, gate.value.binding, gate.value.gate_id);
+    const binding = gate.value.binding;
+    passing = seedReadyFeature(scratch, passingId, passingRun, binding);
+    blocked = seedReadyFeature(scratch, blockedId, blockedRun, binding);
+    assertPassingFixture(scratch.root, passingId, passing.handoff);
+    assertTypedConformanceEvidenceTask(passing.handoff, passingId);
+    assertTypedConformanceEvidenceTask(blocked.handoff, blockedId);
+    stale = seedReadyFeature(scratch, staleId, staleRun, binding);
+    claimed = seedReadyFeature(scratch, claimedId, claimedRun, binding);
+    const staleRevision = applyManualEdits(stale.workspace, { feature_id: staleId, phase: 'plan', version: 1, documents: { 'plan.md': { expected_sha256: fixtureSha256('plan.v1'), actual_sha256: fixtureSha256('plan.edited'), matches: false } } }, 'approved Plan changed after handoff');
+    assert.ok(staleRevision.stale_artifacts.length > 0);
+    staleSnapshot = stale.snapshot;
+    assert.equal(persistWorkspace(scratch.root, staleRevision.workspace, staleRun).status, 'stale');
+    const live = acquireExecutionClaim(scratch.root, claimedId, { handoff: claimed.handoff, run_key: claimedRun, owner_kind: 'do_work', owner_run_id: 'fixture-do-work-claimed' });
+    assert.ok(live.ok, live.ok ? '' : live.error);
+    if (!live.ok) throw new Error(live.error);
 
     open = await openSession(scratch.root, scenario);
     assertRuntimePluginRegistry(open.session, scratch.root);
