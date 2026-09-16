@@ -233,7 +233,7 @@ function exactBootstrappedScratch(): Scratch | null {
   assert.equal(resolve(realpathSync(fullstackLink)), resolve(expectedMonorepo, 'packages', 'fullstack'));
   assert.equal(resolve(realpathSync(coreLink)), resolve(expectedMonorepo, 'packages', 'core'));
   const staleStatePaths: string[] = [];
-  for (const relativePath of ['CONSTITUTION.md', join('.work-state', 'cto'), join('.work-state', 'features'), 'specs']) {
+  for (const relativePath of ['CONSTITUTION.md', join('.work-state', 'cto'), join('.work-state', 'features'), join('.work-state', 'specification'), 'specs']) {
     const candidate = join(canonical, relativePath);
     try {
       const candidateStat = lstatSync(candidate);
