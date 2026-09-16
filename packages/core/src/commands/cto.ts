@@ -2930,6 +2930,7 @@ function abortMappingTransactionPinned(
   if (transaction.status === "pending") {
     aborting = {
       ...transaction,
+      status: "aborting",
       abort_reason: reason,
       abort_started_at: new Date().toISOString(),
     };
