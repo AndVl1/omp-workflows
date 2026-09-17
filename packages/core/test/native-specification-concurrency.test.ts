@@ -154,7 +154,7 @@ function registeredTaskHandler(root: string): (event: unknown, ctx: unknown) => 
   return handler;
 }
 
-test("three independent native start descriptors authorize against their own feature states concurrently", () => {
+test("three independent native start descriptors authorize against their own feature states concurrently", async () => {
   const root = setupRoot();
   try {
     const started = descriptors(root);
@@ -176,7 +176,7 @@ test("three independent native start descriptors authorize against their own fea
       assert.equal(marker?.task_id, state?.dispatch_capability?.dispatches?.[0]?.work_identity?.task_id);
       assert.equal(task.agent, state?.dispatch_capability?.dispatches?.[0]?.agent);
       assert.equal(nativeSpecificationTaskGate({ toolName: "task", input }, { cwd: root })?.block, undefined, `native gate ${index}`);
-      const outcome = handler({ toolName: "task", toolCallId: `task-call-${index}`, input }, TEST_CONTEXT(root));
+      const outcome = await handler({ toolName: "task", toolCallId: `task-call-${index}`, input }, TEST_CONTEXT(root));
       assert.equal(outcome, undefined, `registered task hook ${index}`);
     }
     for (const [index, result] of started.entries()) {
