@@ -4432,6 +4432,8 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         assertCurrentExecutionLiveness();
         const hostIdentity = hostSessionIdentity(ctx);
         if (!hostIdentity || !sameHostSession(hostIdentityBefore, hostIdentity)) return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_REJECTED", error: "trusted host session changed while the checkpoint Ask was open; no human answer was minted" });
+        const currentProfileHash = preflight.context.state.profile_hash;
+        if (typeof currentProfileHash !== "string" || currentProfileHash.length === 0) return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_REJECTED", error: "current workflow profile hash is unavailable for checkpoint authorization" });
         const trustedAnswerId = `checkpoint-answer-${randomUUID()}`;
         const trustedAnswerReference = `terminal:workflow_checkpoint_ask_selected:${trustedAnswerId}`;
         let trustedAnswerCapability: import("./engine/checkpoints.js").TrustedCheckpointAnswerCapability;
@@ -4454,7 +4456,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
             question: dialogQuestion,
             options: allowed,
             session_id: hostIdentity.sessionId,
-            profile_hash: input.profile_hash,
+            profile_hash: currentProfileHash,
           });
         } catch (error) {
           return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_FAILED", error: `trusted host answer capability could not be issued: ${String(error)}` });
