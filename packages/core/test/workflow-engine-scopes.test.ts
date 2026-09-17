@@ -13,11 +13,11 @@ import { test } from "node:test";
 import { TEST_ON, TEST_SESSION_MANAGER } from "./fixtures/registrar-host.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
 import { z as zod } from "zod";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openTestRegistry, registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
+import { closeRetainedTestRegistrations, openTestRegistry, registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
 import { registerWorkflowTools } from "../src/index.js";
@@ -127,6 +127,24 @@ function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "features", "loop", "state.json"), "utf8")) as TeamState;
 }
 
+const CHECKPOINT_REGISTRATION_OWNER = "core-test-profile";
+
+function checkpointFeatureId(root: string, state: TeamState): string {
+  if (state.specification?.feature_id) return state.specification.feature_id;
+  const featuresDir = join(root, ".work-state", "features");
+  const candidates = readdirSync(featuresDir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+  assert.equal(candidates.length, 1, "checkpoint fixture must have exactly one prepared feature state");
+  const feature = candidates[0]?.name;
+  assert.ok(feature, "checkpoint fixture prepared feature state must have a directory name");
+  if (!feature) throw new Error("checkpoint fixture prepared feature state is unavailable");
+  return feature;
+}
+
+function closeCheckpointFixtures(root: string): void {
+  mountedCheckpointAsks.delete(root);
+  closeRetainedTestRegistrations(root);
+}
+
 type MountedCheckpointAsk = {
   execute: (...args: unknown[]) => Promise<{ details: Record<string, unknown> }>;
 };
@@ -137,27 +155,32 @@ function mountedCheckpointAsk(root: string): MountedCheckpointAsk {
   const existing = mountedCheckpointAsks.get(root);
   if (existing) return existing;
   writeTestRegistryMarker(root);
-  const registration = openTestRegistry(root, ["workflow_tools"], "workflow-engine-scopes-checkpoint");
+  const registration = openTestRegistry(root, ["workflow_tools"], CHECKPOINT_REGISTRATION_OWNER);
   const tools = new Map<string, MountedCheckpointAsk>();
-  registerWorkflowTools({
-    zod: { z: zod },
-    on: TEST_ON,
-    registerTool(tool: unknown) {
-      const mounted = tool as { name: string; execute: (...args: unknown[]) => Promise<{ details: Record<string, unknown> }> };
-      tools.set(mounted.name, { execute: mounted.execute.bind(mounted) });
-    },
-  } as never, {
-    owner: () => registration.owner,
-    cwd: root,
-    registrationToken: registration.token,
-    resolveCwd: (ctx: unknown) => (ctx as { cwd: string }).cwd,
-  });
-  registration.retain(true);
-  const ask = tools.get("workflow_checkpoint_ask_selected");
-  assert.ok(ask, "mounted workflow checkpoint Ask must be available");
-  if (!ask) throw new Error("mounted workflow checkpoint Ask is unavailable");
-  mountedCheckpointAsks.set(root, ask);
-  return ask;
+  try {
+    registerWorkflowTools({
+      zod: { z: zod },
+      on: TEST_ON,
+      registerTool(tool: unknown) {
+        const mounted = tool as { name: string; execute: (...args: unknown[]) => Promise<{ details: Record<string, unknown> }> };
+        tools.set(mounted.name, { execute: mounted.execute.bind(mounted) });
+      },
+    } as never, {
+      owner: () => registration.owner,
+      cwd: root,
+      registrationToken: registration.token,
+      resolveCwd: (ctx: unknown) => (ctx as { cwd: string }).cwd,
+    });
+    const ask = tools.get("workflow_checkpoint_ask_selected");
+    assert.ok(ask, "mounted workflow checkpoint Ask must be available");
+    if (!ask) throw new Error("mounted workflow checkpoint Ask is unavailable");
+    registration.retain(true);
+    mountedCheckpointAsks.set(root, ask);
+    return ask;
+  } catch (error) {
+    try { registration.finish(false); } catch { /* preserve original mounted Ask failure */ }
+    throw error;
+  }
 }
 
 async function typedCheckpoint(root: string, stageId: string, checkpointId: string, advanceToken: string, decision = "proceed") {
@@ -165,22 +188,26 @@ async function typedCheckpoint(root: string, stageId: string, checkpointId: stri
   const policy = state.checkpoint_policy;
   const capability = state.dispatch_capability;
   assert.ok(policy, "checkpoint test state must carry a typed policy");
-  assert.ok(capability?.capability_id && capability.issued_for?.cursor_epoch, "checkpoint test state must carry capability binding");
+  assert.ok(capability?.capability_id && capability.issued_for, "checkpoint test state must carry capability binding");
+  if (!capability?.capability_id || !capability.issued_for) throw new Error("checkpoint test capability binding is unavailable");
+  const issuedFor = capability.issued_for;
+  const featureId = checkpointFeatureId(root, state);
+  assert.equal(stageId, issuedFor.stage_cursor, "checkpoint fixture stage must match the current capability");
   const rule = policy.rules[checkpointId];
   assert.ok(rule, `checkpoint test policy must define ${checkpointId}`);
   const feedback = decision === "request_changes" ? "Add the missing failure-path evidence." : undefined;
   const ask = mountedCheckpointAsk(root);
   TEST_SESSION_MANAGER.cwd = root;
   const askInput = {
-    feature_id: "loop",
+    feature_id: featureId,
     advance_token: advanceToken,
     capability_id: capability.capability_id,
-    run_key: state.run_key ?? state.branch,
-    branch: state.branch,
-    workflow: state.classification.workflow,
-    profile_hash: state.profile_hash,
-    stage_cursor: stageId,
-    cursor_epoch: state.cursor_epoch,
+    run_key: issuedFor.run_key,
+    branch: issuedFor.branch,
+    workflow: issuedFor.workflow,
+    profile_hash: issuedFor.profile_hash,
+    stage_cursor: issuedFor.stage_cursor,
+    cursor_epoch: issuedFor.cursor_epoch,
     checkpoint: checkpointId,
     checkpoint_id: checkpointId,
     checkpoint_kind: rule.kind,
@@ -224,8 +251,7 @@ async function typedCheckpoint(root: string, stageId: string, checkpointId: stri
 }
 
 async function persistTypedCheckpoint(root: string, stageId: string, checkpointId: string, advanceToken: string, decision = "proceed"): Promise<void> {
-  const typed = await typedCheckpoint(root, stageId, checkpointId, advanceToken, decision);
-  writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: "loop" });
+  await typedCheckpoint(root, stageId, checkpointId, advanceToken, decision);
 }
 
 const LOOP_PROFILE: Profile = {
@@ -381,6 +407,7 @@ test("checkpoint: unresolved declared checkpoint blocks advance; an explicit typ
     const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "done" });
     assert.equal(advanced.ok, true, "typed decision unblocks advance");
   } finally {
+    closeCheckpointFixtures(root);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -420,22 +447,7 @@ test("checkpoint: approve_stop records durably but advance completes the current
       writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "cause", explanation: "why" }));
     });
 
-    const typed = await typedCheckpoint(root, "diagnose", "approve_diagnosis", issued.advance_token, "approve_stop");
-    const input = {
-      ...advanceAuth(issued),
-      stage_cursor: "diagnose",
-      checkpoint: "approve_diagnosis",
-      checkpoint_id: typed.checkpoint_id,
-      checkpoint_kind: typed.checkpoint_kind,
-      decision: typed.decision,
-      authorization: typed.authorization,
-      actor_provenance: typed.actor,
-      rationale: typed.rationale,
-      feature_id: "loop",
-      run_id: typed.run_id,
-    };
-    const recorded = recordCheckpointDecision(root, input);
-    assert.equal(recorded.ok, true, "approve_stop must be durably recorded");
+    await typedCheckpoint(root, "diagnose", "approve_diagnosis", issued.advance_token, "approve_stop");
     const recordedState = readState(root);
     assert.equal(recordedState.typed_checkpoint_decisions?.length, 1);
     assert.equal(recordedState.typed_checkpoint_decisions?.[0]?.decision, "approve_stop");
@@ -450,11 +462,13 @@ test("checkpoint: approve_stop records durably but advance completes the current
     assert.equal(stopped.dispatch_capability?.status, "complete");
     assert.deepEqual(stopped.dispatch_capability?.dispatches ?? [], []);
   } finally {
+    closeCheckpointFixtures(root);
     rmSync(root, { recursive: true, force: true });
   }
 });
 test("mounted checkpoint request_changes re-arms the current stage, then revised approval advances", async () => {
   const root = mkdtempSync(join(tmpdir(), "ck-revise-mounted-"));
+  let registration: ReturnType<typeof openTestRegistry> | undefined;
   try {
     initGit(root, "feat/loop");
     const nativePolicy = nativeCheckpointPolicy("specification_phase_approval");
@@ -490,7 +504,7 @@ test("mounted checkpoint request_changes re-arms the current stage, then revised
     if (!loaded) return;
     const { issued } = setupStage(root, "feat/loop", loaded, "diagnose", "none", []);
     writeTestRegistryMarker(root);
-    const registration = openTestRegistry(root, ["workflow_tools"], "workflow-scope-tools");
+    registration = openTestRegistry(root, ["workflow_tools"], CHECKPOINT_REGISTRATION_OWNER);
     const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ details: Record<string, unknown> }> }>();
     registerWorkflowTools({
       zod: { z: zod },
@@ -500,35 +514,20 @@ test("mounted checkpoint request_changes re-arms the current stage, then revised
         tools.set(mounted.name, mounted);
       },
     } as never, {
-      owner: () => registration.owner,
+      owner: () => registration!.owner,
       cwd: root,
-      registrationToken: registration.token,
+      registrationToken: registration!.token,
       resolveCwd: (ctx: unknown) => (ctx as { cwd: string }).cwd,
     });
-    registration.retain(true);
-    const checkpointTool = tools.get("workflow_checkpoint");
+    registration!.retain(true);
     const checkpointAskTool = tools.get("workflow_checkpoint_ask_selected");
     const advanceTool = tools.get("workflow_advance");
-    assert.ok(checkpointTool);
     assert.ok(checkpointAskTool);
     assert.ok(advanceTool);
-    if (!checkpointTool || !checkpointAskTool || !advanceTool) return;
+    if (!checkpointAskTool || !advanceTool) return;
     mountedCheckpointAsks.set(root, { execute: checkpointAskTool.execute.bind(checkpointAskTool) });
 
-    const requested = await typedCheckpoint(root, "diagnose", "approve_diagnosis", issued.advance_token, "request_changes");
-    const checkpointInput = {
-      ...mountedAdvanceAuth(issued),
-      checkpoint: requested.checkpoint_id,
-      checkpoint_id: requested.checkpoint_id,
-      checkpoint_kind: requested.checkpoint_kind,
-      decision: requested.decision,
-      authorization: requested.authorization,
-      actor_provenance: requested.actor,
-      rationale: "Add the missing failure-path evidence.",
-      run_id: requested.run_id,
-    };
-    const checkpointResult = await checkpointTool.execute("test", checkpointInput, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
-    assert.equal(checkpointResult.details.ok, true, JSON.stringify(checkpointResult.details));
+    await typedCheckpoint(root, "diagnose", "approve_diagnosis", issued.advance_token, "request_changes");
 
     const firstAdvance = await advanceTool.execute("test", { ...mountedAdvanceAuth(issued), evidence: "revision requested" }, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
     assert.equal(firstAdvance.details.ok, true, JSON.stringify(firstAdvance.details));
@@ -551,27 +550,7 @@ test("mounted checkpoint request_changes re-arms the current stage, then revised
     assert.equal(revisedState.dispatch_capability?.status, "ready");
     assert.equal(revisedState.typed_checkpoint_decisions?.at(-1)?.decision, "request_changes");
 
-    const approved = await typedCheckpoint(root, "diagnose", "approve_diagnosis", revisedHandoff.advance_token, "approve_continue");
-    const revisedCheckpointInput = {
-      advance_token: revisedHandoff.advance_token,
-      capability_id: revisedHandoff.capability_id,
-      run_key: revisedHandoff.run_key,
-      branch: revisedHandoff.branch,
-      workflow: revisedHandoff.workflow,
-      profile_hash: revisedHandoff.profile_hash,
-      stage_cursor: revisedHandoff.stage_cursor,
-      cursor_epoch: revisedHandoff.cursor_epoch,
-      checkpoint: approved.checkpoint_id,
-      checkpoint_id: approved.checkpoint_id,
-      checkpoint_kind: approved.checkpoint_kind,
-      decision: approved.decision,
-      authorization: approved.authorization,
-      actor_provenance: approved.actor,
-      rationale: "The revised evidence is complete.",
-      run_id: approved.run_id,
-    };
-    const revisedCheckpoint = await checkpointTool.execute("test", revisedCheckpointInput, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
-    assert.equal(revisedCheckpoint.details.ok, true, JSON.stringify(revisedCheckpoint.details));
+    await typedCheckpoint(root, "diagnose", "approve_diagnosis", revisedHandoff.advance_token, "approve_continue");
     const secondAdvance = await advanceTool.execute("test", {
       advance_token: revisedHandoff.advance_token,
       capability_id: revisedHandoff.capability_id,
@@ -588,6 +567,8 @@ test("mounted checkpoint request_changes re-arms the current stage, then revised
     assert.equal(secondAdvance.details.stage_cursor, "implementation");
     assert.equal(readState(root).stages.find((stage) => stage.id === "implementation")?.status, "in_progress");
   } finally {
+    closeCheckpointFixtures(root);
+    try { registration?.finish(false); } catch { /* preserve original mounted test failure */ }
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -669,6 +650,7 @@ test("checkpoint: hard-human authorization requires a durable answer proof, not 
       "a replayed answer cannot authorize a different decision",
     );
   } finally {
+    closeCheckpointFixtures(root);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -691,7 +673,7 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
 
     const profileState = readState(root);
     assert.equal(profileState.checkpoint_policy?.source, "profile");
-    writeState(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } }, { featureSlug: "loop" });
+    writeState(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } }, { featureSlug: checkpointFeatureId(root, profileState) });
     await persistTypedCheckpoint(root, "implementation", "approve_implementation", issued.advance_token);
     const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "typed human consent" });
     assert.equal(advanced.ok, true, "routing autonomous=true must not conflict with a profile-source human policy");
@@ -700,8 +682,9 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
     try {
       initGit(migrationRoot, "feat/ck-policy-migration");
       const migrationSetup = setupStage(migrationRoot, "feat/ck-policy-migration", profile, "implementation", "single", roster);
-      const migrationState = readState(migrationRoot);
-      const basePolicy = migrationState.checkpoint_policy!;
+      const typed = await typedCheckpoint(migrationRoot, "implementation", "approve_implementation", migrationSetup.issued.advance_token);
+      const approvedState = readState(migrationRoot);
+      const basePolicy = approvedState.checkpoint_policy!;
       const migrationPolicy = {
         ...basePolicy,
         default: "autonomous_allowed" as const,
@@ -712,23 +695,23 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
         },
       };
       const conflictingState = {
-        ...migrationState,
-        classification: { ...migrationState.classification, autonomous: false },
+        ...approvedState,
+        classification: { ...approvedState.classification, autonomous: false },
         checkpoint_policy: migrationPolicy,
       };
-      writeState(migrationRoot, conflictingState, { featureSlug: "loop" });
-      const typed = await typedCheckpoint(migrationRoot, "implementation", "approve_implementation", migrationSetup.issued.advance_token);
+      writeState(migrationRoot, conflictingState, { featureSlug: checkpointFeatureId(migrationRoot, approvedState) });
       const conflict = validateCheckpointDecision(readState(migrationRoot), typed, {
         stage: { id: "implementation", checkpoint: "approve_implementation", checkpoint_policy: migrationPolicy },
         policy: migrationPolicy,
       });
       assert.equal(conflict.ok, false);
       if (!conflict.ok) assert.equal(conflict.code, "migration_conflict");
-      void migrationSetup;
     } finally {
+      closeCheckpointFixtures(migrationRoot);
       rmSync(migrationRoot, { recursive: true, force: true });
     }
   } finally {
+    closeCheckpointFixtures(root);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -742,8 +725,8 @@ test("checkpoint: typed recording is idempotent; conflicting decisions fail and 
     const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
     const { issued } = setupStage(root, "feat/ck", profile, "implementation", "single", roster);
     const typed = await typedCheckpoint(root, "implementation", "approve_implementation", issued.advance_token);
-    writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: "loop" });
-    writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: "loop" });
+    writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: checkpointFeatureId(root, readState(root)) });
+    writeState(root, appendCheckpointDecision(readState(root), typed), { featureSlug: checkpointFeatureId(root, readState(root)) });
     const decisions = readState(root);
     assert.equal(decisions.typed_checkpoint_decisions?.length, 1, "identical typed decision is idempotent");
     assert.equal(decisions.checkpoint_decisions?.length, 1, "typed mirror remains singular");
@@ -756,6 +739,7 @@ test("checkpoint: typed recording is idempotent; conflicting decisions fail and 
     assert.equal(wrongName.ok, false);
     if (!wrongName.ok) assert.match(wrongName.error, /typed checkpoint authorization and actor provenance/);
   } finally {
+    closeCheckpointFixtures(root);
     rmSync(root, { recursive: true, force: true });
   }
 });

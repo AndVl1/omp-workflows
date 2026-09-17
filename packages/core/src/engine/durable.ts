@@ -2017,7 +2017,7 @@ function stateCapabilityBindingError(
     || state.cursor_epoch !== issued.cursor_epoch) {
     return "capability state binding mismatch";
   }
-  if (featureId !== undefined && state.specification?.feature_id !== featureId) return "capability feature binding mismatch";
+  if (featureId !== undefined && state.specification !== undefined && state.specification.feature_id !== featureId) return "capability feature binding mismatch";
   if (pinnedRoot && state.specification) {
     const identity = state.specification.project_root_identity;
     if (identity.canonical_path !== pinnedRoot.canonical_root || identity.dev !== pinnedRoot.dev || identity.ino !== pinnedRoot.ino) return "capability root binding mismatch";
