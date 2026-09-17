@@ -1135,9 +1135,15 @@ test("bootstrap opens exactly two decisions and approve_continue resumes the exa
       { origin_kind: "native_direct", origin_run_key: RUN_KEY, resume_target: "specify" },
       "an arbitrary valid native gate stage cannot override the normative Specify resume target",
     );
-    const consumedBeforeReplay = JSON.parse(readFileSync(join(root, ".work-state", "features", FEATURE_ID, "state.json"), "utf8")) as TeamState;
-    const consumedAt = consumedBeforeReplay.trusted_checkpoint_answers?.[0]?.consumed_at;
-    assert.ok(consumedAt, "the engine-owned answer ledger records idempotent consumption");
+    const gatePath = join(root, ".work-state", "specification", "constitution", "gate.json");
+    const consumedBeforeReplay = JSON.parse(readFileSync(gatePath, "utf8")) as {
+      trusted_answers?: Array<{ answer_id: string; consumed_at?: string }>;
+    };
+    const consumedAnswerBeforeReplay = consumedBeforeReplay.trusted_answers?.find(
+      (answer) => answer.answer_id === trustedApproval.actor_provenance.proof?.answer_id,
+    );
+    assert.ok(consumedAnswerBeforeReplay?.consumed_at, "the gate-owned answer ledger records idempotent consumption");
+    const consumedAt = consumedAnswerBeforeReplay?.consumed_at;
 
     const replay = decideConstitutionCheckpoint(root, {
       ...trustedApproval,
@@ -1153,8 +1159,13 @@ test("bootstrap opens exactly two decisions and approve_continue resumes the exa
         "the resume marker stays consumed on replay",
       );
     }
-    const consumedAfterReplay = JSON.parse(readFileSync(join(root, ".work-state", "features", FEATURE_ID, "state.json"), "utf8")) as TeamState;
-    assert.equal(consumedAfterReplay.trusted_checkpoint_answers?.[0]?.consumed_at, consumedAt, "replay does not consume the answer twice");
+    const consumedAfterReplay = JSON.parse(readFileSync(gatePath, "utf8")) as {
+      trusted_answers?: Array<{ answer_id: string; consumed_at?: string }>;
+    };
+    const consumedAnswerAfterReplay = consumedAfterReplay.trusted_answers?.find(
+      (answer) => answer.answer_id === trustedApproval.actor_provenance.proof?.answer_id,
+    );
+    assert.equal(consumedAnswerAfterReplay?.consumed_at, consumedAt, "replay does not consume the answer twice");
 
     const resumed = ensureProjectConstitution(root, originDescriptor("native_direct"));
     assert.ok(resumed.ok);
@@ -1927,17 +1938,18 @@ test("constitution approval rejects an immutable draft artifact with mismatched 
     });
     assert.ok(presented.ok);
     if (!presented.ok || !presented.value.checkpoint_ref) return;
+    const approval = trustedDecision(root, presented.value.checkpoint_ref, "approve_continue");
     const draftPath = join(root, ".work-state", "specification", "constitution", "drafts", "v1.json");
     const artifact = JSON.parse(readFileSync(draftPath, "utf8")) as Record<string, unknown>;
     writeFileSync(draftPath, JSON.stringify({ ...artifact, document: VALID_CONSTITUTION_REVISED }, null, 2) + "\n", "utf8");
-    const approval = decideConstitutionCheckpoint(root, {
-      ...trustedDecision(root, presented.value.checkpoint_ref, "approve_continue"),
+    const decision = decideConstitutionCheckpoint(root, {
+      ...approval,
       gate_id: ensured.value.gate_id,
       checkpoint_id: presented.value.checkpoint_ref,
       decision: "approve_continue",
     });
-    assert.equal(approval.ok, false, "approval must fail when the immutable artifact no longer matches the bound draft");
-    if (!approval.ok) assert.equal(approval.code, "SPEC_STATE_INVALID");
+    assert.equal(decision.ok, false, "approval must fail when the immutable artifact no longer matches the bound draft");
+    if (!decision.ok) assert.equal(decision.code, "SPEC_STATE_INVALID");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2000,6 +2012,7 @@ test("approval fails closed when engine-owned draft evidence is missing", () => 
     });
     assert.ok(presented.ok);
     if (!presented.ok || !presented.value.checkpoint_ref) return;
+    const approval = trustedDecision(root, presented.value.checkpoint_ref, "approve_continue");
 
     const evidencePath = join(
       root,
@@ -2009,14 +2022,14 @@ test("approval fails closed when engine-owned draft evidence is missing", () => 
       "validation-" + sha256(VALID_CONSTITUTION) + ".json",
     );
     rmSync(evidencePath);
-    const approval = decideConstitutionCheckpoint(root, {
-      ...trustedDecision(root, presented.value.checkpoint_ref, "approve_continue"),
+    const decision = decideConstitutionCheckpoint(root, {
+      ...approval,
       gate_id: ensured.value.gate_id,
       checkpoint_id: presented.value.checkpoint_ref,
       decision: "approve_continue",
     });
-    assert.equal(approval.ok, false, "missing engine evidence cannot become an approved binding");
-    if (!approval.ok) assert.equal(approval.code, "SPEC_STATE_INVALID");
+    assert.equal(decision.ok, false, "missing engine evidence cannot become an approved binding");
+    if (!decision.ok) assert.equal(decision.code, "SPEC_STATE_INVALID");
 
     const gate = JSON.parse(readFileSync(
       join(root, ".work-state", "specification", "constitution", "gate.json"),
