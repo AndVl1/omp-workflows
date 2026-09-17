@@ -79,6 +79,7 @@ export function issueCtoRuntimeSessionAuthority(
   root: CtoRuntimeSessionAuthorityRoot,
   session: CtoRuntimeSessionAuthoritySession,
   liveGuard: () => void,
+  options: { readonly replaceCurrent?: boolean } = {},
 ): CtoRuntimeSessionAuthority {
   if (!context || typeof context !== "object") throw new TypeError("runtime session authority context is invalid");
   if (!validRoot(root)) throw new TypeError("runtime session authority root is invalid");
@@ -91,8 +92,9 @@ export function issueCtoRuntimeSessionAuthority(
   }
   if (typeof liveGuard !== "function") throw new TypeError("runtime session authority live guard is invalid");
 
+  const replaceCurrent = options.replaceCurrent !== false;
   const prior = contextAuthorities.get(context);
-  if (prior) revokeCtoRuntimeSessionAuthority(prior);
+  if (replaceCurrent && prior) revokeCtoRuntimeSessionAuthority(prior);
   const authority = authorityObject();
   const cell: CtoRuntimeSessionAuthorityCell = {
     context,
@@ -107,7 +109,7 @@ export function issueCtoRuntimeSessionAuthority(
     revoked: false,
   };
   authorityCells.set(authority as object, cell);
-  contextAuthorities.set(context, authority);
+  if (replaceCurrent) contextAuthorities.set(context, authority);
   return authority;
 }
 
@@ -129,6 +131,36 @@ export function revokeCtoRuntimeSessionAuthority(authority: CtoRuntimeSessionAut
   }
 }
 
+
+/**
+ * Promote a pending authority to the current context authority without
+ * revoking the previous authority. The caller owns the surrounding commit;
+ * rollback can therefore restore the previous current value atomically.
+ */
+export function promoteCtoRuntimeSessionAuthority(
+  authority: CtoRuntimeSessionAuthority,
+): boolean {
+  const cell = authority && typeof authority === "object" ? authorityCells.get(authority as object) : undefined;
+  if (!cell || cell.revoked) return false;
+  try { cell.liveGuard(); } catch { revokeCtoRuntimeSessionAuthority(authority); return false; }
+  contextAuthorities.set(cell.context, authority);
+  return true;
+}
+
+/** Restore a prior context authority and revoke the failed replacement. */
+export function restoreCtoRuntimeSessionAuthority(
+  authority: CtoRuntimeSessionAuthority,
+  prior?: CtoRuntimeSessionAuthority,
+): void {
+  const cell = authority && typeof authority === "object" ? authorityCells.get(authority as object) : undefined;
+  if (!cell) return;
+  if (contextAuthorities.get(cell.context) === authority) {
+    const priorCell = prior && typeof prior === "object" ? authorityCells.get(prior as object) : undefined;
+    if (prior && priorCell && !priorCell.revoked && priorCell.context === cell.context) contextAuthorities.set(cell.context, prior);
+    else contextAuthorities.delete(cell.context);
+  }
+  revokeCtoRuntimeSessionAuthority(authority);
+}
 
 /** Attach one runtime facade lease to its lifecycle authority. */
 export function attachCtoRuntimeSessionAuthority(

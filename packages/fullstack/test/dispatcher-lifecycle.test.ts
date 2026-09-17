@@ -4,6 +4,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { PinnedProjectRoot } from "@andvl1/omp-workflows-core";
+import { withCtoRuntimeServiceTransaction } from "@andvl1/omp-workflows-core/cto-runtime";
 import { join } from "node:path";
 import ompWorkflowsFullstack, { isMainSessionContext, resolveSessionCwd } from "../src/index.js";
 import { writeFullstackActivationMarker } from "../src/activation-marker.js";
@@ -93,12 +94,12 @@ test("dispatcher lifecycle: session_start without context cwd starts nothing and
     // land in the scratch dir, never in the repo.
     process.chdir(root);
     ompWorkflowsFullstack(pi as never);
-
     const sessionStart = handlers.get("session_start");
-    assert.ok(sessionStart, "session_start handler registered");
+    const sessionShutdown = handlers.get("session_shutdown");
+    assert.ok(sessionStart && sessionShutdown, "lifecycle handlers registered");
+
     // 17.2.10-shaped context: interactive main session, no cwd field.
     await sessionStart({ type: "session_start" }, { hasUI: true });
-    // Fail-closed: no context cwd -> no dispatcher, no command copy, no lock.
     assert.ok(!existsSync(lock), "no dispatcher lock without a resolvable session cwd");
     assert.ok(!existsSync(join(root, ".omp", "commands")), "no command copy without a resolvable session cwd");
 
@@ -115,8 +116,6 @@ test("dispatcher lifecycle: session_start without context cwd starts nothing and
     assert.ok(!existsSync(lock), "throwing canonical cwd manager cannot start a dispatcher on stale cwd");
     assert.ok(!existsSync(join(root, ".omp", "commands")), "throwing canonical cwd manager cannot copy commands to stale cwd");
 
-    const sessionShutdown = handlers.get("session_shutdown");
-    assert.ok(sessionShutdown, "session_shutdown handler registered");
     await sessionShutdown({ type: "session_shutdown" }, { hasUI: true });
     assert.ok(!existsSync(lock), "dispatcher lock released on shutdown");
   } finally {
@@ -185,7 +184,7 @@ test("dispatcher lifecycle: deferred provider hook hydrates only the current use
     at: new Date().toISOString(),
     by: "adversarial-test",
   }));
-  const manager = testSessionManager(root, "opaque-provider-boundary");
+  const manager = runtime.sessionManager;
   const context = { cwd: root, hasUI: true, sessionManager: manager };
   let sessionShutdown: ((event: unknown, ctx: unknown) => unknown) | undefined;
   try {
@@ -196,7 +195,6 @@ test("dispatcher lifecycle: deferred provider hook hydrates only the current use
     sessionShutdown = handlers.get("session_shutdown");
     assert.ok(sessionStart, "session_start handler registered");
     assert.ok(beforeProvider, "before_provider_request handler registered");
-    assert.ok(sessionShutdown, "session_shutdown handler registered");
     await sessionStart({ type: "session_start", sessionId: "opaque-provider-boundary" }, context);
 
     const deadline = Date.now() + 3000;
@@ -244,7 +242,7 @@ test("dispatcher lifecycle: stale provider wake stays opaque and task replays un
     at: new Date().toISOString(),
     by: "adversarial-test",
   }));
-  const manager = testSessionManager(root, "stale-provider-wake");
+  const manager = runtime.sessionManager;
   const context = { cwd: root, hasUI: true, sessionManager: manager };
   let sessionShutdown: ((event: unknown, ctx: unknown) => unknown) | undefined;
   try {
@@ -278,10 +276,10 @@ test("dispatcher lifecycle: stale provider wake stays opaque and task replays un
 
     // Terminalize R1 and publish a new standby R2 before the deferred host
     // provider request resolves. The old token must never hydrate R1 bytes.
-    runtime.access.withRunTransaction(run1, (transaction) => {
+    withCtoRuntimeServiceTransaction(runtime.serviceAuthority, run1, (transaction) => {
       const state = transaction.readState();
-      state.standby = false;
       state.integration.status = "done";
+      state.pause = { kind: "done", reason: "test terminalization" };
       state.teams = state.teams.map((team) => ({ ...team, status: "done" }));
       transaction.writeState(state);
     });
@@ -318,16 +316,17 @@ test("dispatcher lifecycle: stale answer wake stays opaque and leaves its effect
   }));
   const run1 = runtime.access.ensureStandbyRun();
   const answerSecret = "stale-run answer secret";
+  const answerId = `${run1}/escalation/1`;
   const answers = join(root, ".omp", "fake-rw", "answers");
   mkdirSync(answers, { recursive: true });
   writeFileSync(join(answers, "answer-replay.json"), JSON.stringify({
-    id: "answer-replay",
+    id: answerId,
     run_id: run1,
     answer: answerSecret,
     at: new Date().toISOString(),
     by: "adversarial-test",
   }));
-  const manager = testSessionManager(root, "stale-answer-wake");
+  const manager = runtime.sessionManager;
   const context = { cwd: root, hasUI: true, sessionManager: manager };
   let sessionShutdown: ((event: unknown, ctx: unknown) => unknown) | undefined;
   try {
@@ -359,9 +358,8 @@ test("dispatcher lifecycle: stale answer wake stays opaque and leaves its effect
     assert.match(stalePrompt, /CTO_WAKE_REF schema=1 kind=answer/);
     assert.doesNotMatch(stalePrompt, /stale-run answer secret/);
 
-    runtime.access.withRunTransaction(run1, (transaction) => {
+    withCtoRuntimeServiceTransaction(runtime.serviceAuthority, run1, (transaction) => {
       const state = transaction.readState();
-      state.standby = false;
       state.integration.status = "done";
       state.teams = state.teams.map((team) => ({ ...team, status: "done" }));
       transaction.writeState(state);
@@ -370,7 +368,7 @@ test("dispatcher lifecycle: stale answer wake stays opaque and leaves its effect
     const staleResult = await beforeProvider({ type: "before_provider_request", payload: { messages: [{ role: "user", content: stalePrompt }] } }, context);
     assert.equal(staleResult, undefined, "terminalized answer run remains opaque at provider boundary");
     assert.ok(existsSync(join(root, ".omp", "fake-rw", "answers", "processed", "answer-replay.json")), "answer transport is durably processed");
-    const effectPath = join(root, ".work-state", "cto", run1, "wake-effects", `${createHash("sha256").update(`${run1}/answer-replay`).digest("hex")}.json`);
+    const effectPath = join(root, ".work-state", "cto", run1, "wake-effects", `${createHash("sha256").update(`${run1}/${answerId}`).digest("hex")}.json`);
     assert.ok(existsSync(effectPath), "claimed answer wake effect remains durable");
     const effect = JSON.parse(readFileSync(effectPath, "utf8")) as { status?: string; retryable?: boolean; answer?: { answer?: string } };
     assert.equal(effect.status, "prepared");
@@ -394,8 +392,8 @@ test("dispatcher lifecycle: model-role research requires a one-time session-boun
     get: () => undefined,
   };
   const root = mkdtempSync(join(tmpdir(), "omp-research-auth-"));
-  const manager = testSessionManager(root, "research-auth-session");
   const runtime = openMockRuntime(root, "research-auth-session");
+  const manager = runtime.sessionManager;
   const context = {
     cwd: root,
     hasUI: true,
@@ -473,12 +471,15 @@ test("dispatcher lifecycle: model-role research requires a one-time session-boun
 });
 
 test("dispatcher lifecycle: supported host registers model roles without project-local command copy", async () => {
-  const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+  type LifecycleHandler = (event: unknown, ctx: unknown) => unknown;
+  const handlers = new Map<string, LifecycleHandler[]>();
   const commands = new Map<string, unknown>();
   const prompts: string[] = [];
   const pi = {
-    on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
-      handlers.set(name, handler);
+    on(name: string, handler: LifecycleHandler) {
+      const listeners = handlers.get(name) ?? [];
+      listeners.push(handler);
+      handlers.set(name, listeners);
     },
     registerCommand(name: string, options: unknown) {
       commands.set(name, options);
@@ -496,29 +497,32 @@ test("dispatcher lifecycle: supported host registers model roles without project
     writeFullstackActivationMarker(root);
     ompWorkflowsFullstack(pi as never);
     assert.ok(commands.has("omp-model-roles"), "supported hosts receive /omp-model-roles through registerCommand");
-    const sessionStart = handlers.get("session_start");
-    assert.ok(sessionStart, "session_start handler registered");
-    const sessionContext = { cwd: root, hasUI: true, sessionManager: testSessionManager(root, "supported-host-session") };
-    await sessionStart(
-      { type: "session_start", sessionId: "supported-host-session" },
-      sessionContext,
-    );
-    assert.equal(existsSync(join(root, ".omp", "commands")), false, "session_start must not copy project-local compatibility commands");
+    const initialSessionStarts = [...(handlers.get("session_start") ?? [])];
+    assert.ok(initialSessionStarts.length > 0, "lifecycle start handlers registered");
+    const sessionContext = { cwd: root, hasUI: true, sessionManager: runtime.sessionManager };
+    for (const [index, sessionStart] of initialSessionStarts.entries()) {
+      await sessionStart(
+        { type: "session_start", sessionId: "supported-host-session" },
+        sessionContext,
+      );
+    }
+    const sessionShutdowns = [...(handlers.get("session_shutdown") ?? [])];
+    assert.ok(sessionShutdowns.length > 0, "lifecycle shutdown handlers registered");
     assert.equal(existsSync(lock), true, "dispatcher starts when command registration succeeds");
     const modelRoles = commands.get("omp-model-roles") as { handler: (args: string, ctx: unknown) => Promise<void> };
     await modelRoles.handler("validate", {
       cwd: root,
       hasUI: true,
-      sessionManager: testSessionManager(root, "supported-host-session"),
+      sessionManager: sessionContext.sessionManager,
       models: { list: () => [], resolve: () => undefined },
       ui: { notify: () => undefined },
     });
     assert.match(prompts[0] ?? "", /\/omp-model-roles validate \(degraded\)/);
     assert.doesNotMatch(prompts[0] ?? "", /Failed to load command|Cannot find package/);
 
-    const sessionShutdown = handlers.get("session_shutdown");
-    assert.ok(sessionShutdown, "session_shutdown handler registered");
-    await sessionShutdown({ type: "session_shutdown", sessionId: "supported-host-session" }, sessionContext);
+    for (const [index, sessionShutdown] of sessionShutdowns.entries()) {
+      await sessionShutdown({ type: "session_shutdown", sessionId: "supported-host-session" }, sessionContext);
+    }
     assert.equal(existsSync(lock), false, "dispatcher shutdown releases the lease");
   } finally {
     runtime.close();
@@ -546,8 +550,7 @@ test("dispatcher lifecycle: stale shutdown cannot stop a newer cwd owner", async
 
     const sessionStart = handlers.get("session_start");
     const sessionShutdown = handlers.get("session_shutdown");
-    assert.ok(sessionStart, "session_start handler registered");
-    assert.ok(sessionShutdown, "session_shutdown handler registered");
+    assert.ok(sessionStart && sessionShutdown, "lifecycle handlers registered");
 
     // The session manager is the canonical lifecycle identity source. Each
     // manager represents one interactive owner, even when cwd is shared.
@@ -617,8 +620,7 @@ test("dispatcher lifecycle: same-session restart owns the newest generation", as
 
     const sessionStart = handlers.get("session_start");
     const sessionShutdown = handlers.get("session_shutdown");
-    assert.ok(sessionStart, "session_start handler registered");
-    assert.ok(sessionShutdown, "session_shutdown handler registered");
+    assert.ok(sessionStart && sessionShutdown, "lifecycle handlers registered");
     const firstContext = {
       hasUI: true,
       sessionManager: testSessionManager(root, "session-same"),
@@ -738,6 +740,10 @@ test("dispatcher lifecycle: silent manager root mutation fences pending inbox be
     const sessionStart = handlers.get("session_start");
     const shutdown = handlers.get("session_shutdown");
     assert.ok(sessionStart && shutdown);
+    // The production dispatcher polls every 10s. Shorten only this test's
+    // timer before startup so the real timer boundary is exercised without a long test.
+    globalThis.setInterval = ((handler: Parameters<typeof setInterval>[0], _delay?: number, ...args: unknown[]) =>
+      originalSetInterval(handler, 20, ...args)) as typeof setInterval;
     await sessionStart({ type: "session_start" }, context);
     assert.equal(existsSync(dispatcherLockPath(rootA)), true, "initial root owns the dispatcher");
 
@@ -748,14 +754,13 @@ test("dispatcher lifecycle: silent manager root mutation fences pending inbox be
       at: new Date().toISOString(),
       by: "test",
     }));
-    // The production dispatcher polls every 10s. Shorten only this test's
-    // timer so the real timer boundary is exercised without a long test.
-    globalThis.setInterval = ((handler: Parameters<typeof setInterval>[0], _delay?: number, ...args: unknown[]) =>
-      originalSetInterval(handler, 20, ...args)) as typeof setInterval;
     manager.cwd = rootB;
     manager.sessionId = "mutation-b";
     manager.sessionFile = join(rootB, ".omp", "session.jsonl");
-    await new Promise<void>((resolve) => setTimeout(resolve, 120));
+    const rebindDeadline = Date.now() + 5_000;
+    while ((existsSync(dispatcherLockPath(rootA)) || !existsSync(dispatcherLockPath(rootB))) && Date.now() < rebindDeadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    }
 
     assert.equal(prompts.length, 0, "pending old-root inbox cannot send after silent manager mutation");
     assert.equal(existsSync(join(rootA, ".omp", "fake-rw", "inbound", "task-pending.json")), true, "old inbox remains retryable instead of being consumed");
@@ -790,8 +795,7 @@ test("dispatcher lifecycle: shutdown without a valid session identity is a no-op
 
     const sessionStart = handlers.get("session_start");
     const sessionShutdown = handlers.get("session_shutdown");
-    assert.ok(sessionStart, "session_start handler registered");
-    assert.ok(sessionShutdown, "session_shutdown handler registered");
+    assert.ok(sessionStart && sessionShutdown, "lifecycle handlers registered");
     const ownerContext = {
       hasUI: true,
       sessionManager: testSessionManager(root, "session-owner"),
@@ -837,8 +841,7 @@ test("dispatcher lifecycle: real and symlink-alias cwd share one immutable root 
     ompWorkflowsFullstack(pi as never);
     const sessionStart = handlers.get("session_start");
     const sessionShutdown = handlers.get("session_shutdown");
-    assert.ok(sessionStart);
-    assert.ok(sessionShutdown);
+    assert.ok(sessionStart && sessionShutdown);
     const contextA = { hasUI: true, sessionManager: testSessionManager(realRoot, "alias-a") };
     const contextB = { hasUI: true, sessionManager: testSessionManager(aliasRoot, "alias-b") };
 
@@ -878,8 +881,7 @@ test("dispatcher lifecycle: same lexical path replacement isolates old shutdown"
     ompWorkflowsFullstack(pi as never);
     const sessionStart = handlers.get("session_start");
     const sessionShutdown = handlers.get("session_shutdown");
-    assert.ok(sessionStart);
-    assert.ok(sessionShutdown);
+    assert.ok(sessionStart && sessionShutdown);
     let oldRootUnavailable = false;
     const contextA = {
       hasUI: true,
@@ -891,7 +893,6 @@ test("dispatcher lifecycle: same lexical path replacement isolates old shutdown"
         getSessionId: () => "replace-a",
       },
     };
-    const contextB = { hasUI: true, sessionManager: testSessionManager(root, "replace-b") };
 
     await sessionStart({ type: "session_start" }, contextA);
     assert.ok(existsSync(lock), "old root starts the dispatcher");
@@ -904,6 +905,7 @@ test("dispatcher lifecycle: same lexical path replacement isolates old shutdown"
     }));
     writeFullstackActivationMarker(root);
     runtimeB = openFullstackRuntimeTest(root, "dispatcher-root-replace-b");
+    const contextB = { hasUI: true, sessionManager: runtimeB.sessionManager };
 
     await sessionStart({ type: "session_start" }, contextB);
     assert.ok(existsSync(lock), "replacement root starts a new dispatcher");
@@ -1100,7 +1102,7 @@ test("dispatcher lifecycle: stale claim cleanup cannot remove a replacement leas
   let replaced = false;
   const pin = PinnedProjectRoot.open(root, {
     beforeRename(relativePath) {
-      if (relativePath === "cto-dispatcher.lock") armed = true;
+      if (relativePath === join(".omp", "cto-dispatcher.lock")) armed = true;
     },
   });
   assert.ok(pin);

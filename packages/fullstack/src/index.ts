@@ -822,6 +822,8 @@ function issueResearchRequestAuthorization(pi: ExtensionAPI, ctx: unknown, cwd: 
     token,
     digest: researchPayloadDigest(payload),
     payload,
+    sessionManager: current.sessionManager,
+    sessionGeneration: current.sessionGeneration,
     owner: current.owner,
     rootIdentity: current.rootIdentity,
     cwd: current.cwd,
@@ -1645,61 +1647,76 @@ function ensureFullstackActivation(pi: ExtensionAPI, cwd: string, initialSession
         const currentMap = fullstackActivationRecords.get(pi as object);
         const currentContexts = fullstackActivationContexts.get(pi as object);
         if (currentMap?.get(root) !== currentRecord || currentContexts?.get(root) !== currentRecord.context) throw new Error("activation record changed during session rebinding");
-        const oldProofAuthority = currentRecord.proofAuthority;
-        const oldServiceAuthority = currentRecord.serviceAuthority;
-        const nextProofAuthority = openCtoRuntimeProofAuthority(binding.registryContext, pinnedRoot);
-        if (!nextProofAuthority) throw new Error("runtime proof authority is unavailable after session rebinding");
-        const nextServiceAuthority = openCtoRuntimeServiceMutationAuthority(binding.registryContext, pinnedRoot);
-        if (!nextServiceAuthority) {
-          revokeCtoRuntimeProofAuthority(nextProofAuthority);
-          throw new Error("runtime service mutation authority is unavailable after session rebinding");
-        }
-        const rotated: FullstackActivation = {
-          ...currentRecord,
-          context: binding.registryContext,
-          runtimeAuthority: binding.runtimeAuthority,
-          runtimeAccess: binding.runtimeAccess,
-          sessionManager: binding.sessionManager,
-          sessionId: binding.sessionId,
-          ...(binding.sessionFile !== undefined ? { sessionFile: binding.sessionFile } : {}),
-          ...(binding.sessionBasename !== undefined ? { sessionBasename: binding.sessionBasename } : {}),
-          ...(binding.generation !== undefined ? { generation: binding.generation } : {}),
-          proofAuthority: nextProofAuthority,
-          serviceAuthority: nextServiceAuthority,
-        };
-        if (currentMap?.get(root) !== currentRecord || currentContexts?.get(root) !== currentRecord.context) {
-          const owner = currentMap?.get(root);
-          const bindingOwned = owner?.context === binding.registryContext
-            && owner.runtimeAuthority === binding.runtimeAuthority
-            && owner.runtimeAccess === binding.runtimeAccess;
-          if (!bindingOwned) currentRecord.sessionBindingController.release(binding);
+        const sameBinding = currentRecord.context === binding.registryContext
+          && currentRecord.runtimeAuthority === binding.runtimeAuthority
+          && currentRecord.runtimeAccess === binding.runtimeAccess
+          && currentRecord.sessionManager === binding.sessionManager
+          && currentRecord.sessionId === binding.sessionId
+          && (currentRecord.sessionFile ?? null) === (binding.sessionFile ?? null)
+          && (currentRecord.sessionBasename ?? null) === (binding.sessionBasename ?? null)
+          && (currentRecord.generation ?? null) === (binding.generation ?? null)
+          && currentRecord.binding.canonicalRoot === binding.canonicalRoot
+          && currentRecord.binding.rootDev === binding.rootDev
+          && currentRecord.binding.rootIno === binding.rootIno;
+        if (sameBinding) {
           transientBinding = undefined;
-          revokeCtoRuntimeProofAuthority(nextProofAuthority);
-          revokeCtoRuntimeServiceMutationAuthority(nextServiceAuthority);
-          throw new Error("activation record changed before session rebinding commit");
-        }
-        const rotatedRecord: FullstackActivation = { ...rotated, binding };
-        currentMap.set(root, rotatedRecord);
-        currentContexts.set(root, binding.registryContext);
-        ownedRecord = rotatedRecord;
-        transientBinding = undefined;
-        revokeCtoRuntimeProofAuthority(oldProofAuthority);
-        revokeCtoRuntimeServiceMutationAuthority(oldServiceAuthority);
-        const slots = fullstackRuntimeAccesses.get(pi as object);
-        const oldSlot = slots?.get(root);
-        if (oldSlot && oldSlot.access !== binding.runtimeAccess) {
-          closeRuntimeAccessSlot(root, oldSlot);
-          slots?.delete(root);
-        }
-        if (slots) {
-          slots.set(root, {
+        } else {
+          const oldProofAuthority = currentRecord.proofAuthority;
+          const oldServiceAuthority = currentRecord.serviceAuthority;
+          const nextProofAuthority = openCtoRuntimeProofAuthority(binding.registryContext, pinnedRoot);
+          if (!nextProofAuthority) throw new Error("runtime proof authority is unavailable after session rebinding");
+          const nextServiceAuthority = openCtoRuntimeServiceMutationAuthority(binding.registryContext, pinnedRoot);
+          if (!nextServiceAuthority) {
+            revokeCtoRuntimeProofAuthority(nextProofAuthority);
+            throw new Error("runtime service mutation authority is unavailable after session rebinding");
+          }
+          const rotated: FullstackActivation = {
+            ...currentRecord,
+            context: binding.registryContext,
+            runtimeAuthority: binding.runtimeAuthority,
+            runtimeAccess: binding.runtimeAccess,
+            sessionManager: binding.sessionManager,
             sessionId: binding.sessionId,
-            lexicalRoot: pinnedRoot.lexical_root,
-            authority: binding.runtimeAuthority,
-            access: binding.runtimeAccess,
-          });
-          runtimeAccessByRoot.set(root, binding.runtimeAccess);
-          runtimeAccessByRoot.set(pinnedRoot.lexical_root, binding.runtimeAccess);
+            ...(binding.sessionFile !== undefined ? { sessionFile: binding.sessionFile } : {}),
+            ...(binding.sessionBasename !== undefined ? { sessionBasename: binding.sessionBasename } : {}),
+            ...(binding.generation !== undefined ? { generation: binding.generation } : {}),
+            proofAuthority: nextProofAuthority,
+            serviceAuthority: nextServiceAuthority,
+          };
+          if (currentMap?.get(root) !== currentRecord || currentContexts?.get(root) !== currentRecord.context) {
+            const owner = currentMap?.get(root);
+            const bindingOwned = owner?.context === binding.registryContext
+              && owner.runtimeAuthority === binding.runtimeAuthority
+              && owner.runtimeAccess === binding.runtimeAccess;
+            if (!bindingOwned) currentRecord.sessionBindingController.release(binding);
+            transientBinding = undefined;
+            revokeCtoRuntimeProofAuthority(nextProofAuthority);
+            revokeCtoRuntimeServiceMutationAuthority(nextServiceAuthority);
+            throw new Error("activation record changed before session rebinding commit");
+          }
+          const rotatedRecord: FullstackActivation = { ...rotated, binding };
+          currentMap.set(root, rotatedRecord);
+          currentContexts.set(root, binding.registryContext);
+          ownedRecord = rotatedRecord;
+          transientBinding = undefined;
+          revokeCtoRuntimeProofAuthority(oldProofAuthority);
+          revokeCtoRuntimeServiceMutationAuthority(oldServiceAuthority);
+          const slots = fullstackRuntimeAccesses.get(pi as object);
+          const oldSlot = slots?.get(root);
+          if (oldSlot && oldSlot.access !== binding.runtimeAccess) {
+            closeRuntimeAccessSlot(root, oldSlot);
+            slots?.delete(root);
+          }
+          if (slots) {
+            slots.set(root, {
+              sessionId: binding.sessionId,
+              lexicalRoot: pinnedRoot.lexical_root,
+              authority: binding.runtimeAuthority,
+              access: binding.runtimeAccess,
+            });
+            runtimeAccessByRoot.set(root, binding.runtimeAccess);
+            runtimeAccessByRoot.set(pinnedRoot.lexical_root, binding.runtimeAccess);
+          }
         }
       } else {
         const currentAuthority = ctoRuntimeSessionAuthorityForContext(currentRecord.context);

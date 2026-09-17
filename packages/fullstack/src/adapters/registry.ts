@@ -2378,6 +2378,8 @@ export interface AdapterOperationContext {
   readonly deadline: number;
   /** Track a user callback beyond the bounded race until its promise settles. */
   readonly trackUnderlyingCallback?: (operation: PromiseLike<unknown>) => void;
+  /** Track adapter I/O independently; dispatcher stop never awaits this operation. */
+  readonly trackUnderlyingOperation?: (operation: PromiseLike<unknown>) => void;
   /** Fail closed before/after every network operation when activation revokes. */
   readonly assertLive?: () => void;
 }
@@ -2514,7 +2516,7 @@ async function sendWithRetry(
             : (adapter.send as (esc: Escalation, pinnedRoot?: PinnedProjectRoot, lifecycle?: AdapterOperationContext) => Promise<EscalationReceipt>)(esc, opts.pinnedRoot, opts.lifecycle);
         },
         opts.lifecycle,
-        opts.lifecycle?.trackUnderlyingCallback,
+        opts.lifecycle?.trackUnderlyingOperation,
       );
       assertAdapterRegistrationLive(adapter);
       opts.lifecycle?.assertLive?.();
@@ -4390,7 +4392,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
   const trackCallback = <T>(operation: PromiseLike<T>): Promise<T> => {
     const tracked = Promise.resolve(operation);
     trackedCallbacks.add(tracked);
-    // Consume rejection here as well as in the bounded race. This keeps the
+    // Consume rejection here as well as in shutdown tracking. This keeps the
     // lifetime tracker independent without creating an unhandled rejection.
     void tracked.then(
       () => { trackedCallbacks.delete(tracked); },
@@ -4398,18 +4400,25 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
     );
     return tracked;
   };
-  const awaitTrackedCallbacks = async (deadline = Date.now() + DISPATCHER_STOP_GRACE_MS): Promise<void> => {
-    while (trackedCallbacks.size > 0 && Date.now() < deadline) {
-      const remaining = Math.max(1, deadline - Date.now());
-      await Promise.race([
-        Promise.allSettled([...trackedCallbacks]),
-        new Promise<void>((resolve) => setTimeout(resolve, remaining)),
-      ]);
+  const trackedAdapterOperations = new Set<Promise<unknown>>();
+  const trackAdapterOperation = (operation: PromiseLike<unknown>): void => {
+    const tracked = Promise.resolve(operation);
+    trackedAdapterOperations.add(tracked);
+    // Consume rejection here as well; adapter promises may settle after stop
+    // has detached the bounded lifecycle wrapper.
+    void tracked.then(
+      () => { trackedAdapterOperations.delete(tracked); },
+      () => { trackedAdapterOperations.delete(tracked); },
+    );
+  };
+  const awaitTrackedCallbacks = async (): Promise<void> => {
+    // The stopped fence prevents new admissions, while this dynamic snapshot
+    // loop keeps the lease held until every admitted callback settles. A
+    // callback may admit another callback before it resolves, so re-check the
+    // set after each all-settled batch.
+    while (trackedCallbacks.size > 0) {
+      await Promise.allSettled([...trackedCallbacks]);
     }
-    // Detach unresolved callbacks from the lifetime tracker after bounded
-    // grace. Their late settlements retain rejection handlers and every
-    // admission/mutation path is fenced by `stopped`/runtime revocation.
-    trackedCallbacks.clear();
   };
   const wakeTask = async (task: InboxTask, pinnedRoot: PinnedProjectRoot = dispatcherRoot): Promise<void> => {
     if (stopped) throw new Error("messenger dispatcher is stopped");
@@ -4511,6 +4520,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
       signal: abortController.signal,
       deadline: Date.now() + DISPATCHER_TICK_DEADLINE_MS,
       trackUnderlyingCallback: (operation) => { trackCallback(operation); },
+      trackUnderlyingOperation: (operation) => { trackAdapterOperation(operation); },
       assertLive: () => assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation),
     };
     let nextCursor = lease.runCursor;
@@ -4579,6 +4589,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
         signal: lifecycle.signal,
         deadline: Date.now() + DISPATCHER_TICK_DEADLINE_MS,
         trackUnderlyingCallback: lifecycle.trackUnderlyingCallback,
+        trackUnderlyingOperation: lifecycle.trackUnderlyingOperation,
         assertLive: lifecycle.assertLive,
       };
       await pollInbox(context.root, primary, (task) => wakeTask(task, context.pinnedRoot), (answer) => wakeAnswer(answer, context.pinnedRoot), {
@@ -4611,11 +4622,13 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
   const stop = (): Promise<void> => {
     if (stopPromise) return stopPromise;
     // Synchronous shutdown fence: no callback can enter a new admission after
-    // this point, and the durable lease is released before any await. This
-    // lets a replacement dispatcher claim immediately while old transport I/O
-    // is still unwinding.
+    // this point. Keep the durable lease until every admitted callback settles
+    // so a replacement cannot overlap callback-owned mutations.
     stopped = true;
     activeAbortController?.abort();
+    // Adapter operations can ignore AbortSignal forever; they are fenced by
+    // boundedAdapterCall and deliberately excluded from callback grace.
+    trackedAdapterOperations.clear();
     clearInterval(timer);
     clearInterval(heartbeat);
     try {
@@ -4624,19 +4637,24 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
         else inboundCapable?.setPlainMessageHandler?.(() => undefined);
       }
     } catch { /* release/close must still run */ }
-    releaseDispatcherLease(lease, dispatcherRoot, opts.proofAuthority);
     stopPromise = (async (): Promise<void> => {
+      const operation = inFlightTick;
+      const deadline = Date.now() + DISPATCHER_STOP_GRACE_MS;
       try {
-        const deadline = Date.now() + DISPATCHER_STOP_GRACE_MS;
-        await awaitTrackedCallbacks(deadline);
-        const operation = inFlightTick;
+        // Drain callbacks already admitted before waiting for the in-flight
+        // tick. The final drain below closes the synchronous callback
+        // registration race: a callback can call stop() before its bounded
+        // wrapper returns and registers the underlying promise.
+        await awaitTrackedCallbacks();
         if (operation) {
           await Promise.race([
             operation.catch(() => undefined),
             new Promise<void>((resolve) => setTimeout(resolve, Math.max(1, deadline - Date.now()))),
           ]);
         }
+        await awaitTrackedCallbacks();
       } finally {
+        releaseDispatcherLease(lease, dispatcherRoot, opts.proofAuthority);
         await dispatcherRoot.closeAsync();
       }
     })();
@@ -5733,14 +5751,19 @@ interface InboxWakeClaim {
 
 type InboxWakeRecord = QuarantineRecord & { wake_claim?: InboxWakeClaim };
 
+let cachedSelfProcessStartIdentity: string | undefined;
+
 function processStartIdentity(pid: number): string | null {
+  if (pid === process.pid && cachedSelfProcessStartIdentity !== undefined) return cachedSelfProcessStartIdentity;
   try {
     if (process.platform === "linux") {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
       const close = stat.lastIndexOf(")");
       const fields = stat.slice(close + 2).trim().split(/\s+/u);
       const start = fields[19];
-      return start ? `linux:${start}` : null;
+      const identity = start ? `linux:${start}` : null;
+      if (pid === process.pid && identity !== null) cachedSelfProcessStartIdentity = identity;
+      return identity;
     }
     const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
       encoding: "utf8",
@@ -5750,7 +5773,9 @@ function processStartIdentity(pid: number): string | null {
       env: { PATH: "/usr/bin:/bin", LC_ALL: "C", LANG: "C" },
     });
     const start = typeof result.stdout === "string" ? result.stdout.trim() : "";
-    return result.status === 0 && start.length > 0 ? `ps:${start}` : null;
+    const identity = result.status === 0 && start.length > 0 ? `ps:${start}` : null;
+    if (pid === process.pid && identity !== null) cachedSelfProcessStartIdentity = identity;
+    return identity;
   } catch {
     return null;
   }
@@ -6737,6 +6762,14 @@ export async function pollInbox(
     promoteRetryEntries(...args);
     assertPollLive();
   };
+  const taskCallback = onTask;
+  const wakeTask = taskCallback === undefined
+    ? undefined
+    : (task: InboxTask): Promise<void> => boundedAdapterCall(
+      () => taskCallback(task),
+      opts.lifecycle,
+      opts.lifecycle?.trackUnderlyingCallback,
+    );
   assertPollLive();
   // 1. Local drop (bridge-written tasks + answer markers, or manual/test
   //    injection). The bridge files answers as { kind: "answer" } markers so
@@ -6837,7 +6870,7 @@ export async function pollInbox(
               } else {
                 const task: InboxTask = { id: verifiedRetry.source.id, text: verifiedRetry.source.text, at: verifiedRetry.source.at, by: verifiedRetry.source.by, runId: verifiedRetry.source.run_id };
                 assertPollLive();
-                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
+                const outcome = await dispatchInboxTask(root, task, wakeTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
                 assertPollLive();
                 if (outcome === "retryable") throw new InboxTaskRetryableError();
                 if (outcome === "rejected") { discardPollEntry(dropQueue, name, observed?.expectation, rejectedDirectory); continue; }
@@ -6891,7 +6924,7 @@ export async function pollInbox(
                 if (envelope.text.trim().length === 0 || envelope.text.length > MAX_INBOX_TEXT_LENGTH) {
                   try {
                     assertPollLive();
-                    await handleInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
+                    await handleInboxTask(root, task, wakeTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
                     assertPollLive();
                   } catch (error) {
                     if (error instanceof InboxTaskRetryableError || !pollPin.isStable() || (opts.isOwned && !opts.isOwned())) throw error instanceof InboxTaskRetryableError ? error : new InboxTaskRetryableError();
@@ -6901,7 +6934,7 @@ export async function pollInbox(
                   continue;
                 }
                 assertPollLive();
-                const outcome = await dispatchInboxTask(root, task, onTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
+                const outcome = await dispatchInboxTask(root, task, wakeTask, { idempotentWake: opts.idempotentWake, wakeEvidence: opts.wakeEvidence, pinnedRoot: pollPin, isOwned: opts.isOwned, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
                 assertPollLive();
                 if (outcome === "retryable") throw new InboxTaskRetryableError();
                 if (outcome === "rejected") { discardPollEntry(dropQueue, name, observed?.expectation, rejectedDirectory); continue; }
@@ -6964,7 +6997,7 @@ export async function pollInbox(
           return adapter.pollOnce(adapterPin, opts.lifecycle);
         },
         opts.lifecycle,
-        opts.lifecycle?.trackUnderlyingCallback,
+        opts.lifecycle?.trackUnderlyingOperation,
       );
       assertAdapterRegistrationLive(adapter);
       const answers = detachPolledAnswerBatch(polled);

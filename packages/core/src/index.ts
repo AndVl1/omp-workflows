@@ -67,7 +67,7 @@ import {
 import { isSafeCtoExecutionId, isSafeCtoRunId, readCtoStatePinned } from "./cto/state.js";
 import { parseCtoSliceMarker } from "./cto/slice-gate.js";
 import { openCtoRuntimeAccess, type CtoRuntimeAccessFacade } from "./cto/runtime-access.js";
-import { ctoRuntimeSessionAuthorityForContext, issueCtoRuntimeSessionAuthority, revokeCtoRuntimeSessionAuthority, type CtoRuntimeSessionAuthority } from "./cto/session-authority.js";
+import { ctoRuntimeSessionAuthorityForContext, issueCtoRuntimeSessionAuthority, promoteCtoRuntimeSessionAuthority, restoreCtoRuntimeSessionAuthority, revokeCtoRuntimeSessionAuthority, type CtoRuntimeSessionAuthority } from "./cto/session-authority.js";
 import { readCurrentExecutionClaim } from "./specification/claims.js";
 import {
   persistDoWorkSpecificationConformance,
@@ -363,8 +363,14 @@ function claimRegistrarActivation(
 }
 
 const teamActivationCells = new WeakMap<object, TeamActivationCell>();
-const pendingTeamActivationCleanups = new WeakMap<object, () => void>();
-const teamSessionBindingControllerRevokers = new WeakMap<object, () => void>();
+const pendingTeamActivationRebinds = new WeakMap<object, TeamSessionBinding>();
+const pendingTeamActivationCleanups = new WeakMap<object, Set<() => void>>();
+const pendingTeamActivationRebindReservations = new WeakSet<object>();
+type TeamSessionBindingControllerLease = {
+  readonly revoke: () => void;
+  readonly restore: () => void;
+};
+const teamSessionBindingControllerRevokers = new WeakMap<object, TeamSessionBindingControllerLease>();
 const dynamicTeamRegistrationCallbacks = new WeakSet<object>();
 
 type TeamActivationReservation = {
@@ -380,33 +386,46 @@ function reserveTeamActivation(
   principal?: RegistryRegistrationPrincipal,
   principalFingerprint?: string,
   liveGuard?: () => void,
+  initialSession?: HostSessionIdentity,
 ): TeamActivationReservation {
   const existing = teamActivationCells.get(pi);
   if (existing) {
     if (existing.state === "failed") {
-      const sameRoot = root !== undefined
-        && existing.root === root.canonical_root
-        && existing.rootDev === root.dev
-        && existing.rootIno === root.ino;
-      if (sameRoot && existing.recoverableSession === true && principal && principalFingerprint && liveGuard
-        && existing.principalFingerprint === principalFingerprint) {
-        // The host hooks are still mounted on this extension object. Reuse the
-        // existing lifecycle cell rather than installing a second hook set; the
-        // authenticated transaction is rebound by recordTeamLifecycle below.
-        return { cell: existing, mode: "duplicate", rebinding: { root: root.canonical_root, rootDev: root.dev, rootIno: root.ino, principal, principalFingerprint, liveGuard } };
+      const recoverableOwner = root !== undefined
+        && root.isStable()
+        && existing.root !== undefined
+        && existing.rootDev !== undefined
+        && existing.rootIno !== undefined
+        && existing.recoverableSession === true
+        && principal !== undefined
+        && principalFingerprint !== undefined
+        && liveGuard !== undefined
+        && existing.principalFingerprint !== undefined
+        && existing.principalFingerprint === principalFingerprint;
+      if (recoverableOwner) {
+        // Reuse the retained lifecycle cell rather than installing a second hook set.
+        // A released session may move to a new pinned root only through the same
+        // authenticated owner principal; recordTeamLifecycle below commits the
+        // root/session replacement and fences the retired binding.
+        if (pendingTeamActivationRebindReservations.has(pi)) throw new Error("registry_transaction_invalid: team activation rebind is already pending");
+        pendingTeamActivationRebindReservations.add(pi);
+        return { cell: existing, mode: "rebind", rebinding: { root: root.canonical_root, rootDev: root.dev, rootIno: root.ino, principal, principalFingerprint, liveGuard, ...(initialSession ? { session: initialSession } : {}) } };
       }
       throw new Error(`registration_failed: team activation is terminally failed${existing.failure ? `: ${existing.failure}` : ""}`);
     }
     if (existing.state === "mounting") throw new Error("registry_transaction_invalid: team activation is already mounting");
     if (existing.state === "active") {
-      if (existing.principalFingerprint !== undefined && principalFingerprint !== undefined
+      if (existing.principalFingerprint !== undefined
         && existing.principalFingerprint !== principalFingerprint) {
         throw new Error("owner_conflict: team activation is already active for a different authenticated owner");
       }
       if (root && principal && existing.root !== undefined && existing.rootDev !== undefined && existing.rootIno !== undefined) {
-        const sameIdentity = existing.root === root.canonical_root && existing.rootDev === root.dev && existing.rootIno === root.ino;
-        if (!sameIdentity && liveGuard && principalFingerprint) return { cell: existing, mode: "rebind", rebinding: { root: root.canonical_root, rootDev: root.dev, rootIno: root.ino, principal, principalFingerprint, liveGuard } };
-        return { cell: existing, mode: "duplicate" };
+        if (!root.isStable() || liveGuard === undefined || principalFingerprint === undefined || existing.principalFingerprint !== principalFingerprint) {
+          throw new Error("activation_identity_changed: team activation root/session rebind is not authenticated");
+        }
+        if (pendingTeamActivationRebindReservations.has(pi)) throw new Error("registry_transaction_invalid: team activation rebind is already pending");
+        pendingTeamActivationRebindReservations.add(pi);
+        return { cell: existing, mode: "rebind", rebinding: { root: root.canonical_root, rootDev: root.dev, rootIno: root.ino, principal, principalFingerprint, liveGuard, ...(initialSession ? { session: initialSession } : {}) } };
       }
       return { cell: existing, mode: "duplicate" };
     }
@@ -446,8 +465,25 @@ function closeTeamBindingResources(binding: TeamSessionBinding): void {
   if (binding.runtimeAuthority) revokeCtoRuntimeSessionAuthority(binding.runtimeAuthority);
   binding.cleanup?.();
 }
+function addPendingTeamActivationCleanup(pi: object, cleanup: () => void): void {
+  const pending = pendingTeamActivationCleanups.get(pi) ?? new Set<() => void>();
+  pending.add(cleanup);
+  pendingTeamActivationCleanups.set(pi, pending);
+}
+function removePendingTeamActivationCleanup(pi: object, cleanup: () => void): void {
+  const pending = pendingTeamActivationCleanups.get(pi);
+  if (!pending) return;
+  pending.delete(cleanup);
+  if (pending.size === 0) pendingTeamActivationCleanups.delete(pi);
+}
 
-function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, binding?: TeamSessionBinding): void {
+function recordTeamLifecycle(
+  pi: object,
+  token: RegistryRegistrationToken,
+  binding?: TeamSessionBinding,
+  priorControllerLease?: TeamSessionBindingControllerLease,
+  replacementControllerLease?: TeamSessionBindingControllerLease,
+): void {
   const prior = teamActivationCells.get(pi);
   const rebinding = binding !== undefined
     && (prior?.state === "active" || prior?.state === "failed")
@@ -455,17 +491,35 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
     && prior.principalFingerprint === binding.principalFingerprint;
   if (rebinding) {
     const next = binding;
+    let committedReplacement: TeamActivationCell | undefined;
     recordRegistryUndo(token, () => {
-      teamSessionBindingControllerRevokers.get(pi)?.();
-      closeTeamBindingResources(next);
-      const current = teamActivationCells.get(pi);
-      if (current?.state === "active" && current.root === next.root && current.rootDev === next.rootDev && current.rootIno === next.rootIno) {
-        markTeamFailed(pi, "registration rebind transaction rolled back");
+      // The replacement may have been committed before a later registry
+      // commit callback failed. Fence only that exact replacement, then
+      // restore the prior authenticated cell so rollback is atomic.
+      const currentControllerLease = teamSessionBindingControllerRevokers.get(pi);
+      if (replacementControllerLease && (currentControllerLease === undefined || currentControllerLease === replacementControllerLease)) {
+        replacementControllerLease.revoke();
+        if (priorControllerLease) {
+          priorControllerLease.restore();
+          teamSessionBindingControllerRevokers.set(pi, priorControllerLease);
+        }
+        else teamSessionBindingControllerRevokers.delete(pi);
       }
+      if (next.runtimeAuthority) restoreCtoRuntimeSessionAuthority(next.runtimeAuthority, prior?.runtimeAuthority);
+      closeTeamBindingResources(next);
+      if (prior?.cleanup) removePendingTeamActivationCleanup(pi, prior.cleanup);
+      const current = teamActivationCells.get(pi);
+      if (committedReplacement && current === committedReplacement && prior) teamActivationCells.set(pi, prior);
     });
     recordRegistryCommit(token, "constitution_gate", () => {
+      next.liveGuard();
+      next.runtimeAccess?.assertLive();
       const current = teamActivationCells.get(pi);
-      if (!current || current !== prior) return;
+      if (!current || current !== prior) throw new Error("registry_transaction_invalid: team activation rebind prior cell changed");
+      if (next.runtimeAuthority && !promoteCtoRuntimeSessionAuthority(next.runtimeAuthority)) {
+        throw new Error("activation_revoked: replacement runtime session authority is unavailable");
+      }
+      if (replacementControllerLease) priorControllerLease?.revoke();
       const priorSession = teamCellSession(current);
       const retired = [...(current.retiredSessionIds ?? [])];
       if (priorSession && next.session && priorSession.sessionId !== next.session.sessionId) retired.push(priorSession.sessionId);
@@ -480,7 +534,7 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
       const lifecycleCleanup = next.cleanup || next.runtimeAuthority || next.runtimeAccess
         ? () => closeTeamBindingResources(next)
         : undefined;
-      teamActivationCells.set(pi, {
+      const replacement: TeamActivationCell = {
         ...current,
         state: "active",
         root: next.root,
@@ -503,17 +557,23 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
         ...(uniqueRetired.length > 0 ? { retiredSessionIds: uniqueRetired } : {}),
         ...(uniqueRetiredManagers.length > 0 ? { retiredSessionManagers: uniqueRetiredManagers } : {}),
         ...(uniqueRetiredSessions.length > 0 ? { retiredSessions: uniqueRetiredSessions } : {}),
-      });
-      if (priorCleanup && priorCleanup !== next.cleanup) pendingTeamActivationCleanups.set(pi, priorCleanup);
+      };
+      committedReplacement = replacement;
+      teamActivationCells.set(pi, replacement);
+      if (priorCleanup && priorCleanup !== next.cleanup) addPendingTeamActivationCleanup(pi, priorCleanup);
     });
     return;
   }
   recordRegistryUndo(token, () => {
-    teamSessionBindingControllerRevokers.get(pi)?.();
+    teamSessionBindingControllerRevokers.get(pi)?.revoke();
     if (binding) closeTeamBindingResources(binding);
     markTeamFailed(pi, "registration transaction rolled back");
   });
   recordRegistryCommit(token, "constitution_gate", () => {
+    if (binding) {
+      binding.liveGuard();
+      binding.runtimeAccess?.assertLive();
+    }
     if (!binding) {
       markTeamActive(pi);
       return;
@@ -547,13 +607,15 @@ function recordTeamLifecycle(pi: object, token: RegistryRegistrationToken, bindi
   });
 }
 
-function drainTeamActivationCleanup(pi: object): void {
-  const cleanup = pendingTeamActivationCleanups.get(pi);
-  if (!cleanup) return;
-  pendingTeamActivationCleanups.delete(pi);
-  cleanup();
-}
 
+function drainTeamActivationCleanup(pi: object): void {
+  const pending = pendingTeamActivationCleanups.get(pi);
+  if (!pending) return;
+  pendingTeamActivationCleanups.delete(pi);
+  for (const cleanup of pending) {
+    try { cleanup(); } catch { /* teardown remains best-effort */ }
+  }
+}
 function recordRegistrarLifecycle(
   registrations: WeakMap<object, RegistrarActivation>,
   pi: object,
@@ -1319,6 +1381,9 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       registryToken: suppliedToken,
       registryContext: registryRegistrationContextForToken(suppliedToken),
     });
+    recordRegistryCommit(suppliedToken, "constitution_gate", () => {
+      queueMicrotask(() => drainTeamActivationCleanup(pi as unknown as object));
+    });
     if (opts.deferConstitutionGate && installed) {
       return () => {
         try {
@@ -1436,6 +1501,9 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   const teamPrincipal = activation?.registryContext && teamRoot
     ? requireRegistryContext(activation.registryContext, teamRoot.canonical_root, "workflow_registration").principal_fingerprint
     : undefined;
+  const initialSession = opts.initialSessionContext !== undefined
+    ? hostSessionIdentity(opts.initialSessionContext) ?? undefined
+    : opts.initialSession;
   let observabilityCleanup: (() => Promise<void>) | undefined;
   let activationCleanupDone = false;
   const releaseActivation = (): void => {
@@ -1446,11 +1514,15 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   const teamBinding = teamRoot && activation?.registryToken && teamPrincipal
     ? { root: teamRoot.canonical_root, rootDev: teamRoot.dev, rootIno: teamRoot.ino, principal: registryRegistrationPrincipal(activation.registryToken, "constitution_gate"), principalFingerprint: teamPrincipal, liveGuard: createRegistryRegistrationLiveGuard(activation.registryToken, "constitution_gate"), ...(activation.registryContext ? { registryContext: activation.registryContext } : {}), ...(activation.cleanup ? { cleanup: () => { try { releaseActivation(); } finally { const close = observabilityCleanup?.(); if (close) void close.catch(() => undefined); } } } : {}) }
     : undefined;
-  const teamReservation = reserveTeamActivation(pi as unknown as object, activation?.registryToken === undefined, teamRoot, teamBinding?.principal, teamBinding?.principalFingerprint, teamBinding?.liveGuard);
-  let hostMountStarted = false;
+  const teamReservation = reserveTeamActivation(pi as unknown as object, activation?.registryToken === undefined, teamRoot, teamBinding?.principal, teamBinding?.principalFingerprint, teamBinding?.liveGuard, initialSession);
+  // Existing hooks remain mounted for duplicate/rebind reservations; a failure
+  // must fence the replacement transaction without deleting their lifecycle cell.
+  let hostMountStarted = teamReservation.mode !== "fresh";
   teamRoot?.close();
   const originalPi = pi;
-  teamSessionBindingControllerRevokers.get(originalPi as unknown as object)?.();
+  const priorControllerLease = teamSessionBindingControllerRevokers.get(originalPi as unknown as object);
+  let replacementControllerLease: TeamSessionBindingControllerLease | undefined;
+  if (teamReservation.mode !== "rebind") priorControllerLease?.revoke();
   let revokeSessionBindingController: () => void = () => undefined;
   let liveOwnerGuard: LiveOwnerGuard | undefined;
   pi = guardedRegistrarHostApi(pi, teamActivationCells, true, ctx => liveOwnerGuard?.(ctx), teamBinding?.liveGuard);
@@ -1657,9 +1729,11 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
     }
   };
   const bindSession = (ctx: unknown): void => {
+    if (sessionBindingControllerRevoked) return;
     if (ctx && typeof ctx === "object" && (ctx as { hasUI?: unknown }).hasUI === false) return;
     const originalTeam = originalPi as unknown as object;
     const incomingSession = hostSessionIdentity(ctx);
+    if (!incomingSession) return;
     const before = teamActivationCells.get(originalTeam);
     if (
       (before?.state === "active" || before?.state === "failed")
@@ -1669,23 +1743,34 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
         || before.retiredSessions?.some((retired) => sameHostSession(retired, incomingSession)) === true
       )
     ) return;
-    let activationOpened = false;
+    if (pendingTeamActivationRebinds.has(originalTeam)) return;
+    if (pendingTeamActivationRebindReservations.has(originalTeam)) return;
     let sessionCleanup: (() => void) | undefined;
     let rebinding = (before?.state === "active" || before?.state === "failed") && before.root !== undefined;
-    if (rebinding) {
-      clearNativeTaskSelectors();
-      clearHostContextIdentity(originalTeam);
-    }
+    if (rebinding) pendingTeamActivationRebindReservations.add(originalTeam);
     try {
       const cwd = resolveHookCwd(ctx);
       if (!cwd) return;
+      if (rebinding && before?.root !== undefined && before.rootDev !== undefined && before.rootIno !== undefined) {
+        const sessionCwd = authoritativeSessionCwd(ctx);
+        if (sessionCwd) {
+          const sessionRoot = PinnedProjectRoot.open(sessionCwd);
+          const sameRoot = sessionRoot !== null
+            && sessionRoot.canonical_root === before.root
+            && sessionRoot.dev === before.rootDev
+            && sessionRoot.ino === before.rootIno
+            && sessionRoot.isStable();
+          sessionRoot?.close();
+          if (!sameRoot) return;
+        }
+      }
       const sessionClaim = openOwnerActivation(cwd, ["workflow_registration", "workflow_tools", "config_writer"], opts.owner);
-      activationOpened = sessionClaim !== undefined;
       if (!sessionClaim) {
         writeRuntimeConfig(opts, cwd);
         return;
       }
       let sessionActivationCleaned = false;
+      let sessionActivationCommitted = false;
       let sessionAuthority: CtoRuntimeSessionAuthority | undefined;
       let sessionRuntimeAccess: CtoRuntimeAccessFacade | undefined;
       sessionCleanup = (): void => {
@@ -1699,8 +1784,10 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
           revokeCtoRuntimeSessionAuthority(sessionAuthority);
           sessionAuthority = undefined;
         }
-        clearNativeTaskSelectors();
-        clearHostContextIdentity(originalTeam);
+        if (sessionActivationCommitted) {
+          clearNativeTaskSelectors();
+          clearHostContextIdentity(originalTeam);
+        }
         closeRegistryRegistrationContext(sessionClaim.registry_context);
         releaseWorkflowOwners(sessionClaim.release_token, sessionClaim.leased_capabilities);
       };
@@ -1756,6 +1843,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
               ...(incomingSession.generation !== undefined ? { generation: incomingSession.generation } : {}),
             },
             sessionLiveGuard,
+            { replaceCurrent: !rebinding },
           );
           const openedRuntime = openCtoRuntimeAccess(sessionClaim.registry_context, sessionAuthority, bindingRoot.root);
           if (!openedRuntime.ok) throw new Error(`${openedRuntime.code}: ${openedRuntime.error}`);
@@ -1774,6 +1862,9 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
         ...(incomingSession ? { session: incomingSession } : {}),
       });
         commitRegistryRegistration(transaction.token);
+        clearNativeTaskSelectors();
+        clearHostContextIdentity(originalTeam);
+        sessionActivationCommitted = true;
         drainTeamActivationCleanup(originalTeam);
       } catch (error) {
         rollbackRegistryRegistration(transaction.token);
@@ -1791,24 +1882,34 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       sessionCleanup?.();
       const message = String(error instanceof Error ? error.message : error);
       const activationFailure = message.includes("activation_markers_missing") || message.includes("activation_identity_changed");
-      if (!rebinding || !activationOpened || activationFailure) markTeamFailed(originalTeam, error);
+      if (activationFailure) {
+        clearNativeTaskSelectors();
+        clearHostContextIdentity(originalTeam);
+      }
+      if (!rebinding || activationFailure) markTeamFailed(originalTeam, error);
       throw error;
+    } finally {
+      if (rebinding) pendingTeamActivationRebindReservations.delete(originalTeam);
     }
   };
   let sessionBindingControllerRevoked = false;
   const revokeController = (): void => {
     sessionBindingControllerRevoked = true;
-    if (teamSessionBindingControllerRevokers.get(originalPi as unknown as object) === revokeController) {
+    if (teamSessionBindingControllerRevokers.get(originalPi as unknown as object) === replacementControllerLease) {
       teamSessionBindingControllerRevokers.delete(originalPi as unknown as object);
     }
   };
-  revokeSessionBindingController = revokeController;
+  replacementControllerLease = {
+    revoke: revokeController,
+    restore: (): void => { if (sessionBindingControllerRevoked) sessionBindingControllerRevoked = false; },
+  };
+  revokeSessionBindingController = replacementControllerLease.revoke;
   let pendingSessionBinding: TeamSessionBinding | undefined;
   const releaseExactBinding = (binding: TeamSessionRuntimeBinding): boolean => {
     if (sessionBindingControllerRevoked || !binding || typeof binding !== "object") return false;
     const current = teamActivationCells.get(originalPi as unknown as object);
     const currentSession = current ? teamCellSession(current) : null;
-    if (current?.state === "mounting") {
+    if (pendingSessionBinding) {
       const pending = pendingSessionBinding;
       const bindingSession: HostSessionIdentity = {
         sessionManager: binding.sessionManager,
@@ -1821,6 +1922,9 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
         || pending.runtimeAccess !== binding.runtimeAccess || pending.root !== binding.canonicalRoot || pending.rootDev !== binding.rootDev
         || pending.rootIno !== binding.rootIno || !pending.session || !sameHostSession(pending.session, bindingSession)) return false;
       pendingSessionBinding = undefined;
+      if (current?.state === "mounting") {
+        markTeamFailed(originalPi as unknown as object, "pending session binding released before registry commit", true);
+      }
       revokeController();
       try { closeTeamBindingResources(pending); } catch { /* pending teardown is best-effort */ }
       return true;
@@ -1866,6 +1970,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       retiredSessions,
     });
     try { current.cleanup?.(); } catch { /* teardown remains fenced */ }
+    try { drainTeamActivationCleanup(originalPi as unknown as object); } catch { /* teardown remains fenced */ }
     return true;
   };
   const sessionBindingController: TeamSessionBindingController = Object.freeze({
@@ -1874,31 +1979,30 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       if (!hostSessionIdentity(ctx)) return null;
       const current = teamActivationCells.get(originalPi as unknown as object);
       if (!current) return null;
-      const identity = hostSessionIdentity(ctx);
-      const currentSession = teamCellSession(current);
       // A supplied transaction may still be mounting when the caller
       // synchronously asks for the initial binding. Return only that exact
       // already-authenticated binding; unseen generations still go through
       // bindSession after the outer transaction is active.
-      if (current.state === "mounting") {
-        const expected = currentSession ?? pendingSessionBinding?.session;
-        if (!identity || !pendingSessionBinding || !expected || !sameHostSession(expected, identity)) return null;
+      if (pendingSessionBinding) {
+        // An authenticated replacement remains pending until its registry transaction commits.
+        // Expose only that exact root/session binding; stale or foreign contexts must not
+        // fall through into a second bind transaction.
         return runtimeBindingSnapshotFromTeamBinding(pendingSessionBinding, ctx);
       }
-      if (current.state !== "active" && current.state !== "failed") return null;
+      if (current.state === "mounting" || current.state !== "active" && current.state !== "failed") return null;
       bindSession(ctx);
       return currentTeamSessionRuntimeBinding(originalPi as unknown as object, ctx);
     },
     current: (ctx: unknown): TeamSessionRuntimeBinding | null => {
       if (sessionBindingControllerRevoked) return null;
       const current = teamActivationCells.get(originalPi as unknown as object);
-      if (current?.state === "mounting" && pendingSessionBinding) return runtimeBindingSnapshotFromTeamBinding(pendingSessionBinding, ctx);
+      if (pendingSessionBinding) return runtimeBindingSnapshotFromTeamBinding(pendingSessionBinding, ctx);
       return currentTeamSessionRuntimeBinding(originalPi as unknown as object, ctx);
     },
     release: (binding: TeamSessionRuntimeBinding): boolean => releaseExactBinding(binding),
     isLive: (ctx: unknown): boolean => currentTeamSessionRuntimeBinding(originalPi as unknown as object, ctx) !== null,
   });
-  teamSessionBindingControllerRevokers.set(originalPi as unknown as object, revokeController);
+  teamSessionBindingControllerRevokers.set(originalPi as unknown as object, replacementControllerLease);
 
   if (activation?.registryToken) {
     const runtimeRoot = registryRegistrationProjectRoot(activation.registryToken, "runtime_config");
@@ -2216,7 +2320,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
       console.warn(`omp workflow task reconciliation failed: ${reconciled.error}`);
     }
   });
-  const initialObservabilitySession = opts.initialSession ?? (opts.initialSessionContext === undefined ? undefined : hostSessionIdentity(opts.initialSessionContext));
+  const initialObservabilitySession = initialSession;
   observabilityCleanup = registerObservabilityHooks(pi, {
     enabled: opts.observability,
     toolCall: false,
@@ -2226,9 +2330,6 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   if (!opts.deferConstitutionGate) installConstitutionGate?.();
   if (activation?.registryToken) {
     const current = teamActivationCells.get(originalPi as unknown as object);
-    const initialSession = opts.initialSessionContext !== undefined
-      ? hostSessionIdentity(opts.initialSessionContext)
-      : opts.initialSession;
     let initialRuntimeAuthority: CtoRuntimeSessionAuthority | undefined;
     let initialRuntimeAccess: CtoRuntimeAccessFacade | undefined;
     try {
@@ -2244,6 +2345,7 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
             ...(initialSession.generation !== undefined ? { generation: initialSession.generation } : {}),
           },
           teamBinding.liveGuard,
+          teamReservation.mode === "rebind" ? { replaceCurrent: false } : undefined,
         );
         const opened = openCtoRuntimeAccess(activation.registryContext, initialRuntimeAuthority, teamBinding.root);
         if (!opened.ok) throw new Error(`${opened.code}: ${opened.error}`);
@@ -2260,7 +2362,19 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
           ? { root: current.root, rootDev: current.rootDev, rootIno: current.rootIno, principal: current.principal, principalFingerprint: current.principalFingerprint, liveGuard: current.liveGuard, ...(initialSession ? { session: initialSession } : {}) }
           : undefined);
       if (initialBinding) pendingSessionBinding = initialBinding;
-      recordTeamLifecycle(originalPi as unknown as object, activation.registryToken, initialBinding);
+      const pendingRebind = teamReservation.mode === "rebind" ? initialBinding : undefined;
+      recordTeamLifecycle(originalPi as unknown as object, activation.registryToken, initialBinding, teamReservation.mode === "rebind" ? priorControllerLease : undefined, teamReservation.mode === "rebind" ? replacementControllerLease : undefined);
+      if (pendingRebind) pendingTeamActivationRebinds.set(originalPi as unknown as object, pendingRebind);
+      if (teamReservation.mode === "rebind") {
+        recordRegistryUndo(activation.registryToken, () => {
+          if (pendingRebind && pendingTeamActivationRebinds.get(originalPi as unknown as object) === pendingRebind) pendingTeamActivationRebinds.delete(originalPi as unknown as object);
+          pendingTeamActivationRebindReservations.delete(originalPi as unknown as object);
+        });
+        recordRegistryCommit(activation.registryToken, "constitution_gate", () => {
+          if (pendingRebind && pendingTeamActivationRebinds.get(originalPi as unknown as object) === pendingRebind) pendingTeamActivationRebinds.delete(originalPi as unknown as object);
+          pendingTeamActivationRebindReservations.delete(originalPi as unknown as object);
+        });
+      }
       if (initialBinding) {
         const pending = initialBinding;
         recordRegistryUndo(activation.registryToken, () => { if (pendingSessionBinding === pending) pendingSessionBinding = undefined; });
@@ -2276,7 +2390,17 @@ function registerTeamWorkflowInternal(pi: ExtensionAPI, opts: RegisterOptions, a
   return opts.deferConstitutionGate ? installConstitutionGate : undefined;
   } catch (error) {
     revokeSessionBindingController();
-    markTeamFailed(originalPi as unknown as object, error, !hostMountStarted);
+    if (teamReservation.mode === "rebind") pendingTeamActivationRebinds.delete(originalPi as unknown as object);
+    if (teamReservation.mode === "rebind") pendingTeamActivationRebindReservations.delete(originalPi as unknown as object);
+    const preservesPriorRebind = teamReservation.mode === "rebind"
+      && teamActivationCells.get(originalPi as unknown as object) === teamReservation.cell;
+    const currentControllerLease = teamSessionBindingControllerRevokers.get(originalPi as unknown as object);
+    if (preservesPriorRebind && priorControllerLease
+      && (currentControllerLease === undefined || currentControllerLease === replacementControllerLease)) {
+      priorControllerLease.restore();
+      teamSessionBindingControllerRevokers.set(originalPi as unknown as object, priorControllerLease);
+    }
+    if (!preservesPriorRebind) markTeamFailed(originalPi as unknown as object, error, !hostMountStarted);
     throw error;
   } finally {
     pi = originalPi;
@@ -2414,7 +2538,6 @@ function runtimeBindingSnapshotFromTeamBinding(binding: TeamSessionBinding, ctx:
   const identity = hostSessionIdentity(ctx);
   if (!identity || !binding.session || !sameHostSession(binding.session, identity)
     || !binding.registryContext || !binding.runtimeAuthority || !binding.runtimeAccess
-    || ctoRuntimeSessionAuthorityForContext(binding.registryContext) !== binding.runtimeAuthority
     || hostContextRootIssue(ctx, binding.root, binding.rootDev, binding.rootIno) !== null) return null;
   try {
     binding.liveGuard();

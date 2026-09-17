@@ -593,10 +593,12 @@ test("supplied-token initial runtime authority rolls back before retry", () => {
   }
 });
 
-test("session binding release only closes the exact current generation", () => {
+test("session binding release only closes the exact current generation", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-runtime-binding-release-"));
   let seedToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  const foreignRoot = mkdtempSync(join(tmpdir(), "omp-runtime-binding-foreign-root-"));
   let retryToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let rebindToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
   try {
     writeTestRegistryMarker(root);
     const seed = openTestRegistry(
@@ -605,7 +607,8 @@ test("session binding release only closes the exact current generation", () => {
       "runtime-binding-release",
     );
     seedToken = seed.token;
-    const pi = { setLabel() {}, on() {} };
+    const sessionStarts: SessionStartHandler[] = [];
+    const pi = { setLabel() {}, on(name: string, handler: SessionStartHandler) { if (name === "session_start") sessionStarts.push(handler); } };
     const manager = (id: string) => ({
       getCwd: () => root,
       getSessionId: () => id,
@@ -615,6 +618,7 @@ test("session binding release only closes the exact current generation", () => {
     const contextA = { cwd: root, sessionManager: manager("release-a") };
     const contextB = { cwd: root, sessionManager: manager("release-b") };
     const contextC = { cwd: root, sessionManager: manager("release-c") };
+    const foreignContext = { cwd: foreignRoot, sessionManager: { getCwd: () => foreignRoot, getSessionId: () => "foreign-root", getSessionFile: () => join(foreignRoot, "foreign-root.jsonl") } };
     let controller: core.TeamSessionBindingController | undefined;
     const installed = registerTeamWorkflow(pi as never, {
       cwd: root,
@@ -659,23 +663,54 @@ test("session binding release only closes the exact current generation", () => {
     assert.equal(afterMalformed.runtimeAccess, bindingA.runtimeAccess, "malformed bind preserves the current runtime facade");
     assert.equal(ctoRuntimeSessionAuthorityForContext(bindingA.registryContext), bindingA.runtimeAuthority, "malformed bind preserves the authority claim");
     assert.doesNotThrow(() => bindingA.runtimeAccess.assertLive(), "malformed bind preserves the current facade");
+    for (const handler of sessionStarts) handler({}, malformedContext);
+    const afterMalformedStart = controller.current(contextA);
+    assert.ok(afterMalformedStart, "malformed session_start leaves the current generation mounted");
+    if (!afterMalformedStart) return;
+    assert.equal(afterMalformedStart.runtimeAuthority, bindingA.runtimeAuthority, "malformed session_start preserves the current authority");
+    assert.equal(afterMalformedStart.runtimeAccess, bindingA.runtimeAccess, "malformed session_start preserves the current runtime facade");
+    assert.equal(afterMalformedStart.canonicalRoot, bindingA.canonicalRoot, "malformed session_start preserves the current root");
+    for (const handler of sessionStarts) handler({}, foreignContext);
+    const afterForeignStart = controller.current(contextA);
+    assert.ok(afterForeignStart, "foreign-root session_start preserves the current generation");
+    if (!afterForeignStart) return;
+    assert.equal(afterForeignStart.runtimeAuthority, bindingA.runtimeAuthority, "foreign-root session_start preserves the current authority");
+    assert.equal(afterForeignStart.runtimeAccess, bindingA.runtimeAccess, "foreign-root session_start preserves the current runtime facade");
+    assert.equal(afterForeignStart.canonicalRoot, bindingA.canonicalRoot, "foreign-root session_start preserves the bound host root");
+    assert.doesNotThrow(() => bindingA.runtimeAccess.assertLive(), "foreign-root session_start leaves the host identity live");
+    assert.equal(controller.release(bindingA), true, "the exact A generation is released");
+    assert.equal(controller.isLive(contextA), false, "released A generation is tombstoned");
+    assert.throws(() => bindingA.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "released A facade is closed");
+    for (const handler of sessionStarts) handler({}, contextB);
+    assert.equal(controller.current(contextB), null, "a captured revoked A hook cannot rebind B");
 
-    const bindingB = controller.bind(contextB);
-    assert.ok(bindingB, "rebind publishes the replacement generation");
+    const rebind = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(rebind.ok, true, "retained owner context can mint a fresh B transaction");
+    if (!rebind.ok) return;
+    rebindToken = rebind.token;
+    let reboundController: core.TeamSessionBindingController | undefined;
+    const reboundInstalled = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: rebind.token,
+      initialSessionContext: contextB,
+      onSessionBindingController: candidate => { reboundController = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    reboundInstalled?.();
+    commitOwnerRegistry(rebind.token);
+    rebindToken = undefined;
+    assert.ok(reboundController, "fresh B registration publishes a new controller");
+    if (!reboundController) return;
+    const bindingB = reboundController.current(contextB);
+    assert.ok(bindingB, "fresh B generation is current");
     if (!bindingB) return;
-    assert.equal(controller.current(contextA), null, "the retired A generation is not current after B rebind");
-
-    assert.equal(controller.release(bindingA), false, "a stale generation cannot release the replacement");
-    assert.equal(controller.isLive(contextB), true, "stale release leaves replacement live");
-    assert.doesNotThrow(() => bindingB.runtimeAccess.assertLive(), "stale release leaves replacement facade live");
-
-    assert.equal(controller.release(bindingB), true, "the exact generation is released");
-    assert.equal(controller.isLive(contextB), false, "released generation is tombstoned");
-    assert.equal(ctoRuntimeSessionAuthorityForContext(bindingB.registryContext), null, "released generation authority claim is revoked");
-    assert.throws(() => bindingB.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "released generation facade is closed");
+    assert.doesNotThrow(() => bindingB.runtimeAccess.assertLive(), "fresh B facade is live");
 
     const retry = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
-    assert.equal(retry.ok, true, "retained owner context can mint a retry transaction");
+    assert.equal(retry.ok, true, "retained owner context can mint a C transaction");
     if (!retry.ok) return;
     retryToken = retry.token;
     let retryController: core.TeamSessionBindingController | undefined;
@@ -692,18 +727,496 @@ test("session binding release only closes the exact current generation", () => {
     retryInstalled?.();
     commitOwnerRegistry(retry.token);
     retryToken = undefined;
-    assert.ok(retryController, "retry publishes a fresh binding controller");
+    await new Promise<void>(resolve => queueMicrotask(resolve));
+    assert.throws(() => bindingB.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "queued B cleanup closes the retired facade");
+    assert.ok(retryController, "C rebind publishes a fresh controller");
     if (!retryController) return;
     const bindingC = retryController.current(contextC);
-    assert.ok(bindingC, "retry binds a fresh generation");
+    assert.ok(bindingC, "C generation is current");
     if (!bindingC) return;
-    assert.doesNotThrow(() => bindingC.runtimeAccess.assertLive(), "retry generation runtime facade is live");
-    assert.equal(retryController.release(bindingC), true, "retry generation releases exactly");
+    assert.doesNotThrow(() => bindingC.runtimeAccess.assertLive(), "C generation runtime facade is live");
+    assert.equal(retryController.release(bindingC), true, "C generation releases exactly");
+    assert.equal(ctoRuntimeSessionAuthorityForContext(bindingC.registryContext), null, "C authority claim is revoked");
+    assert.throws(() => bindingC.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "C facade is closed after release");
+  } finally {
+    if (retryToken) { try { rollbackOwnerRegistry(retryToken); } catch { /* preserve test failure */ } }
+    if (rebindToken) { try { rollbackOwnerRegistry(rebindToken); } catch { /* preserve test failure */ } }
+    if (seedToken) { try { rollbackOwnerRegistry(seedToken); } catch { /* preserve test failure */ } }
+    closeRetainedTestRegistrations(root);
+    rmSync(foreignRoot, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pending binding release fences a later supplied commit and permits retry", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-runtime-binding-pending-release-"));
+  let seedToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let retryToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let seed: ReturnType<typeof openTestRegistry> | undefined;
+  try {
+    writeTestRegistryMarker(root);
+    seed = openTestRegistry(
+      root,
+      ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"],
+      "runtime-binding-pending-release",
+    );
+    seedToken = seed.token;
+    const manager = {
+      getCwd: () => root,
+      getSessionId: () => "pending-release",
+      getSessionFile: () => join(root, "pending-release.jsonl"),
+    };
+    const context = { cwd: root, sessionManager: manager };
+    const pi = { setLabel() {}, on() {} };
+    let controller: core.TeamSessionBindingController | undefined;
+    registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed!.owner,
+      registrationToken: seed.token,
+      initialSessionContext: context,
+      onSessionBindingController: candidate => { controller = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    assert.ok(controller, "pending registration publishes a binding controller");
+    if (!controller) return;
+    const pending = controller.current(context);
+    assert.ok(pending, "pending registration exposes the exact binding");
+    if (!pending) return;
+    assert.equal(controller.release(pending), true, "pending binding release succeeds exactly once");
+    assert.equal(controller.current(context), null, "released mounting reservation is deleted");
+    assert.throws(() => pending.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "pending release closes the runtime facade");
+    assert.throws(() => commitOwnerRegistry(seed.token), /activation_revoked|runtime access/i, "later token commit rejects the closed binding");
+    seedToken = undefined;
+
+    const retry = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(retry.ok, true, "the same owner context can retry after fenced commit");
+    if (!retry.ok) return;
+    retryToken = retry.token;
+    let retryController: core.TeamSessionBindingController | undefined;
+    const retryInstalled = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: retry.token,
+      initialSessionContext: context,
+      onSessionBindingController: candidate => { retryController = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    retryInstalled?.();
+    commitOwnerRegistry(retry.token);
+    retryToken = undefined;
+    assert.ok(retryController, "retry publishes a fresh binding controller");
+    if (!retryController) return;
+    const rebound = retryController.current(context);
+    assert.ok(rebound, "retry publishes a live binding");
+    if (!rebound) return;
+    assert.doesNotThrow(() => rebound.runtimeAccess.assertLive(), "retry runtime facade is live");
+    assert.equal(retryController.release(rebound), true, "retry exact release succeeds");
   } finally {
     if (retryToken) { try { rollbackOwnerRegistry(retryToken); } catch { /* preserve test failure */ } }
     if (seedToken) { try { rollbackOwnerRegistry(seedToken); } catch { /* preserve test failure */ } }
+    if (seed) { try { seed.finish(false); } catch { /* preserve test failure */ } }
     closeRetainedTestRegistrations(root);
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("active rebind release preserves the prior binding and permits retry", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-runtime-binding-active-pending-"));
+  let seedToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let reboundToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let seed: ReturnType<typeof openTestRegistry> | undefined;
+  try {
+    writeTestRegistryMarker(root);
+    seed = openTestRegistry(
+      root,
+      ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"],
+      "runtime-binding-active-pending",
+    );
+    seedToken = seed.token;
+    const manager = (id: string) => ({
+      getCwd: () => root,
+      getSessionId: () => id,
+      getSessionFile: () => join(root, `${id}.jsonl`),
+    });
+    const contextA = { cwd: root, sessionManager: manager("active-pending-a") };
+    const contextB = { cwd: root, sessionManager: manager("active-pending-b") };
+    const contextC = { cwd: root, sessionManager: manager("active-pending-c") };
+    const pi = { setLabel() {}, on() {} };
+    let controllerA: core.TeamSessionBindingController | undefined;
+    const installedA = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed!.owner,
+      registrationToken: seed.token,
+      initialSessionContext: contextA,
+      onSessionBindingController: candidate => { controllerA = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedA?.();
+    seed.retain(true);
+    seedToken = undefined;
+    assert.ok(controllerA, "A registration publishes a controller");
+    if (!controllerA) return;
+    const bindingA = controllerA.current(contextA);
+    assert.ok(bindingA, "A generation is current");
+    if (!bindingA) return;
+
+    const beginB = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(beginB.ok, true, "B transaction opens under the retained owner");
+    if (!beginB.ok) return;
+    reboundToken = beginB.token;
+    let controllerB: core.TeamSessionBindingController | undefined;
+    const installedB = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: beginB.token,
+      initialSessionContext: contextB,
+      onSessionBindingController: candidate => { controllerB = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedB?.();
+    assert.throws(() => registerTeamWorkflow(pi as never, { cwd: root, owner: () => seed.owner, registrationToken: beginB.token, initialSessionContext: contextB, rebindSessions: true, deferConstitutionGate: true, observability: false }), /team activation rebind is already pending/, "a second supplied rebind cannot capture the same A generation");
+    assert.ok(controllerB, "active rebind publishes a pending controller");
+    if (!controllerB) return;
+    const pendingB = controllerB.current(contextB);
+    assert.ok(pendingB, "active rebind exposes its exact pending binding");
+    if (!pendingB) return;
+    assert.equal(ctoRuntimeSessionAuthorityForContext(bindingA.registryContext), bindingA.runtimeAuthority, "A remains the context authority before B commit");
+    assert.equal(controllerB.current(contextA), null, "active rebind rejects stale A context while B is pending");
+    assert.equal(controllerB.release(pendingB), true, "pending active replacement release succeeds");
+    assert.doesNotThrow(() => bindingA.runtimeAccess.assertLive(), "pending replacement release preserves active A facade");
+    assert.throws(() => commitOwnerRegistry(beginB.token), /activation_revoked|runtime access/i, "released active replacement cannot commit");
+    reboundToken = undefined;
+    assert.equal(ctoRuntimeSessionAuthorityForContext(bindingA.registryContext), bindingA.runtimeAuthority, "A is restored as the context authority after B rollback");
+    assert.doesNotThrow(() => bindingA.runtimeAccess.assertLive(), "failed B commit leaves A facade live");
+    assert.ok(controllerA.current(contextA), "aborted B commit restores the prior A controller");
+
+    const retry = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(retry.ok, true, "the owner context can retry B after rollback");
+    if (!retry.ok) return;
+    reboundToken = retry.token;
+    let retryController: core.TeamSessionBindingController | undefined;
+    const retryInstalled = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: retry.token,
+      initialSessionContext: contextC,
+      onSessionBindingController: candidate => { retryController = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    retryInstalled?.();
+    commitOwnerRegistry(retry.token);
+    reboundToken = undefined;
+    assert.ok(retryController, "retry publishes a B controller");
+    if (!retryController) return;
+    const bindingC = retryController.current(contextC);
+    assert.ok(bindingC, "later C rebind is current after B abort");
+    if (!bindingC) return;
+    assert.equal(retryController.release(bindingC), true, "later C exact release succeeds");
+  } finally {
+    if (reboundToken) { try { rollbackOwnerRegistry(reboundToken); } catch { /* preserve test failure */ } }
+    if (seedToken) { try { rollbackOwnerRegistry(seedToken); } catch { /* preserve test failure */ } }
+    if (seed) { try { seed.finish(false); } catch { /* preserve test failure */ } }
+    closeRetainedTestRegistrations(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("late rebind commit failure restores the prior controller lease", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-runtime-binding-late-commit-"));
+  let seedToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let reboundToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let retryToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let seed: ReturnType<typeof openTestRegistry> | undefined;
+  try {
+    writeTestRegistryMarker(root);
+    seed = openTestRegistry(root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"], "runtime-binding-late-commit");
+    seedToken = seed.token;
+    const manager = (id: string) => ({
+      getCwd: () => root,
+      getSessionId: () => id,
+      getSessionFile: () => join(root, `.jsonl`),
+    });
+    const contextA = { cwd: root, sessionManager: manager("late-commit-a") };
+    const contextB = { cwd: root, sessionManager: manager("late-commit-b") };
+    const contextC = { cwd: root, sessionManager: manager("late-commit-c") };
+    const pi = { setLabel() {}, on() {} };
+    let controllerA: core.TeamSessionBindingController | undefined;
+    const installedA = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed!.owner,
+      registrationToken: seed.token,
+      initialSessionContext: contextA,
+      onSessionBindingController: candidate => { controllerA = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedA?.();
+    seed.retain(true);
+    seedToken = undefined;
+    assert.ok(controllerA, "A registration publishes a controller");
+    if (!controllerA) return;
+    const bindingA = controllerA.current(contextA);
+    assert.ok(bindingA, "A generation is current");
+    if (!bindingA) return;
+
+    const beginB = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(beginB.ok, true, "B transaction opens under the retained owner");
+    if (!beginB.ok) return;
+    reboundToken = beginB.token;
+    let controllerB: core.TeamSessionBindingController | undefined;
+    const installedB = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: beginB.token,
+      initialSessionContext: contextB,
+      onSessionBindingController: candidate => { controllerB = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedB?.();
+    assert.ok(controllerB, "B registration publishes a replacement controller");
+    if (!controllerB) return;
+    recordRegistryCommit(beginB.token, "constitution_gate", () => { throw new Error("late commit callback failed"); });
+    assert.throws(() => commitOwnerRegistry(beginB.token), /late commit callback failed/);
+    reboundToken = undefined;
+
+    assert.doesNotThrow(() => bindingA.runtimeAccess.assertLive(), "late B failure leaves A facade live");
+    assert.equal(controllerA.current(contextA)?.runtimeAccess, bindingA.runtimeAccess, "late B failure restores A controller and facade");
+    assert.equal(controllerB.current(contextB), null, "late B failure revokes only the replacement controller");
+
+    const beginC = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(beginC.ok, true, "C transaction opens after B rollback");
+    if (!beginC.ok) return;
+    retryToken = beginC.token;
+    let controllerC: core.TeamSessionBindingController | undefined;
+    const installedC = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: beginC.token,
+      initialSessionContext: contextC,
+      onSessionBindingController: candidate => { controllerC = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedC?.();
+    commitOwnerRegistry(beginC.token);
+    retryToken = undefined;
+    assert.ok(controllerC, "C registration publishes a replacement controller");
+    if (!controllerC) return;
+    const bindingC = controllerC.current(contextC);
+    assert.ok(bindingC, "C generation is current after B rollback");
+    if (!bindingC) return;
+    assert.doesNotThrow(() => bindingC.runtimeAccess.assertLive(), "C facade is live after replacing restored A");
+    assert.equal(controllerC.release(bindingC), true, "C exact release succeeds");
+  } finally {
+    if (retryToken) { try { rollbackOwnerRegistry(retryToken); } catch { /* preserve test failure */ } }
+    if (reboundToken) { try { rollbackOwnerRegistry(reboundToken); } catch { /* preserve test failure */ } }
+    if (seedToken) { try { rollbackOwnerRegistry(seedToken); } catch { /* preserve test failure */ } }
+    if (seed) { try { seed.finish(false); } catch { /* preserve test failure */ } }
+    closeRetainedTestRegistrations(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("supplied-token A-B-C rebind drains every retired session cleanup", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-runtime-binding-abc-rebind-"));
+  let seedToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let bToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let cToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  try {
+    writeTestRegistryMarker(root);
+    const seed = openTestRegistry(
+      root,
+      ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"],
+      "runtime-binding-abc-rebind",
+    );
+    seedToken = seed.token;
+    const manager = (id: string) => ({
+      getCwd: () => root,
+      getSessionId: () => id,
+      getSessionFile: () => join(root, `${id}.jsonl`),
+      getSessionGeneration: () => `generation-${id}`,
+    });
+    const contextA = { cwd: root, sessionManager: manager("abc-a") };
+    const contextB = { cwd: root, sessionManager: manager("abc-b") };
+    const contextC = { cwd: root, sessionManager: manager("abc-c") };
+    const pi = { setLabel() {}, on() {} };
+    let controllerA: core.TeamSessionBindingController | undefined;
+    const installedA = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: seed.token,
+      initialSessionContext: contextA,
+      onSessionBindingController: candidate => { controllerA = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedA?.();
+    seed.retain(true);
+    seedToken = undefined;
+    assert.ok(controllerA, "A registration publishes a binding controller");
+    if (!controllerA) return;
+    const bindingA = controllerA.current(contextA);
+    assert.ok(bindingA, "A generation is current");
+    if (!bindingA) return;
+
+    const beginB = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(beginB.ok, true, "B transaction opens under the retained owner");
+    if (!beginB.ok) return;
+    bToken = beginB.token;
+    let controllerB: core.TeamSessionBindingController | undefined;
+    const installedB = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: beginB.token,
+      initialSessionContext: contextB,
+      onSessionBindingController: candidate => { controllerB = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedB?.();
+    commitOwnerRegistry(beginB.token);
+    bToken = undefined;
+    assert.ok(controllerB, "B rebind publishes a replacement controller");
+    if (!controllerB) return;
+    const bindingB = controllerB.current(contextB);
+    assert.ok(bindingB, "B generation is current");
+    if (!bindingB) return;
+    await new Promise<void>(resolve => queueMicrotask(resolve));
+    assert.throws(() => bindingA.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "B commit eventually drains A cleanup");
+
+    const beginC = beginOwnerRegistry(seed.context, root, ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"]);
+    assert.equal(beginC.ok, true, "C transaction opens under the retained owner");
+    if (!beginC.ok) return;
+    cToken = beginC.token;
+    let controllerC: core.TeamSessionBindingController | undefined;
+    const installedC = registerTeamWorkflow(pi as never, {
+      cwd: root,
+      owner: () => seed.owner,
+      registrationToken: beginC.token,
+      initialSessionContext: contextC,
+      onSessionBindingController: candidate => { controllerC = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedC?.();
+    commitOwnerRegistry(beginC.token);
+    cToken = undefined;
+    await new Promise<void>(resolve => queueMicrotask(resolve));
+    assert.throws(() => bindingB.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "B cleanup is drained after C commits");
+    assert.ok(controllerC, "C rebind publishes a replacement controller");
+    if (!controllerC) return;
+    const bindingC = controllerC.current(contextC);
+    assert.ok(bindingC, "C generation is current");
+    if (!bindingC) return;
+    assert.doesNotThrow(() => bindingC.runtimeAccess.assertLive(), "C remains live after retired cleanup drains");
+    assert.equal(controllerC.release(bindingC), true, "C exact release succeeds");
+    assert.throws(() => bindingC.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "C cleanup closes the final facade");
+  } finally {
+    if (cToken) { try { rollbackOwnerRegistry(cToken); } catch { /* preserve test failure */ } }
+    if (bToken) { try { rollbackOwnerRegistry(bToken); } catch { /* preserve test failure */ } }
+    if (seedToken) { try { rollbackOwnerRegistry(seedToken); } catch { /* preserve test failure */ } }
+    closeRetainedTestRegistrations(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("supplied-token cross-root rebind preserves authenticated principal", async () => {
+  const rootA = mkdtempSync(join(tmpdir(), "omp-runtime-binding-cross-root-a-"));
+  const rootB = mkdtempSync(join(tmpdir(), "omp-runtime-binding-cross-root-b-"));
+  let seedToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  let reboundToken: import("../src/registry/owner.js").RegistryRegistrationToken | undefined;
+  try {
+    writeTestRegistryMarker(rootA);
+    writeTestRegistryMarker(rootB);
+    const seed = openTestRegistry(
+      rootA,
+      ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"],
+      "runtime-binding-cross-root",
+    );
+    seedToken = seed.token;
+    const manager = (root: string, id: string) => ({
+      getCwd: () => root,
+      getSessionId: () => id,
+      getSessionFile: () => join(root, `${id}.jsonl`),
+      getSessionGeneration: () => `generation-${id}`,
+    });
+    const contextA = { cwd: rootA, sessionManager: manager(rootA, "cross-root-a") };
+    const contextB = { cwd: rootB, sessionManager: manager(rootB, "cross-root-b") };
+    const pi = { setLabel() {}, on() {} };
+    let controllerA: core.TeamSessionBindingController | undefined;
+    const installedA = registerTeamWorkflow(pi as never, {
+      cwd: rootA,
+      owner: () => seed.owner,
+      registrationToken: seed.token,
+      initialSessionContext: contextA,
+      onSessionBindingController: candidate => { controllerA = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedA?.();
+    seed.retain(true);
+    seedToken = undefined;
+    assert.ok(controllerA, "root A publishes a binding controller");
+    if (!controllerA) return;
+    const bindingA = controllerA.current(contextA);
+    assert.ok(bindingA, "root A generation is current");
+    if (!bindingA) return;
+
+    const rebound = openTestRegistry(
+      rootB,
+      ["workflow_profiles", "workflow_tools", "constitution_gate", "runtime_config"],
+      "runtime-binding-cross-root",
+    );
+    reboundToken = rebound.token;
+    let controllerB: core.TeamSessionBindingController | undefined;
+    const installedB = registerTeamWorkflow(pi as never, {
+      cwd: rootB,
+      owner: () => rebound.owner,
+      registrationToken: rebound.token,
+      initialSessionContext: contextB,
+      onSessionBindingController: candidate => { controllerB = candidate; },
+      rebindSessions: true,
+      deferConstitutionGate: true,
+      observability: false,
+    });
+    installedB?.();
+    rebound.retain(true);
+    reboundToken = undefined;
+    await new Promise<void>(resolve => queueMicrotask(resolve));
+    assert.ok(controllerB, "root B publishes a replacement controller");
+    if (!controllerB) return;
+    assert.equal(controllerA.current(contextA), null, "root A controller is revoked after cross-root commit");
+    assert.throws(() => bindingA.runtimeAccess.assertLive(), /activation_revoked|runtime access/i, "root A runtime facade is retired after cross-root commit");
+    const bindingB = controllerB.current(contextB);
+    assert.ok(bindingB, "root B generation is current");
+    if (!bindingB) return;
+    assert.equal(bindingB.canonicalRoot, realpathSync(rootB), "cross-root binding uses root B identity");
+    assert.doesNotThrow(() => bindingB.runtimeAccess.assertLive(), "root B runtime facade remains live");
+    assert.equal(controllerB.release(bindingB), true, "root B exact release succeeds");
+  } finally {
+    if (reboundToken) { try { rollbackOwnerRegistry(reboundToken); } catch { /* preserve test failure */ } }
+    if (seedToken) { try { rollbackOwnerRegistry(seedToken); } catch { /* preserve test failure */ } }
+    closeRetainedTestRegistrations();
+    rmSync(rootA, { recursive: true, force: true });
+    rmSync(rootB, { recursive: true, force: true });
   }
 });
 

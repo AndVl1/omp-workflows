@@ -34,6 +34,7 @@ import { issueCtoRuntimeSessionAuthority, revokeCtoRuntimeSessionAuthority } fro
 import { openCtoRuntimeProofAuthority, revokeCtoRuntimeProofAuthority, signCtoRuntimeProof, verifyCtoRuntimeProof } from "../src/cto/proof-authority.js";
 import { ctoRuntimeRunInitialIdentityDigest, mintCtoRuntimeRunOrigin, newCtoState, readCtoState, writeCtoRuntimeStateProof, writeCtoState } from "../src/cto/state.js";
 import { PinnedProjectRoot } from "../src/specification/pinned-root.js";
+import { readOrCreateRootRuntimeSecret } from "../src/runtime-secret.js";
 import type { TeamPlan } from "../src/cto/types.js";
 
 const MARKER = '{"schema_version":1,"bundle_id":"@andvl1/omp-workflows-fullstack","entrypoint":"dist/index.js"}\n';
@@ -175,6 +176,32 @@ test("opaque proof authority binds allowed domains to the live registry claim", 
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(foreignRoot, { recursive: true, force: true });
+  }
+});
+
+test("runtime secret snapshots do not cross a same-turn HOME swap", () => {
+  const root = makeProject();
+  const homeA = mkdtempSync(join(tmpdir(), "omp-runtime-secret-home-a-"));
+  const homeB = mkdtempSync(join(tmpdir(), "omp-runtime-secret-home-b-"));
+  const previousHome = process.env.HOME;
+  let pinned: PinnedProjectRoot | null = null;
+  try {
+    process.env.HOME = homeA;
+    pinned = PinnedProjectRoot.open(root);
+    assert.ok(pinned);
+    const first = readOrCreateRootRuntimeSecret(pinned);
+    assert.equal(typeof first, "string");
+    process.env.HOME = homeB;
+    const second = readOrCreateRootRuntimeSecret(pinned);
+    assert.equal(typeof second, "string");
+    assert.notEqual(second, first, "a HOME swap must not reuse the previous home secret");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    pinned?.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(homeA, { recursive: true, force: true });
+    rmSync(homeB, { recursive: true, force: true });
   }
 });
 

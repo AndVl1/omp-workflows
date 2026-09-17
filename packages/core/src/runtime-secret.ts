@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { PinnedProjectRoot } from "./specification/pinned-root.js";
@@ -43,12 +44,86 @@ function validRecord(value: unknown, identity: RuntimeSecretRootIdentity): value
     && value.secret.length <= RUNTIME_SECRET_MAX_CHARS;
 }
 
+type RuntimeSecretHome = {
+  readonly path: string;
+  readonly root: PinnedProjectRoot;
+};
+
+type RuntimeSecretSnapshot = {
+  readonly home: RuntimeSecretHome;
+  readonly secret: string;
+};
+
+/**
+ * Keep one descriptor-anchored home root for the process. Opening a Darwin
+ * pinned root starts a helper process, so repeating that for every proof HMAC
+ * makes synchronous callers starve the event loop. A root secret is securely
+ * read and verified on cache miss, then retained only for the current
+ * synchronous turn; the exact root and project identities remain bound.
+ */
+let cachedRuntimeSecretHome: RuntimeSecretHome | undefined;
+const runtimeSecretSnapshots = new Map<string, RuntimeSecretSnapshot>();
+
+function runtimeSecretCacheKey(identity: RuntimeSecretRootIdentity): string {
+  return `${identity.canonical_root}\u0000${identity.root_dev}\u0000${identity.root_ino}`;
+}
+
+function cacheRuntimeSecret(identity: RuntimeSecretRootIdentity, home: RuntimeSecretHome, secret: string): string {
+  const key = runtimeSecretCacheKey(identity);
+  const snapshot: RuntimeSecretSnapshot = { home, secret };
+  runtimeSecretSnapshots.set(key, snapshot);
+  queueMicrotask(() => {
+    if (runtimeSecretSnapshots.get(key) === snapshot) runtimeSecretSnapshots.delete(key);
+  });
+  return secret;
+}
+
+function currentRuntimeSecretHomeMatches(home: RuntimeSecretHome, path: string): boolean {
+  try {
+    const lexical = lstatSync(path);
+    if (lexical.isSymbolicLink() || !lexical.isDirectory()) return false;
+    const canonical = realpathSync(path);
+    if (canonical !== home.root.canonical_root) return false;
+    const resolved = lstatSync(canonical);
+    return resolved.isDirectory()
+      && lexical.dev === home.root.dev
+      && lexical.ino === home.root.ino
+      && resolved.dev === home.root.dev
+      && resolved.ino === home.root.ino;
+  } catch {
+    return false;
+  }
+}
+
+function runtimeSecretHome(): RuntimeSecretHome | null {
+  const path = homedir();
+  const cached = cachedRuntimeSecretHome;
+  if (cached && cached.path === path && cached.root.isStable() && currentRuntimeSecretHomeMatches(cached, path)) return cached;
+  if (cached) {
+    cached.root.close();
+    cachedRuntimeSecretHome = undefined;
+    runtimeSecretSnapshots.clear();
+  }
+  const root = PinnedProjectRoot.open(path);
+  if (!root) return null;
+  const next = { path, root };
+  cachedRuntimeSecretHome = next;
+  return next;
+}
+
+function invalidateRuntimeSecretHome(root: PinnedProjectRoot): void {
+  if (cachedRuntimeSecretHome?.root !== root) return;
+  cachedRuntimeSecretHome = undefined;
+  runtimeSecretSnapshots.clear();
+  root.close();
+}
+
 function homeRelative(home: PinnedProjectRoot, target: string): string | null {
   const relative = home.relativePath(target);
   return relative && relative.startsWith(`${RUNTIME_SECRET_DIRECTORY}/`) ? relative : null;
 }
 
-function readExact(home: PinnedProjectRoot, relative: string, identity: RuntimeSecretRootIdentity): string | null {
+function readExact(home: PinnedProjectRoot, relative: string, identity: RuntimeSecretRootIdentity, onFailure?: () => void): string | null {
   try {
     const info = home.pathEntryInfo(relative);
     if (!info || info.kind !== "file" || info.mode !== 0o600 || info.size > RUNTIME_SECRET_MAX_BYTES) return null;
@@ -59,6 +134,7 @@ function readExact(home: PinnedProjectRoot, relative: string, identity: RuntimeS
     try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(read.bytes)); } catch { return null; }
     return validRecord(parsed, identity) ? parsed.secret : null;
   } catch {
+    onFailure?.();
     return null;
   }
 }
@@ -67,26 +143,45 @@ function readExact(home: PinnedProjectRoot, relative: string, identity: RuntimeS
 export function readOrCreateRootRuntimeSecret(pinnedRoot: PinnedProjectRoot): string | null {
   if (!pinnedRoot.isStable()) return null;
   const identity = rootIdentity(pinnedRoot);
-  const home = PinnedProjectRoot.open(homedir());
+  const cacheKey = runtimeSecretCacheKey(identity);
+  const cached = runtimeSecretSnapshots.get(cacheKey);
+  if (cached) {
+    const currentPath = homedir();
+    if (cached.home === cachedRuntimeSecretHome && currentPath === cached.home.path && currentRuntimeSecretHomeMatches(cached.home, currentPath)) return cached.secret;
+    if (runtimeSecretSnapshots.get(cacheKey) === cached) runtimeSecretSnapshots.delete(cacheKey);
+  }
+  const home = runtimeSecretHome();
   if (!home) return null;
+  const invalidate = (): void => invalidateRuntimeSecretHome(home.root);
   try {
-    const target = join(homedir(), RUNTIME_SECRET_DIRECTORY, secretFileName(identity));
-    const relative = homeRelative(home, target);
-    if (!relative || !home.isStable()) return null;
-    home.ensureDirectory(RUNTIME_SECRET_DIRECTORY);
-    const directory = home.pathEntryInfo(RUNTIME_SECRET_DIRECTORY);
+    const target = join(home.path, RUNTIME_SECRET_DIRECTORY, secretFileName(identity));
+    const relative = homeRelative(home.root, target);
+    if (!relative || !home.root.isStable()) return null;
+    home.root.ensureDirectory(RUNTIME_SECRET_DIRECTORY);
+    const directory = home.root.pathEntryInfo(RUNTIME_SECRET_DIRECTORY);
     if (!directory || directory.kind !== "directory" || directory.mode !== 0o700) return null;
-    const existing = readExact(home, relative, identity);
-    if (existing) return pinnedRoot.isStable() ? existing : null;
+    const existing = readExact(home.root, relative, identity, invalidate);
+    if (existing) {
+      if (!pinnedRoot.isStable()) return null;
+      if (!currentRuntimeSecretHomeMatches(home, home.path)) {
+        invalidate();
+        return null;
+      }
+      return cacheRuntimeSecret(identity, home, existing);
+    }
     const secret = randomBytes(32).toString("hex");
     const serialized = JSON.stringify({ schema: 1, root_identity: identity.canonical_root, root_dev: identity.root_dev, root_ino: identity.root_ino, secret });
-    try { home.writeExclusive(relative, Buffer.from(serialized, "utf8")); } catch { /* another live owner may have won creation */ }
-    const committed = readExact(home, relative, identity);
-    return committed && pinnedRoot.isStable() ? committed : null;
+    try { home.root.writeExclusive(relative, Buffer.from(serialized, "utf8")); } catch { /* another live owner may have won creation */ }
+    const committed = readExact(home.root, relative, identity, invalidate);
+    if (!committed || !pinnedRoot.isStable()) return null;
+    if (!currentRuntimeSecretHomeMatches(home, home.path)) {
+      invalidate();
+      return null;
+    }
+    return cacheRuntimeSecret(identity, home, committed);
   } catch {
+    invalidate();
     return null;
-  } finally {
-    home.close();
   }
 }
 

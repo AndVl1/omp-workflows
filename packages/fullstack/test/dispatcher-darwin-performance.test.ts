@@ -22,7 +22,7 @@ test("Darwin dispatcher keeps the event loop responsive with two deferred tasks"
     const runId = "run-darwin-performance";
     const now = new Date().toISOString();
     const plan = { id: runId, task: "active", teams: [], created_at: now };
-    const state = newCtoState({ id: runId, task: "active", branch: "", autonomous: false, plan });
+    const state = newCtoState({ id: runId, task: "active", branch: "", autonomous: false, plan, owner_session: runtime.sessionId });
     mkdirSync(join(root, ".omp"), { recursive: true });
     assert.ok(runtime.access.createRun(state, { source_id: `darwin-performance:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
     assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
