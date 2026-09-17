@@ -539,14 +539,13 @@ export type IssuedCapability = {
 };
 
 export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff; implementation_handoff?: NativeImplementationHandoffFinalizationResult; child_join?: ChildJoin; transition?: "advance" | "stopped" | "revision_required" } | { ok: false; error: string; state?: TeamState; child_join?: ChildJoin };
-/** Apply a trusted mounted checkpoint decision to the canonical native phase record. */
-export function projectNativeSpecificationPhaseDecision(
+/** Apply a trusted mounted checkpoint decision to the canonical specification phase record. */
+export function projectSpecificationPhaseDecision(
   workspace: FeatureWorkspace,
   phase: "specify" | "plan" | "tasks",
   decision: "approve_continue" | "request_changes" | "approve_stop",
   rationale: string,
 ): FeatureWorkspace {
-  if (workspace.source_kind !== "native") return workspace;
   const record = workspace.phases.find((candidate) => candidate.phase === phase);
   if (!record || record.current_version === null) return workspace;
   const revisionRequired = decision === "request_changes";
@@ -6937,11 +6936,12 @@ function advanceCursorMutation(
   // result order. A retry replaces only the same slot's terminal record.
   const joinCap = activeCapability(state.dispatch_capability) ?? cap;
   const expected = new Set(joinCap.expected_roles);
-  const nativeGenerationDispatch = state.specification?.source_kind === "native"
-    && ["specify", "plan", "tasks"].includes(currentStage.id);
+  const phaseValidationDispatch = state.specification !== undefined
+    && ["specify", "plan", "tasks"].includes(currentStage.id)
+    && joinCap.dispatches.some((record) => record.purpose === "validation");
   const latest = new Map<string, DispatchRecord>();
   for (const record of joinCap.dispatches) {
-    if (nativeGenerationDispatch && record.purpose === "generation") continue;
+    if (phaseValidationDispatch && record.purpose === "generation") continue;
     const prior = latest.get(record.role);
     if (!prior || record.attempt > prior.attempt) latest.set(record.role, record);
   }
@@ -6981,7 +6981,7 @@ function advanceCursorMutation(
   if (isMultiSlotConsilium) {
     const currentRecords = activeCapability(state.dispatch_capability)?.dispatches ?? records;
     const withoutArtifacts = currentRecords
-      .filter((record) => (!nativeGenerationDispatch || record.purpose !== "generation") && record.status === "succeeded" && (record.completion?.artifact_ids.length ?? 0) === 0)
+      .filter((record) => (!phaseValidationDispatch || record.purpose !== "generation") && record.status === "succeeded" && (record.completion?.artifact_ids.length ?? 0) === 0)
       .map((record) => `${record.role} (${durableNamespacedArtifactId(stageProduces(currentStage)[0] ?? "artifact", record.role)})`);
     if (withoutArtifacts.length > 0) {
       return {
@@ -8760,12 +8760,12 @@ function recordCheckpointDecisionMutation(cwd: string, state: TeamState, target:
   try {
     const next = appendCheckpointDecision(state, validated.decision);
     if (
-      next.specification?.source_kind === "native"
+      next.specification !== undefined
       && ["specify", "plan", "tasks"].includes(stage.id)
       && ["approve_continue", "request_changes", "approve_stop"].includes(validated.decision.decision)
     ) {
       const phase = stage.id as "specify" | "plan" | "tasks";
-      const projected = projectNativeSpecificationPhaseDecision(
+      const projected = projectSpecificationPhaseDecision(
         next.specification,
         phase,
         validated.decision.decision as "approve_continue" | "request_changes" | "approve_stop",

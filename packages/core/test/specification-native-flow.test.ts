@@ -55,7 +55,7 @@ import {
   resolveProfileControlPlane,
   validateProfileControlPlane,
 } from "../src/engine/profile.js";
-import { authorizeDispatch, authorizeSpecificationPhaseValidationDispatch, completeDispatch, createCapability, advanceCursor, issueTrustedMappingProof, projectNativeSpecificationPhaseDecision, setConstitutionContinuationGate, type DispatchAuth } from "../src/engine/durable.js";
+import { authorizeDispatch, authorizeSpecificationPhaseValidationDispatch, completeDispatch, createCapability, advanceCursor, issueTrustedMappingProof, projectSpecificationPhaseDecision, setConstitutionContinuationGate, type DispatchAuth } from "../src/engine/durable.js";
 import { appendCheckpointDecision, checkpointPolicyHash, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge } from "../src/engine/checkpoints.js";
 import { resolveState, setStateTransactionTestHooks, writeState } from "../src/engine/state.js";
 import type { Profile } from "../src/engine/types.js";
@@ -1082,7 +1082,7 @@ test("native phase dispatch is capability-bound and advances specify to plan", (
       decided_at: new Date().toISOString(),
     });
     const projectedWorkspace = decisionState.specification
-      ? projectNativeSpecificationPhaseDecision(decisionState.specification, "specify", "approve_continue", "Explicit trusted consent to continue from specify to plan.")
+      ? projectSpecificationPhaseDecision(decisionState.specification, "specify", "approve_continue", "Explicit trusted consent to continue from specify to plan.")
       : undefined;
     const approvedState = projectedWorkspace
       ? { ...decisionState, specification: projectedWorkspace }

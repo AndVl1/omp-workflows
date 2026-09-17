@@ -22,7 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { registerTestConstitutionGate, registerTestProfiles, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
-import { createCapability, authorizeDispatch, authorizeDispatchFromPersisted, authorizeDispatchTrusted, authorizeSpecificationPhaseValidationDispatch, consumeSpecificationPhaseValidationDispatch, completeDispatch, reconcileTrustedTaskResult, advanceCursor, issueCurrentTrustedMappingProof, projectNativeSpecificationPhaseDecision, type TrustedMappingProof } from "../src/engine/durable.js";
+import { createCapability, authorizeDispatch, authorizeDispatchFromPersisted, authorizeDispatchTrusted, authorizeSpecificationPhaseValidationDispatch, consumeSpecificationPhaseValidationDispatch, completeDispatch, reconcileTrustedTaskResult, advanceCursor, issueCurrentTrustedMappingProof, projectSpecificationPhaseDecision, type TrustedMappingProof } from "../src/engine/durable.js";
 import { appendCheckpointDecision, checkpointPolicyHash, issueTrustedCheckpointAnswerCapability, recordTrustedCheckpointAnswer, registerTrustedCheckpointHostBridge } from "../src/engine/checkpoints.js";
 import {
   namespacedArtifactId,
@@ -429,7 +429,7 @@ function approveSpecify(root: string, issued: ReturnType<typeof createCapability
     rationale: "fixture approval", decided_at: new Date().toISOString(),
   });
   const projectedWorkspace = decisionState.specification
-    ? projectNativeSpecificationPhaseDecision(decisionState.specification, "specify", "approve_continue", "fixture approval")
+    ? projectSpecificationPhaseDecision(decisionState.specification, "specify", "approve_continue", "fixture approval")
     : undefined;
   const decision = { ok: true as const, state: projectedWorkspace ? { ...decisionState, specification: projectedWorkspace } : decisionState };
   writeState(root, decision.state, { target: resolveState(root) });

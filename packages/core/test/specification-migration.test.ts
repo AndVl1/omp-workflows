@@ -29,6 +29,7 @@ import { test } from "node:test";
 import { validFeatureWorkspace } from "./fixtures/specification-fixtures.js";
 import { resolveState, updateStateAtomically } from "../src/engine/state.js";
 import { registerTestWorkflowTools } from "./fixtures/host-tool-activation.js";
+import { registerTestConstitutionGate, writeTestRegistryMarker } from "./fixtures/registry-activation.js";
 import { completeDispatch, resolveNativePhaseCheckpointSubject } from "../src/engine/durable.js";
 import { z as zod } from "zod";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
@@ -379,6 +380,8 @@ test("migrated state runs validator failure, native v2 revision, checkpoint, and
       on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => { if (event === "session_start") sessionStart = handler; },
       registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any> }) => registered.push(tool),
     };
+    writeTestRegistryMarker(root);
+    registerTestConstitutionGate(root, "core-test-workflow-tools");
     registerTestWorkflowTools(root, pi as never, { beforeBegin: () => mapping, resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd });
     const tool = (name: string) => {
       const found = registered.find((candidate) => candidate.name === name);
@@ -528,11 +531,11 @@ test("migrated state runs validator failure, native v2 revision, checkpoint, and
       feature_id: featureId,
       advance_token: checkpointHandoff.advance_token,
       capability_id: checkpointHandoff.capability_id,
-      run_key: runKey,
-      branch: checkpointHandoff.branch,
-      workflow: checkpointHandoff.workflow,
-      profile_hash: checkpointHandoff.profile_hash,
-      stage_cursor: "specify",
+      run_key: phaseAuth.run_key,
+      branch: phaseAuth.branch,
+      workflow: phaseAuth.workflow,
+      profile_hash: phaseAuth.profile_hash,
+      stage_cursor: checkpointHandoff.stage_cursor,
       cursor_epoch: checkpointHandoff.cursor_epoch,
       checkpoint: checkpointId,
       checkpoint_id: checkpointId,
@@ -540,6 +543,13 @@ test("migrated state runs validator failure, native v2 revision, checkpoint, and
       loop_iteration: 1,
     }, undefined, undefined, context);
     assert.equal(asked.details.ok, true, JSON.stringify(asked.details));
+    const requiredNext = asked.details.required_next_tool as { name?: string; arguments?: Record<string, unknown> };
+    assert.equal(requiredNext.name, "workflow_advance");
+    assert.ok(requiredNext.arguments, "selected Ask must return the exact workflow_advance descriptor");
+    if (!requiredNext.arguments) return;
+    const advanced = await tool("workflow_advance").execute("test", requiredNext.arguments, undefined, undefined, context);
+    assert.equal(advanced.details.ok, true, JSON.stringify(advanced.details));
+    assert.equal(advanced.details.transition, "advance");
     restarted = resolveState(root, undefined, { feature_id: featureId, run_key: runKey });
     const finalPhase = restarted.state?.specification?.phases.find((phase) => phase.phase === "specify");
     assert.equal(finalPhase?.status, "approved");

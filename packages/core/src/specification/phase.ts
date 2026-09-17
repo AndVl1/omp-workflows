@@ -22,7 +22,6 @@ import {
   createCapability,
   resolveSpecificationPhaseDispatch,
   finalizeNativeImplementationHandoffMutation,
-  projectNativeSpecificationPhaseDecision,
   reissueNativeSpecificationCheckpointCapability,
   resolveNativePhaseCheckpointSubject,
 } from "../engine/durable.js";
