@@ -9495,6 +9495,60 @@ export function validateCheckpointAskSelected(
   }
 }
 
+/**
+ * Probe an explicitly selected mounted Ask for an exact native answer that was
+ * already applied. The transaction is discard-only: it obtains the state lock
+ * and revalidates the current postimage, but never writes state or answer data.
+ */
+export function tryReplayNativeSelectedCheckpointAsk(
+  cwd: string,
+  input: CheckpointAskSelectedRequest,
+  options: CheckpointAskSelectedValidationOptions = {},
+): CheckpointAnswerSelectedCommitResult | null {
+  if (!isRecord(input) || !isSafeFeatureId(input.feature_id) || !selectedBoundedString(input.run_key)) {
+    return { ok: false, kind: "rejected", code: "selector_invalid", error: "an explicit safe feature_id and nonblank run_key selector are required" };
+  }
+  const runtimeOptions: unknown = options;
+  const candidatePinnedRoot = isRecord(runtimeOptions) ? runtimeOptions.pinnedRoot : undefined;
+  if (candidatePinnedRoot !== undefined && !(candidatePinnedRoot instanceof PinnedProjectRoot)) {
+    return { ok: false, kind: "rejected", code: "state_invalid", error: "native selected answer replay pinned root is invalid" };
+  }
+  const ownsPinnedRoot = candidatePinnedRoot === undefined;
+  const pinnedRoot = candidatePinnedRoot ?? PinnedProjectRoot.open(cwd);
+  if (!pinnedRoot) return { ok: false, kind: "rejected", code: "state_invalid", error: "current project root could not be pinned for native checkpoint replay" };
+  try {
+    const result = updateStateAtomically<CheckpointAnswerSelectedCommitResult | null>(
+      cwd,
+      (snapshot: StateSnapshot): StateMutation<CheckpointAnswerSelectedCommitResult | null> => {
+        if (!snapshot.state) return { op: "discard", value: { ok: false, kind: "rejected", code: "state_missing", error: "workflow state not found" } };
+        if (snapshot.target.isStale) return { op: "discard", value: { ok: false, kind: "stale", code: "state_stale", error: "workflow state is stale for the selected feature/run" } };
+        const workspace = snapshot.state.specification;
+        if (workspace?.source_kind !== "native" || !["specify", "plan", "tasks"].includes(input.stage_cursor)) return { op: "discard", value: null };
+        const phase = input.stage_cursor as "specify" | "plan" | "tasks";
+        const record = workspace.phases.find((candidate) => candidate.phase === phase);
+        if (!record) return { op: "discard", value: { ok: false, kind: "rejected", code: "checkpoint_invalid", error: "checkpoint_invalid: native selected answer replay phase record is unavailable" } };
+        if (record.status === "awaiting_approval") return { op: "discard", value: null };
+        const capability = activeCapability(snapshot.state.dispatch_capability);
+        if (!capability) return { op: "discard", value: { ok: false, kind: "rejected", code: "checkpoint_invalid", error: "checkpoint_invalid: native selected answer replay capability is unavailable" } };
+        const selectedToken = selectedAdvanceToken(input);
+        if (!selectedToken) return { op: "discard", value: { ok: false, kind: "rejected", code: "token_invalid", error: "checkpoint_invalid: native selected answer replay advance_token is invalid" } };
+        const authError = auth(capability, { ...input, token: selectedToken }, capability.advance_token_hash);
+        if (authError) return { op: "discard", value: { ok: false, kind: "rejected", code: "checkpoint_invalid", error: "checkpoint_invalid: native selected answer replay " + authError } };
+        const replay = nativeSelectedAnswerReplay(snapshot.state, snapshot.target, pinnedRoot, input, capability, "mounted_ask");
+        if (replay === null) return { op: "discard", value: { ok: false, kind: "rejected", code: "checkpoint_invalid", error: "checkpoint_invalid: native selected answer replay candidate is not current" } };
+        if (replay.kind === "reject") return { op: "discard", value: { ok: false, kind: "rejected", code: "checkpoint_invalid", error: replay.error } };
+        return { op: "discard", value: replay.value };
+      },
+      { selector: { feature_id: input.feature_id, run_key: input.run_key }, pinnedRoot },
+    );
+    if (!result.ok) return { ok: false, kind: "rejected", code: result.code, error: result.error };
+    if (result.value === undefined) return { ok: false, kind: "rejected", code: "state_invalid", error: "native selected answer replay produced no result" };
+    return result.value;
+  } finally {
+    if (ownsPinnedRoot) pinnedRoot.close();
+  }
+}
+
 export type CheckpointAnswerSelectedCommitResult =
   | {
       ok: true;
@@ -9539,6 +9593,8 @@ type NativeSelectedAnswerReplay =
   | { kind: "reject"; error: string }
   | null;
 
+type NativeSelectedAnswerReplayMode = "commit" | "mounted_ask";
+
 /**
  * Revalidate an already-applied native selected answer without reopening the
  * pre-answer awaiting_approval subject. The atomic Ask projects native phase
@@ -9551,8 +9607,9 @@ function nativeSelectedAnswerReplay(
   state: TeamState,
   target: ResolvedState,
   pinnedRoot: PinnedProjectRoot,
-  input: CheckpointAskSelectedRequest & { decision: string; feedback?: string },
+  input: CheckpointAskSelectedRequest & { decision?: string; feedback?: string },
   cap: ActiveCapability,
+  mode: NativeSelectedAnswerReplayMode = "commit",
 ): NativeSelectedAnswerReplay {
   const workspace = state.specification;
   if (workspace && (workspace.source_kind === "native" || workspace.source_kind === "legacy" || workspace.source_kind === "external")) {
@@ -9562,22 +9619,57 @@ function nativeSelectedAnswerReplay(
   if (workspace?.source_kind !== "native" || !["specify", "plan", "tasks"].includes(input.stage_cursor)) return null;
   const phase = input.stage_cursor as "specify" | "plan" | "tasks";
   const record = workspace.phases.find((candidate) => candidate.phase === phase);
-  if (record?.status !== "approved" && record?.status !== "revision_required") return null;
+  if (!record || record.status === "awaiting_approval") return null;
+  if (record.status !== "approved" && record.status !== "revision_required") {
+    return { kind: "reject", error: "checkpoint_invalid: native selected answer replay phase is not a projected approval" };
+  }
   const profile = loadProfile(cap.issued_for.workflow);
   const stage = profile?.stages.find((candidate) => candidate.id === phase);
   if (!profile || !stage?.checkpoint || input.checkpoint !== stage.checkpoint || input.checkpoint_id !== stage.checkpoint || input.checkpoint_kind !== (resolveCheckpointPolicy(stage, state)?.rules[stage.checkpoint]?.kind ?? "")) {
     return { kind: "reject", error: "checkpoint_invalid: native selected answer replay stage or policy identity is stale" };
   }
+  if (cap.status === "invalidated" || cap.status === "complete") {
+    return { kind: "reject", error: "checkpoint_invalid: native selected answer replay capability is no longer active" };
+  }
+  if (profileHash(profile) !== cap.issued_for.profile_hash) {
+    return { kind: "reject", error: "checkpoint_invalid: native selected answer replay profile binding drifted" };
+  }
+  const capabilityStateError = stateCapabilityBindingError(state, cap, pinnedRoot, input.feature_id);
+  if (capabilityStateError) return { kind: "reject", error: "checkpoint_invalid: native selected answer replay " + capabilityStateError };
+  if (workspace.project_root !== pinnedRoot.canonical_root) {
+    return { kind: "reject", error: "checkpoint_invalid: native selected answer replay project root binding is stale" };
+  }
+  if (!pinnedRoot.isStable()) return { kind: "reject", error: "checkpoint_invalid: native selected answer replay root changed" };
   const typed = (state.typed_checkpoint_decisions ?? []).filter((candidate) =>
     candidate.stage_id === phase && candidate.checkpoint_id === stage.checkpoint,
   );
-  if (typed.length !== 1) return { kind: "reject", error: "checkpoint_invalid: native selected answer replay is missing or has duplicate typed decisions" };
-  const decision = typed[0]!;
+  const currentArtifactId = record.current_version === null ? null : `${phase}.v${record.current_version}`;
+  const currentTyped = typed.filter((candidate) =>
+    candidate.feature_id === workspace.feature_id
+    && candidate.capability_id === cap.capability_id
+    && candidate.capability_epoch === cap.issued_for.cursor_epoch
+    && candidate.artifact_id === currentArtifactId
+    && candidate.artifact_version === record.current_version
+    && candidate.validation_ref === record.validation_ref,
+  );
+  if (currentTyped.length !== 1) return { kind: "reject", error: "checkpoint_invalid: native selected answer replay is missing or has duplicate current typed decisions" };
+  const decision = currentTyped[0]!;
   const answerId = decision.actor.proof?.answer_id;
-  const answer = answerId ? (state.trusted_checkpoint_answers ?? []).find((candidate) => candidate.answer_id === answerId) : undefined;
+  const matchingAnswers = answerId ? (state.trusted_checkpoint_answers ?? []).filter((candidate) => candidate.answer_id === answerId) : [];
+  const answer = matchingAnswers.length === 1 ? matchingAnswers[0] : undefined;
   const policy = resolveCheckpointPolicy(stage, state);
   const rule = policy?.rules[stage.checkpoint];
-  if (!policy || !rule || !answer || answer.consumed_at === undefined || decision.actor.kind !== "user" || decision.actor.ref !== answer.reference || decision.authorization !== "human" || decision.run_id !== state.run_key || decision.feature_id !== workspace.feature_id || decision.capability_id !== cap.capability_id || decision.capability_epoch !== cap.issued_for.cursor_epoch || decision.policy_hash !== checkpointPolicyHash(policy) || answer.run_id !== state.run_key || answer.stage_id !== phase || answer.checkpoint_id !== stage.checkpoint || answer.capability_id !== cap.capability_id || answer.capability_epoch !== cap.issued_for.cursor_epoch || answer.policy_hash !== checkpointPolicyHash(policy) || answer.feature_id !== workspace.feature_id || answer.decision !== input.decision || decision.decision !== input.decision || answer.feedback !== input.feedback || (input.decision === "request_changes" ? decision.rationale !== input.feedback : decision.rationale !== "trusted selected checkpoint answer")) {
+  if (input.loop_iteration !== undefined && input.loop_iteration !== decision.loop_iteration) {
+    return { kind: "reject", error: "checkpoint_invalid: native selected answer replay loop iteration is stale" };
+  }
+  const expectedDecision = mode === "mounted_ask" ? decision.decision : input.decision;
+  const expectedFeedback = mode === "mounted_ask"
+    ? (decision.decision === "request_changes" ? decision.rationale : undefined)
+    : input.feedback;
+  if (mode === "commit" && typeof input.decision !== "string") {
+    return { kind: "reject", error: "checkpoint_invalid: native selected answer replay decision is unavailable" };
+  }
+  if (!policy || !rule || !rule.allowed_decisions.includes(expectedDecision ?? "") || !answer || answer.consumed_at === undefined || answer.subject_revision !== selectedStateRevision(state) || decision.actor.kind !== "user" || decision.actor.ref !== answer.reference || decision.authorization !== "human" || decision.run_id !== state.run_key || decision.feature_id !== workspace.feature_id || decision.capability_id !== cap.capability_id || decision.capability_epoch !== cap.issued_for.cursor_epoch || decision.policy_hash !== checkpointPolicyHash(policy) || decision.subject_binding !== answer.subject_binding || decision.loop_iteration !== answer.loop_iteration || answer.run_id !== state.run_key || answer.stage_id !== phase || answer.checkpoint_id !== stage.checkpoint || answer.capability_id !== cap.capability_id || answer.capability_epoch !== cap.issued_for.cursor_epoch || answer.policy_hash !== checkpointPolicyHash(policy) || answer.feature_id !== workspace.feature_id || answer.decision !== expectedDecision || decision.decision !== expectedDecision || answer.feedback !== expectedFeedback || (expectedDecision === "request_changes" ? decision.rationale !== expectedFeedback || answer.feedback !== decision.rationale : decision.rationale !== "trusted selected checkpoint answer")) {
     return { kind: "reject", error: "checkpoint_invalid: native selected answer replay proof or applied decision does not match current state" };
   }
   if (answer.binding !== checkpointAnswerBinding(answer)) return { kind: "reject", error: "checkpoint_invalid: native selected answer replay proof binding is invalid" };
@@ -9593,6 +9685,7 @@ function nativeSelectedAnswerReplay(
     feature_id: decision.feature_id,
     loop_iteration: decision.loop_iteration,
     subject_binding: decision.subject_binding,
+    subject_revision: answer.subject_revision,
     root_identity: { canonical_root: pinnedRoot.canonical_root, dev: pinnedRoot.dev, ino: pinnedRoot.ino },
     bind_active_context: true,
     feedback: decision.decision === "request_changes" ? decision.rationale : undefined,
@@ -9608,7 +9701,7 @@ function nativeSelectedAnswerReplay(
   if (!artifact || !validation || validationRef === null || decision.artifact_id !== artifact.artifact_id || decision.artifact_version !== version || decision.artifact_digest !== digestOf(artifact) || decision.validation_ref !== validationRef || decision.validation_digest !== digestOf(validation)) {
     return { kind: "reject", error: "checkpoint_invalid: native selected answer replay draft or validation digest is stale" };
   }
-  const expectedStatus = input.decision === "request_changes" ? "revision_required" : "approved";
+  const expectedStatus = expectedDecision === "request_changes" ? "revision_required" : "approved";
   if (record.status !== expectedStatus || state.stage_cursor !== phase || cap.issued_for.stage_cursor !== phase || state.cursor_epoch !== cap.issued_for.cursor_epoch) {
     return { kind: "reject", error: "checkpoint_invalid: native selected answer replay resulting phase or cursor identity is stale" };
   }

@@ -29,7 +29,7 @@ import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
 import { ctoSliceTaskGate } from "./cto/slice-gate.js";
 import { registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
-import { authorizeDispatchTrusted, authorizeSpecificationPhaseValidationDispatch, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, completeSpecificationExecution, recordCheckpointDecision, setConstitutionContinuationGate, validateCheckpointAskSelected, commitCheckpointAnswerSelected, renderCheckpointCanonicalPacket, finalizeImportedHandoff, issueTrustedMappingProof, issueCurrentTrustedMappingProof, registerTrustedTaskResultHostBridge, issueTrustedTaskResultHostCapability, recordTrustedTaskResultFromHost, MAX_ADVANCE_FIELD_BYTES, MAX_ADVANCE_EVIDENCE_BYTES, MAX_COMPLETION_ARTIFACT_COUNT, MAX_COMPLETION_ARTIFACT_BYTES, MAX_ROSTER_SELECTION_COUNT, MAX_ROSTER_SELECTION_BYTES, MAX_CHECKPOINT_RATIONALE_BYTES, isBoundedLineInert, isSafeWorkflowIdentifier, type CheckpointAskSelectedRequest, type ImportedHandoffFinalizationInput, type CtoSpecificationCompletionEnvelope, type TrustedMappingProof, type TrustedTaskResultHostCapability } from "./engine/durable.js";
+import { authorizeDispatchTrusted, authorizeSpecificationPhaseValidationDispatch, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, completeSpecificationExecution, recordCheckpointDecision, setConstitutionContinuationGate, validateCheckpointAskSelected, tryReplayNativeSelectedCheckpointAsk, commitCheckpointAnswerSelected, renderCheckpointCanonicalPacket, finalizeImportedHandoff, issueTrustedMappingProof, issueCurrentTrustedMappingProof, registerTrustedTaskResultHostBridge, issueTrustedTaskResultHostCapability, recordTrustedTaskResultFromHost, MAX_ADVANCE_FIELD_BYTES, MAX_ADVANCE_EVIDENCE_BYTES, MAX_COMPLETION_ARTIFACT_COUNT, MAX_COMPLETION_ARTIFACT_BYTES, MAX_ROSTER_SELECTION_COUNT, MAX_ROSTER_SELECTION_BYTES, MAX_CHECKPOINT_RATIONALE_BYTES, isBoundedLineInert, isSafeWorkflowIdentifier, type CheckpointAskSelectedRequest, type ImportedHandoffFinalizationInput, type CtoSpecificationCompletionEnvelope, type TrustedMappingProof, type TrustedTaskResultHostCapability } from "./engine/durable.js";
 import { registerWorkflowProfiles } from "./engine/profile.js";
 import { findCheckpointDecision, issueTrustedCheckpointAnswerCapability, registerTrustedCheckpointHostBridge } from "./engine/checkpoints.js";
 import { admitImplementationWorkflowBegin, prepareWorkflowState, type ModelClassification, type WorkflowPrepareOptions } from "./engine/run.js";
@@ -4311,7 +4311,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_checkpoint_ask_selected",
     label: "Ask human for selected checkpoint",
-    description: "Trusted terminal ingest for one explicitly selected feature/run checkpoint. Validates the exact selected state, prompts the trusted host UI for one policy-allowed label, and atomically applies that answer as the typed checkpoint decision. The engine derives the subject binding, audit rationale/evidence, actor provenance, and next workflow action; the model must never compose a workflow_checkpoint payload. No active-feature pointer or model-supplied UI surface is consulted. Await one selected Ask before invoking another.",
+    description: "Trusted terminal ingest for one explicitly selected feature/run checkpoint. Validates the exact selected state, prompts the trusted host UI for one policy-allowed label, and atomically applies that answer as the typed checkpoint decision. The engine derives the subject binding, audit rationale/evidence, actor provenance, and next workflow action; the model must never compose a workflow_checkpoint payload. No active-feature pointer or model-supplied UI surface is consulted. An exact already-applied native Ask is replayed without reopening the UI; all other new Asks still require one current awaiting_approval candidate. Await one selected Ask before invoking another.",
     parameters: z.object({
       feature_id: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,127}$/u).max(128),
       advance_token: z.string().min(1).max(4096),
@@ -4343,10 +4343,37 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       const pinnedRoot = PinnedProjectRoot.open(cwd);
       if (!pinnedRoot) return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_UNAVAILABLE", error: "current project root could not be pinned for checkpoint authorization" });
       let externalSourceRoot: PinnedProjectRoot | undefined;
+      const renderAlreadyRecorded = (
+        decision: string,
+        checkpointKind: string,
+        answerId: string,
+        persistedDecision?: unknown,
+        answer?: { reference: string },
+        proof?: unknown,
+      ) => toolResult({
+        ok: true,
+        transition: "checkpoint",
+        checkpoint: input.checkpoint,
+        decision,
+        checkpoint_kind: checkpointKind,
+        ...(answer && proof ? { actor_provenance: { kind: "user", ref: answer.reference, proof } } : {}),
+        ...(persistedDecision ? { persisted_decision: persistedDecision } : {}),
+        already_recorded: true,
+        next: "decision already recorded; resume with workflow_advance using the selected feature/run handoff",
+        required_next_tool: selectedCheckpointAdvanceDescriptor(input, "checkpoint-answer:" + answerId),
+        next_action: "Immediately execute required_next_tool.arguments verbatim; the checkpoint decision is already persisted and no workflow_checkpoint follow-up is required.",
+        state: workflowStateSummary(cwd, options.mappingSummary, { feature_id: input.feature_id, run_key: input.run_key }),
+      });
       try {
         if (signal?.aborted) return aborted();
-        const selectorError = specificationSelectorGate(cwd, input, { allowMissing: false });
+        const selectorError = specificationSelectorGate(cwd, input, { allowMissing: false, pinnedRoot });
         if (selectorError) return selectorError;
+        const replay = tryReplayNativeSelectedCheckpointAsk(cwd, input, { pinnedRoot });
+        if (replay !== null) {
+          if (!replay.ok) return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_REJECTED", error: replay.error });
+          const answerId = replay.answer?.answer_id ?? replay.persisted_decision?.actor.proof?.answer_id ?? "existing";
+          return renderAlreadyRecorded(replay.decision, replay.checkpoint_kind, answerId, replay.persisted_decision, replay.answer ?? undefined, replay.proof ?? undefined);
+        }
         const preflight = validateCheckpointAskSelected(cwd, input, { pinnedRoot });
         if (!preflight.ok) return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_REJECTED", error: preflight.error });
         const { stage, rule, allowed, canonical_summary, subject_binding, state_revision, state_digest } = preflight.context;
@@ -4375,19 +4402,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
             && (candidate.actor.proof?.answer_id !== undefined || (candidate.feature_id === input.feature_id && candidate.subject_binding === subject_binding)),
           );
           const answerId = persisted?.actor.proof?.answer_id ?? "existing";
-          return toolResult({
-            ok: true,
-            transition: "checkpoint",
-            checkpoint: input.checkpoint,
-            decision: existing.decision,
-            checkpoint_kind: rule.kind,
-            ...(persisted ? { persisted_decision: persisted } : {}),
-            already_recorded: true,
-            next: "decision already recorded; resume with workflow_advance using the selected feature/run handoff",
-            required_next_tool: selectedCheckpointAdvanceDescriptor(input, "checkpoint-answer:" + answerId),
-            next_action: "Immediately execute required_next_tool.arguments verbatim; the checkpoint decision is already persisted and no workflow_checkpoint follow-up is required.",
-            state: workflowStateSummary(cwd, options.mappingSummary, { feature_id: input.feature_id, run_key: input.run_key }),
-          });
+          return renderAlreadyRecorded(existing.decision, rule.kind, answerId, persisted);
         }
         if (preflight.context.external_source_root) {
           const expected = preflight.context.external_source_root;
@@ -6450,6 +6465,7 @@ export {
 export {
   hashDispatchSecret,
   validateCheckpointAskSelected,
+  tryReplayNativeSelectedCheckpointAsk,
   type CheckpointDecisionInput,
   type CheckpointAskSelectedRequest,
   type CheckpointAnswerSelectedCommitResult,
