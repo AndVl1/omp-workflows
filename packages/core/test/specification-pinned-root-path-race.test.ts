@@ -8,6 +8,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { PinnedProjectRoot, PinnedRootError, processStartIdentity } from "../src/specification/pinned-root.js";
+import { MAX_PINNED_ROOT_READ_BYTES } from "../src/specification/limits.js";
 import { setStateTransactionTestHooks, updateStateAtomically } from "../src/engine/state.js";
 import { captureWorkspaceRoot, createFeatureWorkspace } from "../src/specification/workspace.js";
 
@@ -191,6 +192,36 @@ test("Darwin helper startup publishes ready before concurrent multi-root request
     }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Darwin helper rejects an IPC FIFO symlink swap without touching its target", async () => {
+  if (process.platform !== "darwin") return;
+  const root = await fsPromises.mkdtemp(join(tmpdir(), "spec-pinned-fifo-symlink-"));
+  const outside = await fsPromises.mkdtemp(join(tmpdir(), "spec-pinned-fifo-outside-"));
+  const outsideFile = join(outside, "sentinel");
+  await fsPromises.writeFile(outsideFile, "sentinel bytes\n", "utf8");
+  let swapped = false;
+  const pinned = PinnedProjectRoot.open(root, {
+    beforeDarwinHelperOpen: (channel, path) => {
+      if (channel !== "request" || swapped) return;
+      swapped = true;
+      fs.unlinkSync(path);
+      fs.symlinkSync(outsideFile, path, "file");
+    },
+  });
+  assert.ok(pinned);
+  try {
+    assert.throws(
+      () => pinned.pathEntryExists("missing.txt"),
+      (error: unknown) => error instanceof PinnedRootError && (error.code === "unsupported" || error.code === "changed"),
+    );
+    assert.equal(swapped, true, "the FIFO path must be swapped before Node opens it");
+    assert.equal(fs.readFileSync(outsideFile, "utf8"), "sentinel bytes\n", "a swapped FIFO path must not follow or truncate its target");
+  } finally {
+    await pinned.closeAsync();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
   }
 });
 
@@ -672,6 +703,28 @@ test("conditional pinned CAS preserves a concurrent winner", async () => {
       removeRaced.close();
     }
     assert.equal(fs.readFileSync(target, "utf8"), "remove winner\n");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("public conditional CAS rejects an expectation above the caller read cap before mutation", () => {
+  const root = fs.mkdtempSync(join(tmpdir(), "spec-pinned-cas-read-cap-"));
+  const target = join(root, "document.md");
+  try {
+    fs.writeFileSync(target, "old bytes\n", "utf8");
+    const pinned = PinnedProjectRoot.open(root);
+    assert.ok(pinned);
+    if (!pinned) return;
+    try {
+      assert.throws(
+        () => pinned.replaceFileIfMatches("document.md", { dev: 1, ino: 1, size: MAX_PINNED_ROOT_READ_BYTES + 1, sha256: "0".repeat(64) }, "replacement\n"),
+        (error: unknown) => error instanceof PinnedRootError && error.code === "invalid",
+      );
+      assert.equal(fs.readFileSync(target, "utf8"), "old bytes\n", "an oversized caller expectation must fail before CAS mutation");
+    } finally {
+      pinned.close();
+    }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

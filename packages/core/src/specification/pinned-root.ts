@@ -174,7 +174,7 @@ readonly relative_path: string;
 readonly dev: number;
 readonly ino: number;
 readonly size: number;
-readonly sha256: string;}const descriptorReceipts = new WeakMap<PinnedRootWriteDescriptor, PinnedRootWriteReceipt>();const descriptorPreimages = new WeakMap<PinnedRootWriteDescriptor, PinnedRootWritePreimage>();const DARWIN_PYTHON_CANDIDATES = ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"] as const;const DARWIN_HELPER_MAX_OUTPUT = 24 * 1024 * 1024;/** Synchronous helper operations have one total deadline, including startup. */const DARWIN_HELPER_TIMEOUT_MS = 4_000;// Large framed writes must allow the complete bounded payload to cross the
+readonly sha256: string;}const descriptorReceipts = new WeakMap<PinnedRootWriteDescriptor, PinnedRootWriteReceipt>();const descriptorPreimages = new WeakMap<PinnedRootWriteDescriptor, PinnedRootWritePreimage>();const DARWIN_PYTHON_CANDIDATES = ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"] as const;const DARWIN_HELPER_MAX_OUTPUT = 24 * 1024 * 1024;/** Base helper execution watchdog; bounded FIFO transfer time is separate. */const DARWIN_HELPER_TIMEOUT_MS = 4_000;const DARWIN_HELPER_SERIALIZATION_TIMEOUT_MS = 5_000;// Large framed writes must allow the complete bounded payload to cross the
 // synchronous FIFOs on slower Darwin hosts. Keep the allowance finite and
 // derive it from the validated frame size below; ordinary helper calls retain
 // the short default deadline.
@@ -250,7 +250,9 @@ const ids = LIVE_DARWIN_BATCH_IDS.get(rootDigest);
 if (!ids) return;
 ids.delete(batchId);
 if (ids.size === 0) LIVE_DARWIN_BATCH_IDS.delete(rootDigest);}function canonicalDarwinHelperJson(value: unknown): string {
-const encoded = JSON.stringify(value, (_key, nested) => {
+assertWellFormedUtf16(value);
+const encoded = JSON.stringify(value, (key, nested) => {
+if (!isWellFormedUtf16(key) || (typeof nested === "string" && !isWellFormedUtf16(nested))) throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
 if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
 const record = nested as Record<string, unknown>;
 return Object.fromEntries(Object.keys(record).sort().map((key) => [key, record[key]]));
@@ -487,6 +489,20 @@ def read_at(parent, name, max_read=MAX_READ):
         os.close(fd)
 
 
+def read_bounded_at(parent, name, expected_size=None):
+    max_read = MAX_WRITE if isinstance(expected_size, int) and expected_size > MAX_READ else MAX_READ
+    return read_at(parent, name, max_read)
+
+def read_descriptor_at(parent, name, descriptor):
+    # Caller-supplied expectations are always bounded by the public read cap.
+    return read_at(parent, name, MAX_READ)
+
+def read_owned_descriptor_at(parent, name, descriptor):
+    # Only descriptors created by this helper may authorize the larger write
+    # bound; caller preimages never opt into it.
+    expected_size = descriptor.get("size") if isinstance(descriptor, dict) else None
+    return read_bounded_at(parent, name, expected_size)
+
 def read_prefix_at(parent, name, max_read=MAX_READ):
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     fd = os.open(name, flags, dir_fd=parent)
@@ -673,7 +689,7 @@ def remove_legacy_ownerless_directory(parent, name, grace_ms):
         return False
 
 
-def remove_exact_regular(parent, name, expected):
+def remove_exact_regular(parent, name, expected, owned=False):
     """Compare and remove one exact descriptor-relative regular entry."""
     stale = bounded_name("cleanup", name, ".stale")
     try:
@@ -681,7 +697,7 @@ def remove_exact_regular(parent, name, expected):
     except FileNotFoundError:
         return False
     try:
-        data, info = read_at(parent, stale)
+        data, info = (read_owned_descriptor_at if owned else read_descriptor_at)(parent, stale, expected)
         if same_identity(info, expected) and (expected.get("size") is None or len(data) == expected.get("size")) and same_digest(data, expected):
             os.unlink(stale, dir_fd=parent)
             fsync_regular(parent)
@@ -954,7 +970,7 @@ def owner_identity_dead(owner):
     return actual_identity == "darwin:zombie" or (actual_identity is not None and actual_identity != expected_identity)
 
 
-def quarantine_untrusted_entry(parent, name, relative_path, expected, prefix):
+def quarantine_untrusted_entry(parent, name, relative_path, expected, prefix, owned=False):
     """Move only an observed regular internal entry, verifying its descriptor."""
     for _ in range(32):
         candidate = bounded_name(prefix, relative_path, ".quarantined")
@@ -965,7 +981,7 @@ def quarantine_untrusted_entry(parent, name, relative_path, expected, prefix):
         except FileNotFoundError:
             return None
         try:
-            data, info = read_at(parent, candidate)
+            data, info = (read_owned_descriptor_at if owned else read_descriptor_at)(parent, candidate, expected)
             if (not stat.S_ISREG(info.st_mode) or not same_identity(info, expected)
                 or (expected.get("size") is not None and len(data) != expected.get("size"))
                 or not same_digest(data, expected)):
@@ -991,7 +1007,7 @@ def quarantine_dead_untrusted_lease(parent, root_fd, target, relative_path, lock
     lock_expected = {"dev": lock_info.st_dev, "ino": lock_info.st_ino, "size": len(lock_data), "sha256": hashlib.sha256(lock_data).hexdigest()}
     quarantine_untrusted_entry(parent, lock_name, relative_path, lock_expected, "restart-lease")
     try:
-        stage_data, stage_info = read_at(parent, stage_name)
+        stage_data, stage_info = read_bounded_at(parent, stage_name, MAX_WRITE)
     except FileNotFoundError:
         stage_data = stage_info = None
     except Exception as error:
@@ -1000,7 +1016,7 @@ def quarantine_dead_untrusted_lease(parent, root_fd, target, relative_path, lock
         if not stat.S_ISREG(stage_info.st_mode):
             raise RecoveryRequired("untrusted lease stage is not a regular file")
         stage_expected = {"dev": stage_info.st_dev, "ino": stage_info.st_ino, "size": len(stage_data), "sha256": hashlib.sha256(stage_data).hexdigest()}
-        quarantine_untrusted_entry(parent, stage_name, relative_path, stage_expected, "restart-stage")
+        quarantine_untrusted_entry(parent, stage_name, relative_path, stage_expected, "restart-stage", True)
     batch_id = owner.get("batch_id") if isinstance(owner, dict) else None
     journal_name = owner.get("batch_journal") if isinstance(owner, dict) else None
     if (isinstance(batch_id, str) and isinstance(journal_name, str) and len(batch_id) <= 128
@@ -1029,7 +1045,7 @@ def expected_matches(owner, expected, operation):
         and recorded.get("sha256") == expected.get("sha256")
     )
 
-def conditional_lock(parent, target, relative_path, expected, desired_sha, operation, group=None):
+def conditional_lock(parent, target, relative_path, expected, desired_sha, operation, group=None, desired_size=None, owned_expected=False):
     lock_name = bounded_name("cas-lock", relative_path, ".lock", nonce=False)
     stage_name = bounded_name("cas-stage", relative_path, ".tmp", nonce=False)
     # Read legacy lease names only when they already fit NAME_MAX. New
@@ -1102,7 +1118,7 @@ def conditional_lock(parent, target, relative_path, expected, desired_sha, opera
                     current_matches = False
                     preimage_matches_current = False
                     try:
-                        data, info = read_at(parent, target)
+                        data, info = read_owned_descriptor_at(parent, target, postimage)
                         current_matches = info.st_dev == postimage.get("dev") and info.st_ino == postimage.get("ino") and len(data) == postimage.get("size") and hashlib.sha256(data).hexdigest() == postimage.get("sha256")
                         preimage_matches_current = (
                             preimage.get("kind") == "file"
@@ -1123,7 +1139,7 @@ def conditional_lock(parent, target, relative_path, expected, desired_sha, opera
                     committed = True
             if expected_matches(owner, expected, operation):
                 try:
-                    data, info = read_at(parent, target)
+                    data, info = read_bounded_at(parent, target, desired_size) if operation == "replace" else (read_owned_descriptor_at if owned_expected else read_descriptor_at)(parent, target, expected)
                     if operation == "replace" and not same_identity(info, expected) and hashlib.sha256(data).hexdigest() == desired_sha:
                         committed = True
                 except FileNotFoundError:
@@ -1136,11 +1152,11 @@ def conditional_lock(parent, target, relative_path, expected, desired_sha, opera
                 # Stage bytes are private transaction residue. Remove only a
                 # stage whose digest matches the stale owner metadata.
                 try:
-                    stage_data, stage_info = read_at(parent, stage_name)
+                    stage_data, stage_info = read_bounded_at(parent, stage_name, MAX_WRITE)
                     stage_digest = hashlib.sha256(stage_data).hexdigest()
                     owner_expected = owner.get("expected") if isinstance(owner.get("expected"), dict) else {}
                     if stage_digest == owner.get("desired_sha256") or (owner_expected.get("kind") == "file" and stage_digest == owner_expected.get("sha256")):
-                        remove_exact_regular(parent, stage_name, {"dev": stage_info.st_dev, "ino": stage_info.st_ino, "sha256": stage_digest})
+                        remove_exact_regular(parent, stage_name, {"dev": stage_info.st_dev, "ino": stage_info.st_ino, "sha256": stage_digest}, True)
                 except FileNotFoundError:
                     pass
             if committed and reclaimed:
@@ -1267,7 +1283,7 @@ def mutate_conditional_postimage(parent, target):
     finally:
         os.close(fd)
 
-def quarantine_conditional_stage(parent, stage, relative_path, expected):
+def quarantine_conditional_stage(parent, stage, relative_path, expected, owned=False):
     """Move a failed exchange stage to an exact, no-clobber recovery artifact."""
     for _ in range(32):
         candidate = bounded_name("cas-recovery", relative_path, ".quarantined")
@@ -1278,7 +1294,7 @@ def quarantine_conditional_stage(parent, stage, relative_path, expected):
         except FileNotFoundError as error:
             raise RecoveryRequired("conditional replacement recovery artifact is unavailable") from error
         try:
-            data, info = read_at(parent, candidate)
+            data, info = (read_owned_descriptor_at if owned else read_descriptor_at)(parent, candidate, expected)
             if (not same_identity(info, expected)
                 or (expected.get("size") is not None and len(data) != expected.get("size"))
                 or not same_digest(data, expected)):
@@ -1304,12 +1320,12 @@ def quarantine_conditional_entry(parent, name, relative_path, prefix):
     raise RecoveryRequired("conditional replacement quarantine path could not be reserved")
 
 
-def conditional_exchange_replace(parent, target, stage, expected, desired_sha, desired_size, mutate_post_exchange=False, mutate_stage_after_exchange=False, mutate_pre_exchange=False, mutate_stage_pre_exchange=False, retain_displaced=False):
+def conditional_exchange_replace(parent, target, stage, expected, desired_sha, desired_size, mutate_post_exchange=False, mutate_stage_after_exchange=False, mutate_pre_exchange=False, mutate_stage_pre_exchange=False, retain_displaced=False, owned_expected=False):
     """Atomically publish stage while preserving an exact target preimage."""
     try:
-        observed, observed_info = read_at(parent, target)
+        observed, observed_info = (read_owned_descriptor_at if owned_expected else read_descriptor_at)(parent, target, expected)
         target_matches = same_identity(observed_info, expected) and (expected.get("size") is None or len(observed) == expected.get("size")) and same_digest(observed, expected)
-        staged, staged_info = read_at(parent, stage)
+        staged, staged_info = read_bounded_at(parent, stage, desired_size)
         stage_receipt = {"dev": staged_info.st_dev, "ino": staged_info.st_ino, "size": len(staged), "sha256": hashlib.sha256(staged).hexdigest()}
         desired_matches = len(staged) == desired_size and same_digest(staged, {"sha256": desired_sha})
         if not target_matches or not desired_matches:
@@ -1326,19 +1342,19 @@ def conditional_exchange_replace(parent, target, stage, expected, desired_sha, d
         if mutate_stage_after_exchange:
             mutate_conditional_postimage(parent, displaced)
         try:
-            current, current_info = read_at(parent, target)
+            current, current_info = read_bounded_at(parent, target, desired_size)
             desired_current = same_identity(current_info, {"dev": staged_info.st_dev, "ino": staged_info.st_ino}) and len(current) == desired_size and same_digest(current, {"sha256": desired_sha})
         except Exception:
             desired_current = False
         try:
-            displaced_current, displaced_current_info = read_at(parent, displaced)
+            displaced_current, displaced_current_info = (read_owned_descriptor_at if owned_expected else read_descriptor_at)(parent, displaced, expected)
             displaced_current_expected = same_identity(displaced_current_info, expected) and (expected.get("size") is None or len(displaced_current) == expected.get("size")) and same_digest(displaced_current, expected)
             displaced_receipt = {"dev": displaced_current_info.st_dev, "ino": displaced_current_info.st_ino, "size": len(displaced_current), "sha256": hashlib.sha256(displaced_current).hexdigest()}
         except Exception:
             displaced_current_expected = False
             displaced_receipt = stage_receipt
         if desired_current and displaced_current_expected:
-            if not retain_displaced and not remove_exact_regular(parent, displaced, displaced_receipt):
+            if not retain_displaced and not remove_exact_regular(parent, displaced, displaced_receipt, owned_expected):
                 raise RecoveryRequired("conditional replacement displaced cleanup could not be proven")
             fsync_regular(parent)
             return True, current_info
@@ -1361,7 +1377,7 @@ def mutate_conditional_symlink(parent, target):
     os.symlink("conditional-winner", target, dir_fd=parent)
 
 
-def conditional_move_remove(parent, target, stage, expected, relative_path, mutate_stage_after_move=False, mutate_before_move=False, symlink_before_move=False):
+def conditional_move_remove(parent, target, stage, expected, relative_path, mutate_stage_after_move=False, mutate_before_move=False, symlink_before_move=False, owned_expected=False):
     """Remove target only after its exact moved inode and bytes survive."""
     if mutate_before_move:
         mutate_conditional_postimage(parent, target)
@@ -1375,7 +1391,7 @@ def conditional_move_remove(parent, target, stage, expected, relative_path, muta
     displaced_info = None
     try:
         try:
-            displaced, displaced_info = read_at(parent, stage)
+            displaced, displaced_info = (read_owned_descriptor_at if owned_expected else read_descriptor_at)(parent, stage, expected)
         except Exception as error:
             try:
                 rename_noreplace(parent, stage, target)
@@ -1393,7 +1409,7 @@ def conditional_move_remove(parent, target, stage, expected, relative_path, muta
         matches = same_identity(displaced_info, expected) and (expected.get("size") is None or len(displaced) == expected.get("size")) and same_digest(displaced, expected)
         if matches:
             fsync_entry(parent, stage)
-            if not remove_exact_regular(parent, stage, stage_expected):
+            if not remove_exact_regular(parent, stage, stage_expected, True):
                 raise RuntimeError("conditional removal stage cleanup could not be proven")
             fsync_regular(parent)
             return True
@@ -1401,7 +1417,7 @@ def conditional_move_remove(parent, target, stage, expected, relative_path, muta
             rename_noreplace(parent, stage, target)
             moved = False
         except FileExistsError as error:
-            quarantine = quarantine_conditional_stage(parent, stage, relative_path, stage_expected)
+            quarantine = quarantine_conditional_stage(parent, stage, relative_path, stage_expected, owned_expected)
             raise RecoveryRequired(f"conditional removal found a newer canonical winner; moved winner quarantined at {quarantine}") from error
         raise RecoveryRequired("conditional removal target changed; original winner restored canonically")
     except RecoveryRequired:
@@ -1414,7 +1430,7 @@ def conditional_move_remove(parent, target, stage, expected, relative_path, muta
             moved = False
         except FileExistsError as restore_error:
             try:
-                quarantine = quarantine_conditional_stage(parent, stage, relative_path, {"dev": displaced_info.st_dev if displaced_info is not None else expected.get("dev"), "ino": displaced_info.st_ino if displaced_info is not None else expected.get("ino"), "size": len(displaced) if displaced is not None else expected.get("size"), "sha256": hashlib.sha256(displaced).hexdigest() if displaced is not None else expected.get("sha256")})
+                quarantine = quarantine_conditional_stage(parent, stage, relative_path, {"dev": displaced_info.st_dev if displaced_info is not None else expected.get("dev"), "ino": displaced_info.st_ino if displaced_info is not None else expected.get("ino"), "size": len(displaced) if displaced is not None else expected.get("size"), "sha256": hashlib.sha256(displaced).hexdigest() if displaced is not None else expected.get("sha256")}, owned_expected)
             except Exception:
                 quarantine = stage
             raise RecoveryRequired(f"conditional removal winner appeared during restore; moved entry quarantined at {quarantine}") from restore_error
@@ -1891,7 +1907,7 @@ def read_batch_journal(root_fd, journal_name, batch_id):
 
 def target_matches_descriptor(parent, name, descriptor):
     try:
-        data, info = read_at(parent, name)
+        data, info = read_owned_descriptor_at(parent, name, descriptor)
     except Exception:
         return False
     return (isinstance(descriptor, dict) and same_identity(info, descriptor)
@@ -2002,7 +2018,10 @@ def cleanup_rollback_temp(parent, name, expected, alternate=None):
     if not isinstance(name, str):
         return
     try:
-        data, info = read_at(parent, name)
+        if isinstance(alternate, dict):
+            data, info = read_owned_descriptor_at(parent, name, alternate)
+        else:
+            data, info = read_descriptor_at(parent, name, expected)
     except FileNotFoundError:
         return
     if expected.get("kind") not in ("absent", "file"):
@@ -2013,7 +2032,7 @@ def cleanup_rollback_temp(parent, name, expected, alternate=None):
         and receipt["size"] == alternate.get("size") and receipt["sha256"] == alternate.get("sha256"))
     if not expected_match and not alternate_match:
         raise RecoveryRequired("prepared batch rollback temporary entry changed")
-    if not remove_exact_regular(parent, name, receipt):
+    if not remove_exact_regular(parent, name, receipt, isinstance(alternate, dict)):
         raise RecoveryRequired("prepared batch rollback temporary cleanup could not be proven")
 
 
@@ -2158,7 +2177,7 @@ def rollback_prepared_target(parent, name, path, expected, postimage, rollback_t
         if not target_matches_descriptor(parent, name, postimage):
             raise RecoveryRequired("prepared write rollback target changed before exact removal")
         if not isinstance(rollback_temp, str) or rollback_temp != bounded_name("cas-stage", path, ".tmp", nonce=False):
-            if not remove_exact_regular(parent, name, postimage):
+            if not remove_exact_regular(parent, name, postimage, True):
                 raise RecoveryRequired("prepared write rollback removal could not be proven")
             cleanup_rollback_temp(parent, rollback_temp, expected, postimage)
             return
@@ -2166,7 +2185,7 @@ def rollback_prepared_target(parent, name, path, expected, postimage, rollback_t
             rename_noreplace(parent, name, rollback_temp)
         except FileExistsError as error:
             raise RecoveryRequired("prepared write rollback stage changed before exact removal") from error
-        moved_data, moved_info = read_at(parent, rollback_temp)
+        moved_data, moved_info = read_owned_descriptor_at(parent, rollback_temp, postimage)
         if not same_identity(moved_info, postimage) or len(moved_data) != postimage.get("size") or hashlib.sha256(moved_data).hexdigest() != postimage.get("sha256"):
             raise RecoveryRequired("prepared write rollback moved postimage changed")
         fsync_regular(parent)
@@ -2187,7 +2206,7 @@ def rollback_prepared_target(parent, name, path, expected, postimage, rollback_t
 
 
             raise RecoveryRequired("prepared write rollback backup changed")
-        committed, _ = conditional_exchange_replace(parent, name, stage, postimage, expected.get("sha256"), expected.get("size"), retain_displaced=retain_displaced)
+        committed, _ = conditional_exchange_replace(parent, name, stage, postimage, expected.get("sha256"), expected.get("size"), retain_displaced=retain_displaced, owned_expected=True)
         if not committed and not target_matches_preimage(parent, name, expected):
             raise RecoveryRequired("prepared write rollback replacement was not committed")
         stage = None
@@ -2248,7 +2267,7 @@ def recover_rolled_back_batch(root_fd, journal_name, batch_id, document):
                     raise RecoveryRequired("prepared batch rollback lease is missing")
                 stage_exists = False
                 try:
-                    stage_data, stage_info = read_at(parent, stage_name)
+                    stage_data, stage_info = read_bounded_at(parent, stage_name, MAX_WRITE)
                     stage_exists = True
                 except FileNotFoundError:
                     stage_data = stage_info = None
@@ -2263,7 +2282,7 @@ def recover_rolled_back_batch(root_fd, journal_name, batch_id, document):
                         and stage_receipt["size"] == displaced_descriptor.get("size") and stage_receipt["sha256"] == displaced_descriptor.get("sha256"))
                     if target_restored and stage_is_displaced:
                         if entry.get("rollback_state") == "rolled_back":
-                            if not remove_exact_regular(parent, stage_name, stage_receipt):
+                            if not remove_exact_regular(parent, stage_name, stage_receipt, True):
                                 raise RecoveryRequired("prepared batch rollback displaced cleanup could not be proven")
                             fsync_regular(parent)
                     elif not target_restored and not stage_is_backup:
@@ -2469,7 +2488,7 @@ def remove_batch_journal(root_fd, journal_name, batch_id, allow_prepared=False, 
 
 def verify_recovery_stage(state):
     try:
-        data, info = read_at(state["parent"], state["stage"])
+        data, info = read_bounded_at(state["parent"], state["stage"], state["postimage"].get("size"))
     except FileNotFoundError as error:
         raise RecoveryRequired("prepared batch stage disappeared during recovery") from error
     except Exception as error:
@@ -2561,7 +2580,7 @@ def recover_prepared_batch(root_fd, journal_name, batch_id):
             target_published = target_matches_descriptor(parent, name, postimage)
             target_prepared = expected is not None and target_matches_preimage(parent, name, expected)
             try:
-                stage_data, stage_info = read_at(parent, stage_name)
+                stage_data, stage_info = read_bounded_at(parent, stage_name, entry["size"])
                 stage_exists = True
             except FileNotFoundError:
                 stage_data = stage_info = None
@@ -2728,7 +2747,7 @@ def prepare_write(payload):
     candidate_token = None
     try:
         lease, recovered, lock_name, stage_name = conditional_lock(
-            parent, name, relative_path, lock_expected, desired_sha, "write_atomic" if op == "prepare_write_atomic" else "write_exclusive", {"batch_id": batch_id, "batch_index": batch_index, "batch_size": batch_size, "batch_journal": batch_journal_name(batch_id)} if grouped else None)
+            parent, name, relative_path, lock_expected, desired_sha, "write_atomic" if op == "prepare_write_atomic" else "write_exclusive", {"batch_id": batch_id, "batch_index": batch_index, "batch_size": batch_size, "batch_journal": batch_journal_name(batch_id)} if grouped else None, len(data))
         if recovered:
             # Recovery may have published an earlier group prefix; capture the
             # exact post-recovery target before reacquiring this lease.
@@ -2740,7 +2759,7 @@ def prepare_write(payload):
                 if prepared_snapshot_bytes + recovered_snapshot_bytes > MAX_BATCH_ROLLBACK:
                     raise LimitError("prepared batch rollback snapshot exceeds its byte bound")
             lease, recovered, lock_name, stage_name = conditional_lock(
-                parent, name, relative_path, lock_expected, desired_sha, "write_atomic" if op == "prepare_write_atomic" else "write_exclusive", {"batch_id": batch_id, "batch_index": batch_index, "batch_size": batch_size, "batch_journal": batch_journal_name(batch_id)} if grouped else None)
+                parent, name, relative_path, lock_expected, desired_sha, "write_atomic" if op == "prepare_write_atomic" else "write_exclusive", {"batch_id": batch_id, "batch_index": batch_index, "batch_size": batch_size, "batch_journal": batch_journal_name(batch_id)} if grouped else None, len(data))
             if recovered:
                 raise RuntimeError("prepared write lease could not be recovered")
         if op == "prepare_write_exclusive":
@@ -2908,7 +2927,7 @@ def abort_prepared_stage_exact(prepared):
         return
     if not stat.S_ISREG(info.st_mode) or info.st_dev != expected.st_dev or info.st_ino != expected.st_ino:
         raise RecoveryRequired("prepared write abort found a foreign stage")
-    if not remove_exact_regular(prepared["parent"], stage, {"dev": expected.st_dev, "ino": expected.st_ino, "size": prepared["size"], "sha256": prepared["sha256"]}):
+    if not remove_exact_regular(prepared["parent"], stage, {"dev": expected.st_dev, "ino": expected.st_ino, "size": prepared["size"], "sha256": prepared["sha256"]}, True):
         raise RecoveryRequired("prepared write abort stage cleanup could not be proven")
 
 def rollback_prepared_write(payload):
@@ -3130,7 +3149,7 @@ def verify_prepared_stage(prepared):
     if not isinstance(stage, str) or not stage:
         raise RecoveryRequired("prepared write stage is missing before commit")
     try:
-        data, info = read_at(prepared["parent"], stage)
+        data, info = read_at(prepared["parent"], stage, MAX_WRITE)
     except FileNotFoundError as error:
         raise RecoveryRequired("prepared write stage disappeared before commit") from error
     expected = prepared.get("temp_info")
@@ -3145,7 +3164,7 @@ def verify_prepared_stage(prepared):
     raise RecoveryRequired("prepared write stage changed before commit; stage quarantined at " + str(quarantine or stage))
 
 def mutate_prepared_target_same_inode(prepared):
-    data, _ = read_at(prepared["parent"], prepared["name"])
+    data, _ = read_at(prepared["parent"], prepared["name"], MAX_WRITE)
     mutated = bytes((byte ^ 0xff) for byte in data) if data else b"x"
     fd = os.open(prepared["name"], os.O_WRONLY, dir_fd=prepared["parent"])
     try:
@@ -3164,7 +3183,7 @@ def conditional_pre_ack_mutation(payload, prepared):
 
 def verify_prepared_target(prepared):
     try:
-        data, info = read_at(prepared["parent"], prepared["name"])
+        data, info = read_at(prepared["parent"], prepared["name"], MAX_WRITE)
     except FileNotFoundError as error:
         raise RecoveryRequired("prepared write target disappeared after publication") from error
     expected = prepared.get("temp_info")
@@ -3177,7 +3196,7 @@ def verify_prepared_target(prepared):
     moved = quarantine_conditional_entry(prepared["parent"], prepared["name"], prepared["path"], "cas-recovery")
     if moved is None:
         raise RecoveryRequired("prepared write target disappeared after publication")
-    moved_data, moved_info = read_at(prepared["parent"], moved)
+    moved_data, moved_info = read_at(prepared["parent"], moved, MAX_WRITE)
     moved_is_our_publication = (isinstance(expected, os.stat_result) and moved_info.st_dev == expected.st_dev and moved_info.st_ino == expected.st_ino)
     if not moved_is_our_publication:
         try:
@@ -3237,7 +3256,7 @@ def commit_prepared_write(payload):
                 # retain ownership only when the exact desired postimage is
                 # observable. Otherwise leave the competing target untouched.
                 try:
-                    observed, observed_info = read_at(parent, prepared["name"])
+                    observed, observed_info = read_bounded_at(parent, prepared["name"], prepared["size"])
                     committed = same_identity(observed_info, prepared["temp_info"]) and len(observed) == prepared["size"] and hashlib.sha256(observed).hexdigest() == prepared["sha256"]
                 except FileNotFoundError:
                     committed = False
@@ -3283,6 +3302,33 @@ def inherit_operation_context(parent, child):
     return nested
 
 
+MAX_RESPONSE_OUTPUT = 24 * 1024 * 1024
+MAX_RESPONSE_OVERHEAD = 64 * 1024
+
+def response_size_bound(payload):
+    op = payload.get("op")
+    raw = 0
+    if op in ("prepare_write_exclusive", "prepare_write_atomic", "replace_if_matches"):
+        expected = payload.get("expected")
+        raw = 0 if op == "replace_if_matches" and payload.get("_owned_postimage") is True else (expected.get("size") if isinstance(expected, dict) and isinstance(expected.get("size"), int) else MAX_READ)
+    elif op == "batch_atomic":
+        raw = MAX_BATCH_ROLLBACK
+    elif op in ("read", "read_prefix"):
+        raw = payload.get("max_read", MAX_READ) if isinstance(payload.get("max_read", MAX_READ), int) else MAX_READ
+    elif op == "read_batch":
+        raw = payload.get("max_total_bytes", 2 * 1024 * 1024) if isinstance(payload.get("max_total_bytes", 2 * 1024 * 1024), int) else MAX_BATCH_ROLLBACK
+    elif op == "batch":
+        raw = sum(response_size_bound(child) for child in payload.get("operations", []) if isinstance(child, dict))
+    if raw < 0 or raw > MAX_RESPONSE_OUTPUT:
+        raise LimitError("descriptor helper response exceeds its bounded output limit before mutation")
+    bound = raw * 2 + MAX_RESPONSE_OVERHEAD
+    if bound > MAX_RESPONSE_OUTPUT:
+        raise LimitError("descriptor helper response exceeds its bounded output limit before mutation")
+    return bound
+
+def preflight_response_size(payload):
+    response_size_bound(payload)
+
 def operation(payload):
     global AUTHORIZED_BATCH_IDS, CURRENT_ROOT_BINDING, LIVE_HELPER_SESSION_IDS
     helper_sessions = payload.get("_live_helper_session_ids", [])
@@ -3302,6 +3348,7 @@ def operation(payload):
     if not isinstance(root_digest, str) or len(root_digest) != 64:
         raise ValueError("root path identity is invalid")
     CURRENT_ROOT_BINDING = {"dev": payload["root_dev"], "ino": payload["root_ino"], "path_digest": root_digest}
+    preflight_response_size(payload)
     op = payload.get("op")
     path = payload.get("path", "")
     if op in ("prepare_write_exclusive", "prepare_write_atomic"):
@@ -3489,6 +3536,13 @@ def operation(payload):
             if parent is not None:
                 os.close(parent)
         return {"ok": True, "moved": moved}
+    if op == "hash":
+        parent, name = parent_for(root_fd, path, False)
+        try:
+            data, info = read_at(parent, name, MAX_WRITE)
+            return {"ok": True, "dev": info.st_dev, "ino": info.st_ino, "size": info.st_size, "sha256": hashlib.sha256(data).hexdigest()}
+        finally:
+            os.close(parent)
     if op == "read_prefix":
         parent, name = parent_for(root_fd, path, False)
         try:
@@ -3600,7 +3654,7 @@ def operation(payload):
         expected = payload.get("expected")
         if (not isinstance(expected, dict) or not isinstance(expected.get("dev"), int) or not isinstance(expected.get("ino"), int)
             or not isinstance(expected.get("sha256"), str)
-            or (expected.get("size") is not None and (not isinstance(expected.get("size"), int) or expected.get("size") < 0))):
+            or (expected.get("size") is not None and (not isinstance(expected.get("size"), int) or expected.get("size") < 0 or expected.get("size") > MAX_READ and payload.get("_owned_postimage") is not True))):
             raise ValueError("conditional expectation is invalid")
         operation_name = "replace" if op == "replace_if_matches" else "remove"
         desired = base64.b64decode(payload.get("bytes", ""), validate=True) if op == "replace_if_matches" else b""
@@ -3610,16 +3664,16 @@ def operation(payload):
         lease = None
         temp = None
         try:
-            lease, recovered, lock_name, stage_name = conditional_lock(parent, name, relative_path, expected, desired_sha, operation_name)
+            lease, recovered, lock_name, stage_name = conditional_lock(parent, name, relative_path, expected, desired_sha, operation_name, None, len(desired), payload.get("_owned_postimage") is True)
             if recovered:
                 if operation_name == "replace":
-                    recovered_data, recovered_info = read_at(parent, name)
+                    recovered_data, recovered_info = read_bounded_at(parent, name, len(desired))
                     if hashlib.sha256(recovered_data).hexdigest() != desired_sha:
                         raise RuntimeError("recovered conditional replacement has unexpected bytes")
-                    return {"ok": True, "recovered": True, "preimage": {"kind": "file", "dev": recovered_info.st_dev, "ino": recovered_info.st_ino, "size": len(recovered_data), "sha256": hashlib.sha256(recovered_data).hexdigest(), "bytes": base64.b64encode(recovered_data).decode("ascii")}, "dev": recovered_info.st_dev, "ino": recovered_info.st_ino, "size": len(recovered_data), "sha256": desired_sha}
+                    return {"ok": True, "recovered": True, "dev": recovered_info.st_dev, "ino": recovered_info.st_ino, "size": len(recovered_data), "sha256": desired_sha}
                 return {"ok": True, "recovered": True}
             conditional_crash(payload, "after_lock")
-            old_data, old_info = read_at(parent, name)
+            old_data, old_info = (read_owned_descriptor_at if payload.get("_owned_postimage") is True else read_descriptor_at)(parent, name, expected)
             if not same_identity(old_info, expected) or (expected.get("size") is not None and len(old_data) != expected.get("size")) or not same_digest(old_data, expected):
                 raise RuntimeError("anchored target changed before compare-and-swap")
             conditional_crash(payload, "after_verification")
@@ -3636,11 +3690,11 @@ def operation(payload):
                 # exchange and quarantines failed postimages for recovery.
                 temp = None
                 try:
-                    committed, descriptor = conditional_exchange_replace(parent, name, stage_name, expected, desired_sha, len(desired), payload.get("test_post_exchange_mutation") is True, payload.get("test_post_exchange_stage_mutation") is True, payload.get("test_pre_exchange_mutation") is True, payload.get("test_stage_pre_exchange_mutation") is True)
+                    committed, descriptor = conditional_exchange_replace(parent, name, stage_name, expected, desired_sha, len(desired), payload.get("test_post_exchange_mutation") is True, payload.get("test_post_exchange_stage_mutation") is True, payload.get("test_pre_exchange_mutation") is True, payload.get("test_stage_pre_exchange_mutation") is True, owned_expected=payload.get("_owned_postimage") is True)
                 except Exception:
                     raise
             else:
-                committed = conditional_move_remove(parent, name, stage_name, expected, relative_path, payload.get("test_post_exchange_stage_mutation") is True, payload.get("test_pre_move_mutation") is True, payload.get("test_pre_move_symlink") is True)
+                committed = conditional_move_remove(parent, name, stage_name, expected, relative_path, payload.get("test_post_exchange_stage_mutation") is True, payload.get("test_pre_move_mutation") is True, payload.get("test_pre_move_symlink") is True, payload.get("_owned_postimage") is True)
                 descriptor = None
             if not committed:
                 raise RuntimeError("anchored target changed before conditional commit")
@@ -3648,7 +3702,11 @@ def operation(payload):
             conditional_crash(payload, "before_cleanup")
             if operation_name == "replace" and descriptor is None:
                 raise RuntimeError("conditional replacement completed without an operation descriptor")
-            return {"ok": True, "preimage": {"kind": "file", "dev": old_info.st_dev, "ino": old_info.st_ino, "size": len(old_data), "sha256": hashlib.sha256(old_data).hexdigest(), "bytes": base64.b64encode(old_data).decode("ascii")}, **({"dev": descriptor.st_dev, "ino": descriptor.st_ino, "size": len(desired), "sha256": desired_sha} if descriptor is not None else {})}
+            if operation_name == "replace":
+                if payload.get("_owned_postimage") is True:
+                    return {"ok": True, **({"dev": descriptor.st_dev, "ino": descriptor.st_ino, "size": len(desired), "sha256": desired_sha} if descriptor is not None else {})}
+                return {"ok": True, "preimage": {"kind": "file", "dev": old_info.st_dev, "ino": old_info.st_ino, "size": len(old_data), "sha256": hashlib.sha256(old_data).hexdigest(), "bytes": base64.b64encode(old_data).decode("ascii")}, **({"dev": descriptor.st_dev, "ino": descriptor.st_ino, "size": len(desired), "sha256": desired_sha} if descriptor is not None else {})}
+            return {"ok": True}
         finally:
             cleanup_temp(parent, temp)
             if lease is not None:
@@ -3818,7 +3876,7 @@ def recover_missing_batch_residue(root_fd, journal_name, batch_id, entries):
 
                     raise RecoveryRequired("prepared batch orphan lease identity changed")
                 try:
-                    stage_data, stage_info = read_at(parent, stage_name)
+                    stage_data, stage_info = read_bounded_at(parent, stage_name, entry["size"])
                 except FileNotFoundError:
                     pass
                 except Exception as error:
@@ -3827,7 +3885,7 @@ def recover_missing_batch_residue(root_fd, journal_name, batch_id, entries):
                     if (not stat.S_ISREG(stage_info.st_mode)
                         or len(stage_data) != entry["size"] or hashlib.sha256(stage_data).hexdigest() != entry["sha256"]):
                         raise RecoveryRequired("prepared batch orphan stage is foreign")
-                    if not remove_exact_regular(parent, stage_name, {"dev": stage_info.st_dev, "ino": stage_info.st_ino, "size": len(stage_data), "sha256": entry["sha256"]}):
+                    if not remove_exact_regular(parent, stage_name, {"dev": stage_info.st_dev, "ino": stage_info.st_ino, "size": len(stage_data), "sha256": entry["sha256"]}, True):
                         raise RecoveryRequired("prepared batch orphan stage cleanup could not be proven")
                 lock_expected = {"dev": lock_info.st_dev, "ino": lock_info.st_ino, "size": len(lock_data), "sha256": hashlib.sha256(lock_data).hexdigest()}
                 if not remove_exact_regular(parent, lock_name, lock_expected):
@@ -3909,7 +3967,7 @@ def recover_partial_prepared_batch(root_fd, journal_name, batch_id):
             expected = owner_expected if isinstance(owner_expected, dict) else journal_expected
             postimage = owner_postimage if isinstance(owner_postimage, dict) else journal_postimage
             try:
-                stage_data, stage_info = read_at(parent, stage_name)
+                stage_data, stage_info = read_bounded_at(parent, stage_name, entry["size"])
             except FileNotFoundError:
                 if not isinstance(expected, dict) or not target_matches_preimage(parent, name, expected):
                     raise RecoveryRequired("prepared batch partial recovery prepared-prefix preimage is unavailable")
@@ -3926,7 +3984,7 @@ def recover_partial_prepared_batch(root_fd, journal_name, batch_id):
         for state in states:
             if state["lock_data"] is None:
                 continue
-            if state.get("remove_stage") and not remove_exact_regular(state["parent"], state["stage"], {"dev": state["stage_info"].st_dev, "ino": state["stage_info"].st_ino, "size": state["stage_size"], "sha256": state["stage_sha256"]}):
+            if state.get("remove_stage") and not remove_exact_regular(state["parent"], state["stage"], {"dev": state["stage_info"].st_dev, "ino": state["stage_info"].st_ino, "size": state["stage_size"], "sha256": state["stage_sha256"]}, True):
                 raise RecoveryRequired("prepared batch partial stage cleanup could not be proven")
             lock_data = state["lock_data"]
             lock_info = state["lock_info"]
@@ -3990,6 +4048,23 @@ def execute(payload):
         return fail("write_failed", str(exc))
 
 
+def open_fifo_verified(path, mode, flags, created):
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise NotImplementedError("FIFO no-follow operations are unavailable")
+    fd = os.open(path, flags | os.O_NOFOLLOW)
+    try:
+        observed = os.fstat(fd)
+        if (not stat.S_ISFIFO(observed.st_mode) or observed.st_dev != created.st_dev
+                or observed.st_ino != created.st_ino or stat.S_IMODE(observed.st_mode) != 0o600
+                or observed.st_uid != created.st_uid):
+            raise RuntimeError("persistent helper FIFO identity changed before descriptor wrapping")
+        stream = os.fdopen(fd, mode, buffering=0)
+        fd = None
+        return stream
+    finally:
+        if fd is not None:
+            os.close(fd)
+
 def main():
     request_fifo = os.environ.get("OMP_DARWIN_HELPER_REQUEST_FIFO")
     response_fifo = os.environ.get("OMP_DARWIN_HELPER_RESPONSE_FIFO")
@@ -4022,7 +4097,13 @@ def main():
         os.chmod(response_fifo, 0o600)
     except FileExistsError:
         raise RuntimeError("persistent helper FIFO already exists")
-    with open(request_fifo, "rb", buffering=0) as request_stream, open(response_fifo, "wb", buffering=0) as response_stream:
+    request_created = os.lstat(request_fifo)
+    response_created = os.lstat(response_fifo)
+    if (not stat.S_ISFIFO(request_created.st_mode) or not stat.S_ISFIFO(response_created.st_mode)
+            or stat.S_IMODE(request_created.st_mode) != 0o600 or stat.S_IMODE(response_created.st_mode) != 0o600
+            or request_created.st_uid != os.getuid() or response_created.st_uid != os.getuid()):
+        raise RuntimeError("persistent helper FIFO creation was not authenticated")
+    with open_fifo_verified(request_fifo, "rb", os.O_RDONLY, request_created) as request_stream, open_fifo_verified(response_fifo, "wb", os.O_WRONLY, response_created) as response_stream:
         ready_frame = (json.dumps(signed_frame({"ok": True, "ready": True, "_ready_nonce": ready_nonce, "_session_id": SESSION_ID}), separators=(",", ":")) + "\n").encode("utf-8")
         write_all(response_stream, ready_frame)
         replay_frame = None
@@ -4135,14 +4216,25 @@ return left + right;
 if (!Number.isSafeInteger(left) || left < 0 || !Number.isSafeInteger(right) || right < 0 || (left !== 0 && right > Math.floor(Number.MAX_SAFE_INTEGER / left))) return Number.MAX_SAFE_INTEGER;
 return left * right;
 }function darwinHelperReadResponseHint(operation: string, payload: Record<string, unknown>): number {
+let rawResponseBytes = 0;
 const maxRead = payload.max_read;
+if (operation === "prepare_write_exclusive" || operation === "prepare_write_atomic") {
+rawResponseBytes = MAX_PINNED_ROOT_READ_BYTES;
+} else if (operation === "replace_if_matches") {
+const expected = payload.expected;
+const expectedSize = expected && typeof expected === "object" && !Array.isArray(expected) ? (expected as Record<string, unknown>).size : undefined;
+rawResponseBytes = payload._owned_postimage === true ? 0 : (typeof expectedSize === "number" && Number.isSafeInteger(expectedSize) && expectedSize >= 0 ? expectedSize : MAX_PINNED_ROOT_READ_BYTES);
+} else if (operation === "batch_atomic") {
+rawResponseBytes = MAX_BATCH_ROLLBACK_BYTES;
+} else if (operation === "read" || operation === "read_prefix") {
 if (typeof maxRead !== "number" || !Number.isSafeInteger(maxRead) || maxRead <= 0) return 0;
-let rawResponseBytes = maxRead;
-if (operation === "read_batch") {
+rawResponseBytes = maxRead;
+} else if (operation === "read_batch") {
 const maxEntries = payload.max_entries;
 const maxNameBytes = payload.max_name_bytes;
 const maxTotalBytes = payload.max_total_bytes;
-if (typeof maxEntries !== "number" || !Number.isSafeInteger(maxEntries) || maxEntries <= 0
+if (typeof maxRead !== "number" || !Number.isSafeInteger(maxRead) || maxRead <= 0
+|| typeof maxEntries !== "number" || !Number.isSafeInteger(maxEntries) || maxEntries <= 0
 || typeof maxNameBytes !== "number" || !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0
 || typeof maxTotalBytes !== "number" || !Number.isSafeInteger(maxTotalBytes) || maxTotalBytes <= 0) return 0;
 const names = Array.isArray(payload.names) ? payload.names.length : maxEntries;
@@ -4152,14 +4244,21 @@ rawResponseBytes = darwinHelperSaturatingAdd(
  darwinHelperSaturatingAdd(boundedDataBytes, maxNameBytes),
  darwinHelperSaturatingMultiply(maxEntries, 128),
 );
-} else if (operation !== "read" && operation !== "read_prefix") return 0;
-return darwinHelperSaturatingAdd(darwinHelperSaturatingMultiply(rawResponseBytes, 6), DARWIN_HELPER_READ_RESPONSE_ENVELOPE_BYTES);
+} else if (operation === "batch" && Array.isArray(payload.operations)) {
+rawResponseBytes = payload.operations.reduce((total, child) => total + darwinHelperReadResponseHint(
+ typeof child === "object" && child !== null && typeof (child as Record<string, unknown>).op === "string" ? String((child as Record<string, unknown>).op) : "",
+ typeof child === "object" && child !== null ? child as Record<string, unknown> : {},
+), 0);
+} else {
+return 0;
+}
+return darwinHelperSaturatingAdd(darwinHelperSaturatingMultiply(rawResponseBytes, 2), DARWIN_HELPER_READ_RESPONSE_ENVELOPE_BYTES);
+}function darwinHelperTransferAllowance(operation: string, bytes: number): number {
+if (!DARWIN_HELPER_TRANSFER_OPERATIONS.has(operation) || bytes <= DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) return 0;
+const transferMs = Math.ceil((bytes - DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) / DARWIN_HELPER_TRANSFER_BYTES_PER_MS) + 500;
+return Math.min(DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS, transferMs);
 }function darwinHelperTransferTimeout(operation: string, baseTimeoutMs: number, requestBytes: number, responseBytes = 0): number {
-if (!DARWIN_HELPER_TRANSFER_OPERATIONS.has(operation)) return baseTimeoutMs;
-const effectiveBytes = Math.max(requestBytes, responseBytes);
-if (effectiveBytes <= DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) return baseTimeoutMs;
-const transferMs = Math.ceil((effectiveBytes - DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES) / DARWIN_HELPER_TRANSFER_BYTES_PER_MS) + 500;
-return baseTimeoutMs + Math.min(DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS, transferMs);}function errnoCode(error: unknown): string | undefined {
+return baseTimeoutMs + Math.max(darwinHelperTransferAllowance(operation, requestBytes), darwinHelperTransferAllowance(operation, responseBytes));}function errnoCode(error: unknown): string | undefined {
 return error && typeof error === "object" && "code" in error
 ? String((error as NodeJS.ErrnoException).code)
 : undefined;}function assertDarwinFifoDescriptor(fd: number, expected: Stats, label: string): void {
@@ -4193,13 +4292,29 @@ for (let index = 0; index < value.length; index += 1) {
 const code = value.charCodeAt(index);
 if (code >= 0xd800 && code <= 0xdbff) {
 const next = value.charCodeAt(index + 1);
-if (next < 0xdc00 || next > 0xdfff) return false;
+if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) return false;
 index += 1;
 } else if (code >= 0xdc00 && code <= 0xdfff) {
 return false;
 }
 }
-return true;}function contentByteLength(content: PinnedRootWriteContent): number {
+return true;}function assertWellFormedUtf16(value: unknown, seen = new WeakSet<object>()): void {
+if (typeof value === "string") {
+if (!isWellFormedUtf16(value)) throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
+return;
+}
+if (value === null || typeof value !== "object" || seen.has(value)) return;
+seen.add(value);
+if (Array.isArray(value)) {
+for (const item of value) assertWellFormedUtf16(item, seen);
+return;
+}
+const record = value as Record<string, unknown>;
+for (const key of Object.keys(record)) {
+if (!isWellFormedUtf16(key)) throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
+assertWellFormedUtf16(record[key], seen);
+}
+}function contentByteLength(content: PinnedRootWriteContent): number {
 if (typeof content === "string" && !isWellFormedUtf16(content)) {
 throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
 }
@@ -4254,23 +4369,26 @@ sha256,
 const raw = response.preimage;
 if (!raw || typeof raw !== "object") throw new PinnedRootError("write_failed", "prepared write returned no exact preimage");
 const record = raw as Record<string, unknown>;
+const recordSize = record.size;
 if (record.kind === "absent") return { kind: "absent" };
 if (record.kind !== "file" || typeof record.bytes !== "string"
 || !Number.isSafeInteger(record.dev) || (record.dev as number) < 0
 || !Number.isSafeInteger(record.ino) || (record.ino as number) < 0
-|| !Number.isSafeInteger(record.size) || (record.size as number) < 0
+|| typeof recordSize !== "number" || !Number.isSafeInteger(recordSize) || recordSize < 0
 || typeof record.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(record.sha256)) {
 throw new PinnedRootError("write_failed", "prepared write returned an invalid exact preimage");
 }
+if (recordSize > MAX_PINNED_ROOT_READ_BYTES) throw new PinnedRootError("limit", "prepared write preimage exceeds the bounded read limit");
 let bytes: Buffer;
 try { bytes = Buffer.from(record.bytes, "base64"); } catch { throw new PinnedRootError("write_failed", "prepared write returned invalid preimage bytes"); }
-if (bytes.byteLength !== record.size || createHash("sha256").update(bytes).digest("hex") !== record.sha256) {
+if (bytes.byteLength > MAX_PINNED_ROOT_READ_BYTES) throw new PinnedRootError("limit", "prepared write preimage exceeds the bounded read limit");
+if (bytes.byteLength !== recordSize || createHash("sha256").update(bytes).digest("hex") !== record.sha256) {
 throw new PinnedRootError("write_failed", "prepared write returned an inconsistent exact preimage");
 }
 return {
 kind: "file",
 bytes,
-expectation: { dev: record.dev as number, ino: record.ino as number, size: record.size as number, sha256: record.sha256 },
+expectation: { dev: record.dev as number, ino: record.ino as number, size: recordSize, sha256: record.sha256 },
 };}function safeRelativeSegments(value: unknown, allowEmpty = false): string[] {
 if (typeof value !== "string") throw new PinnedRootError("path_unauthorized", "anchored path must be a string");
 if (value.length > MAX_RELATIVE_PATH_LENGTH || value.includes("\\") || value.includes("\0") || isAbsolute(value) || /^[A-Za-z]:/u.test(value)) {
@@ -5757,12 +5875,13 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_
 }
 }
 }
-private readDarwinFrame(session: DarwinHelperSession, deadline: number, operation: string, tolerateInitialEof = false): string {
+private readDarwinFrame(session: DarwinHelperSession, deadline: number, operation: string, tolerateInitialEof = false, transferAllowanceMs = 0, hardDeadline = deadline): string {
 const chunk = Buffer.allocUnsafe(64 * 1024);
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const textParts: string[] = [];
 let total = 0;
-while (Date.now() <= deadline) {
+let transferStarted = false;
+while (Date.now() <= Math.min(hardDeadline, deadline + (transferStarted ? transferAllowanceMs : 0))) {
 try {
 const read = readSync(session.responseFd, chunk, 0, chunk.byteLength, null);
 if (read === 0) {
@@ -5772,12 +5891,13 @@ continue;
 }
 throw new PinnedRootError("unsupported", "descriptor helper response channel closed");
 }
+transferStarted = true;
 const bytes = chunk.subarray(0, read);
 total += read;
 if (total > DARWIN_HELPER_MAX_OUTPUT) throw new PinnedRootError("limit", "descriptor helper response exceeds its bounded output limit");
 const newline = bytes.indexOf(0x0a);
 if (newline >= 0) {
-if (newline !== read - 1) throw new PinnedRootError("unsupported", `descriptor helper '${operation}' returned trailing frame bytes`);
+if (newline !== read - 1) throw new PinnedRootError("unsupported", "descriptor helper '" + operation + "' returned trailing frame bytes");
 textParts.push(decodeDarwinHelperUtf8(decoder, bytes.subarray(0, newline), false, operation));
 return textParts.join("");
 }
@@ -5787,10 +5907,12 @@ if (errnoCode(error) !== "EAGAIN" && errnoCode(error) !== "EWOULDBLOCK") throw e
 }
 Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, DARWIN_HELPER_POLL_MS);
 }
-throw new PinnedRootError("unsupported", `descriptor helper '${operation}' timed out`);
+throw new PinnedRootError("unsupported", "descriptor helper '" + operation + "' timed out");
 }
 private requestDarwinHelper<T extends Record<string, unknown>>(executable: string, operation: string, payload: Record<string, unknown>, timeoutMs: number): T {
 if (this.darwinHelperPoisoned) throw new PinnedRootError("unsupported", "descriptor helper is poisoned after a failed operation");
+const totalStartedAt = Date.now();
+const serializationDeadline = totalStartedAt + DARWIN_HELPER_SERIALIZATION_TIMEOUT_MS;
 const requestId = randomUUID();
 const requestPayload: Record<string, unknown> = { ...payload, op: operation, root_dev: this.dev, root_ino: this.ino, _root_path_digest: this.rootPathDigest, _request_id: requestId };
 if (this.hooks.helperSleepMs !== undefined) requestPayload.test_sleep_ms = this.hooks.helperSleepMs;
@@ -5799,21 +5921,31 @@ const liveBatchIds = LIVE_DARWIN_BATCH_IDS.get(this.rootPathDigest);
 if (liveBatchIds && liveBatchIds.size > 0) requestPayload._live_batch_ids = [...liveBatchIds];
 const liveHelperSessionIds = liveDarwinHelperSessionIds(this.rootPathDigest);
 if (liveHelperSessionIds.length > 0) requestPayload._live_helper_session_ids = liveHelperSessionIds;
-const unsignedRequest = Buffer.from(JSON.stringify(requestPayload) + "\n", "utf8");
-if (unsignedRequest.byteLength > DARWIN_HELPER_MAX_INPUT) throw new PinnedRootError("limit", `descriptor helper '' request exceeds the bounded input limit`);
-const transferTimeoutMs = darwinHelperTransferTimeout(operation, timeoutMs, unsignedRequest.byteLength, darwinHelperReadResponseHint(operation, payload));
-const transferMarginMs = transferTimeoutMs > timeoutMs ? DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS : 0;
-const operationDeadline = Date.now() + transferTimeoutMs + transferMarginMs + DARWIN_HELPER_START_TIMEOUT_MS;
+assertWellFormedUtf16(requestPayload);
+if (Date.now() > serializationDeadline) throw new PinnedRootError("unsupported", "descriptor helper request serialization timed out");
+const unsignedRequest = Buffer.from(JSON.stringify(requestPayload, (key, nested) => {
+if (!isWellFormedUtf16(key) || (typeof nested === "string" && !isWellFormedUtf16(nested))) throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
+return nested;
+}) + "\n", "utf8");
+if (unsignedRequest.byteLength > DARWIN_HELPER_MAX_INPUT) throw new PinnedRootError("limit", "descriptor helper " + operation + " request exceeds the bounded input limit");
+if (Date.now() > serializationDeadline) throw new PinnedRootError("unsupported", "descriptor helper request serialization timed out");
+const responseBytes = darwinHelperReadResponseHint(operation, payload);
+if (responseBytes > DARWIN_HELPER_MAX_OUTPUT) throw new PinnedRootError("limit", "descriptor helper possible response exceeds the bounded output limit");
+const initialTransferTimeoutMs = darwinHelperTransferTimeout(operation, timeoutMs, unsignedRequest.byteLength, responseBytes);
+const initialTransferMarginMs = initialTransferTimeoutMs > timeoutMs ? DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS : 0;
+const totalDeadline = totalStartedAt + DARWIN_HELPER_SERIALIZATION_TIMEOUT_MS + initialTransferTimeoutMs + initialTransferMarginMs + DARWIN_HELPER_START_TIMEOUT_MS;
+const startupDeadline = totalDeadline;
+let operationDeadline = totalDeadline;
 if (!this.darwinHelperSession) {
 try {
-this.darwinHelperSession = this.startDarwinHelper(executable, operationDeadline);
+this.darwinHelperSession = this.startDarwinHelper(executable, startupDeadline);
 } catch (error) {
 this.darwinHelperPoisoned = true;
 throw error;
 }
 }
 const session = this.darwinHelperSession;
-if (session.runtimeError || session.exited || Date.now() > operationDeadline) {
+if (session.runtimeError || session.exited || Date.now() > totalDeadline) {
 this.poisonDarwinHelper();
 throw new PinnedRootError("unsupported", "descriptor helper failed before request dispatch");
 }
@@ -5823,14 +5955,26 @@ const authorizedHelperSessionIds = new Set(liveDarwinHelperSessionIds(this.rootP
 authorizedHelperSessionIds.add(session.sessionId);
 requestPayload._live_helper_session_ids = [...authorizedHelperSessionIds];
 requestPayload._nonce = ++session.nonce;
+if (Date.now() > totalDeadline) { this.poisonDarwinHelper(); throw new PinnedRootError("unsupported", "descriptor helper request deadline expired"); }
 requestPayload._mac = darwinHelperMac(requestPayload, session.authKey);
-const request = Buffer.from(JSON.stringify(requestPayload) + "\n", "utf8");
-if (request.byteLength > DARWIN_HELPER_MAX_INPUT) throw new PinnedRootError("limit", `descriptor helper '' request exceeds the bounded input limit`);
-const requestDeadline = Math.min(operationDeadline, Date.now() + transferTimeoutMs + transferMarginMs);
+const request = Buffer.from(JSON.stringify(requestPayload, (key, nested) => {
+if (!isWellFormedUtf16(key) || (typeof nested === "string" && !isWellFormedUtf16(nested))) throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
+return nested;
+}) + "\n", "utf8");
+if (request.byteLength > DARWIN_HELPER_MAX_INPUT) throw new PinnedRootError("limit", "descriptor helper " + operation + " request exceeds the bounded input limit");
+if (Date.now() > totalDeadline) { this.poisonDarwinHelper(); throw new PinnedRootError("unsupported", "descriptor helper request serialization timed out"); }
+const transferTimeoutMs = darwinHelperTransferTimeout(operation, timeoutMs, request.byteLength, responseBytes);
+const requestTransferAllowanceMs = darwinHelperTransferAllowance(operation, request.byteLength);
+const responseTransferAllowanceMs = darwinHelperTransferAllowance(operation, responseBytes);
+const requestMarginMs = requestTransferAllowanceMs > 0 ? DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS : 0;
+const operationStartedAt = Date.now();
+const requestDeadline = Math.min(totalDeadline, operationStartedAt + timeoutMs + requestTransferAllowanceMs + requestMarginMs);
+operationDeadline = Math.min(totalDeadline, operationStartedAt + timeoutMs);
 let responseReceived = false;
 try {
 this.writeDarwinFrame(session, request, requestDeadline, operation);
-const output = this.readDarwinFrame(session, requestDeadline, operation);
+operationDeadline = Math.min(totalDeadline, Date.now() + timeoutMs);
+const output = this.readDarwinFrame(session, operationDeadline, operation, false, responseTransferAllowanceMs, totalDeadline);
 let result: unknown;
 try { result = JSON.parse(output); } catch (error) { throw new PinnedRootError("unsupported", `descriptor helper returned invalid output: ${String(error)}`); }
 if (!result || typeof result !== "object") throw new PinnedRootError("unsupported", "descriptor helper returned an invalid result");
@@ -5926,6 +6070,13 @@ this.darwinHelperPoisoned = false;
 }
 private publishedDescriptorMatches(relativeFile: string, descriptor: PinnedRootWriteDescriptor): boolean {
 try {
+if (descriptor.size > MAX_PINNED_ROOT_READ_BYTES) {
+const observed = this.runDescriptorHelper<{ dev: number; ino: number; size: number; sha256: string }>("hash", { path: relativeFile });
+return observed.dev === descriptor.dev
+&& observed.ino === descriptor.ino
+&& observed.size === descriptor.size
+&& observed.sha256 === descriptor.sha256;
+}
 const observed = this.readFile(relativeFile, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
 return observed.dev === descriptor.dev
 && observed.ino === descriptor.ino
@@ -6220,6 +6371,7 @@ try { this.hooks.beforeCleanup?.(entry.path); } catch { /* preserve primary resu
 private runDescriptorHelper<T extends Record<string, unknown>>(operation: string, payload: Record<string, unknown> = {}): T {
 this.assertOpen();
 assertCurrentExecutionLiveness();
+assertWellFormedUtf16(payload);
 if (this.hooks.disableDarwinHelper) throw new PinnedRootError("unsupported", "descriptor helper is disabled");
 let executable: string | null = this.hooks.helperExecutable ?? null;
 for (const candidate of DARWIN_PYTHON_CANDIDATES) {
@@ -6227,9 +6379,6 @@ if (executable !== null) break;
 try { accessSync(candidate, constants.X_OK); executable = candidate; break; } catch { /* try next interpreter */ }
 }
 if (executable === null) throw new PinnedRootError("unsupported", "descriptor helper is unavailable");
-if (typeof payload.text === "string" && !isWellFormedUtf16(payload.text)) {
-throw new PinnedRootError("invalid", "anchored write text payload is not valid UTF-8");
-}
 const timeoutMs = this.hooks.helperTimeoutMs ?? DARWIN_HELPER_TIMEOUT_MS;
 if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > DARWIN_HELPER_TIMEOUT_MS) {
 throw new PinnedRootError("invalid", `descriptor helper '${operation}' timeout is invalid`);
@@ -6869,7 +7018,7 @@ throw error;
 }
 private assertExpectation(expected: PinnedRootFileExpectation): void {
 if (!expected || !Number.isSafeInteger(expected.dev) || !Number.isSafeInteger(expected.ino)
-|| (expected.size !== undefined && (!Number.isSafeInteger(expected.size) || expected.size < 0))
+|| (expected.size !== undefined && (!Number.isSafeInteger(expected.size) || expected.size < 0 || expected.size > MAX_PINNED_ROOT_READ_BYTES))
 || typeof expected.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(expected.sha256)) {
 throw new PinnedRootError("invalid", "conditional file expectation is invalid");
 }
@@ -6938,6 +7087,7 @@ const operation = preimage.kind === "absent" ? "remove_if_matches" : "replace_if
 const result = this.runDescriptorHelper<PinnedWriteDescriptorResponse>(operation, {
 path: relativeFile,
 expected,
+_owned_postimage: true,
 ...(preimage.kind === "file" ? { bytes: contentToBase64(preimage.bytes) } : {}),
 });
 if (result.ok === true) return true;

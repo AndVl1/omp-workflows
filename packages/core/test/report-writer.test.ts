@@ -22,8 +22,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-import { drainDarwinHelperClosePromisesForTesting, PinnedProjectRoot } from "../src/specification/pinned-root.js";
-import { MAX_REPORT_HTML_BYTES, ReportHtmlLimitError, writeReport, writeReportPinned } from "../src/report/assemble.js";
+import { drainDarwinHelperClosePromisesForTesting, PinnedProjectRoot, PinnedRootError } from "../src/specification/pinned-root.js";
+import { MAX_REPORT_HTML_BYTES, ReportHtmlLimitError, ReportWriteRecoveryError, writeReport, writeReportPinned } from "../src/report/assemble.js";
 import { redactText, redactReportBody, DEFAULT_REDACTION_CONFIG } from "../src/report/redact.js";
 
 // Standalone report writers close Darwin helpers asynchronously; drain them
@@ -147,10 +147,39 @@ test("writeAtomic text transport preserves UTF-8 controls and rejects ambiguous 
 
     const invalidTarget = ".work-state/features/text/invalid.html";
     assert.throws(
-      () => helper.runDescriptorHelper("write_atomic", { path: invalidTarget, text: "invalid-" + String.fromCharCode(0xd800) }),
-      /not valid UTF-8/u,
+      () => pin.writeAtomic(invalidTarget, "invalid-" + String.fromCharCode(0xd800)),
+      (error: unknown) => error instanceof PinnedRootError && error.code === "invalid" && /not valid UTF-8/u.test(error.message),
     );
     assert.equal(existsSync(join(cwd, invalidTarget)), false, "invalid UTF-8 must fail before creating a target");
+
+    const nestedInvalidTarget = ".work-state/features/text/nested-invalid.html";
+    assert.throws(
+      () => helper.runDescriptorHelper("batch", {
+        operations: [{ op: "write_atomic", path: nestedInvalidTarget, text: "nested-" + String.fromCharCode(0xd800) }],
+      }),
+      (error: unknown) => error instanceof PinnedRootError && error.code === "invalid" && /not valid UTF-8/u.test(error.message),
+    );
+    assert.equal(existsSync(join(cwd, nestedInvalidTarget)), false, "nested invalid UTF-8 must fail before creating a target");
+  } finally {
+    pin.close();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("writeAtomic: large authenticated requests retain the helper watchdog", { skip: process.platform !== "darwin" }, () => {
+  const cwd = tmpWorkspace();
+  const target = ".work-state/features/large/timeout.html";
+  const html = "<html>" + "界".repeat(Math.floor((2 * 1024 * 1024) / 3)) + "</html>";
+  const pin = PinnedProjectRoot.open(cwd, { helperSleepMs: 60_000, helperTimeoutMs: 50 });
+  assert.ok(pin);
+  const started = Date.now();
+  try {
+    assert.throws(
+      () => pin.writeAtomic(target, html),
+      (error: unknown) => error instanceof PinnedRootError && error.code === "unsupported",
+    );
+    assert.ok(Date.now() - started < 10_000, "large request must not grant the sleeping helper an unbounded response window");
+    assert.equal(existsSync(join(cwd, target)), false, "timed-out large request must not publish a target");
   } finally {
     pin.close();
     rmSync(cwd, { recursive: true, force: true });
@@ -314,6 +343,108 @@ test("writeReportPinned: root and ancestor swaps after containment fail before r
     ancestorPin.close();
     if (ancestorDisplaced !== null) restoreDirectory(container, ancestorDisplaced);
     rmSync(container, { recursive: true, force: true });
+  }
+});
+
+test("writeReportPinned: rolls back a large publication after root swap", () => {
+  const root = tmpWorkspace();
+  const replacement = tmpWorkspace();
+  const moved = root + ".moved";
+  const target = ".work-state/features/large/report.html";
+  mkdirSync(join(root, dirname(target)), { recursive: true });
+  writeFileSync(join(root, target), "original report\n", "utf8");
+  const html = "<html>" + "界".repeat(Math.floor((13 * 1024 * 1024 - 13) / 3)) + "</html>";
+  let swapped = false;
+  const pin = PinnedProjectRoot.open(root, {
+    beforeCleanup: (relativePath) => {
+      if (swapped || relativePath !== target) return;
+      swapped = true;
+      renameSync(root, moved);
+      renameSync(replacement, root);
+    },
+  });
+  assert.ok(pin);
+  try {
+    assert.throws(
+      () => writeReportPinned(root, target, html, pin),
+      /report could not be written safely/u,
+    );
+    assert.equal(swapped, true, "root replacement seam must run after large publication");
+    assert.equal(existsSync(join(moved, target)), true, "small original preimage must remain in the detached root");
+    assert.equal(readFileSync(join(moved, target), "utf8"), "original report\n", "small original preimage must be restored in the detached root");
+    assert.equal(existsSync(join(root, target)), false, "replacement root must remain untouched");
+  } finally {
+    pin.close();
+    rmSync(moved, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+    rmSync(replacement, { recursive: true, force: true });
+  }
+});
+
+test("writeReportPinned: retains the exact receipt across a post-write root swap", () => {
+  const root = tmpWorkspace();
+  const replacement = tmpWorkspace();
+  const moved = root + ".moved";
+  const pin = PinnedProjectRoot.open(root);
+  assert.ok(pin);
+  let swapped = false;
+  const original = pin.writeAtomicWithReceipt.bind(pin);
+  const seam = pin as unknown as { writeAtomicWithReceipt: (path: string, content: string) => { rollback: () => boolean } };
+  seam.writeAtomicWithReceipt = (path, content) => {
+    const receipt = original(path, content);
+    renameSync(root, moved);
+    renameSync(replacement, root);
+    swapped = true;
+    return receipt;
+  };
+  try {
+    assert.throws(
+      () => writeReportPinned(root, ".work-state/features/post-write/report.html", "post-write", pin),
+      /project boundary changed during write/u,
+    );
+    assert.equal(swapped, true, "the post-write seam must run after receipt creation");
+    assert.equal(existsSync(join(moved, ".work-state/features/post-write/report.html")), false, "receipt rollback removes only the owned detached postimage");
+    assert.equal(existsSync(join(root, ".work-state/features/post-write/report.html")), false, "replacement root stays untouched");
+  } finally {
+    pin.close();
+    rmSync(moved, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+    rmSync(replacement, { recursive: true, force: true });
+  }
+});
+
+test("writeReportPinned: reports recovery when a foreign winner blocks receipt rollback", () => {
+  const root = tmpWorkspace();
+  const replacement = tmpWorkspace();
+  const moved = root + ".moved";
+  const target = ".work-state/features/recovery/report.html";
+  const pin = PinnedProjectRoot.open(root);
+  assert.ok(pin);
+  const original = pin.writeAtomicWithReceipt.bind(pin);
+  const seam = pin as unknown as { writeAtomicWithReceipt: (path: string, content: string) => { rollback: () => boolean } };
+  seam.writeAtomicWithReceipt = (path, content) => {
+    const receipt = original(path, content);
+    renameSync(root, moved);
+    renameSync(replacement, root);
+    writeFileSync(join(moved, path), "foreign winner\n", "utf8");
+    return receipt;
+  };
+  try {
+    assert.throws(
+      () => writeReportPinned(root, target, "published report", pin),
+      (error: unknown) => error instanceof ReportWriteRecoveryError
+        && error.code === "REPORT_WRITE_RECOVERY_REQUIRED"
+        && /recovery is required; exact rollback was not proven/u.test(error.message)
+        && error.cause instanceof Error
+        && error.cause.message === "writeReport: project boundary changed during write",
+    );
+    assert.equal(readFileSync(join(moved, target), "utf8"), "foreign winner\n", "foreign winner must remain untouched when rollback is unprovable");
+    assert.equal(existsSync(join(root, target)), false, "replacement root must remain untouched");
+  } finally {
+    pin.close();
+    rmSync(moved, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+    rmSync(replacement, { recursive: true, force: true });
   }
 });
 

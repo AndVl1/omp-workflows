@@ -27,7 +27,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { PinnedProjectRoot, PinnedRootError } from "../specification/pinned-root.js";
+import { PinnedProjectRoot, PinnedRootError, type PinnedRootWriteReceipt } from "../specification/pinned-root.js";
 
 import { isSafeStateSegment } from "../engine/state.js";
 import { loadProfile } from "../engine/profile.js";
@@ -109,6 +109,16 @@ export class ReportHtmlLimitError extends Error {
     );
     this.name = "ReportHtmlLimitError";
     this.byteLength = byteLength;
+  }
+}
+
+/** Typed fail-closed error when a published report cannot be rolled back exactly. */
+export class ReportWriteRecoveryError extends Error {
+  readonly code = "REPORT_WRITE_RECOVERY_REQUIRED" as const;
+
+  constructor(options?: { cause?: unknown }) {
+    super("writeReport: report publication recovery is required; exact rollback was not proven", options);
+    this.name = "ReportWriteRecoveryError";
   }
 }
 
@@ -1209,13 +1219,23 @@ export function writeReportPinned(
       throw new Error("writeReport: project boundary changed during write");
     }
   };
+  let receipt: PinnedRootWriteReceipt | null = null;
   try {
     ensureStable();
     pin.ensureDirectory(parentRelative);
     ensureStable();
-    pin.writeAtomic(targetRelative, html);
+    receipt = pin.writeAtomicWithReceipt(targetRelative, html);
     ensureStable();
   } catch (error) {
+    if (receipt !== null) {
+      let rollbackProven = false;
+      try {
+        rollbackProven = receipt.rollback();
+      } catch {
+        // The published target remains unresolved; surface recovery below.
+      }
+      if (!rollbackProven) throw new ReportWriteRecoveryError({ cause: error });
+    }
     if (error instanceof Error && (
       error.message.startsWith("writeReport:")
       || (error instanceof PinnedRootError && error.code === "invalid" && /not valid UTF-8/u.test(error.message))
