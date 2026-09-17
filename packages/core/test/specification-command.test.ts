@@ -19,7 +19,7 @@ import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mappin
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { prepareWorkflowState, seedSpecificationImportWorkflowState } from "../src/engine/run.js";
-import { advanceCursor, beginCapability, commitCheckpointAnswerSelected, finalizeImportedHandoff, validateCheckpointAskSelected } from "../src/engine/durable.js";
+import { advanceCursor, beginCapability, finalizeImportedHandoff, issueCurrentTrustedMappingProof } from "../src/engine/durable.js";
 import { resolveSpecificationLanguage } from "../src/specification/language.js";
 import { resolveSpecificationTemplateSet, SHIPPED_SPECIFICATION_TEMPLATE_IDS, shippedSpecificationTemplateDir } from "../src/specification/templates.js";
 import { createFeatureWorkspace, persistFeatureWorkspace, resolveFeatureWorkspace } from "../src/specification/workspace.js";
@@ -156,6 +156,37 @@ function mountedWorkflowParameters(name: string): { safeParse: (input: unknown) 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+}
+async function executeMountedSelectedAsk(
+  root: string,
+  tools: Map<string, { execute: (...args: unknown[]) => Promise<{ details: Record<string, unknown> }> }>,
+  input: Record<string, unknown>,
+  decision: "approve_continue" | "request_changes" | "approve_stop",
+): Promise<Record<string, unknown>> {
+  const ask = tools.get("workflow_checkpoint_ask_selected");
+  assert.ok(ask, "selected Ask tool must be mounted");
+  if (!ask) throw new Error("selected Ask tool is unavailable");
+  const response = await ask.execute("specification-command-mounted-ask", input, undefined, undefined, {
+    ...TEST_CONTEXT(root),
+    ui: {
+      askDialog: async (questions: Array<{ id: string; question: string; header?: string; options: Array<{ label: string }>; multi?: boolean }>) => {
+        const question = questions[0];
+        if (!question) return undefined;
+        return {
+          kind: "submit" as const,
+          results: [{
+            id: question.id,
+            question: question.question,
+            header: question.header,
+            options: question.options.map((option) => option.label),
+            multi: false,
+            selectedOptions: [decision],
+          }],
+        };
+      },
+    },
+  });
+  return response.details;
 }
 function ensureCrossProviderRecognizer(root: string): void {
   writeTestRegistryMarker(root);
@@ -792,7 +823,7 @@ test("workflow instructions exposes the composite native preparation descriptor"
     assert.ok(workerSchema, "native instructions expose the canonical worker output schema");
     assert.equal(workerSchema.properties.tasks.items.properties.affected_scope.type, "array");
     assert.equal(workerSchema.properties.verification.items.properties.observable_behavior.type, "boolean");
-    assert.equal(workerSchema.properties.constitution_principles.items.properties.binding.type, "object");
+    assert.equal(workerSchema.properties.constitution_principles.items.properties.evidence.type, "string");
     const workerName = details.worker_name;
     assert.equal(workerName, "<COPY workflow_start_native_specification_phase.worker_name VERBATIM>");
     assert.equal((details.stage as { instructions?: unknown }).instructions, undefined, "native stage must not duplicate the general instructions contract");
@@ -1843,6 +1874,7 @@ test("an unresolved prerequisite routes phase entry through the canonical consti
 
 test("spec-import ready output keeps imported mapping inert and exposes one canonical approval checkpoint", async () => {
   const root = makeProject();
+  let pinnedRoot: PinnedProjectRoot | null = null;
   try {
     writeUsableConstitution(root);
     writeFileSync(
@@ -1911,6 +1943,9 @@ test("spec-import ready output keeps imported mapping inert and exposes one cano
     });
     const artifactsDir = join(root, ".work-state", "features", "checkout", "artifacts");
     assert.deepEqual(readdirSync(artifactsDir).filter(name => !name.startsWith(".")).sort(), ["compatibility_report.json", "import_snapshot.json"]);
+    pinnedRoot = PinnedProjectRoot.open(root);
+    assert.ok(pinnedRoot, "import preparation replay root must be pinnable");
+    if (!pinnedRoot) return;
     const prepared = prepareWorkflowState({
       task: "Read-only external specification compatibility validation",
       cwd: root,
@@ -1919,6 +1954,7 @@ test("spec-import ready output keeps imported mapping inert and exposes one cano
       classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-preparation" },
       feature_id: "checkout",
       run_key: persisted.run_key as string,
+      pinnedRoot,
     });
     assert.equal(prepared.state.stage_cursor, "compatibility_approval");
     assert.deepEqual(prepared.state.stages.slice(0, 3).map(stage => stage.status), ["done", "done", "done"]);
@@ -1930,6 +1966,7 @@ test("spec-import ready output keeps imported mapping inert and exposes one cano
       classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-preparation" },
       feature_id: "checkout",
       run_key: persisted.run_key as string,
+      pinnedRoot,
     });
     assert.equal(replayed.state.stage_cursor, "compatibility_approval");
     assert.deepEqual(replayed.state.stages, prepared.state.stages);
@@ -1948,8 +1985,10 @@ test("spec-import ready output keeps imported mapping inert and exposes one cano
       classification: { type: "SPEC", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "spec-preparation" },
       feature_id: "checkout",
       run_key: persisted.run_key as string,
+      pinnedRoot,
     }), /seed|artifact|compatibility/i, "tampered compatibility artifact must not reopen the imported workflow");
   } finally {
+    pinnedRoot?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -2460,7 +2499,7 @@ test("migrated selected Ask persists exact identity before the legacy approve_st
   try {
     writeUsableConstitution(root);
     writeTestRegistryMarker(root);
-    registerTestConstitutionGate(root, "spec-command-migrated-selected-stop");
+    registerTestConstitutionGate(root, "core-test-workflow-tools");
     mkdirSync(join(root, ".omp"), { recursive: true });
     writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { "specification-analyst": "specification-worker", "specification-architect": "specification-worker", validator: "validator" } }) + "\n", "utf8");
     const mappingConfig = resolveConfig(root);
@@ -2506,18 +2545,32 @@ test("migrated selected Ask persists exact identity before the legacy approve_st
     const askEnd = out.indexOf("\n" + String.fromCharCode(96, 96, 96), askStart);
     assert.ok(askStart > askMarker && askEnd > askStart);
     const ask = JSON.parse(out.slice(askStart, askEnd)) as Record<string, unknown>;
-    const preflight = validateCheckpointAskSelected(root, ask as never);
-    assert.equal(preflight.ok, true, preflight.ok ? "" : preflight.error);
-    const committed = commitCheckpointAnswerSelected(root, { ...ask, decision: "approve_stop" } as never, { apply_decision: true });
-    assert.equal(committed.ok, true, committed.ok ? "" : committed.error);
-    if (!committed.ok) return;
-    const persisted = committed.state.typed_checkpoint_decisions?.at(-1);
+    const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ details: Record<string, unknown> }> }>();
+    registerTestWorkflowTools(root, {
+      zod: { z: zod },
+      on: testWorkflowOn(root),
+      registerTool(tool: unknown) {
+        const mounted = tool as { name: string; execute: (...args: unknown[]) => Promise<{ details: Record<string, unknown> }> };
+        tools.set(mounted.name, mounted);
+      },
+    } as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd: string }).cwd });
+    const selected = await executeMountedSelectedAsk(root, tools, ask, "approve_stop");
+    assert.equal(selected.ok, true, selected.ok ? "" : String(selected.error));
+    if (selected.ok !== true) return;
+    assert.equal(selected.decision, "approve_stop");
+    const persistedState = JSON.parse(stateBytes(root, featureId)) as { typed_checkpoint_decisions?: Array<Record<string, any>> };
+    const persisted = persistedState.typed_checkpoint_decisions?.at(-1);
     assert.equal(persisted?.artifact_id, "specify.v1");
     assert.equal(persisted?.artifact_version, 1);
     assert.match(persisted?.artifact_digest ?? "", /^[a-f0-9]{64}$/u);
     assert.equal(persisted?.validation_ref, "validation.specify.v1");
     assert.match(persisted?.validation_digest ?? "", /^[a-f0-9]{64}$/u);
-    const advanced = advanceCursor(root, { ...ask, token: ask.advance_token, evidence: "approve stop accepted" } as never);
+    const required = selected.required_next_tool as { name?: string; arguments?: Record<string, unknown> };
+    assert.equal(required.name, "workflow_advance");
+    assert.ok(required.arguments, "selected Ask must return the exact advance descriptor");
+    if (!required.arguments) return;
+    const trustedMappingProof = issueCurrentTrustedMappingProof(root);
+    const advanced = advanceCursor(root, { ...required.arguments, token: required.arguments.advance_token } as never, trustedMappingProof === undefined ? undefined : { trustedMappingProof });
     assert.equal(advanced.ok, true, advanced.ok ? "" : advanced.error);
     if (advanced.ok) assert.equal(advanced.transition, "stopped");
     const state = JSON.parse(stateBytes(root, featureId)) as { stages?: Array<{ id: string; status: string }>; specification?: FeatureWorkspace };
@@ -2559,13 +2612,13 @@ test("spec-import mounted approve_stop resumes only through an exact command and
         tools.set(mounted.name, mounted);
       },
     } as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd: string }).cwd });
-    const checkpointTool = tools.get("workflow_checkpoint");
+    const askTool = tools.get("workflow_checkpoint_ask_selected");
     const advanceTool = tools.get("workflow_advance");
-    assert.ok(checkpointTool);
+    assert.ok(askTool);
     assert.ok(advanceTool);
-    if (!checkpointTool || !advanceTool) return;
+    if (!askTool || !advanceTool) return;
 
-    const selected = commitCheckpointAnswerSelected(root, {
+    const selected = await executeMountedSelectedAsk(root, tools, {
       feature_id: featureId,
       advance_token: handoff.advance_token,
       capability_id: handoff.capability_id,
@@ -2578,36 +2631,11 @@ test("spec-import mounted approve_stop resumes only through an exact command and
       checkpoint: "import_compatibility_approval",
       checkpoint_id: "import_compatibility_approval",
       checkpoint_kind: "custom",
-      decision: "approve_stop",
-    }, { apply_decision: false });
-    assert.equal(selected.ok, true, selected.ok ? "mounted checkpoint answer seeded" : selected.error);
-    if (!selected.ok || !selected.proof || !selected.answer) return;
-    const seededState = JSON.parse(stateBytes(root, featureId)) as {
-      trusted_checkpoint_answers?: Array<Record<string, unknown>>;
-      typed_checkpoint_decisions?: Array<Record<string, unknown>>;
-    };
-    assert.ok(seededState.trusted_checkpoint_answers?.some((answer) => answer.answer_id === selected.answer?.answer_id && answer.consumed_at === undefined), "trusted selected answer must be durable before mounted checkpoint application");
-    assert.equal(seededState.typed_checkpoint_decisions?.some((candidate) => candidate.stage_id === "compatibility_approval" && candidate.checkpoint_id === "import_compatibility_approval") ?? false, false, "selected-answer seed must not apply a duplicate checkpoint decision");
-    const checkpoint = await checkpointTool.execute("test", {
-      feature_id: featureId,
-      advance_token: handoff.advance_token,
-      capability_id: handoff.capability_id,
-      run_key: handoff.run_key,
-      branch: handoff.branch,
-      workflow: handoff.workflow,
-      profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor,
-      cursor_epoch: handoff.cursor_epoch,
-      checkpoint: "import_compatibility_approval",
-      checkpoint_id: "import_compatibility_approval",
-      checkpoint_kind: "custom",
-      authorization: "human",
-      actor_provenance: { kind: "user", ref: selected.answer.reference, proof: selected.proof },
-      decision: "approve_stop",
-      rationale: "trusted selected checkpoint answer",
-      evidence: `checkpoint-answer:${selected.answer.answer_id}`,
-    }, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
-    assert.equal(checkpoint.details.ok, true, JSON.stringify(checkpoint.details));
+    }, "approve_stop");
+    assert.equal(selected.ok, true, selected.ok ? "mounted checkpoint Ask applied" : String(selected.error));
+    if (selected.ok !== true) return;
+    assert.equal(selected.decision, "approve_stop");
+    assert.ok(selected.actor_provenance, "mounted Ask returns trusted actor provenance");
     const checkpointState = JSON.parse(stateBytes(root, featureId)) as {
       typed_checkpoint_decisions?: Array<Record<string, unknown>>;
       checkpoint_decisions?: Array<Record<string, unknown>>;
@@ -2625,18 +2653,11 @@ test("spec-import mounted approve_stop resumes only through an exact command and
       assert.equal(typedDecision.validation_ref, undefined, "import approval does not acquire native validation identity");
     }
 
-    const stopped = await advanceTool.execute("test", {
-      advance_token: handoff.advance_token,
-      capability_id: handoff.capability_id,
-      run_key: handoff.run_key,
-      branch: handoff.branch,
-      workflow: handoff.workflow,
-      profile_hash: handoff.profile_hash,
-      stage_cursor: handoff.stage_cursor,
-      cursor_epoch: handoff.cursor_epoch,
-      feature_id: featureId,
-      evidence: "stop at compatibility approval",
-    }, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER });
+    const required = selected.required_next_tool as { name?: string; arguments?: Record<string, unknown> };
+    assert.equal(required.name, "workflow_advance");
+    assert.ok(required.arguments, "selected Ask must return the exact advance descriptor");
+    if (!required.arguments) return;
+    const stopped = await advanceTool.execute("test", required.arguments, undefined, undefined, TEST_CONTEXT(root));
     assert.equal(stopped.details.ok, true, JSON.stringify(stopped.details));
     const resumed = await output(specImportCommand, args, root);
     assert.match(resumed, /workflow_begin/u);
