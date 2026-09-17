@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +33,7 @@ import { nativeCheckpointPolicy } from "../src/engine/checkpoints.js";
 
 import { materializeFeatureDocuments, renderPhaseValidationReport } from "../src/specification/materialize.js";
 import { digestOf, MAX_NATIVE_VALIDATION_WORK, prepareNativePhaseValidation, sha256Hex } from "../src/specification/validation.js";
+import { nativeGenerationBinding } from "../src/gates/dispatch.js";
 import { createPreparationHandoff, preparationStartPostimageDigest, preparationStateDigest } from "../src/engine/preparation.js";
 import type { NativePhaseValidationInput } from "../src/specification/validation.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
@@ -361,6 +363,8 @@ function setup(): PhaseDurabilityRun {
   input.request_id = startedHandoff.request_id;
   input.cursor_epoch = startedHandoff.cursor_epoch;
   input.dispatch_id = startedHandoff.dispatch_id;
+  input.input_ref = startedHandoff.input_ref;
+  input.input_digest = startedHandoff.input_digest;
   input.source_artifact = {
     ...input.source_artifact,
     worker: { ...input.source_artifact.worker, dispatch_id: startedHandoff.dispatch_id },
@@ -466,7 +470,7 @@ function validationDispatch(root: string, run: ReturnType<typeof setup>, credent
   return { token: authorized.dispatch_token, capability_id: authorized.capability_id, request_id: authorized.record.tool_call_id!, dispatch_id: authorized.record.id, cursor_epoch: authorized.capability_epoch };
 }
 
-function validationDispatchForPhase(run: ReturnType<typeof setup>, phase: "specify" | TestPhase, credentials: { token: string; capability_id: string; cursor_epoch: string }): { token: string; capability_id: string; request_id: string; dispatch_id: string; cursor_epoch: string; advance_token: string } {
+function validationDispatchForPhase(run: ReturnType<typeof setup>, phase: "specify" | TestPhase, credentials: { token: string; capability_id: string; cursor_epoch: string }, requestId = "validation-" + phase + "-request"): { token: string; capability_id: string; request_id: string; dispatch_id: string; cursor_epoch: string; advance_token: string } {
   const authorized = authorizeSpecificationPhaseValidationDispatch(run.root, {
     token: credentials.token,
     capability_id: credentials.capability_id,
@@ -477,7 +481,7 @@ function validationDispatchForPhase(run: ReturnType<typeof setup>, phase: "speci
     profile_hash: nativeProfileHash(run),
     stage_cursor: phase,
     cursor_epoch: credentials.cursor_epoch,
-    request_id: "validation-" + phase + "-request",
+    request_id: requestId,
   }, { trustedMappingProof: currentTrustedMappingProof(run.root) });
   if (!authorized.ok) throw new Error(authorized.error);
   return { token: authorized.dispatch_token, capability_id: authorized.capability_id, request_id: authorized.record.tool_call_id!, dispatch_id: authorized.record.id, cursor_epoch: authorized.capability_epoch, advance_token: authorized.advance_token };
@@ -958,19 +962,53 @@ test("phase validation persists failure evidence, retries strict pass, and repla
     const failedState = resolveState(run.root, BRANCH, { feature_id: FEATURE_ID, run_key: RUN_KEY }).state!;
     assert.equal(failedState.specification?.phases.find((phase) => phase.phase === "specify")?.status, "revision_required");
     assert.equal(failedState.pending, undefined, "failed validation must not leave a top-level pending lifecycle");
-    const generationCapability = createCapability({ run_key: RUN_KEY, branch: BRANCH, workflow: "spec-preparation", profile_hash: PROFILE_HASH, stage_cursor: "specify", cursor_epoch: failedState.dispatch_capability?.issued_for?.cursor_epoch ?? failedState.cursor_epoch, capability_id: failedState.dispatch_capability?.capability_id ?? failedState.preparation_start?.capability_id, kind: "single", expected_roster: [{ role: "specification-analyst", agent: "specification-worker" }], dispatch_secret: "phase-revision-secret", advance_secret: "phase-revision-advance" });
-    writeState(run.root, { ...failedState, cursor_epoch: generationCapability.state.issued_for!.cursor_epoch, dispatch_capability: { ...generationCapability.state, status: "ready" } }, { featureSlug: FEATURE_ID });
-    const generation = dispatchSpecificationPhase(run.root, {
-      token: generationCapability.dispatch_token, capability_id: generationCapability.capability_id, feature_id: FEATURE_ID, run_key: RUN_KEY, branch: BRANCH, workflow: "spec-preparation", profile_hash: PROFILE_HASH, phase: "specify", request_id: "phase-revision-request", cursor_epoch: generationCapability.state.issued_for!.cursor_epoch, role: "specification-analyst", slot_id: "specification-analyst", agent: "specification-worker",
-    }, { trustedMappingProof: currentTrustedMappingProof(run.root) });
+    const preparedRoot = PinnedProjectRoot.open(run.root);
+    assert.ok(preparedRoot);
+    if (!preparedRoot) throw new Error("native revision preparation fixture root unavailable");
+    const refreshed = updateStateAtomically(run.root, (snapshot) => {
+      if (!snapshot.state) return { op: "fail" as const, code: "state_missing", error: "native revision preparation fixture state unavailable" };
+      const nextRevision = snapshot.revision + 1;
+      const { dispatch_capability: _dispatchCapability, preparation_start: _preparationStart, preparation_handoff: _preparationHandoff, work_identity: _workIdentity, completion_envelope: _completionEnvelope, pending: _pending, ...withoutAuthority } = snapshot.state;
+      const resetState: TeamState = { ...withoutAuthority, cursor_epoch: randomUUID() };
+      const handoff = createPreparationHandoff({
+        feature_id: FEATURE_ID,
+        run_key: RUN_KEY,
+        branch: BRANCH,
+        task: resetState.task,
+        classification: resetState.classification,
+        state_revision: nextRevision,
+        state_digest: preparationStateDigest(resetState, nextRevision),
+        root_identity: { canonical_path: preparedRoot.canonical_root, dev: preparedRoot.dev, ino: preparedRoot.ino },
+        source_kind: "native",
+        constitution_binding: resetState.specification?.constitution_binding ?? null,
+        constitution_gate_ref: resetState.specification?.constitution_gate_ref ?? null,
+        capacity: 1,
+        authentication: {
+          source_kind: "native",
+          constitution_binding: resetState.specification?.constitution_binding ?? null,
+          constitution_gate_ref: resetState.specification?.constitution_gate_ref ?? null,
+          capacity: 1,
+          pinned_root: preparedRoot,
+        },
+      });
+      return { op: "commit" as const, state: { ...resetState, preparation_handoff: handoff } };
+    }, { selector: { feature_id: FEATURE_ID, run_key: RUN_KEY }, pinnedRoot: preparedRoot });
+    preparedRoot.close();
+    assert.equal(refreshed.ok, true, refreshed.ok ? "" : refreshed.error);
+    if (!refreshed.ok) throw new Error(refreshed.error);
+    const currentPreparation = resolveState(run.root, BRANCH, { feature_id: FEATURE_ID, run_key: RUN_KEY }).state?.preparation_handoff;
+    assert.ok(currentPreparation);
+    if (!currentPreparation) throw new Error("native revision preparation handoff unavailable");
+    const generation = startNativeSpecificationPhase(run.root, { feature_id: FEATURE_ID, run_key: RUN_KEY, preparation_handoff: currentPreparation });
     assert.equal(generation.ok, true);
     if (!generation.ok) throw new Error("generation authorization failed");
-    const revisionModel = { ...(run.input.source_artifact.semantic_model as Record<string, unknown>), version: 2, worker: { ...(run.input.source_artifact.worker as Record<string, unknown>), dispatch_id: generation.value.dispatch_id } };
+    const generationHandoff = generation.value.handoff;
+    const revisionModel = { ...(run.input.source_artifact.semantic_model as Record<string, unknown>), version: 2, worker: { ...(run.input.source_artifact.worker as Record<string, unknown>), dispatch_id: generationHandoff.dispatch_id } };
     const revisionDocumentContent = renderDurabilityDocument("specify", revisionModel as any);
-    const revisionInput = { ...run.input, token: generationCapability.dispatch_token, capability_id: generationCapability.capability_id, cursor_epoch: generationCapability.state.issued_for!.cursor_epoch, request_id: "phase-revision-request", dispatch_id: generation.value.dispatch_id, version: 2, source_artifact: { ...run.input.source_artifact, version: 2, document_sha256: sha256Hex(revisionDocumentContent), worker: { ...(run.input.source_artifact.worker as Record<string, unknown>), dispatch_id: generation.value.dispatch_id }, semantic_model: revisionModel }, documents: run.input.documents.map((document) => document.path === "spec.md" ? { ...document, content: revisionDocumentContent } : document), semantic_sections: revisionModel.sections as Record<string, string> };
+    const revisionInput = { ...run.input, token: generationHandoff.token, capability_id: generationHandoff.capability_id, cursor_epoch: generationHandoff.cursor_epoch, request_id: generationHandoff.request_id, dispatch_id: generationHandoff.dispatch_id, input_ref: generationHandoff.input_ref, input_digest: generationHandoff.input_digest, version: 2, source_artifact: { ...run.input.source_artifact, version: 2, document_sha256: sha256Hex(revisionDocumentContent), worker: { ...(run.input.source_artifact.worker as Record<string, unknown>), dispatch_id: generationHandoff.dispatch_id }, semantic_model: revisionModel }, documents: run.input.documents.map((document) => document.path === "spec.md" ? { ...document, content: revisionDocumentContent } : document), semantic_sections: revisionModel.sections as Record<string, string> };
     const revised = persistSpecificationPhaseResult(run.root, revisionInput);
     assert.equal(revised.ok, true);
-    const retryAuth = validationDispatch(run.root, run, { token: generationCapability.dispatch_token, capability_id: generationCapability.capability_id, cursor_epoch: generationCapability.state.issued_for!.cursor_epoch });
+    const retryAuth = validationDispatch(run.root, run, { token: generationHandoff.token, capability_id: generationHandoff.capability_id, cursor_epoch: generationHandoff.cursor_epoch });
     const retryBase = { ...base, token: retryAuth.token, capability_id: retryAuth.capability_id, request_id: retryAuth.request_id, dispatch_id: retryAuth.dispatch_id, cursor_epoch: retryAuth.cursor_epoch };
     const valid = persistSpecificationPhaseValidation(run.root, { ...retryBase, validation: { ...validationPayload(run, [{ principle_id: "constitution", status: "pass", evidence: "verified" }]), validation_id: "validation.specify.v2", version: 2, artifact_version: "specify.v2", document_sha256: sha256Hex(readFileSync(join(run.root, "specs", FEATURE_ID, "spec.md"), "utf8")), } });
     assert.equal(valid.ok, true, valid.ok ? "valid" : valid.error);
@@ -1295,6 +1333,22 @@ test("late terminal worker cannot publish after retry authority changes", () => 
     assert.equal(retryDispatch.ok, true, retryDispatch.ok ? "" : retryDispatch.error);
     if (!retryDispatch.ok) return;
     const retryRecord = retryDispatch.record;
+    assert.ok(retryRecord.work_identity);
+    if (!retryRecord.work_identity) throw new Error("retry dispatch work identity unavailable");
+    const retryBinding = nativeGenerationBinding({
+      feature_id: FEATURE_ID,
+      run_key: RUN_KEY,
+      phase: "specify",
+      version: 1,
+      request_id: retryAuth.request_id,
+      dispatch_id: retryRecord.id,
+      capability_id: retryRecord.work_identity.capability_id,
+      capability_epoch: retryRecord.work_identity.capability_epoch,
+      run_id: retryRecord.work_identity.run_id,
+      workflow: retryRecord.work_identity.workflow,
+      task_id: retryRecord.work_identity.task_id,
+      worker_id: retryRecord.work_identity.worker_id,
+    });
 
     const beforeLate = resolveState(run.root, undefined, { feature_id: FEATURE_ID, run_key: RUN_KEY });
     const late = persistSpecificationPhaseResult(run.root, run.input);
@@ -1309,7 +1363,7 @@ test("late terminal worker cannot publish after retry authority changes", () => 
     const retryModel = { ...(run.input.source_artifact.semantic_model as Record<string, unknown>), worker: { ...(run.input.source_artifact.worker as Record<string, unknown>), dispatch_id: retryRecord.id } };
     const retryDocumentContent = renderDurabilityDocument("specify", retryModel as any);
     const retryInput: SpecificationWorkerResultInput = {
-      ...run.input, request_id: retryAuth.request_id, dispatch_id: retryRecord.id, role: "specification-analyst", agent: "specification-worker",
+      ...run.input, request_id: retryAuth.request_id, dispatch_id: retryRecord.id, input_ref: retryBinding.input_ref, input_digest: retryBinding.input_digest, role: "specification-analyst", agent: "specification-worker",
       source_artifact: { ...run.input.source_artifact, document_sha256: sha256Hex(retryDocumentContent), worker: { ...run.input.source_artifact.worker as Record<string, unknown>, dispatch_id: retryRecord.id }, semantic_model: retryModel },
       documents: run.input.documents.map((document) => document.path === "spec.md" ? { ...document, content: retryDocumentContent } : document), semantic_sections: retryModel.sections as Record<string, string>,
     };
@@ -1386,7 +1440,7 @@ test("cross-process phase authority lock serializes terminal retry race", async 
       cursor_epoch: run.input.cursor_epoch,
       role: "specification-analyst",
       agent: "specification-worker",
-      request_id: "phase-request-race-retry",
+      request_id: run.input.request_id,
       retry_of: run.input.dispatch_id,
     };
     const phasePromise = runPhaseRaceChild([run.root, "phase", JSON.stringify(run.input), readyPath, releasePath, bStartedPath, aDonePath]);
@@ -1420,10 +1474,26 @@ test("cross-process phase authority lock serializes terminal retry race", async 
     if (!lateD1.ok) assert.equal(lateD1.code, "SPEC_PHASE_FORBIDDEN");
 
     const retryRecord = bResult.retry.record!;
+    assert.ok(retryRecord.work_identity);
+    if (!retryRecord.work_identity) throw new Error("retry dispatch work identity unavailable");
+    const retryBinding = nativeGenerationBinding({
+      feature_id: FEATURE_ID,
+      run_key: RUN_KEY,
+      phase: "specify",
+      version: 1,
+      request_id: retry.request_id,
+      dispatch_id: retryRecord.id,
+      capability_id: retryRecord.work_identity.capability_id,
+      capability_epoch: retryRecord.work_identity.capability_epoch,
+      run_id: retryRecord.work_identity.run_id,
+      workflow: retryRecord.work_identity.workflow,
+      task_id: retryRecord.work_identity.task_id,
+      worker_id: retryRecord.work_identity.worker_id,
+    });
     const retryModel = { ...(run.input.source_artifact.semantic_model as Record<string, unknown>), worker: { ...(run.input.source_artifact.worker as Record<string, unknown>), dispatch_id: retryRecord.id } };
     const retryDocumentContent = renderDurabilityDocument("specify", retryModel as any);
     const retryInput: SpecificationWorkerResultInput = {
-      ...run.input, request_id: retry.request_id, dispatch_id: retryRecord.id, role: "specification-analyst", agent: "specification-worker",
+      ...run.input, request_id: retry.request_id, dispatch_id: retryRecord.id, input_ref: retryBinding.input_ref, input_digest: retryBinding.input_digest, role: "specification-analyst", agent: "specification-worker",
       source_artifact: { ...run.input.source_artifact, document_sha256: sha256Hex(retryDocumentContent), worker: { ...run.input.source_artifact.worker as Record<string, unknown>, dispatch_id: retryRecord.id }, semantic_model: retryModel },
       documents: run.input.documents.map((document) => document.path === "spec.md" ? { ...document, content: retryDocumentContent } : document), semantic_sections: retryModel.sections as Record<string, string>,
     };
@@ -3043,7 +3113,7 @@ function nativeRecoveryFixture(): { run: ReturnType<typeof setup>; advanceToken:
   const persisted = persistSpecificationPhaseResult(run.root, run.input);
   assert.equal(persisted.ok, true, persisted.ok ? "" : persisted.error);
   writeFileSync(join(run.root, ".work-state", "features", FEATURE_ID, "artifacts", "specify_draft.json"), JSON.stringify(run.input.source_artifact.semantic_model, null, 2) + "\n", "utf8");
-  const generation = completeDispatch(run.root, {
+  const generation = completeNativeSpecificationGeneration(run.root, {
     ...run.input,
     stage_cursor: "specify",
     role: "specification-analyst",
@@ -3058,7 +3128,7 @@ function nativeRecoveryFixture(): { run: ReturnType<typeof setup>; advanceToken:
     token: run.input.token,
     capability_id: run.input.capability_id,
     cursor_epoch: run.input.cursor_epoch,
-  });
+  }, "native-validation-specify-" + FEATURE_ID + "-1");
   const validation = persistSpecificationPhaseValidation(run.root, {
     token: validationDispatchResult.token,
     capability_id: validationDispatchResult.capability_id,
