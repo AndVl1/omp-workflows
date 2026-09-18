@@ -20,6 +20,15 @@ import { fullstackOwnerForCwd } from "../src/index.js";
 import { writeFullstackActivationMarker } from "../src/activation-marker.js";
 import { registerMockAdapterForTesting } from "../src/adapters/mock.js";
 
+export type FullstackRuntimeLiveGuard = () => RegistryContextSnapshot;
+
+export type FullstackRuntimeSessionManager = Readonly<{
+  readonly getCwd: () => string;
+  readonly getSessionId: () => string;
+  readonly getSessionFile: () => string;
+  readonly getSessionGeneration: () => string;
+}>;
+
 export type FullstackRuntimeTestFixture = {
   readonly root: string;
   readonly access: CtoRuntimeAccessFacade;
@@ -27,8 +36,10 @@ export type FullstackRuntimeTestFixture = {
   readonly serviceAuthority: CtoRuntimeServiceMutationAuthority;
   readonly activation: Extract<WorkflowActivationResult, { readonly ok: true }>;
   readonly sessionId: string;
+  /** The exact manager identity authenticated into the runtime authority. */
+  readonly sessionManager: FullstackRuntimeSessionManager;
   readonly activationSnapshot: RegistryContextSnapshot;
-  readonly liveGuard: ReturnType<typeof createRegistryRegistrationLiveGuard>;
+  readonly liveGuard: FullstackRuntimeLiveGuard;
   close(): void;
 };
 
@@ -117,6 +128,7 @@ export function openFullstackRuntimeTest(
     serviceAuthority,
     activation,
     sessionId,
+    sessionManager,
     activationSnapshot: activationSnapshotGuard(),
     liveGuard: activationSnapshotGuard,
     close(): void {

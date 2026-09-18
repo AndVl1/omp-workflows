@@ -255,7 +255,17 @@ function resolveRouteSession(config) {
   if (!expected) throw new BridgeRouteUnavailableError("the pinned Telegram configuration has no unique read-write primary route");
   bridgeRoute.assertLive();
   const selected = bridgeRoute.resolveTelegramRoute();
-  if (!selected) return { sessionId, runId: null, standby: true };
+  if (!selected) {
+    const candidates = bridgeRoute.readActiveDeliveryCandidates();
+    if (candidates && candidates.ok === true && Array.isArray(candidates.entries)
+      && !candidates.entries.some((entry) => entry && typeof entry === "object" && entry.status === "active")) {
+      return { sessionId, runId: null, standby: true, blocked: false };
+    }
+    if (candidates && candidates.ok === false && candidates.code === "missing") {
+      return { sessionId, runId: null, standby: true, blocked: false };
+    }
+    return { sessionId, runId: null, standby: false, blocked: true };
+  }
   if (routeProfileKey(selected.channelProfile) !== expected.key) {
     throw new BridgeRouteUnavailableError("authenticated Telegram route changed during selection");
   }
@@ -456,7 +466,7 @@ const { chatId } = adapterConfig.telegram;
 const pendingPlainAcks = [];
 
 function crashForTest(seam) {
-  if (process.env.TG_BRIDGE_TEST_CRASH === seam) process.kill(process.pid, "SIGKILL");
+  if (process.env.NODE_ENV === "test" && process.env.TG_BRIDGE_TEST_CRASH === seam) process.kill(process.pid, "SIGKILL");
 }
 
 async function assertAround(action, candidatePin = bridgePin) {
@@ -472,7 +482,7 @@ function openInboundRuntimeAccess() {
   assertLive();
   assertPinnedConfig(configSnapshot);
   const route = resolveRouteSession(config);
-  return { access: undefined, routeAccess: bridgeRoute, owned: false, standby: route.standby, runId: route.runId };
+  return { access: undefined, routeAccess: bridgeRoute, owned: false, standby: route.standby, blocked: route.blocked === true, runId: route.runId };
 }
 
 function closeInboundRuntimeAccess(binding) {
@@ -486,17 +496,23 @@ adapter.setPlainMessageHandler(async (msg, suppliedPin) => {
   try {
     crashForTest("before-core");
     inboundRuntime = openInboundRuntimeAccess();
+    if (inboundRuntime.blocked) {
+      assertLive(callbackPin);
+      assertPinnedConfig(configSnapshot);
+      throw new BridgeRouteUnavailableError("authenticated active Telegram route candidates are unavailable; retrying without committing the update");
+    }
     const result = classifyIncoming(leaseRoot, msg, callbackPin, inboundRuntime.access, proofAuthority, inboundRuntime.routeAccess);
     assertLive(callbackPin);
     assertPinnedConfig(configSnapshot);
     crashForTest("after-core");
-    if (result.reply && typeof adapter.sendPlainText === "function") {
+    const shouldReply = result.reply !== undefined && result.filedPath !== null;
+    if (shouldReply && typeof adapter.sendPlainText === "function") {
       const targetChatId = msg.chatId ?? chatId;
       // The adapter invokes this callback before its commit hook. Queue the
       // optional acknowledgement so core persistence and high-water commit
       // complete first; each entry is attempted at most once.
       pendingPlainAcks.push({ id: msg.id, targetChatId, reply: result.reply, action: result.action, callbackPin });
-    } else if (result.reply) {
+    } else if (shouldReply) {
       throw new Error(`telegram bridge transport '${adapter.kind}' has no sendPlainText`);
     } else {
       assertLive(callbackPin);

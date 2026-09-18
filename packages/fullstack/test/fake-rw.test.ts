@@ -33,10 +33,12 @@ function runtimeFor(root: string): FullstackRuntime {
   runtimeFixtures.set(root, runtime);
   return runtime;
 }
-test.after(() => {
+function closeRuntimeFixtures(): void {
   for (const runtime of runtimeFixtures.values()) runtime.close();
   runtimeFixtures.clear();
-});
+}
+test.afterEach(closeRuntimeFixtures);
+test.after(closeRuntimeFixtures);
 function registryScope(root: string): { runtime: FullstackRuntime; pinnedRoot: PinnedProjectRoot } {
   const runtime = runtimeFor(root);
   const pinnedRoot = PinnedProjectRoot.open(root);
@@ -869,7 +871,7 @@ test("fake-rw: registry factory rejects absolute and .. persisted dirs, allows r
   const root = mkdtempSync(join(tmpdir(), "fake-rw-sec-"));
   const scope = registryScope(root);
   const load = () => loadEscalationConfig(root, { kind: "mock", pinnedRoot: scope.pinnedRoot, runtimeAccess: scope.runtime.access });
-  const create = (config: NonNullable<ReturnType<typeof loadEscalationConfig>>) => createEscalationAdapter(config, root, scope.pinnedRoot, scope.runtime.access);
+  const create = (config: NonNullable<ReturnType<typeof loadEscalationConfig>>) => createEscalationAdapter(config, root, scope.pinnedRoot, scope.runtime.access, scope.runtime.proofAuthority);
   try {
     withConfig(root, { adapter: "mock", mock: { persisted: true, dir: "/abs/path" } });
     assert.equal(create(load()!), null, "absolute dir rejected at the config boundary");

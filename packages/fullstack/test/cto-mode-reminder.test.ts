@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, renameSync, symlinkSync, unlinkSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
-import { newCtoState, setCtoPause, writeCtoState } from "../../core/src/cto/state.js";
+import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState, setCtoPause, writeCtoState } from "../../core/src/cto/state.js";
 import {
 	CTO_MODE_MARKER,
 	activateCtoMode,
@@ -71,8 +71,12 @@ test("cto-reminder: handler dedupes by event identity, not marker text", () => {
 			branch: "main",
 			autonomous: false,
 			plan: { id: "run-one", task: "Implement OAuth", teams: [], created_at: new Date().toISOString() },
+			owner_session: "session-one",
 		});
-		writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+		assert.ok(runtime.access.createRun(state, {
+			source_id: "cto-reminder:handler",
+			initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state),
+		}));
 		activateCtoMode(root, "session-one", "run-one", runtime.access);
 		const handler = createCtoModeReminderHandler();
 		const event = {
@@ -173,8 +177,12 @@ test("cto-reminder: manager cwd and session id take precedence over stale contex
 			branch: "main",
 			autonomous: false,
 			plan: { id: "run-manager", task: "Manager identity", teams: [], created_at: new Date().toISOString() },
+			owner_session: "manager-session",
 		});
-		writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+		assert.ok(runtime.access.createRun(state, {
+			source_id: "cto-reminder:manager",
+			initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state),
+		}));
 		activateCtoMode(root, "manager-session", "run-manager", runtime.access);
 		const handler = createCtoModeReminderHandler();
 		const event = { messages: [USER_MSG] };
@@ -197,7 +205,7 @@ test("cto-reminder: same lexical root replacement revokes prior activation", () 
 	const displaced = join(parent, "project-old");
 	mkdirSync(root);
 	const runtime = openFullstackRuntimeTest(root, "session-replacement");
-	let replacementRuntime: ReturnType<typeof openFullstackRuntimeTest> | undefined;
+	let replacementRuntime: FullstackRuntimeTestFixture | undefined;
 	try {
 		const state = newCtoState({
 			id: "run-replacement",
@@ -205,25 +213,33 @@ test("cto-reminder: same lexical root replacement revokes prior activation", () 
 			branch: "main",
 			autonomous: false,
 			plan: { id: "run-replacement", task: "Original root", teams: [], created_at: new Date().toISOString() },
+			owner_session: "session-replacement",
 		});
-		writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+		assert.ok(runtime.access.createRun(state, {
+			source_id: "cto-reminder:original-root",
+			initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state),
+		}));
 		activateCtoMode(root, "session-replacement", "run-replacement", runtime.access);
 		assert.deepEqual(resolveActiveCtoRun(root, "session-replacement", runtime.access), { runId: "run-replacement", status: "active" });
 
 		renameSync(root, displaced);
 		mkdirSync(root);
+		assert.equal(resolveActiveCtoRun(root, "session-replacement", runtime.access), null, "old activation cannot authorize a same-path replacement");
+
+		runtime.close();
+		replacementRuntime = openFullstackRuntimeTest(root, "session-replacement");
 		const replacement = newCtoState({
 			id: "run-replacement",
 			task: "Replacement root",
 			branch: "main",
 			autonomous: false,
 			plan: { id: "run-replacement", task: "Replacement root", teams: [], created_at: new Date().toISOString() },
+			owner_session: "session-replacement",
 		});
-		writeCtoState(replacement, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-		assert.equal(resolveActiveCtoRun(root, "session-replacement", runtime.access), null, "old activation cannot authorize a same-path replacement");
-
-		runtime.close();
-		replacementRuntime = openFullstackRuntimeTest(root, "session-replacement");
+		assert.ok(replacementRuntime.access.createRun(replacement, {
+			source_id: "cto-reminder:replacement-root",
+			initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(replacement),
+		}));
 		activateCtoMode(root, "session-replacement", "run-replacement", replacementRuntime.access);
 		assert.deepEqual(resolveActiveCtoRun(root, "session-replacement", replacementRuntime.access), { runId: "run-replacement", status: "active" }, "replacement requires explicit activation");
 	} finally {
@@ -243,7 +259,7 @@ test("cto-reminder: symlinked ancestor replacement revokes prior activation", ()
 	const outside = join(outsideParent, "project");
 	mkdirSync(root, { recursive: true });
 	const runtime = openFullstackRuntimeTest(root, "session-symlink");
-	let replacementRuntime: ReturnType<typeof openFullstackRuntimeTest> | undefined;
+	let replacementRuntime: FullstackRuntimeTestFixture | undefined;
 	let replacedWithSymlink = false;
 	try {
 		const state = newCtoState({
@@ -252,27 +268,35 @@ test("cto-reminder: symlinked ancestor replacement revokes prior activation", ()
 			branch: "main",
 			autonomous: false,
 			plan: { id: "run-symlink", task: "Original root", teams: [], created_at: new Date().toISOString() },
+			owner_session: "session-symlink",
 		});
-		writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+		assert.ok(runtime.access.createRun(state, {
+			source_id: "cto-reminder:symlink-original",
+			initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state),
+		}));
 		activateCtoMode(root, "session-symlink", "run-symlink", runtime.access);
 		assert.deepEqual(resolveActiveCtoRun(root, "session-symlink", runtime.access), { runId: "run-symlink", status: "active" });
 
 		renameSync(parent, displacedParent);
 		mkdirSync(outside);
-		const replacement = newCtoState({
-			id: "run-symlink",
-			task: "Symlink replacement root",
-			branch: "main",
-			autonomous: false,
-			plan: { id: "run-symlink", task: "Symlink replacement root", teams: [], created_at: new Date().toISOString() },
-		});
-		writeCtoState(replacement, outside, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
 		symlinkSync(outsideParent, parent, "dir");
 		replacedWithSymlink = true;
 		assert.equal(resolveActiveCtoRun(root, "session-symlink", runtime.access), null, "old activation cannot authorize a symlinked-ancestor replacement");
 
 		runtime.close();
 		replacementRuntime = openFullstackRuntimeTest(root, "session-symlink");
+		const replacement = newCtoState({
+			id: "run-symlink",
+			task: "Symlink replacement root",
+			branch: "main",
+			autonomous: false,
+			plan: { id: "run-symlink", task: "Symlink replacement root", teams: [], created_at: new Date().toISOString() },
+			owner_session: "session-symlink",
+		});
+		assert.ok(replacementRuntime.access.createRun(replacement, {
+			source_id: "cto-reminder:symlink-replacement",
+			initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(replacement),
+		}));
 		activateCtoMode(root, "session-symlink", "run-symlink", replacementRuntime.access);
 		assert.deepEqual(resolveActiveCtoRun(root, "session-symlink", replacementRuntime.access), { runId: "run-symlink", status: "active" }, "symlinked-ancestor replacement requires explicit activation");
 	} finally {
@@ -295,8 +319,12 @@ test("cto-reminder: resolveActiveCtoRun finds an engine-written active run after
 			branch: "main",
 			autonomous: false,
 			plan: { id: "run-one", task: "Implement OAuth", teams: [], created_at: new Date().toISOString() },
+			owner_session: "session-one",
 		});
-		writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+		assert.ok(runtime.access.createRun(state, {
+			source_id: "cto-reminder:engine-written",
+			initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state),
+		}));
 		activateCtoMode(root, "session-one", "run-one", runtime.access);
 		const run = resolveActiveCtoRun(root, "session-one", runtime.access);
 		assert.ok(run, "active run resolved");

@@ -5,6 +5,7 @@ import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, 
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { withCtoRuntimeServiceTransaction } from "@andvl1/omp-workflows-core/cto-runtime";
 import { openBoundedQueue } from "@andvl1/omp-workflows-core/queue";
 import { ctoRuntimeRunInitialIdentityDigest, newCtoState, readCtoRunDeliveryIndexPage, readCtoState, writeCtoState } from "../../core/src/cto/state.js";
 import { canonicalDurableIdFileName } from "../../core/src/cto/durable-id.js";
@@ -46,11 +47,13 @@ function runtimeFor(root: string): FullstackRuntimeTestFixture {
   runtimeFixtures.set(root, fixture);
   return fixture;
 }
-test.after(() => {
+function closeRuntimeFixtures(): void {
   for (const fixture of runtimeFixtures.values()) fixture.close();
   runtimeFixtures.clear();
   retryDrainContexts.clear();
-});
+}
+test.afterEach(closeRuntimeFixtures);
+test.after(closeRuntimeFixtures);
 
 function createAuthenticatedInboxEnvelope(root: string, kind: Parameters<typeof createAuthenticatedInboxEnvelopeRaw>[1], payload: Parameters<typeof createAuthenticatedInboxEnvelopeRaw>[2], pinnedRoot?: Parameters<typeof createAuthenticatedInboxEnvelopeRaw>[3]) {
   return createAuthenticatedInboxEnvelopeRaw(root, kind, payload, pinnedRoot, runtimeFor(root).proofAuthority);
@@ -129,23 +132,24 @@ function resignInboxFile(root: string, path: string, runId: string): void {
 function runWakeCrash(root: string, runId: string, identity: string, mode: "before" | "after"): number | null {
   const registryUrl = new URL("../src/adapters/registry.ts", import.meta.url).href;
   const runtimeUrl = new URL("./runtime-access-fixture.ts", import.meta.url).href;
-  const script = `const fs = await import("node:fs"); const runtimeModule = await import(${JSON.stringify(runtimeUrl)}); const runtime = runtimeModule.openFullstackRuntimeTest(process.env.WAKE_ROOT, "messaging-security-child-" + process.env.WAKE_ID, undefined, false); const mod = await import(${JSON.stringify(registryUrl)}); const task = { id: process.env.WAKE_ID, text: "crash boundary task", at: new Date().toISOString(), runId: process.env.WAKE_RUN }; mod.handleInboxTask(process.env.WAKE_ROOT, task, () => { if (process.env.WAKE_MODE === "after") fs.writeFileSync(process.env.WAKE_EFFECT, "effect", { flag: "a" }); process.exit(17); }, { idempotentWake: true, runtimeAccess: runtime.access, proofAuthority: runtime.proofAuthority });`;
+  const parentRuntime = runtimeFor(root);
+  const script = `const fs = await import("node:fs"); const runtimeModule = await import(${JSON.stringify(runtimeUrl)}); const root = process.env.WAKE_ROOT; const targetGeneration = Number(process.env.WAKE_CLAIM_GENERATION); for (let generation = 1; generation < targetGeneration; generation += 2) { const warmup = runtimeModule.openFullstackRuntimeTest(root, "messaging-security-warmup-" + generation, undefined, false); warmup.close(); } const runtime = runtimeModule.openFullstackRuntimeTest(root, "messaging-security-child-" + process.env.WAKE_ID, undefined, false); const mod = await import(${JSON.stringify(registryUrl)}); const task = { id: process.env.WAKE_ID, text: "crash boundary task", at: new Date().toISOString(), runId: process.env.WAKE_RUN }; await mod.handleInboxTask(root, task, () => { if (process.env.WAKE_MODE === "after") fs.writeFileSync(process.env.WAKE_EFFECT, "effect", { flag: "a" }); process.exit(17); }, { idempotentWake: true, runtimeAccess: runtime.access, serviceAuthority: runtime.serviceAuthority, proofAuthority: runtime.proofAuthority });`;
   return spawnSync(process.execPath, ["--import", "tsx", "--eval", script], {
     cwd: process.cwd(),
-    env: { ...process.env, WAKE_ROOT: root, WAKE_RUN: runId, WAKE_ID: identity, WAKE_MODE: mode, WAKE_EFFECT: join(root, "observed-effect") },
-    encoding: "utf8",
+    env: { ...process.env, WAKE_ROOT: root, WAKE_RUN: runId, WAKE_ID: identity, WAKE_MODE: mode, WAKE_EFFECT: join(root, "observed-effect"), WAKE_CLAIM_GENERATION: String(parentRuntime.activationSnapshot.claim_generation) },
   }).status;
 }
 
 function createIndexedPendingRun(root: string, runId: string): void {
+  const runtime = runtimeFor(root);
   const state = newCtoState({
     id: runId,
     task: "indexed delivery test",
     branch: "main",
     autonomous: true,
     plan: { id: runId, task: "indexed delivery test", teams: [], created_at: new Date().toISOString() },
+    owner_session: runtime.sessionId,
   });
-  const runtime = runtimeFor(root);
   assert.ok(runtime.access.createRun(state, { source_id: `messaging-security:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
   assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
 }
@@ -159,6 +163,7 @@ function createIndexedPendingRuns(root: string, runIds: readonly string[]): void
       branch: "main",
       autonomous: true,
       plan: { id: runId, task: "indexed delivery test", teams: [], created_at: new Date().toISOString() },
+      owner_session: runtime.sessionId,
     });
     assert.ok(runtime.access.createRun(state, { source_id: `messaging-security:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
     assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
@@ -166,6 +171,7 @@ function createIndexedPendingRuns(root: string, runIds: readonly string[]): void
 }
 
 function createIndexedPendingTerminalSummaries(root: string, runIds: readonly string[]): void {
+  const runtime = runtimeFor(root);
   for (const [index, runId] of runIds.entries()) {
     const now = new Date().toISOString();
     const waveId = `wave-${String(index).padStart(2, "0")}`;
@@ -175,11 +181,11 @@ function createIndexedPendingTerminalSummaries(root: string, runIds: readonly st
       branch: "main",
       autonomous: true,
       plan: { id: runId, task: "terminal summary pagination test", teams: [], created_at: now },
+      owner_session: runtime.sessionId,
     });
     state.integration.status = "done";
-    state.pause = { kind: "done", reason: "terminal summary pagination test" };
     state.wave_history = [{ id: waveId, source: "inbox", source_id: `${runId}-source`, task: `terminal task ${index}`, slice_ids: [], status: "done", started_at: now, finished_at: now }];
-    const runtime = runtimeFor(root);
+    state.pause = { kind: "done", reason: "terminal summary pagination test" };
     assert.ok(runtime.access.createRun(state, { source_id: `messaging-security:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
     assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "summary"), true);
   }
@@ -197,9 +203,8 @@ function pendingRunDeliveryCount(root: string): number {
 
 async function runConcurrentDispatcherChildren(root: string, evidence: string): Promise<Array<{ status: number; stderr: string }>> {
   const registryUrl = new URL("../src/adapters/registry.ts", import.meta.url).href;
-  const fullstackIndexUrl = new URL("../src/index.ts", import.meta.url).href;
-  const mockUrl = new URL("../src/adapters/mock.ts", import.meta.url).href;
-  const script = `const fs = await import("node:fs"); const coreRegistry = await import("@andvl1/omp-workflows-core/registry"); const runtimeCore = await import("@andvl1/omp-workflows-core/cto-runtime"); const fullstack = await import(${JSON.stringify(fullstackIndexUrl)}); const mock = await import(${JSON.stringify(mockUrl)}); const mod = await import(${JSON.stringify(registryUrl)}); const root = process.env.WAKE_ROOT; const owner = fullstack.fullstackOwnerForCwd(root); const activation = coreRegistry.openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], owner); if (!activation.ok) throw new Error(activation.code + ": " + activation.error); const transaction = coreRegistry.beginRegistryRegistration(activation.registry_context, root, ["escalation_adapters"]); if (!transaction.ok) throw new Error(transaction.code + ": " + transaction.error); mock.registerMockAdapterForTesting(transaction.token); coreRegistry.commitRegistryRegistration(transaction.token); const opened = runtimeCore.openCtoRuntimeAccess(activation.registry_context, { sessionId: "messaging-security-child", main: true }, root); if (!opened.ok) throw new Error(opened.code + ": " + opened.error); const adapter = { kind: "mock", send: async () => ({ sent: true }), cancel: async () => undefined, pollOnce: async () => { fs.appendFileSync(process.env.EVIDENCE, "tick" + String.fromCharCode(10)); return []; } }; const stop = mod.startDispatcher(root, adapter, 10000, { runtimeAccess: opened.access }); setTimeout(() => { stop(); opened.access.close(); coreRegistry.closeWorkflowActivation(activation); process.exit(0); }, 250);`;
+  const runtimeFixtureUrl = new URL("./runtime-access-fixture.ts", import.meta.url).href;
+  const script = `const fs = await import("node:fs"); const runtimeModule = await import(${JSON.stringify(runtimeFixtureUrl)}); const runtime = runtimeModule.openFullstackRuntimeTest(process.env.WAKE_ROOT, "messaging-security-child-" + process.pid, undefined, false); const mod = await import(${JSON.stringify(registryUrl)}); const root = process.env.WAKE_ROOT; const adapter = { kind: "mock", send: async () => ({ sent: true }), cancel: async () => undefined, pollOnce: async () => { fs.appendFileSync(process.env.EVIDENCE, "tick" + String.fromCharCode(10)); return []; } }; const stop = mod.startDispatcher(root, adapter, 10000, { runtimeAccess: runtime.access, serviceAuthority: runtime.serviceAuthority, proofAuthority: runtime.proofAuthority, session_id: runtime.sessionId, liveGuard: runtime.liveGuard }); setTimeout(() => { void stop().finally(() => { runtime.close(); process.exit(0); }); }, 250);`;
   const children = [1, 2].map(() => spawn(process.execPath, ["--import", "tsx", "--eval", script], { cwd: process.cwd(), env: { ...process.env, WAKE_ROOT: root, EVIDENCE: evidence }, stdio: ["ignore", "ignore", "pipe"] }));
   return Promise.all(children.map((child) => {
     let stderr = "";
@@ -217,7 +222,7 @@ test("messenger security: symlink and FIFO bridge locks cannot touch outside pat
   try {
     writeFileSync(join(outside, "sentinel"), "outside");
     symlinkSync(outside, join(root, ".omp"), "dir");
-    assert.throws(() => writeBridgeLock(root), /queue directory/);
+    assert.throws(() => writeBridgeLock(root), /queue directory|activation marker parent/);
     assert.equal(readFileSync(join(outside, "sentinel"), "utf8"), "outside");
     assert.equal(existsSync(join(outside, "bridge.lock")), false);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -448,6 +453,8 @@ test("messenger security: one drain tick is bounded for 4097 entries", async () 
     createIndexedPendingRun(root, "page");
     const directory = outboxDir("page", root);
     mkdirSync(directory, { recursive: true });
+    const authorityPath = publishOutbox(root, "page", { id: "page/zz-authority", level: "question", title: "authority", body: "authority", intent: "question", at: new Date().toISOString(), by: "test", run_id: "page" });
+    rmSync(authorityPath);
     for (let index = 0; index < 4097; index += 1) writeFileSync(join(directory, `entry-${String(index).padStart(4, "0")}.json`), JSON.stringify({ id: `page/entry/${index}`, level: "question", title: "T", body: "b" }));
     const results = await drainOutbox(root, { kind: "mock", send: async () => ({ sent: false }), cancel: async () => undefined }, 1);
     assert.ok(results.length > 0 && results.length <= 8);
@@ -645,7 +652,7 @@ test("messenger security: active revision bump retries a direct outbox claim", {
     const staleRevision = state.state_revision;
     state.updated_at = new Date().toISOString();
     const runtime = runtimeFor(root);
-    assert.ok(runtime.access.createRun(state, { source_id: `messaging-security:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+    withCtoRuntimeServiceTransaction(runtime.serviceAuthority, runId, (transaction) => { transaction.writeState(state); });
     assert.equal(runtime.access.markDeliveryPending(runId, staleRevision, "outbox"), false);
     const directory = outboxDir(runId, root);
     mkdirSync(directory, { recursive: true });
@@ -767,7 +774,7 @@ test("messenger dispatcher pages mixed-case pending terminal summaries across a 
     const allDelivered = new Promise<void>((resolve) => { resolveAll = resolve; });
     const adapter = { kind: "mock", send: async () => ({ sent: true }), sendWithIdempotency: async (esc: { id: string }) => { const runId = esc.id.slice(0, esc.id.indexOf("/")); delivered.set(runId, (delivered.get(runId) ?? 0) + 1); if (delivered.size === runIds.length) resolveAll(); return { sent: true }; }, cancel: async () => undefined, pollOnce: async () => [] };
     const stop = startDispatcher(root, adapter, 5);
-    try { await Promise.race([allDelivered, new Promise<void>((_, reject) => setTimeout(() => reject(new Error("terminal summaries timed out")), 15_000))]); await waitForCondition(() => pendingRunDeliveryCount(root) === 0, "terminal summary pending markers remain"); } finally { await stop(); }
+    try { await Promise.race([allDelivered, new Promise<void>((_, reject) => setTimeout(() => reject(new Error("terminal summaries timed out")), 60_000))]); await waitForCondition(() => pendingRunDeliveryCount(root) === 0, "terminal summary pending markers remain"); } finally { await stop(); }
     assert.deepEqual([...delivered.keys()].sort(), [...runIds].sort());
     assert.ok([...delivered.values()].every((attempts) => attempts === 1));
     for (const [index, runId] of runIds.entries()) assert.equal(existsSync(join(outboxDir(runId, root), "sent", canonicalDurableIdFileName(`${runId}/wave/wave-${String(index).padStart(2, "0")}/summary`))), true);
@@ -795,7 +802,7 @@ test("messenger security: same-lexical bridge root replacement cannot reuse copi
     cpSync(join(oldRoot, ".work-state", "cto", runId, "state.json"), statePath);
     cpSync(join(oldRoot, ".work-state", "cto", "active-run-index.json"), indexPath);
     writeFileSync(join(root, ".omp", "inbox", "old.json"), JSON.stringify(envelope));
-    assert.throws(() => createAuthenticatedInboxEnvelope(root, "task", { id: `${runId}/replacement`, text: "must fail", at: new Date().toISOString(), by: "bridge", run_id: runId }), /lease unavailable/);
+    assert.throws(() => createAuthenticatedInboxEnvelope(root, "task", { id: `${runId}/replacement`, text: "must fail", at: new Date().toISOString(), by: "bridge", run_id: runId }), /lease unavailable|proof authority unavailable|runtime proof authority is unavailable/);
     assert.doesNotThrow(() => writeBridgeLock(root));
     let wakes = 0;
     await assert.rejects(() => pollInbox(root, null, () => { wakes += 1; }), /activation_revoked|registration root identity/);

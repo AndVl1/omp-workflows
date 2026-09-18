@@ -1029,15 +1029,24 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
       enumerable: false,
       value: (): string => {
         requireLive(cell);
-        let active: ReturnType<typeof findActiveCtoRun>;
-        try {
-          const indexPath = join(".work-state", "cto", "active-run-index.json");
-          active = cell.root.pathEntryInfo(indexPath) ? findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root }) : null;
-        } catch (error) {
-          if (error instanceof CtoAuthorityUnavailableError || (error instanceof Error && /delivery index|proof|state read|authority/i.test(error.message))) {
-            throw runtimeError("runtime_access_invalid", "canonical CTO delivery authority is unavailable");
+        const readActiveCandidates = (): CtoRunDeliveryCandidatesRead => {
+          const candidates = readCtoRunDeliveryActiveCandidatesPinned(cell.root);
+          if (!candidates.ok && candidates.code !== "missing") {
+            throw runtimeError("runtime_access_invalid", `canonical CTO delivery authority is unavailable (${candidates.code})`);
           }
-          throw error;
+          return candidates;
+        };
+        let active: ReturnType<typeof findActiveCtoRun> = null;
+        const initialCandidates = readActiveCandidates();
+        if (initialCandidates.ok) {
+          try {
+            active = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
+          } catch (error) {
+            if (error instanceof CtoAuthorityUnavailableError || (error instanceof Error && /delivery index|proof|state read|authority/i.test(error.message))) {
+              throw runtimeError("runtime_access_invalid", "canonical CTO delivery authority is unavailable");
+            }
+            throw error;
+          }
         }
         if (active) return active.runId;
         try {
@@ -1045,9 +1054,19 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
             cell.root.canonical_root,
             () => {
               requireLive(cell);
-              const indexPath = join(".work-state", "cto", "active-run-index.json");
-              const current = cell.root.pathEntryInfo(indexPath) ? findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root }) : null;
-              if (current) return current.runId;
+              const reboundCandidates = readActiveCandidates();
+              if (reboundCandidates.ok) {
+                let current: ReturnType<typeof findActiveCtoRun> = null;
+                try {
+                  current = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
+                } catch (error) {
+                  if (error instanceof CtoAuthorityUnavailableError || (error instanceof Error && /delivery index|proof|state read|authority/i.test(error.message))) {
+                    throw runtimeError("runtime_access_invalid", "canonical CTO delivery authority is unavailable");
+                  }
+                  throw error;
+                }
+                if (current) return current.runId;
+              }
 
               const runId = `standby-${Date.now()}-${randomUUID().slice(0, 8)}`;
               const runDirectory = join(".work-state", "cto", runId);
@@ -1109,11 +1128,13 @@ function makeFacade(cell: RuntimeCell): CtoRuntimeAccessFacade {
                 return runId;
               } catch (error) {
                 if ((error as NodeJS.ErrnoException)?.code === "EEXIST") {
-                  const indexPath = join(".work-state", "cto", "active-run-index.json");
-                  const winner = cell.root.pathEntryInfo(indexPath) ? findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root }) : null;
-                  if (winner) {
-                    completed = true;
-                    return winner.runId;
+                  const winnerCandidates = readActiveCandidates();
+                  if (winnerCandidates.ok) {
+                    const winner = findActiveCtoRun(cell.root.canonical_root, { sessionId: cell.sessionId, pinnedRoot: cell.root });
+                    if (winner) {
+                      completed = true;
+                      return winner.runId;
+                    }
                   }
                 }
                 throw error;
@@ -1700,6 +1721,9 @@ function openBridgeRouteFromCell(
     const profile = routeProfile();
     if (!profile) throw runtimeError("runtime_access_invalid", "authenticated Telegram route is unavailable");
     const existing = readCtoRunDeliveryActiveCandidatesPinned(root);
+    if (!existing.ok && existing.code !== "missing") {
+      throw runtimeError("runtime_access_invalid", `canonical CTO delivery authority is unavailable (${existing.code})`);
+    }
     if (existing.ok) {
       const matches = existing.entries.filter((entry) => validStandbyEntry(entry, profile));
       if (matches.length > 1) throw runtimeError("runtime_access_invalid", "multiple authenticated standby Telegram routes are ambiguous");
@@ -1708,6 +1732,9 @@ function openBridgeRouteFromCell(
     return withCtoRegistryLock(root.canonical_root, () => {
       assertLive();
       const rebound = readCtoRunDeliveryActiveCandidatesPinned(root);
+      if (!rebound.ok && rebound.code !== "missing") {
+        throw runtimeError("runtime_access_invalid", `canonical CTO delivery authority is unavailable (${rebound.code})`);
+      }
       if (rebound.ok) {
         const matches = rebound.entries.filter((entry) => validStandbyEntry(entry, profile));
         if (matches.length > 1) throw runtimeError("runtime_access_invalid", "multiple authenticated standby Telegram routes are ambiguous");

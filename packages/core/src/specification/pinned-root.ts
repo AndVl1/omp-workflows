@@ -90,7 +90,7 @@ helperTimeoutMs?: number;
 /** Test-only absolute executable override for spawn-error coverage. */
 helperExecutable?: string;
 /** Test-only deterministic response-channel fault. */
-helperProtocolTest?: "short_write" | "epipe" | "eof" | "oversized_response" | "two_frames" | "invalid_utf8" | "invalid_json" | "truncated" | "valid_multibyte_control" | "forged_response" | "replay_response" | "cross_session_replay" | "forged_request" | "eof_after_prepared_commit" | "eof_after_prepared_ack";
+helperProtocolTest?: "short_write" | "epipe" | "eof" | "oversized_response" | "two_frames" | "invalid_utf8" | "invalid_json" | "truncated" | "valid_multibyte_control" | "forged_response" | "replay_response" | "cross_session_replay" | "forged_request" | "eof_after_prepared_commit" | "eof_after_prepared_ack" | "eof_after_discard_stage";
 /** Test-only seam immediately before opening a helper FIFO. */
 beforeDarwinHelperOpen?: (channel: "request" | "response", path: string) => void;
 /** Test-only seam immediately before a conditional target lock. */
@@ -121,6 +121,12 @@ conditionalFailurePhase?: "after_lock" | "after_verification" | "after_stage" | 
 preparedBatchJournalIndex?: number;
 /** Test-only seam: fail a Darwin batch immediately after this operation. */
 batchFailureIndex?: number;
+/** Test-only destination winner injected into expected discard publication. */
+discardBatchDestinationWinner?: boolean;
+/** Test-only same-inode destination mutation before receipt verification. */
+discardBatchDestinationMutation?: boolean;
+/** Test-only source winner injected after expected-discard staging. */
+discardBatchSourceWinner?: boolean;
 beforeDirectoryCreate?: (relativePath: string) => void;
 beforeTempOpen?: (relativePath: string) => void;
 beforeRename?: (relativePath: string) => void;
@@ -179,7 +185,7 @@ readonly sha256: string;}const descriptorReceipts = new WeakMap<PinnedRootWriteD
 // derive it from the validated frame size below; ordinary helper calls retain
 // the short default deadline.
 const DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS = 90_000;const DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS = 5_000;const DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES = 1 * 1024 * 1024;const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 1 * 1024;const DARWIN_HELPER_READ_RESPONSE_ENVELOPE_BYTES = 4 * 1024;const DARWIN_HELPER_TRANSFER_OPERATIONS = new Set([
-"write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches", "read", "read_prefix", "read_batch",]);const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;const DARWIN_HELPER_START_TIMEOUT_MS = 1_000;const DARWIN_HELPER_CLOSE_TIMEOUT_MS = 1_000;const DARWIN_HELPER_POLL_MS = 2;const MAX_PINNED_ROOT_WRITE_BYTES = 64 * 1024 * 1024;interface DarwinHelperSession {
+"write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches", "read", "read_prefix", "read_batch", "discard_batch", "discard_batch_expected",]);const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;const DARWIN_HELPER_START_TIMEOUT_MS = 1_000;const DARWIN_HELPER_CLOSE_TIMEOUT_MS = 1_000;const DARWIN_HELPER_POLL_MS = 2;const MAX_PINNED_ROOT_WRITE_BYTES = 64 * 1024 * 1024;interface DarwinHelperSession {
 readonly directory: string;
 readonly requestPath: string;
 readonly responsePath: string;
@@ -533,6 +539,32 @@ def bounded_name(domain, relative_path, suffix, nonce=True):
     digest = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
     token = ("-" + secrets.token_hex(16)) if nonce else ""
     return ".omp-" + domain + "-" + digest + token + suffix
+
+def bounded_discard_name(relative_path, source_name):
+    """Build a bounded quarantine name that retains the source basename prefix."""
+    suffix = ".discarded"
+    token = "-" + secrets.token_hex(16)
+    digest = hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:16]
+    fixed = len(("." + digest + token + suffix).encode("utf-8"))
+    source_bytes = source_name.encode("utf-8")
+    available = 255 - fixed
+    if available > 0 and len(source_bytes) > available:
+        source_name = source_bytes[:available].decode("utf-8", "ignore")
+    if not source_name:
+        source_name = "entry"
+    return source_name + "." + digest + token + suffix
+
+
+def bounded_discard_stage_name(relative_path, source_name, expected, operation_nonce):
+    """Build the deterministic, operation-owned expected-discard stage name."""
+    if (not isinstance(operation_nonce, str) or not operation_nonce or len(operation_nonce) > 64
+            or any(char not in "0123456789abcdef-" for char in operation_nonce)):
+        raise ValueError("bounded expected discard operation nonce is invalid")
+    binding = "\x00".join((relative_path, source_name, str(expected.get("dev")),
+                             str(expected.get("ino")), str(expected.get("size")),
+                             str(expected.get("sha256")), operation_nonce))
+    digest = hashlib.sha256(binding.encode("utf-8")).hexdigest()
+    return ".omp-discard-stage-" + operation_nonce + "-" + digest + ".stage"
 
 
 def reserve(parent, relative_path):
@@ -3521,20 +3553,163 @@ def operation(payload):
                     except FileNotFoundError:
                         continue
                     destination_path = "/".join(safe_segments(rejected, allow_empty=True) + [name])
-                    destination = bounded_name("discard", destination_path, ".discarded")
+                    destination = bounded_discard_name(destination_path, name)
                     for _ in range(8):
                         try:
                             rename_noreplace(parent, name, destination, rejected_parent)
                             moved += 1
                             break
                         except FileExistsError:
-                            destination = bounded_name("discard", destination_path, ".discarded")
+                            destination = bounded_discard_name(destination_path, name)
             finally:
                 if rejected_parent is not None:
                     os.close(rejected_parent)
         finally:
             if parent is not None:
                 os.close(parent)
+        return {"ok": True, "moved": moved}
+    if op == "discard_batch_expected":
+        entries = payload.get("entries")
+        rejected = payload.get("rejected")
+        max_entries = payload.get("max_entries")
+        max_name_bytes = payload.get("max_name_bytes")
+        if not isinstance(entries, list) or not isinstance(max_entries, int) or max_entries <= 0 or max_entries > MAX_DIRECTORY_ENTRIES or len(entries) > max_entries or not isinstance(max_name_bytes, int) or max_name_bytes <= 0 or max_name_bytes > MAX_DIRECTORY_NAME_BYTES:
+            raise ValueError("bounded expected discard batch limits are invalid")
+        safe_segments(rejected)
+        source_segments = safe_segments(path, allow_empty=True)
+        operation_nonce = payload.get("operation_nonce")
+        if (not isinstance(operation_nonce, str) or not operation_nonce or len(operation_nonce) > 64
+                or any(char not in "0123456789abcdef-" for char in operation_nonce)):
+            raise ValueError("bounded expected discard operation nonce is invalid")
+        normalized = []
+        seen_names = set()
+        name_work = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("bounded expected discard batch entry is invalid")
+            name = entry.get("name")
+            expected = entry.get("expected")
+            stage = entry.get("stage")
+            segments = safe_segments(name) if isinstance(name, str) else []
+            stage_segments = safe_segments(stage) if isinstance(stage, str) else []
+            if not isinstance(name, str) or len(segments) != 1:
+                raise ValueError("bounded expected discard batch entry name is invalid")
+            if not isinstance(stage, str) or len(stage_segments) != 1:
+                raise ValueError("bounded expected discard batch entry stage is invalid")
+            name = segments[0]
+            stage = stage_segments[0]
+            if name in seen_names:
+                raise ValueError("bounded expected discard batch contains duplicate source name")
+            seen_names.add(name)
+            if (not isinstance(expected, dict) or expected.get("kind") != "file"
+                    or not isinstance(expected.get("dev"), int) or expected.get("dev") < 0
+                    or not isinstance(expected.get("ino"), int) or expected.get("ino") < 0
+                    or not isinstance(expected.get("size"), int) or expected.get("size") < 0 or expected.get("size") > MAX_READ
+                    or not isinstance(expected.get("sha256"), str) or len(expected.get("sha256")) != 64
+                    or any(char not in "0123456789abcdef" for char in expected.get("sha256"))):
+                raise ValueError("bounded expected discard batch file expectation is invalid")
+            source_path = "/".join(source_segments + [name])
+            expected_stage = bounded_discard_stage_name(source_path, name, expected, operation_nonce)
+            if stage != expected_stage:
+                raise ValueError("bounded expected discard batch entry stage is not operation-owned")
+            name_work += len(name.encode("utf-8"))
+            normalized.append((name, expected, stage))
+        if name_work > max_name_bytes:
+            raise LimitError("bounded expected discard batch exceeded name-byte limit")
+        parent = None
+        rejected_parent = None
+        moved = 0
+        try:
+            parent = parent_dir(root_fd, path, False)
+            rejected_parent = parent_dir(root_fd, rejected, True)
+            # Preflight every present source before publishing any quarantine
+            # name. The move phase repeats the exact check after staging so a
+            # replacement cannot be accepted between preflight and rename.
+            present = []
+            for name, expected, stage in normalized:
+                root_guard(root_fd, payload)
+                try:
+                    data, info = read_at(parent, name, MAX_READ)
+                except FileNotFoundError:
+                    continue
+                if (not stat.S_ISREG(info.st_mode) or not same_identity(info, expected)
+                        or len(data) != expected.get("size") or not same_digest(data, expected)):
+                    raise RuntimeError("anchored discard source changed before quarantine")
+                present.append((name, expected, stage))
+            for name, expected, stage in present:
+                root_guard(root_fd, payload)
+                source_path = "/".join(safe_segments(path, allow_empty=True) + [name])
+                staged = False
+                try:
+                    rename_noreplace(parent, name, stage)
+                    staged = True
+                except FileExistsError:
+                    raise RuntimeError("anchored discard operation stage is already occupied")
+                try:
+                    if payload.get("_test_response_mode") == "eof_after_discard_stage":
+                        if payload.get("test_discard_source_winner"):
+                            winner_temp = write_named_temp(parent, name, b"winner")
+                            try:
+                                rename_noreplace(parent, winner_temp, name)
+                            except Exception:
+                                cleanup_temp(parent, winner_temp)
+                                raise
+                        os._exit(0)
+                    staged_data, staged_info = read_at(parent, stage, MAX_READ)
+                    if (not stat.S_ISREG(staged_info.st_mode) or not same_identity(staged_info, expected)
+                            or len(staged_data) != expected.get("size") or not same_digest(staged_data, expected)):
+                        raise RuntimeError("anchored discard source changed during quarantine staging")
+                    destination_path = "/".join(safe_segments(rejected, allow_empty=True) + [name])
+                    destination = bounded_discard_name(destination_path, name)
+                    if payload.get("test_discard_destination_winner") and not payload.get("_discard_destination_winner_injected"):
+                        payload["_discard_destination_winner_injected"] = True
+                        write_named_temp(rejected_parent, destination, b"winner")
+                    published = False
+                    for _ in range(32):
+                        try:
+                            rename_noreplace(parent, stage, destination, rejected_parent)
+                            staged = False
+                            published = True
+                            break
+                        except FileExistsError:
+                            destination = bounded_discard_name(destination_path, name)
+                    if not published:
+                        raise OSError("unable to reserve an exclusive discard destination")
+                    if payload.get("test_discard_destination_mutation") and not payload.get("_discard_destination_mutation_injected"):
+                        payload["_discard_destination_mutation_injected"] = True
+                        mutation_fd = os.open(destination, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=rejected_parent)
+                        try:
+                            os.lseek(mutation_fd, 0, os.SEEK_SET)
+                            os.write(mutation_fd, b"X")
+                            os.fsync(mutation_fd)
+                        finally:
+                            os.close(mutation_fd)
+                    fsync_regular(parent)
+                    fsync_regular(rejected_parent)
+                    try:
+                        destination_data, destination_info = read_at(rejected_parent, destination, MAX_READ)
+                    except Exception as error:
+                        raise RecoveryRequired("anchored discard destination receipt is unavailable; published destination is preserved") from error
+                    if (not stat.S_ISREG(destination_info.st_mode)
+                            or not same_identity(destination_info, expected)
+                            or len(destination_data) != expected.get("size")
+                            or not same_digest(destination_data, expected)):
+                        raise RecoveryRequired("anchored discard destination receipt mismatched; published destination is preserved")
+                    moved += 1
+                except Exception:
+                    if staged:
+                        try:
+                            rename_noreplace(parent, stage, name)
+                        except FileExistsError:
+                            pass
+                    raise
+                root_guard(root_fd, payload)
+        finally:
+            if rejected_parent is not None:
+                os.close(rejected_parent)
+            if parent is not None:
+                os.close(parent)
+        root_guard(root_fd, payload)
         return {"ok": True, "moved": moved}
     if op == "hash":
         parent, name = parent_for(root_fd, path, False)
@@ -4025,7 +4200,7 @@ def execute(payload):
         # remain path_unauthorized.  A kernel EACCES while mutating the
         # journal/projection is an ordinary persistence failure and must keep
         # its write_failed contract.
-        write_ops = ("ensure_directory", "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "recover_prepared_batch", "batch_atomic", "replace_if_matches", "remove_if_matches", "remove_empty_directory_if_matches", "link_exclusive", "rename", "rename_noreplace", "rmdir", "remove_entry", "remove", "unlink", "lock_acquire", "lock_release")
+        write_ops = ("ensure_directory", "write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "recover_prepared_batch", "batch_atomic", "replace_if_matches", "remove_if_matches", "remove_empty_directory_if_matches", "link_exclusive", "rename", "rename_noreplace", "rmdir", "remove_entry", "remove", "unlink", "lock_acquire", "lock_release", "discard_batch", "discard_batch_expected")
         batch_writes = op_name in ("batch", "batch_atomic") and isinstance(payload, dict) and isinstance(payload.get("operations"), list) and any(isinstance(item, dict) and item.get("op") in write_ops for item in payload["operations"])
         if getattr(exc, "errno", None) == 13 and (op_name in write_ops or batch_writes):
             return fail("write_failed", str(exc))
@@ -4407,7 +4582,14 @@ return segments;}function boundedTemporaryComponent(domain: string, relativePath
 const digest = createHash("sha256").update(relativePath, "utf8").digest("hex");
 return `.omp-${domain}-${digest}-${randomUUID()}${suffix}`;}function boundedDarwinSibling(domain: string, relativePath: string, suffix: string): string {
 const digest = createHash("sha256").update(relativePath, "utf8").digest("hex");
-return ".omp-" + domain + "-" + digest + suffix;}function closeQuietly(fd: number | null): void {
+return ".omp-" + domain + "-" + digest + suffix;}
+function boundedDarwinDiscardStage(relativeDirectory: string, sourceName: string, expected: PinnedRootFileExpectation, operationNonce: string): string {
+const sourcePath = relativeDirectory.length === 0 ? sourceName : `${relativeDirectory}/${sourceName}`;
+const binding = [sourcePath, sourceName, String(expected.dev), String(expected.ino), String(expected.size ?? ""), expected.sha256, operationNonce].join("\0");
+const digest = createHash("sha256").update(binding, "utf8").digest("hex");
+return `.omp-discard-stage-${operationNonce}-${digest}.stage`;
+}
+function closeQuietly(fd: number | null): void {
 if (fd === null) return;
 try { closeSync(fd); } catch { /* preserve the primary operation result */ }}function removeDarwinHelperDirectory(directory: string): void {
 try { rmSync(directory, { recursive: true, force: true }); } catch {
@@ -4649,6 +4831,237 @@ throw new PinnedRootError("write_failed", `anchored target could not be removed 
 parent.close();
 }
 }
+  /**
+   * Move one bounded batch of exact regular-file preimages to rejected storage.
+   * Darwin performs all verification and no-replace moves in one helper
+   * request; portable callers retain the staged descriptor-anchored fallback.
+   */
+  private recoverDarwinExpectedDiscardEntry(
+    relativeDirectory: string,
+    entry: { name: string; expected: PinnedRootFileExpectation; stage: string },
+  ): void {
+    const sourcePath = join(relativeDirectory, entry.name);
+    const stagePath = join(relativeDirectory, entry.stage);
+    const matchesExpected = (observed: PinnedRootReadResult): boolean =>
+      observed.dev === entry.expected.dev
+      && observed.ino === entry.expected.ino
+      && observed.bytes.byteLength === entry.expected.size
+      && createHash("sha256").update(observed.bytes).digest("hex") === entry.expected.sha256;
+    const inspect = (candidatePath: string, label: string): { present: boolean; matches: boolean } => {
+      let info: PinnedRootPathEntryInfo | null;
+      try {
+        info = this.pathEntryInfo(candidatePath);
+      } catch (error) {
+        throw new PinnedRootError("recovery_required", `expected discard ${label} could not be inspected during recovery: ${String(error)}`);
+      }
+      if (info === null) return { present: false, matches: false };
+      if (info.kind !== "file") throw new PinnedRootError("recovery_required", `expected discard ${label} stage is not a regular file; preserving artifact`);
+      let observed: PinnedRootReadResult;
+      try {
+        observed = this.readFile(candidatePath, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
+      } catch (error) {
+        throw new PinnedRootError("recovery_required", `expected discard ${label} could not verify its regular-file artifact; preserving artifact: ${String(error)}`);
+      }
+      return { present: true, matches: matchesExpected(observed) };
+    };
+    if (!this.isStable()) throw new PinnedRootError("recovery_required", "pinned project root changed before expected discard recovery");
+    const stage = inspect(stagePath, `stage '${entry.stage}'`);
+    const source = inspect(sourcePath, `source '${entry.name}'`);
+    if (!stage.present) {
+      if (source.present && source.matches && this.isStable()) return;
+      throw new PinnedRootError("recovery_required", `expected discard '${entry.name}' has no verifiable operation stage or exact source; preserving artifact`);
+    }
+    if (!stage.matches) throw new PinnedRootError("recovery_required", `expected discard '${entry.name}' operation stage is foreign or changed; preserving artifact`);
+    if (source.present) throw new PinnedRootError("recovery_required", `expected discard '${entry.name}' source winner is present; preserving stage artifact`);
+    if (!this.isStable()) throw new PinnedRootError("recovery_required", "pinned project root changed before expected discard stage restore");
+    try {
+      this.renameFileExclusive(stagePath, sourcePath);
+    } catch (error) {
+      // A lost response from the compensating no-replace rename is safe only
+      // when the exact source postimage and stage absence can be re-proven.
+      let restored: { present: boolean; matches: boolean };
+      let remainingStage: { present: boolean; matches: boolean };
+      try {
+        restored = inspect(sourcePath, `source '${entry.name}' after restore`);
+        remainingStage = inspect(stagePath, `stage '${entry.stage}' after restore`);
+      } catch (recoveryError) {
+        throw recoveryError instanceof PinnedRootError
+          ? recoveryError
+          : new PinnedRootError("recovery_required", `expected discard '${entry.name}' restore could not be proven; preserving artifact`);
+      }
+      if (restored.present && restored.matches && !remainingStage.present && this.isStable()) return;
+      throw new PinnedRootError("recovery_required", `expected discard '${entry.name}' stage restore could not be proven; preserving artifact: ${String(error)}`);
+    }
+    if (!this.isStable()) throw new PinnedRootError("recovery_required", `expected discard '${entry.name}' root changed after stage restore; preserving artifact`);
+    const restored = inspect(sourcePath, `source '${entry.name}' after restore`);
+    const remainingStage = inspect(stagePath, `stage '${entry.stage}' after restore`);
+    if (!restored.present || !restored.matches || remainingStage.present) {
+      throw new PinnedRootError("recovery_required", `expected discard '${entry.name}' stage restore could not be proven; preserving artifact`);
+    }
+  }
+
+  private recoverDarwinExpectedDiscard(
+    relativeDirectory: string,
+    entries: readonly { name: string; expected: PinnedRootFileExpectation; stage: string }[],
+  ): void {
+    this.resetDarwinHelperForCompensation();
+    let firstRecovery: PinnedRootError | null = null;
+    for (const entry of entries) {
+      try {
+        this.recoverDarwinExpectedDiscardEntry(relativeDirectory, entry);
+      } catch (error) {
+        if (firstRecovery === null) {
+          firstRecovery = error instanceof PinnedRootError && error.code === "recovery_required"
+            ? error
+            : new PinnedRootError("recovery_required", `expected discard '${entry.name}' recovery could not be proven; preserving artifact: ${String(error)}`);
+        }
+      }
+    }
+    if (firstRecovery !== null) throw firstRecovery;
+  }
+
+  discardBatchIfMatches(
+    relativeDirectory: string,
+    entries: readonly { name: string; expected: PinnedRootFileExpectation }[],
+    rejectedRelativeDirectory: string,
+    options: { maxEntries?: number; maxNameBytes?: number } = {},
+  ): number {
+    safeRelativeSegments(relativeDirectory, true);
+    safeRelativeSegments(rejectedRelativeDirectory, true);
+    assertCurrentExecutionLiveness();
+    const maxEntries = options.maxEntries ?? 512;
+    const maxNameBytes = options.maxNameBytes ?? 64 * 1024;
+    if (!Array.isArray(entries)) throw new PinnedRootError("invalid", "bounded expected discard batch entries are invalid");
+    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0 || maxEntries > DEFAULT_DIRECTORY_MAX_ENTRIES || entries.length > maxEntries || !Number.isSafeInteger(maxNameBytes) || maxNameBytes <= 0 || maxNameBytes > DEFAULT_DIRECTORY_MAX_NAME_BYTES) {
+      throw new PinnedRootError("invalid", "bounded expected discard batch limits are invalid");
+    }
+    if (entries.length === 0) return 0;
+    const normalizedNames = new Set<string>();
+    const operationNonce = randomUUID();
+    const validEntries = entries.map((entry) => {
+      if (!entry || typeof entry !== "object") throw new PinnedRootError("invalid", "bounded expected discard batch entry is invalid");
+      const nameSegments = safeRelativeSegments(entry.name);
+      if (nameSegments.length !== 1) throw new PinnedRootError("path_unauthorized", "expected discard batch entry must be one path segment");
+      const normalizedName = nameSegments[0]!;
+      if (normalizedNames.has(normalizedName)) throw new PinnedRootError("invalid", `bounded expected discard batch contains duplicate source name '${normalizedName}'`);
+      normalizedNames.add(normalizedName);
+      const expected = entry.expected;
+      if (!expected || expected.kind !== "file" || !Number.isSafeInteger(expected.dev) || expected.dev < 0 || !Number.isSafeInteger(expected.ino) || expected.ino < 0 || !Number.isSafeInteger(expected.size) || expected.size < 0 || expected.size > MAX_PINNED_ROOT_READ_BYTES || typeof expected.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(expected.sha256)) {
+        throw new PinnedRootError("invalid", `expected discard batch entry '${nameSegments[0]!}' requires an exact bounded regular-file expectation`);
+      }
+      const normalizedExpected = { kind: "file" as const, dev: expected.dev, ino: expected.ino, size: expected.size, sha256: expected.sha256 };
+      return { name: nameSegments[0]!, expected: normalizedExpected, stage: boundedDarwinDiscardStage(relativeDirectory, nameSegments[0]!, normalizedExpected, operationNonce) };
+    });
+    if (validEntries.reduce((total, entry) => total + Buffer.byteLength(entry.name, "utf8"), 0) > maxNameBytes) {
+      throw new PinnedRootError("limit", "bounded expected discard batch exceeded name-byte limit");
+    }
+    if (process.platform === "darwin") {
+      try {
+        const result = this.runDescriptorHelper<{ moved?: unknown }>("discard_batch_expected", {
+          path: relativeDirectory,
+          entries: validEntries,
+          operation_nonce: operationNonce,
+          rejected: rejectedRelativeDirectory,
+          max_entries: maxEntries,
+          max_name_bytes: maxNameBytes,
+          ...(this.hooks.discardBatchDestinationWinner ? { test_discard_destination_winner: true } : {}),
+          ...(this.hooks.discardBatchDestinationMutation ? { test_discard_destination_mutation: true } : {}),
+          ...(this.hooks.discardBatchSourceWinner ? { test_discard_source_winner: true } : {}),
+        });
+        assertCurrentExecutionLiveness();
+        if (!Number.isSafeInteger(result.moved) || (result.moved as number) < 0 || (result.moved as number) > validEntries.length) {
+          throw new PinnedRootError("write_failed", "descriptor helper returned an invalid expected discard count");
+        }
+        return result.moved as number;
+      } catch (error) {
+        // Only an authenticated helper/transport failure poisons the session
+        // and leaves the source-to-stage exchange ambiguous. Typed helper
+        // responses (changed, receipt, limits, etc.) retain their existing
+        // per-entry contract and must not be rewritten as recovery failures.
+        const ambiguous = this.darwinHelperPoisoned;
+        if (ambiguous) this.recoverDarwinExpectedDiscard(relativeDirectory, validEntries);
+        throw error;
+      }
+    }
+
+    this.ensureDirectory(rejectedRelativeDirectory);
+    let moved = 0;
+    for (const entry of validEntries) {
+      const source = join(relativeDirectory, entry.name);
+      const stage = join(relativeDirectory, boundedTemporaryComponent("discard-stage", source, ".stage"));
+      let staged = false;
+      try {
+        try {
+          this.renameFileExclusive(source, stage);
+          staged = true;
+        } catch (error) {
+          if (error instanceof PinnedRootError && error.code === "not_found") continue;
+          throw error;
+        }
+        const observed = this.readFile(stage, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
+        if (observed.dev !== entry.expected.dev || observed.ino !== entry.expected.ino || observed.bytes.byteLength !== entry.expected.size || createHash("sha256").update(observed.bytes).digest("hex") !== entry.expected.sha256) {
+          throw new PinnedRootError("changed", `queue entry '${entry.name}' changed during quarantine staging`);
+        }
+        let published = false;
+        let destination = join(rejectedRelativeDirectory, boundedTemporaryComponent("discard", join(rejectedRelativeDirectory, entry.name), ".discarded"));
+        for (let attempt = 0; attempt < 32; attempt += 1) {
+          try {
+            this.renameFileExclusive(stage, destination);
+            published = true;
+            break;
+          } catch (error) {
+            if (error instanceof PinnedRootError && error.code === "exists") {
+              destination = join(rejectedRelativeDirectory, boundedTemporaryComponent("discard", join(rejectedRelativeDirectory, entry.name), ".discarded"));
+              continue;
+            }
+            throw error;
+          }
+        }
+        if (!published) throw new PinnedRootError("write_failed", "unable to reserve an exclusive discard destination");
+        staged = false;
+        this.hooks.afterPublish?.(destination);
+        if (this.hooks.discardBatchDestinationMutation) {
+          const destinationPath = this.canonicalPath(destination);
+          const fd = openSync(destinationPath, constants.O_WRONLY);
+          try {
+            const mutation = Buffer.from("X", "utf8");
+            writeSync(fd, mutation, 0, mutation.byteLength, 0);
+            fsyncSync(fd);
+          } finally {
+            closeSync(fd);
+          }
+        }
+        this.syncDirectory(relativeDirectory);
+        this.syncDirectory(rejectedRelativeDirectory);
+        let receipt: PinnedRootReadResult;
+        try {
+          receipt = this.readFile(destination, { maxBytes: MAX_PINNED_ROOT_READ_BYTES });
+        } catch (error) {
+          throw new PinnedRootError("recovery_required", `queue entry '${entry.name}' destination receipt is unavailable; published destination is preserved: ${String(error)}`);
+        }
+        if (receipt.dev !== entry.expected.dev
+          || receipt.ino !== entry.expected.ino
+          || receipt.bytes.byteLength !== entry.expected.size
+          || createHash("sha256").update(receipt.bytes).digest("hex") !== entry.expected.sha256) {
+          throw new PinnedRootError("recovery_required", `queue entry '${entry.name}' destination receipt mismatched; published destination is preserved`);
+        }
+        moved += 1;
+      } catch (error) {
+        if (staged) {
+          try {
+            this.renameFileExclusive(stage, source);
+          } catch {
+            throw new PinnedRootError("recovery_required", `queue entry '${entry.name}' requires recovery from stage ${stage}`);
+          }
+        }
+        throw error;
+      }
+      assertCurrentExecutionLiveness();
+    }
+    assertCurrentExecutionLiveness();
+    return moved;
+  }
+
   /**
    * Move one bounded batch of queue entries to a durable rejected namespace.
    * Darwin performs all moves under one inherited root descriptor; portable
@@ -7183,6 +7596,24 @@ if (!this.isStable()) throw new PinnedRootError("changed", "pinned project root 
 private canonicalPath(relativeFile: string): string {
 const segments = safeRelativeSegments(relativeFile);
 return join(this.canonical_root, ...segments);
+}
+private syncDirectory(relativeDirectory: string): void {
+  const segments = safeRelativeSegments(relativeDirectory, true);
+  const parent = this.openParent(segments, false);
+  try {
+    this.assertCanonicalDirectory(segments.join("/"));
+    this.assertParentPathIdentity(parent.fd, segments.join("/"));
+    try {
+      fsyncSync(parent.fd);
+    } catch (error) {
+      const code = errnoCode(error);
+      if (code !== "EINVAL" && code !== "ENOTSUP") throw error;
+    }
+    this.assertStable();
+    assertCurrentExecutionLiveness();
+  } finally {
+    parent.close();
+  }
 }
 private openParent(segments: string[], create: boolean): { fd: number; identity: Stats; close: () => void } {
 let parentFd = this.rootFd;

@@ -124,6 +124,34 @@ test("currentOutboxDeliveryStatus validates genuine outbox publication and raw r
   }
 });
 
+test("readCompletedDeliveryIndexPage preserves active pending-retry authority", () => {
+  const root = makeProject("omp-cto-delivery-pending-retry-page-");
+  try {
+    const { runtime, access } = openAccess(root);
+    try {
+      const runId = "delivery-pending-retry-page";
+      const state = createAuthenticatedRun(access, runId);
+      const input = deliveryInput(runId, state.state_revision as number);
+      assert.ok(publishWithObligation(root, access, input));
+      const outboxPath = join(root, ".work-state", "cto", runId, "outbox", input.entry_name);
+      const retryName = "r2-retry-page.json";
+      const retryPath = join(root, ".work-state", "cto", runId, "outbox-retry", retryName);
+      mkdirSync(join(root, ".work-state", "cto", runId, "outbox-retry"));
+      renameSync(outboxPath, retryPath);
+      assert.equal(access.markDeliveryPending(runId, input.state_revision, "retry"), true);
+      assert.equal(access.readDeliveryIndexPage().entries.find((entry) => entry.run_id === runId)?.pending_retry, true);
+      assert.deepEqual(access.readCompletedDeliveryIndexPage().entries, []);
+      const pending = access.readDeliveryIndexPage().entries.find((entry) => entry.run_id === runId);
+      assert.equal(pending?.pending_retry, true, "completed-page reads preserve active retry authority");
+      assert.equal(access.currentOutboxDeliveryStatus({ ...input, lane: "retry", storage_entry_name: retryName }), "current");
+    } finally {
+      runtime.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("currentOutboxDeliveryStatus rejects valid-looking unindexed files and stale, tampered, or cross-root input", () => {
   const root = makeProject("omp-cto-delivery-guard-negative-");
   const otherRoot = makeProject("omp-cto-delivery-guard-other-");

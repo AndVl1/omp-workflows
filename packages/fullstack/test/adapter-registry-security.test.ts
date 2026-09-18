@@ -26,10 +26,12 @@ function runtimeFor(root: string, owner = fullstackTestOwner(root)): FullstackRu
   runtimeFixtures.set(root, runtime);
   return runtime;
 }
-test.after(() => {
+function closeRuntimeFixtures(): void {
   for (const runtime of runtimeFixtures.values()) runtime.close();
   runtimeFixtures.clear();
-});
+}
+test.afterEach(closeRuntimeFixtures);
+test.after(closeRuntimeFixtures);
 
 function register(
   root: string,

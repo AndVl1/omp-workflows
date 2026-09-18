@@ -10,6 +10,7 @@ export type CtoRuntimeProofDomain =
   | "bridge-lease-v1"
   | "cto-dispatcher-lease-v1"
   | "telegram-mapping-v1"
+  | "telegram-delivery-effect-v1"
   | "cto-inbox-auth-v1"
   | "cto-wake-effect-v1";
 
@@ -20,6 +21,7 @@ const DOMAIN_VALUES: ReadonlySet<string> = new Set([
   "bridge-lease-v1",
   "cto-dispatcher-lease-v1",
   "telegram-mapping-v1",
+  "telegram-delivery-effect-v1",
   "cto-inbox-auth-v1",
   "cto-wake-effect-v1",
 ]);

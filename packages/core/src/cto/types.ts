@@ -345,7 +345,8 @@ export interface CtoTerminalSummaryEvidence {
   wave_id: string;
   source_revision: number;
   envelope_sha256: string;
-  envelope: string;
+  /** Full immutable envelope while delivery remains pending; omitted once settled. */
+  envelope?: string;
 }
 
 export interface CtoControlPlaneFields {

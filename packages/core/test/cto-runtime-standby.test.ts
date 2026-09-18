@@ -230,3 +230,31 @@ test("ensureStandbyRun fails closed when active discovery is temporarily unavail
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+
+test("ensureStandbyRun rejects a corrupt active index without creating a standby", () => {
+  const root = makeProject();
+  try {
+    const active = newCtoState({
+      id: "corrupt-index-active",
+      task: "corrupt index active run",
+      branch: "main",
+      autonomous: false,
+      owner_session: "main-session",
+      plan: { id: "corrupt-index-active", task: "corrupt index active run", teams: [], created_at: "" },
+    });
+    const { runtime, access } = openAccess(root);
+    access.createRun(active, { source_id: "runtime-standby-test", initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(active) });
+    const ctoRoot = join(root, ".work-state", "cto");
+    const indexPath = join(ctoRoot, CTO_RUN_DELIVERY_INDEX_FILE);
+    writeFileSync(indexPath, "{not-json");
+    assert.throws(
+      () => access.ensureStandbyRun(),
+      (error: unknown) => error instanceof CtoRuntimeAccessError && error.code === "runtime_access_invalid",
+    );
+    assert.equal(readdirSync(ctoRoot).some((name) => name.startsWith("standby-")), false);
+    runtime.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

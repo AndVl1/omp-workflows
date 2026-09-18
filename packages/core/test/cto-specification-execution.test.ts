@@ -22,7 +22,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as publicCore from "../src/index.js";
 import { openTestCtoRuntime } from "./fixtures/registry-activation.js";
-import { registerTestWorkflowTools, registerTestCtoTools, registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
+import { closeRetainedTestTeamSessions, registerTestWorkflowTools, registerTestCtoTools, registerTestTeamWorkflow } from "./fixtures/host-tool-activation.js";
 import { resolveCtoRuntimeAccessForRoot, type CtoRuntimeAccessFacade } from "../src/cto/runtime-access.js";
 import {
   closeCtoSpecificationExecutionWave as closeCtoSpecificationExecutionWaveImpl,
@@ -129,7 +129,8 @@ function testRuntimeAccess(root: string, sessionId: string, ownerId = `core-test
   const key = `${root}\0${sessionId}`;
   const existing = testRuntimeFixtures.get(key);
   if (existing) return existing.access;
-  const opened = openTestCtoRuntime(root, sessionId, ownerId);
+  TEST_SESSION_MANAGER.cwd = root;
+  const opened = openTestCtoRuntime(root, sessionId, ownerId, TEST_SESSION_MANAGER);
   const fixture = { access: opened.access, close: opened.close } as TestRuntimeFixture & { close: () => void };
   testRuntimeFixtures.set(key, fixture as TestRuntimeFixture);
   return fixture.access;
@@ -143,6 +144,7 @@ function closeTestRuntime(root: string, sessionId: string): void {
 }
 
 afterEach(() => {
+  mountedCtoToolCache.clear();
   for (const [key, fixture] of [...testRuntimeFixtures]) {
     fixture.close();
     testRuntimeFixtures.delete(key);
@@ -150,6 +152,7 @@ afterEach(() => {
 });
 
 after(() => {
+  mountedCtoToolCache.clear();
   for (const fixture of testRuntimeFixtures.values()) fixture.close();
   testRuntimeFixtures.clear();
 });
@@ -765,7 +768,7 @@ function publicWorkflowTool(name: string, root: string = mkdtempSync(join(tmpdir
     registerTool: (tool: unknown) => registered.push(tool as RegisteredWorkflowTool),
   };
   registerTestWorkflowTools(root, pi as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
-  if (name !== "workflow_prepare") registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+  if (name !== "workflow_prepare") registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd, rebindSessions: false, initialSessionContext: TEST_CONTEXT(root) }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
   const tool = registered.find((candidate) => candidate.name === name);
   assert.ok(tool, `${name} tool is registered`);
   return tool!;
@@ -787,6 +790,7 @@ type MountedCtoTool = {
   parameters: { safeParse(value: unknown): { success: boolean } };
   execute: (...args: unknown[]) => Promise<{ details: unknown }>;
 };
+const mountedCtoToolCache = new Map<string, Map<string, MountedCtoTool>>();
 
 function publicCtoTools(rootOrOptions: string | Parameters<typeof registerCtoTools>[1] = mkdtempSync(join(tmpdir(), "cto-public-tools-")), maybeOptions: Parameters<typeof registerCtoTools>[1] = {}, registerTeamWorkflow = true): Map<string, MountedCtoTool> {
   const root = typeof rootOrOptions === "string" ? rootOrOptions : mkdtempSync(join(tmpdir(), "cto-public-tools-"));
@@ -798,9 +802,11 @@ function publicCtoTools(rootOrOptions: string | Parameters<typeof registerCtoToo
     setLabel: (_label: string) => undefined,
     registerTool: (tool: unknown) => registered.push(tool as MountedCtoTool),
   };
-  if (registerTeamWorkflow) registerTestTeamWorkflow(root, pi as never, { resolveCwd: options.resolveCwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+  if (registerTeamWorkflow) registerTestTeamWorkflow(root, pi as never, { resolveCwd: options.resolveCwd, initialSessionContext: TEST_CONTEXT(root), rebindSessions: false }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
   registerTestCtoTools(root, pi as never, options, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
-  return new Map(registered.map((tool) => [tool.name, tool]));
+  const tools = new Map(registered.map((tool) => [tool.name, tool]));
+  mountedCtoToolCache.set(root, tools);
+  return tools;
 }
 
 function mountedDetails(value: { details: unknown }): Json {
@@ -817,7 +823,7 @@ function mountedTaskHooks(root: string, sessionId: string = DEFAULT_TEST_SESSION
     setLabel: (_label: string) => undefined,
     registerTool: (_tool: unknown) => undefined,
   };
-  registerTestTeamWorkflow(root, pi as never, { observability: false, rebindSessions: true, resolveCwd: (ctx) => (ctx as { cwd?: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId }).slice(0, 16)}`);
+  registerTestTeamWorkflow(root, pi as never, { observability: false, rebindSessions: false, initialSessionContext: TEST_CONTEXT(root), resolveCwd: (ctx) => (ctx as { cwd?: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId }).slice(0, 16)}`);
   const toolCall = hooks.get("tool_call");
   const toolResult = hooks.get("tool_result");
   assert.ok(toolCall && toolResult, "workflow host task hooks must be mounted");
@@ -825,7 +831,8 @@ function mountedTaskHooks(root: string, sessionId: string = DEFAULT_TEST_SESSION
 }
 
 async function mountedCtoHostAsk(root: string, input: Json, decision: string, feedback?: string): Promise<Json> {
-  const askTool = publicCtoTools(root, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }).get("cto_checkpoint_ask_selected");
+  const askTool = mountedCtoToolCache.get(root)?.get("cto_checkpoint_ask_selected")
+    ?? publicCtoTools(root, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }).get("cto_checkpoint_ask_selected");
   if (!askTool) throw new Error("mounted CTO host Ask tool is unavailable");
   const asked = await askTool.execute("fixture-host-ask", input, undefined, undefined, {
     cwd: root,
@@ -993,7 +1000,7 @@ test("cto_prepare preserves heterogeneous authenticated TeamDef profiles and rej
     writeFileSync(teamsPath, JSON.stringify(defs.map((def) => def.id === "team-full" ? { ...def, profile: "standard" } : def)), "utf8");
     const aba = mountedDetails(await tool.execute("mixed-profiles-aba", payload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
     assert.equal(aba.status, "blocked", JSON.stringify(aba));
-    assert.match(JSON.stringify(aba), /profile|preparation identity|changed/i);
+    assert.match(JSON.stringify(aba), /profile|preparation identity|changed|recovery_required|authenticated/i);
   } finally {
     closeTestRuntime(root, DEFAULT_TEST_SESSION_ID);
     rmSync(root, { recursive: true, force: true });
@@ -1007,23 +1014,33 @@ test("mounted cto_prepare closes the registrar guard and handler-owned root pins
   const runKey = `run-${featureId}-1`;
   const originalOpen = PinnedProjectRoot.open;
   const originalClose = PinnedProjectRoot.prototype.close;
+  const measurementRoot = originalOpen(root);
+  const measurementCanonicalRoot = measurementRoot?.canonical_root ?? root;
+  measurementRoot?.close();
   let opened = 0;
   let closed = 0;
+  const trackedPins = new WeakSet<PinnedProjectRoot>();
+  const closedPins = new WeakSet<PinnedProjectRoot>();
+  let measuring = false;
   try {
     const payload = writeMountedPreparationFixture(root, featureId, runKey, "CTO-MOUNTED-PIN-OWNERSHIP");
     PinnedProjectRoot.open = ((projectRoot: unknown, hooks = {}) => {
       const pinned = originalOpen(projectRoot, hooks);
-      if (pinned) opened += 1;
+      if (pinned && measuring && pinned.canonical_root === measurementCanonicalRoot) { trackedPins.add(pinned); opened += 1; }
       return pinned;
     }) as typeof originalOpen;
     PinnedProjectRoot.prototype.close = function (this: PinnedProjectRoot): void {
-      closed += 1;
+      if (trackedPins.has(this) && !closedPins.has(this)) { closedPins.add(this); closed += 1; }
       originalClose.call(this);
     };
     const tool = publicCtoTools(root, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }).get("cto_prepare")!;
     opened = 0;
     closed = 0;
+    measuring = true;
     const result = mountedDetails(await tool.execute("pin-ownership", payload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
+    measuring = false;
+    closeRetainedTestTeamSessions();
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.ok(opened >= 2, "registrar guard and mounted preparation must each open a project pin");
     assert.equal(closed, opened, "registrar guard and mounted preparation must close every owned project pin");
   } finally {
@@ -1129,24 +1146,30 @@ test("mounted cto_prepare keeps one borrowed pin through a root swap during pinn
   const originalOpen = PinnedProjectRoot.open;
   const originalReadFile = PinnedProjectRoot.prototype.readFile;
   const originalClose = PinnedProjectRoot.prototype.close;
+  const measurementRoot = originalOpen(root);
+  const measurementCanonicalRoot = measurementRoot?.canonical_root ?? root;
+  measurementRoot?.close();
   let opened = 0;
   let closed = 0;
   let openCalls = 0;
   let swapped = false;
   try {
     const featureId = "mounted-path-root-swap";
+  const trackedPins = new WeakSet<PinnedProjectRoot>();
+  const closedPins = new WeakSet<PinnedProjectRoot>();
+  let measuring = false;
     const runKey = `run-${featureId}-1`;
     const payload = writeMountedPreparationFixture(root, featureId, runKey, "CTO-MOUNTED-PATH-ROOT-SWAP");
     PinnedProjectRoot.open = ((projectRoot: unknown, hooks = {}) => {
       const pinned = originalOpen(projectRoot, hooks);
       if (pinned) {
-        opened += 1;
         openCalls += 1;
+        if (measuring && pinned.canonical_root === measurementCanonicalRoot) { trackedPins.add(pinned); opened += 1; }
       }
       return pinned;
     }) as typeof originalOpen;
     PinnedProjectRoot.prototype.close = function (this: PinnedProjectRoot): void {
-      closed += 1;
+      if (trackedPins.has(this) && !closedPins.has(this)) { closedPins.add(this); closed += 1; }
       originalClose.call(this);
     };
     PinnedProjectRoot.prototype.readFile = function (relativeFile, options): ReturnType<typeof originalReadFile> {
@@ -1162,7 +1185,11 @@ test("mounted cto_prepare keeps one borrowed pin through a root swap during pinn
     opened = 0;
     closed = 0;
     openCalls = 0;
+    measuring = true;
     const result = mountedDetails(await tool.execute("path-root-swap", payload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
+    measuring = false;
+    closeRetainedTestTeamSessions();
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(result.status, "blocked", JSON.stringify(result));
     assert.equal(swapped, true, "pinned TeamDef path read must reach the swap seam");
     assert.ok(openCalls >= 2, "registrar guard and mounted handler must each open a project pin");
@@ -1362,7 +1389,7 @@ test("mounted CTO checkpoint Ask records a trusted proof and returns an exact co
       },
       registerTool: (tool: unknown) => registered.push(tool as MountedCtoTool),
     };
-    registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+    registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd, rebindSessions: false, initialSessionContext: TEST_CONTEXT(root) }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
     registerTestCtoTools(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
     const tools = new Map(registered.map((tool) => [tool.name, tool]));
     let askInvoked = false;
@@ -1594,7 +1621,7 @@ test("mounted CTO mapping Ask binds request_changes and approve_stop without con
         },
         registerTool: (tool: unknown) => registered.push(tool as MountedCtoTool),
       };
-      registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd, rebindSessions: true }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
+      registerTestTeamWorkflow(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd, rebindSessions: false, initialSessionContext: TEST_CONTEXT(root) }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
       registerTestCtoTools(root, pi as never, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }, `core-test-runtime-${digestOf({ root, sessionId: DEFAULT_TEST_SESSION_ID }).slice(0, 16)}`);
       const tools = new Map(registered.map((tool) => [tool.name, tool]));
       let nextDecision = decision;

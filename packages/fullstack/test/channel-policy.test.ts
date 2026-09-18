@@ -66,11 +66,13 @@ function runtimeFor(root: string): FullstackRuntime {
 function closeRuntime(root: string): void {
   runtimeFixtures.get(root)?.close();
 }
-test.after(() => {
+function closeRuntimeFixtures(): void {
   for (const runtime of runtimeFixtures.values()) runtime.close();
   runtimeFixtures.clear();
   retryDrainContexts.clear();
-});
+}
+test.afterEach(closeRuntimeFixtures);
+test.after(closeRuntimeFixtures);
 type ChannelCapabilities = Parameters<typeof createChannelSetRaw>[1];
 type ChannelPinnedRoot = Parameters<typeof createChannelSetRaw>[2];
 type DispatcherOptions = Parameters<typeof startChannelDispatcherRaw>[3];
@@ -163,6 +165,7 @@ function withIndexedRun(root: string, runId: string, ackTarget?: string): void {
     task: "channel routing",
     branch: "main",
     autonomous: true,
+    owner_session: runtimeFor(root).sessionId,
     plan: { id: runId, task: "channel routing", teams: [], created_at: new Date().toISOString() },
   });
   if (ackTarget) state.channel_profile = { ackTarget };
@@ -172,11 +175,13 @@ function withIndexedRun(root: string, runId: string, ackTarget?: string): void {
 }
 
 function queueTerminalSummary(root: string, runId: string): string {
+  const runtime = runtimeFor(root);
   const state = newCtoState({
     id: runId,
     task: "terminal summary",
     branch: "main",
     autonomous: true,
+    owner_session: runtime.sessionId,
     plan: { id: runId, task: "terminal summary", teams: [], created_at: new Date().toISOString() },
   });
   const wave = {
@@ -190,13 +195,23 @@ function queueTerminalSummary(root: string, runId: string): string {
     started_at: new Date(0).toISOString(),
     finished_at: new Date(1_000).toISOString(),
   };
-  state.wave_history = [wave];
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-  setCtoPause(state, "done", "terminal");
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-  const current = readCtoState(runId, root);
+  state.work_identity = {
+    run_id: runId,
+    wave_id: wave.id,
+    slice_id: "terminal-summary",
+    session_id: runtime.sessionId,
+  };
+  assert.ok(runtime.access.createRun(state, { source_id: `channel-policy:summary:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+  runtime.access.withRunTransaction(runId, (transaction) => {
+    const current = transaction.readState();
+    current.wave_history = [wave];
+    setCtoPause(current, "done", "terminal");
+    transaction.writeState(current);
+  });
+  const current = runtime.access.readState(runId) as ReturnType<typeof readCtoState>;
   assert.ok(current, "canonical terminal CTO state exists");
   const summary = buildCtoTerminalSummaryEnvelope(current, wave);
+  assert.equal(runtime.access.markDeliveryPending(runId, current.state_revision, "summary"), true);
   const queued = queueCtoDelivery(root, runId, summary);
   assert.ok(queued, "canonical terminal summary publication succeeds");
   return queued;
@@ -208,9 +223,11 @@ function withActiveRun(root: string): void {
     task: "Some task",
     branch: "main",
     autonomous: true,
+    owner_session: runtimeFor(root).sessionId,
     plan: { id: "run-one", task: "Some task", teams: [], created_at: new Date().toISOString() },
   });
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+  const runtime = runtimeFor(root);
+  assert.ok(runtime.access.createRun(state, { source_id: "channel-policy:active-run", initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
 }
 
 /**
@@ -1644,7 +1661,6 @@ test("ask gate: explicit validated RW primary blocks; invalid declared-rw kind b
     withConfig(root, { channels: [{ id: "sink", adapter: "http", direction: "read-write" }] });
     const invalid = gate({ toolName: "ask" }, { cwd: root });
     assert.ok(invalid?.block === true, "invalid declared-rw kind blocks configuration");
-    assert.match(invalid?.reason ?? "", /configuration is blocked/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

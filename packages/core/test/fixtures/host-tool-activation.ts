@@ -276,7 +276,7 @@ export function registerTestTeamWorkflow(
   ownerId = "core-test-team-workflow",
 ): void {
   writeTestRegistryMarker(root);
-  const registration = openTestRegistry(root, ["workflow_profiles", "constitution_gate", "runtime_config"], ownerId, ["workflow_registration", "config_writer"]);
+  const registration = openTestRegistry(root, ["workflow_profiles", "constitution_gate", "runtime_config"], ownerId, ["workflow_registration", "workflow_tools", "config_writer"]);
   const captureState: TeamSessionCaptureState = { closed: false };
   activeTestTeamCaptures.add(captureState);
   let restoreOn: () => void = () => undefined;

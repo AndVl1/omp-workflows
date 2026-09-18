@@ -452,7 +452,17 @@ export class BoundedQueue {
 
   /** Discard one regular unusable entry only when its classified postimage still matches. */
   discard(name: string, expected: BoundedQueueEntryExpectation, rejectedRelativeDirectory: string): void {
-    this.discardBatch([{ name: entryName(name), expected }], rejectedRelativeDirectory);
+    const sourceName = entryName(name);
+    if (expected?.kind === "file") {
+      try {
+        const current = this.classify(sourceName);
+        if (!sameQueueExpectation(current, expected)) throw new BoundedQueueError("changed", `queue entry '${sourceName}' changed before quarantine`);
+      } catch (error) {
+        if (error instanceof BoundedQueueError && error.code === "not_found") return;
+        throw error;
+      }
+    }
+    this.discardBatch([{ name: sourceName, expected }], rejectedRelativeDirectory);
   }
 
   /** Discard a bounded classified batch without path-only fallback. */
@@ -460,6 +470,17 @@ export class BoundedQueue {
     if (!Array.isArray(entries) || entries.length === 0) return 0;
     if (typeof rejectedRelativeDirectory !== "string" || rejectedRelativeDirectory.length === 0) {
       throw new BoundedQueueError("path_unauthorized", "queue rejected directory must be a bounded relative path");
+    }
+    const allRegularFiles = entries.every((entry) => entry?.expected?.kind === "file");
+    if (allRegularFiles) {
+      try {
+        return this.root.discardBatchIfMatches(this.relativeDirectory, entries as readonly { name: string; expected: PinnedRootFileExpectation }[], rejectedRelativeDirectory, {
+          maxEntries: this.maxEntries,
+          maxNameBytes: this.maxWork,
+        });
+      } catch (error) {
+        throw queueError(error, "queue entry batch could not be discarded safely");
+      }
     }
     let moved = 0;
     try {

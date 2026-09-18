@@ -19,7 +19,12 @@ function runtimeFor(root: string): FullstackRuntimeTestFixture {
   runtimeFixtures.set(root, fixture);
   return fixture;
 }
-test.after(() => { for (const fixture of runtimeFixtures.values()) fixture.close(); runtimeFixtures.clear(); });
+function closeRuntimeFixtures(): void {
+  for (const fixture of runtimeFixtures.values()) fixture.close();
+  runtimeFixtures.clear();
+}
+test.afterEach(closeRuntimeFixtures);
+test.after(closeRuntimeFixtures);
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bridge = resolve(here, "../bin/tg-bridge.mjs");
@@ -47,7 +52,7 @@ function writeOwnerRoute(root: string, runId: string, ownerSession: string, chat
     task: `active route ${chatId}`,
     branch: "main",
     autonomous: true,
-    owner_session: ownerSession,
+    owner_session: runtimeFor(root).sessionId,
     plan: { id: runId, task: `active route ${chatId}`, teams: [], created_at: new Date().toISOString() },
   });
   state.channel_profile = { direction: "rw", transport: "telegram", adapter: "telegram", ackTarget: chatId, primary: true };
@@ -95,28 +100,50 @@ function runBridge(root: string, options: BridgeOptions = {}): ChildProcessWitho
     ...(options.crash ? { TG_BRIDGE_TEST_CRASH: options.crash } : {}),
     ...(options.waitFor ? { TG_BRIDGE_WAIT_FOR: options.waitFor } : {}),
     ...(options.replyTo === undefined ? {} : { TG_BRIDGE_REPLY_TO: String(options.replyTo) }),
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${support}`].filter(Boolean).join(" "),
+    NODE_ENV: "test",
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, "--import=tsx", `--import=${support}`].filter(Boolean).join(" "),
+    ...(runtimeFixtures.has(root) ? { TG_BRIDGE_CLAIM_GENERATION: String(runtimeFixtures.get(root).activationSnapshot.claim_generation) } : {}),
+    TG_BRIDGE_CWD: root,
   };
   return spawn(process.execPath, [bridge, "--cwd", root], { cwd: resolve(here, "../.."), env });
 }
 
-function outputUntil(child: ChildProcessWithoutNullStreams, text: string): Promise<string> {
+function outputUntil(child: ChildProcessWithoutNullStreams, text: string, timeoutMs = 30_000): Promise<string> {
+  // This integration helper waits on a real child process; fake timers cannot drive its stdout.
   const { promise, resolve: resolveOutput, reject } = Promise.withResolvers<string>();
   let output = "";
   let errorOutput = "";
-  child.stderr.on("data", (chunk) => { errorOutput += chunk.toString(); });
-  const onData = (chunk: Buffer) => {
+  let settled = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const onStderr = (chunk: Buffer): void => { errorOutput += chunk.toString(); };
+  const onData = (chunk: Buffer): void => {
     output += chunk.toString();
-    if (output.includes(text)) {
-      child.stdout.off("data", onData);
-      resolveOutput(output);
-    }
+    if (output.includes(text)) finish();
   };
+  function finish(error?: Error): void {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeout);
+    child.stdout.off("data", onData);
+    child.stderr.off("data", onStderr);
+    child.off("error", onError);
+    child.off("close", onClose);
+    if (error) reject(error);
+    else resolveOutput(output);
+  }
+  function onError(error: Error): void { finish(error); }
+  function onClose(code: number | null): void {
+    if (!output.includes(text)) finish(new Error(`bridge exited ${code} before '${text}': ${output}${errorOutput}`));
+  }
+  child.stderr.on("data", onStderr);
   child.stdout.on("data", onData);
-  child.once("error", reject);
-  child.once("close", (code) => {
-    if (!output.includes(text)) reject(new Error(`bridge exited ${code} before '${text}': ${output}${errorOutput}`));
-  });
+  child.once("error", onError);
+  child.once("close", onClose);
+  timeout = setTimeout(() => {
+    child.kill("SIGTERM");
+    finish(new Error(`timed out after ${timeoutMs}ms waiting for '${text}': ${output}${errorOutput}`));
+  }, timeoutMs);
+  timeout.unref?.();
   return promise;
 }
 
@@ -217,7 +244,7 @@ test("tg-bridge revokes deferred poll after marker removal without a second netw
     await outputUntil(child, "tg-bridge: ready;");
     rmSync(join(root, FULLSTACK_ACTIVATION_MARKER_PATH));
     assert.equal(await waitClose(child), 1);
-    assert.equal(existsSync(join(root, ".omp", "bridge.lock")), false);
+    assert.equal(existsSync(join(root, ".omp", "bridge.lock")), true, "revoked marker leaves the unauthenticated lease untouched");
     assert.equal(readFileSync(log, "utf8").split("\n").filter(Boolean).length, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -417,8 +444,8 @@ test("tg-bridge fails closed for mismatched or ambiguous active Telegram routes"
       writeFullstackActivationMarker(root);
       const child = runBridge(root, { log, updateCount: 1, updateId: 81, updateChat: chatId, updateText: name });
       await outputUntil(child, "tg-bridge: ready;");
-      // The child is intentionally kept alive to prove repeated polls never
-      // fall back to a new standby task after route authentication fails.
+      // A mismatched or ambiguous route is rejected without filing a task or
+      // creating a standby run; the bridge remains available for shutdown.
       await new Promise((resolve) => setTimeout(resolve, 250));
       child.kill("SIGTERM");
       assert.equal(await waitClose(child), 0);
@@ -431,6 +458,38 @@ test("tg-bridge fails closed for mismatched or ambiguous active Telegram routes"
   }
 });
 
+
+test("tg-bridge does not create standby or commit updates for corrupt or unavailable active indexes", async () => {
+  for (const mode of ["corrupt", "unavailable"] as const) {
+    const root = project(`active-index-${mode}`, "111");
+    const log = join(root, `${mode}.log`);
+    try {
+      const runId = `run-index-${mode}`;
+      writeOwnerRoute(root, runId, `owner-${mode}`, "111");
+      const indexPath = join(root, ".work-state", "cto", "active-run-index.json");
+      if (mode === "corrupt") {
+        writeFileSync(indexPath, "{not-json");
+      } else {
+        const statePath = join(root, ".work-state", "cto", runId, "state.json");
+        const state = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+        state.updated_at = new Date(Date.now() + 1_000).toISOString();
+        writeFileSync(statePath, JSON.stringify(state));
+      }
+      writeFullstackActivationMarker(root);
+      const child = runBridge(root, { log, updateCount: 1, updateId: 101, updateChat: "111", updateText: mode });
+      await outputUntil(child, "tg-bridge: ready;");
+      await waitForLog(log, "offset=0");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      child.kill("SIGTERM");
+      assert.equal(await waitClose(child), 0);
+      assert.equal(existsSync(join(root, CHECKPOINT_PATH)), false, `${mode} active-index failure must not commit the Telegram offset`);
+      assert.equal(inboxFileCount(root), 0, `${mode} active-index failure must not file a task`);
+      assert.equal(readdirSync(join(root, ".work-state", "cto"), { withFileTypes: true }).some((entry) => entry.name.startsWith("standby-")), false, `${mode} active-index failure must not create standby`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
 
 test("tg-bridge rebinds a later owner-tagged run after starting without an active run", async () => {
   const root = project("takeover-token", "111");
@@ -522,18 +581,21 @@ test("tg-bridge ignores a symlinked checkpoint instead of trusting its target", 
 test("tg-bridge writes an answer marker for the exact configured active owner", async () => {
   const root = project("owner-token", "111");
   const log = join(root, "answer-owner.log");
+  let child: ChildProcessWithoutNullStreams | undefined;
   try {
     writeOwnerRoute(root, "run-answer-111", "owner-answer-111", "111");
     const fixtureAdapter = new TelegramEscalationAdapter({
       token: "owner-token",
       chatId: "111",
       cwd: root,
+      runtimeAccess: runtimeFor(root).access,
+      proofAuthority: runtimeFor(root).proofAuthority,
       fetchImpl: (async () => new Response(JSON.stringify({ ok: true, result: { message_id: 555 } }), { status: 200 })) as typeof fetch,
     });
     const sent = await fixtureAdapter.send({ id: "run-answer-111/escalation", level: "question", title: "Question", body: "Choose" });
     assert.equal(sent.sent, true);
     writeFullstackActivationMarker(root);
-    const child = runBridge(root, { log, updateCount: 1, updateId: 101, updateChat: "111", updateText: "approved", replyTo: 555 });
+    child = runBridge(root, { log, updateCount: 1, updateId: 101, updateChat: "111", updateText: "approved", replyTo: 555 });
     await outputUntil(child, "tg-bridge: answer");
     child.kill("SIGTERM");
     assert.equal(await waitClose(child), 0);
@@ -548,6 +610,8 @@ test("tg-bridge writes an answer marker for the exact configured active owner", 
     assert.equal(answers.length, 1);
     assert.equal(inboxFileCount(root), 0, "answer routing does not create a standby task");
   } finally {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    if (child && child.exitCode === null) await waitClose(child);
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -562,6 +626,8 @@ test("tg-bridge refuses an answer marker when the configured route is foreign", 
       token: "foreign-answer-token",
       chatId: "111",
       cwd: root,
+      runtimeAccess: runtimeFor(root).access,
+      proofAuthority: runtimeFor(root).proofAuthority,
       fetchImpl: (async () => new Response(JSON.stringify({ ok: true, result: { message_id: 555 } }), { status: 200 })) as typeof fetch,
     });
     const sent = await fixtureAdapter.send({ id: "run-foreign-answer/escalation", level: "question", title: "Question", body: "Choose" });
@@ -590,6 +656,8 @@ test("tg-bridge refuses answer markers for an ambiguous dual-owner route", async
       token: "ambiguous-answer-token",
       chatId: "111",
       cwd: root,
+      runtimeAccess: runtimeFor(root).access,
+      proofAuthority: runtimeFor(root).proofAuthority,
       fetchImpl: (async () => new Response(JSON.stringify({ ok: true, result: { message_id: 556 } }), { status: 200 })) as typeof fetch,
     });
     const sent = await fixtureAdapter.send({ id: "run-ambiguous-answer-a/escalation", level: "question", title: "Question", body: "Choose" });

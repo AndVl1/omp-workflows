@@ -2,6 +2,16 @@
 
 import { appendFileSync, existsSync } from "node:fs";
 
+const targetGeneration = Number(process.env.TG_BRIDGE_CLAIM_GENERATION);
+const root = process.env.TG_BRIDGE_CWD;
+if (root && Number.isSafeInteger(targetGeneration) && targetGeneration >= 1) {
+  const runtimeModule = await import(new URL("./runtime-access-fixture.ts", import.meta.url).href);
+  for (let generation = 1; generation < targetGeneration; generation += 2) {
+    const warmup = runtimeModule.openFullstackRuntimeTest(root, "tg-bridge-child-warmup-" + generation, undefined, false);
+    warmup.close();
+  }
+}
+
 const logPath = process.env.TG_BRIDGE_FETCH_LOG;
 const parsedUpdateCount = Number(process.env.TG_BRIDGE_UPDATE_COUNT);
 const updateCount = Number.isSafeInteger(parsedUpdateCount) && parsedUpdateCount >= 0 ? parsedUpdateCount : 0;
@@ -45,6 +55,7 @@ globalThis.fetch = async (url, init) => {
       update_id: updateId + index,
       message: {
         message_id: updateId + index,
+        date: 1_700_000_000,
         text: updateText,
         chat: { id: Number(updateChat) },
         from: { id: 7 },

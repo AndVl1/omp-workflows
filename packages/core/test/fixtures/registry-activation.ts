@@ -126,6 +126,7 @@ export function openTestCtoRuntime(
   root: string,
   sessionId = "main-session",
   ownerId = "core-cto-runtime-test",
+  sessionManagerOverride?: { readonly cwd: string; readonly getSessionId: () => string; readonly getSessionFile?: () => string; readonly getSessionGeneration?: () => string | number; readonly getCwd: () => string },
 ): {
   readonly access: CtoRuntimeAccessFacade;
   readonly refreshAccess: () => CtoRuntimeAccessFacade;
@@ -148,7 +149,7 @@ export function openTestCtoRuntime(
   if (!activated.ok) throw new Error(`${activated.code}: ${activated.error}`);
   const runtimeRoot = realpathSync(root);
   const runtimeIdentity = statSync(runtimeRoot);
-  const sessionManager = Object.freeze({ cwd: root, getSessionId: () => sessionId, getCwd: () => root });
+  const sessionManager = sessionManagerOverride ?? Object.freeze({ cwd: root, getSessionId: () => sessionId, getCwd: () => root });
   const authority = issueCtoRuntimeSessionAuthority(
     activated.registry_context,
     { canonical_root: runtimeRoot, dev: runtimeIdentity.dev, ino: runtimeIdentity.ino },

@@ -62,6 +62,7 @@ import {
   legacyDurableIdFileName,
   safeLegacyDurableIdFileName,
   PinnedProjectRoot,
+  PinnedRootError,
   isSafeCtoInboundText,
   isSafeCtoRunId,
   isSafeEscalationId,
@@ -119,6 +120,13 @@ type RuntimeWaveView = {
 
 type RuntimeTeamView = { readonly status: string };
 
+type RuntimeTerminalSummaryEvidence = {
+  readonly wave_id: string;
+  readonly source_revision: number;
+  readonly envelope_sha256: string;
+  readonly envelope: string;
+};
+
 type RuntimeStateView = {
   readonly id: string;
   readonly state_revision?: number;
@@ -128,6 +136,7 @@ type RuntimeStateView = {
   readonly integration?: { readonly status: string };
   readonly teams: readonly RuntimeTeamView[];
   readonly wave_history: readonly RuntimeWaveView[];
+  readonly terminal_summary_evidence?: readonly RuntimeTerminalSummaryEvidence[];
 };
 
 type StateView = CtoState | RuntimeStateView;
@@ -328,6 +337,26 @@ function runtimeStateView(value: Readonly<Record<string, unknown>>): RuntimeStat
     }
   }
 
+  const terminalSummaryEvidence: RuntimeTerminalSummaryEvidence[] = [];
+  const terminalSummaryEvidenceValue = value.terminal_summary_evidence;
+  if (terminalSummaryEvidenceValue !== undefined) {
+    if (!Array.isArray(terminalSummaryEvidenceValue)) return null;
+    const evidenceWaveIds = new Set<string>();
+    for (const evidenceValue of terminalSummaryEvidenceValue) {
+      if (!isReadonlyRecord(evidenceValue)) return null;
+      const waveId = evidenceValue.wave_id;
+      const sourceRevision = evidenceValue.source_revision;
+      const envelopeSha256 = evidenceValue.envelope_sha256;
+      const envelope = evidenceValue.envelope;
+      if (typeof waveId !== "string" || waveId.length === 0 || evidenceWaveIds.has(waveId)
+        || typeof sourceRevision !== "number" || !Number.isSafeInteger(sourceRevision) || sourceRevision < 0
+        || typeof envelopeSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(envelopeSha256)
+        || typeof envelope !== "string") return null;
+      evidenceWaveIds.add(waveId);
+      terminalSummaryEvidence.push({ wave_id: waveId, source_revision: sourceRevision, envelope_sha256: envelopeSha256, envelope });
+    }
+  }
+
   const waveHistory: RuntimeWaveView[] = [];
   const waveHistoryValue = value.wave_history;
   if (waveHistoryValue !== undefined) {
@@ -348,6 +377,7 @@ function runtimeStateView(value: Readonly<Record<string, unknown>>): RuntimeStat
     ...(standby === undefined ? {} : { standby }),
     ...(pause === undefined ? {} : { pause }),
     ...(integration === undefined ? {} : { integration }),
+    ...(terminalSummaryEvidenceValue === undefined ? {} : { terminal_summary_evidence: terminalSummaryEvidence }),
   };
 }
 
@@ -424,7 +454,7 @@ function decodeUtf8(bytes: Uint8Array): string {
  * Delivery intent stamped on durable outbox entries. Additive fields on the
  * Escalation shape — core validateEscalation tolerates extras, and
  * sanitizeEscalation/redactEscalation preserve them, so the whole
- * retry/redaction/sent-file path passes them through untouched.
+ * retry/redaction/archive-cleanup path passes them through untouched.
  */
 export type DeliveryIntent = "ack" | "question" | "progress" | "summary";
 
@@ -542,13 +572,11 @@ function canonicalCtoDelivery(delivery: CtoDelivery, runId?: string, stateRevisi
  * duplicate returns null without overwriting. Returns the file path or null
  * on duplicate / write failure (best-effort — the caller must never treat
  * this as a blocking path). The regular `drainOutbox` tick picks the entry
- * up with the existing retry/redaction/sent-file semantics.
+ * up with the existing retry/redaction/archive-cleanup semantics.
  *
- * At-most-once across restart: the drain moves delivered files to
- * `sent/`, so a later identical queue (e.g. a producer re-run after a
- * dispatcher restart) must NOT re-queue an id that was already delivered.
- * The `outbox/` `wx` guard alone only dedupes the not-yet-drained window;
- * the `sent/` existence check below closes the drained window too.
+ * The durable receiver idempotency key, not workspace archives, is the
+ * crash-recovery authority. The outbox publication and state obligation remain
+ * durable until a receiver-confirmed send is followed by archive cleanup.
  */
 export function queueCtoDelivery(root: string, runId: string, delivery: CtoDelivery, providedRoot?: PinnedProjectRoot, isOwned?: () => boolean, runtimeAccess?: RuntimeAccess): string | null {
   if (!validCtoDelivery(delivery, runId)) return null;
@@ -873,6 +901,11 @@ const builtinAdapterFactories = new Map<string, AdapterRegistration>([
               allowedChatIds: config.telegram.allowedChatIds,
               allowedSenderIds: config.telegram.allowedSenderIds,
               legacyMappingMigration: config.telegram.legacyMappingMigration,
+              routingProfile: {
+                id: typeof (config as Record<string, unknown>).id === "string" ? String((config as Record<string, unknown>).id).trim() || null : null,
+                direction: (config as Record<string, unknown>).direction === "read-only" ? "read-only" : "read-write",
+                primary: (config as Record<string, unknown>).primary === true || !(config as Record<string, unknown>).direction,
+              },
               proofAuthority,
               runtimeAccess: (bridgeRoute ?? runtimeAccess) as TelegramRuntimeAccess | undefined,
               assertRoutingLive,
@@ -1859,16 +1892,21 @@ function isSummarizableWave(wave: unknown): wave is RuntimeWaveView {
  * queue summaries — `drainOutbox` delivers them to the RO sinks (the
  * permitted report fan-out; RO never becomes an inbound/answer source).
  *
- * At-most-once per (runId, waveId): the outbox/ `wx` guard dedupes within
- * the not-yet-drained window, the `sent/` dedupe (queueCtoDelivery) closes
- * the drained window across ticks and dispatcher restarts. Called from the
+ * Receiver-side idempotency is keyed by the canonical delivery id; the
+ * workspace `sent/` archive is cleanup evidence only. Called from the
  * dispatcher tick BEFORE `drainOutbox` so the first tick after a wave
  * finishes both queues AND drains it.
  *
  * Returns the number of NEW deliveries queued (0 on re-runs). Never throws.
  */
-export function produceWaveDeliveries(root: string, opts: { isOwned?: () => boolean; runEntries?: readonly CtoRunDeliveryIndexEntry[]; pinnedRoot?: PinnedProjectRoot; runtimeAccess?: RuntimeAccess; serviceAuthority?: RuntimeServiceAuthority; proofAuthority: CtoRuntimeProofAuthority }): number {
+export function produceWaveDeliveries(root: string, opts: { isOwned?: () => boolean; runEntries?: readonly CtoRunDeliveryIndexEntry[]; pinnedRoot?: PinnedProjectRoot; runtimeAccess?: RuntimeAccess; serviceAuthority?: RuntimeServiceAuthority; maxNewDeliveries?: number; proofAuthority: CtoRuntimeProofAuthority }): number {
   try {
+    const maxNewDeliveries = opts.maxNewDeliveries === undefined
+      ? Number.POSITIVE_INFINITY
+      : Number.isFinite(opts.maxNewDeliveries) && opts.maxNewDeliveries >= 0
+        ? Math.floor(opts.maxNewDeliveries)
+        : 0;
+    if (maxNewDeliveries === 0) return 0;
     const channelSet = createChannelSet(root, undefined, opts.pinnedRoot, opts.runtimeAccess, opts.proofAuthority);
     if (channelSet.profiles.length === 0) return 0;
     let queued = 0;
@@ -1883,9 +1921,14 @@ export function produceWaveDeliveries(root: string, opts: { isOwned?: () => bool
       for (const wave of history) {
         if (opts.isOwned && !opts.isOwned()) break;
         if (!isSummarizableWave(wave)) continue;
+        if (state.terminal_summary_evidence?.some((evidence) => evidence.wave_id === wave.id)) continue;
         const delivery = queueCtoDelivery(root, runId, terminalSummaryEnvelope(state, wave), opts.pinnedRoot, opts.isOwned, opts.runtimeAccess);
-        if (delivery) queued += 1;
+        if (delivery) {
+          queued += 1;
+          if (queued >= maxNewDeliveries) break;
+        }
       }
+      if (queued >= maxNewDeliveries) break;
       } catch {
         // One corrupt run cannot starve later entries in the bounded page.
         continue;
@@ -1994,6 +2037,15 @@ export async function drainOutbox(
       }
       const terminalRun = terminalState(state);
       if (!stateRevisionMatches(state, runEntry)) continue;
+      if (terminalRun && directEntryForRun) {
+        quarantineDirectOutboxEntry(root, runId, directEntryForRun.name, "terminal", pinnedRoot, opts.lifecycle, opts.runtimeAccess);
+        continue;
+      }
+
+      // Removing one archived obligation commits a state revision. Keep the
+      // page bound to the latest revision produced by this drain so later
+      // entries remain current without accepting an arbitrary stale revision.
+      let currentStateRevision = runEntry.state_revision;
       if (!runEntry.pending_outbox && !runEntry.pending_retry) {
         if (directEntryForRun) quarantineDirectOutboxEntryIfInvalid(root, runId, directEntryForRun.name, runEntry.state_revision, "unpublished", pinnedRoot, opts.lifecycle, opts.runtimeAccess);
         continue;
@@ -2010,13 +2062,17 @@ export async function drainOutbox(
         retryDirectory,
         retryClockNow(opts.now),
         runId,
-        runEntry.state_revision,
+        currentStateRevision,
         pinnedRoot,
         immediateFirstRetry,
         opts.runtimeAccess,
         drainFence,
       );
       let rejectedDuringPromotion = false;
+      const removeArchivedObligation = (entryName: string, storedBytes: Uint8Array): void => {
+        const nextRevision = removeArchivedOutboxObligation(opts.runtimeAccess!, runId, entryName, storedBytes, currentStateRevision, drainFence);
+        if (nextRevision !== null) currentStateRevision = nextRevision;
+      };
       const clearRejectedEvidenceAfterSuccess = (): void => {
         if (rejectedDuringPromotion || results.some((result) => result.runId === runId && !result.sent)) return;
         clearOutboxRejectedEvidence(root, runId, pinnedRoot, drainFence);
@@ -2053,7 +2109,7 @@ export async function drainOutbox(
               stored = outboxQueue.read(name);
               status = currentDeliveryStatus(opts.runtimeAccess!, {
                 run_id: runId,
-                state_revision: runEntry.state_revision,
+                state_revision: currentStateRevision,
                 entry_name: name,
                 json: stored.bytes,
                 lane: "outbox",
@@ -2096,7 +2152,7 @@ export async function drainOutbox(
             }
             const publication: CtoRuntimeOutboxDeliveryInput = {
               run_id: runId,
-              state_revision: runEntry.state_revision,
+              state_revision: currentStateRevision,
               entry_name: name,
               json: storedBytes,
               lane: "outbox",
@@ -2149,11 +2205,6 @@ export async function drainOutbox(
           continue;
         }
         if (!ensureCurrentPublicationBeforeMutation()) continue;
-        if (discardAlreadyArchivedOutboxEntry(root, outboxQueue, activeDirectory, name, archiveName, archiveText, pinnedRoot, drainFence)) {
-          clearRejectedEvidenceAfterSuccess();
-          results.push({ runId, escId, sent: true });
-          continue;
-        }
         if (!adapter) {
           // RO-only set: only subscribed report entries are deliverable.
           if (raw.intent === "summary") {
@@ -2169,6 +2220,7 @@ export async function drainOutbox(
               // nothing was attempted, archive as sent with no sinkErrors.
               if (!ensureCurrentPublicationBeforeMutation()) continue;
               archiveOutboxEntry(root, outboxQueue, activeDirectory, name, archiveName, archiveText, pinnedRoot, drainFence);
+              removeArchivedObligation(name, storedBytes!);
               clearRejectedEvidenceAfterSuccess();
               results.push({ runId, escId, sent: true });
             } else if (outcome.failed > 0 && outcome.failed === outcome.attempted) {
@@ -2184,6 +2236,7 @@ export async function drainOutbox(
               // sink failures are recorded (today's behavior).
               if (!ensureCurrentPublicationBeforeMutation()) continue;
               archiveOutboxEntry(root, outboxQueue, activeDirectory, name, archiveName, archiveText, pinnedRoot, drainFence);
+              removeArchivedObligation(name, storedBytes!);
               clearRejectedEvidenceAfterSuccess();
               const result: DrainOutboxResult = { runId, escId, sent: true };
               if (sinkErrors.length > 0) result.sinkErrors = sinkErrors;
@@ -2241,6 +2294,7 @@ export async function drainOutbox(
           }
           if (!ensureCurrentPublicationBeforeMutation()) continue;
           archiveOutboxEntry(root, outboxQueue, activeDirectory, name, archiveName, archiveText, pinnedRoot, drainFence);
+          removeArchivedObligation(name, storedBytes!);
           clearRejectedEvidenceAfterSuccess();
           const result: DrainOutboxResult = { runId, escId, sent: true };
           if (sinkErrors.length > 0) result.sinkErrors = sinkErrors;
@@ -2258,7 +2312,7 @@ export async function drainOutbox(
               if (storedBytes) {
                 const malformedStatus = currentDeliveryStatus(opts.runtimeAccess!, {
                   run_id: runId,
-                  state_revision: runEntry.state_revision,
+                  state_revision: currentStateRevision,
                   entry_name: name,
                   json: storedBytes,
                   lane: "outbox",
@@ -2967,6 +3021,28 @@ function persistInboxRetryEntry(queue: BoundedQueue, name: string, expected: { d
   }
 }
 
+function removeArchivedOutboxObligation(runtimeAccess: RuntimeAccess, runId: string, entryName: string, storedBytes: Uint8Array, expectedStateRevision: number, fence?: MutationFence): number | null {
+  assertMutationLive(fence);
+  const candidates = runtimeAccess.readOutboxDeliveryObligations(runId).filter((obligation) => obligation.entry_name === entryName);
+  if (candidates.length === 0) return null;
+  const exact = candidates.find((obligation) => Buffer.from(obligation.json).equals(Buffer.from(storedBytes)));
+  if (!exact) throw new Error("outbox delivery obligation does not match archived bytes");
+  assertMutationLive(fence);
+  const removed = runtimeAccess.removeOutboxDeliveryObligation(runId, entryName, exact.envelope_id);
+  if (!removed) {
+    throw new Error("outbox delivery obligation could not be removed after archival");
+  }
+  assertMutationLive(fence);
+  const latestState = runtimeAccess.readState(runId);
+  const latestRevision = typeof latestState?.state_revision === "number" && Number.isSafeInteger(latestState.state_revision)
+    ? latestState.state_revision
+    : null;
+  if (latestRevision === null || latestRevision <= expectedStateRevision) {
+    throw new Error("outbox delivery state changed during archival");
+  }
+  return latestRevision;
+}
+
 function archiveOutboxEntry(
   root: string,
   outboxQueue: BoundedQueue,
@@ -2989,8 +3065,31 @@ function archiveOutboxEntry(
     assertMutationLive(fence);
     try {
       const source = outboxQueue.read(sourceName);
-      outboxQueue.moveToIfMatches(sourceName, source.expectation, join(outboxQueue.relativeDirectory, "sent", archiveName));
-      assertMutationLive(fence);
+      try {
+        outboxQueue.moveToIfMatches(sourceName, source.expectation, join(outboxQueue.relativeDirectory, "sent", archiveName));
+        assertMutationLive(fence);
+      } catch (error) {
+        rethrowActivationFailure(error);
+        if (!(error instanceof BoundedQueueError) || error.code !== "exists") throw error;
+        // A pre-existing sent copy is not transport proof. It is accepted only
+        // after the current adapter returned a successful authenticated receipt;
+        // then remove the exact active source idempotently.
+        const sentQueue = openBoundedQueue(pinnedRoot?.canonical_root ?? root, join(activeDirectory, "sent"), {
+          ...ACTIVE_QUEUE_OPTIONS,
+          createDirectory: false,
+          ...(pinnedRoot ? { pinnedRoot } : {}),
+        });
+        if (!sentQueue) throw error;
+        try {
+          const archived = sentQueue.read(archiveName);
+          if (!Buffer.from(archived.bytes).equals(Buffer.from(source.bytes))) throw error;
+          assertMutationLive(fence);
+          outboxQueue.removeIfMatches(sourceName, queueExpected(source));
+          assertMutationLive(fence);
+        } finally {
+          sentQueue.close();
+        }
+      }
     } catch (error) {
       rethrowActivationFailure(error);
       throw error;
@@ -3023,40 +3122,6 @@ function archiveOutboxEntry(
       rethrowActivationFailure(error);
       throw error;
     }
-  } finally {
-    sentQueue.close();
-  }
-}
-
-function discardAlreadyArchivedOutboxEntry(
-  root: string,
-  outboxQueue: BoundedQueue,
-  activeDirectory: string,
-  sourceName: string,
-  archiveName: string,
-  envelopeText: string,
-  pinnedRoot?: PinnedProjectRoot,
-  fence?: MutationFence,
-): boolean {
-  const sentQueue = openBoundedQueue(pinnedRoot?.canonical_root ?? root, join(activeDirectory, "sent"), {
-    ...ACTIVE_QUEUE_OPTIONS,
-    createDirectory: false,
-    ...(pinnedRoot ? { pinnedRoot } : {}),
-  });
-  if (!sentQueue) return false;
-  try {
-    const source = outboxQueue.read(sourceName);
-    const archived = sentQueue.read(archiveName);
-    const payload = Buffer.from(envelopeText, "utf8");
-    if (!Buffer.from(archived.bytes).equals(payload)
-      && !(sourceName === archiveName && Buffer.from(archived.bytes).equals(Buffer.from(source.bytes)))) return false;
-    assertMutationLive(fence);
-    outboxQueue.removeIfMatches(sourceName, queueExpected(source));
-    assertMutationLive(fence);
-    return true;
-  } catch (error) {
-    rethrowActivationFailure(error);
-    return false;
   } finally {
     sentQueue.close();
   }
@@ -3537,8 +3602,19 @@ function discoverDirectOutbox(
   runtimeAccess?: RuntimeAccess,
   lifecycle?: AdapterOperationContext,
 ): DirectOutboxDiscovery {
-  if (!runtimeAccess) return { runId: previousRunId, stateRevision: null, nextCursor: previousCursor, entryName: null, entry: null };
-  lifecycle?.assertLive?.();
+  const empty = (runId: string | null, stateRevision: number | null, nextCursor: string | null = null): DirectOutboxDiscovery => ({
+    runId,
+    stateRevision,
+    nextCursor,
+    entryName: null,
+    entry: null,
+  });
+  if (!runtimeAccess) return empty(previousRunId, null, previousCursor);
+  const withinDeadline = (): boolean => {
+    lifecycle?.assertLive?.();
+    return lifecycle === undefined || Date.now() < lifecycle.deadline;
+  };
+  if (!withinDeadline()) return empty(previousRunId, null, previousCursor);
   if (providedRoot && !providedRoot.isStable()) throw new DispatcherActivationRevokedError("dispatcher project root identity changed");
   let active: { runId: string; state: RuntimeStateView } | null;
   try {
@@ -3547,72 +3623,104 @@ function discoverDirectOutbox(
   } catch (error) {
     lifecycle?.assertLive?.();
     runtimeAccess.assertLive();
-    return { runId: previousRunId, stateRevision: null, nextCursor: previousCursor, entryName: null, entry: null };
+    return empty(previousRunId, null, previousCursor);
   }
-  if (!active) {
-    return { runId: previousRunId, stateRevision: null, nextCursor: previousCursor, entryName: null, entry: null };
-  }
+  if (!active) return empty(previousRunId, null, previousCursor);
   const revision = active.state.state_revision;
   if (!safeRunId(active.runId) || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) {
-    return { runId: null, stateRevision: null, nextCursor: null, entryName: null, entry: null };
+    return empty(null, null);
   }
   const runId = active.runId;
   const stateRevision = revision;
+  const scanCursor = previousRunId === runId ? previousCursor : null;
   const queue = openBoundedQueue(providedRoot?.canonical_root ?? root, join(".work-state", "cto", runId, "outbox"), {
     ...DIRECT_OUTBOX_QUEUE_OPTIONS,
     createDirectory: false,
     ...(providedRoot ? { pinnedRoot: providedRoot } : {}),
   });
-  if (!queue) return { runId, stateRevision, nextCursor: null, entryName: null, entry: null };
-  let indexEntry: CtoRunDeliveryIndexEntry | undefined;
+  if (!queue) return empty(runId, stateRevision, scanCursor);
+  const noEntry = (nextCursor: string | null = scanCursor): DirectOutboxDiscovery => empty(runId, stateRevision, nextCursor);
   try {
-    // Direct discovery is recovery-only: an active state file is not an
-    // authorization to drain arbitrary bytes from outbox/. Require the
-    // authenticated runtime's current pending delivery projection first.
+    // Direct discovery is recovery-only: authenticate the exact active/standby
+    // projection before reading attacker-controlled queue bytes. A single
+    // projection read replaces the old unbounded page walk; any non-ok or
+    // ambiguous match remains fail-closed.
+    if (!withinDeadline()) return noEntry();
+    const candidates = runtimeAccess.readActiveDeliveryCandidates();
+    if (!candidates.ok || !Array.isArray(candidates.entries) || candidates.active_run_id !== runId) return noEntry();
     const expectedStatus = active.state.standby === true ? "standby" : "active";
-    let cursor: string | undefined;
-    for (;;) {
-      const page = runtimeAccess.readDeliveryIndexPage({
-        ...(cursor === undefined ? {} : { after_run_id: cursor }),
-        limit: RUN_DELIVERY_PAGE_LIMIT,
-      });
-      indexEntry = page.entries.find((entry) => entry.run_id === runId
-        && entry.state_revision === stateRevision
-        && entry.status === expectedStatus
-        && entry.updated_at === active.state.updated_at
-        && (entry.pending_outbox || entry.pending_retry));
-      if (indexEntry || page.next_after_run_id === null || page.entries.length === 0) break;
-      cursor = page.next_after_run_id;
+    const matches = candidates.entries.filter((entry) =>
+      entry.run_id === runId
+      && entry.state_revision === stateRevision
+      && entry.updated_at === active.state.updated_at
+      && entry.status === expectedStatus
+      && (entry.pending_outbox === true || entry.pending_retry === true));
+    if (matches.length !== 1) return noEntry();
+    const indexEntry = matches[0]!;
+
+    // State-owned obligations identify the exact canonical publication without
+    // scanning an attacker-controlled overfull outbox first. Probe those names
+    // before the bounded recovery scanner and preserve the current scan cursor
+    // when an obligation is found.
+    if (!withinDeadline()) return noEntry();
+    const obligations = runtimeAccess.readOutboxDeliveryObligations(runId);
+    for (const obligation of obligations) {
+      if (!withinDeadline()) return noEntry();
+      if (obligation.run_id !== runId || obligation.state_revision !== stateRevision) continue;
+      if (!withinDeadline()) return noEntry();
+      let stored: { bytes: Uint8Array; expectation: BoundedQueueEntryExpectation & { kind: "file" } };
+      try {
+        stored = queue.read(obligation.entry_name);
+      } catch (error) {
+        if (isDispatcherActivationFailure(error)) throw error;
+        continue;
+      }
+      if (!withinDeadline()) return noEntry();
+      const status = currentDeliveryStatus(runtimeAccess, {
+        run_id: runId,
+        state_revision: stateRevision,
+        entry_name: obligation.entry_name,
+        json: stored.bytes,
+        lane: "outbox",
+        routing_binding: routingBindingForBytes(runtimeAccess, stored.bytes, providedRoot) ?? undefined,
+      }, providedRoot);
+      if (status === "current") {
+        if (!withinDeadline()) return noEntry();
+        return { runId, stateRevision, nextCursor: scanCursor, entryName: obligation.entry_name, entry: indexEntry };
+      }
     }
-  } catch (error) {
-    if (isDispatcherActivationFailure(error)) {
-      queue.close();
-      throw error;
-    }
+
+    if (!withinDeadline()) return noEntry();
+    let page: ReturnType<BoundedQueue["listPage"]>;
     try {
-      runtimeAccess.assertLive();
-    } finally {
-      queue.close();
+      page = queue.listPage(scanCursor);
+    } catch (error) {
+      if (isDispatcherActivationFailure(error)) throw error;
+      // Unsafe names and listing failures remain in place and block recovery.
+      return noEntry();
     }
-    return { runId, stateRevision, nextCursor: null, entryName: null, entry: null };
-  }
-  if (!indexEntry) {
-    // No authoritative active-index candidate: retain every observed byte for
-    // a later scanner pass. State presence alone never authorizes cleanup.
-    queue.close();
-    return { runId, stateRevision, nextCursor: previousCursor, entryName: null, entry: null };
-  }
-  try {
-    const batch = queue.list();
-    const observed = batch.filter((item) => !(item.name === "sent" && isArchiveDirectory(queue, item.name)));
+    let completePage = true;
     const validNames: string[] = [];
     const rejectedEntries: { name: string; expected: BoundedQueueEntryExpectation }[] = [];
-    for (const item of observed) {
+    for (const item of page.entries) {
+      if (!withinDeadline()) {
+        completePage = false;
+        break;
+      }
+      if (item.name === "sent" && isArchiveDirectory(queue, item.name)) continue;
       let status: DeliveryAuthorityStatus = "unavailable";
       let expected: BoundedQueueEntryExpectation | undefined;
       try {
+        if (!withinDeadline()) {
+          completePage = false;
+          break;
+        }
         const stored = queue.read(item.name);
         expected = stored.expectation;
+        if (!withinDeadline()) {
+          completePage = false;
+          break;
+        }
         status = currentDeliveryStatus(runtimeAccess, {
           run_id: runId,
           state_revision: stateRevision,
@@ -3626,23 +3734,26 @@ function discoverDirectOutbox(
       }
       if (status === "current") validNames.push(item.name);
       else if (status === "invalid" && expected) rejectedEntries.push({ name: item.name, expected });
-      // unavailable remains in the scanner for a later authority read.
+      // Unavailable remains in the scanner for a later authoritative tick.
     }
     if (rejectedEntries.length > 0) {
-      lifecycle?.assertLive?.();
-      runtimeAccess.assertLive();
-      if (providedRoot && !providedRoot.isStable()) throw new DispatcherActivationRevokedError("dispatcher project root identity changed");
-      queue.discardBatch(rejectedEntries, join(".work-state", "cto", runId, "outbox-rejected"));
-      lifecycle?.assertLive?.();
-      runtimeAccess.assertLive();
+      if (!withinDeadline()) completePage = false;
+      else {
+        runtimeAccess.assertLive();
+        if (providedRoot && !providedRoot.isStable()) throw new DispatcherActivationRevokedError("dispatcher project root identity changed");
+        queue.discardBatch(rejectedEntries, join(".work-state", "cto", runId, "outbox-rejected"));
+        lifecycle?.assertLive?.();
+      }
     }
+    if (!withinDeadline()) return noEntry(completePage && validNames.length === 0 ? page.nextCursor : scanCursor);
     const entryName = validNames[0] ?? null;
+    const nextCursor = completePage ? page.nextCursor : scanCursor;
     return entryName === null
-      ? { runId, stateRevision, nextCursor: null, entryName: null, entry: null }
-      : { runId, stateRevision, nextCursor: null, entryName, entry: indexEntry! };
+      ? noEntry(nextCursor)
+      : { runId, stateRevision, nextCursor, entryName, entry: indexEntry };
   } catch (error) {
     if (isDispatcherActivationFailure(error)) throw error;
-    return { runId, stateRevision, nextCursor: null, entryName: null, entry: null };
+    return noEntry();
   } finally {
     queue.close();
   }
@@ -3769,7 +3880,16 @@ function clearOutboxRejectedEvidence(root: string, runId: string, pinnedRoot?: P
     if (depth > 2 || attempts >= MAX_REJECTED_EVIDENCE_CLEANUP) return false;
     for (;;) {
       assertMutationLive(fence);
-      const entries = [...boundedQueueEntries(current)];
+      let entries: Array<{ name: string; relativePath: string }>;
+      try {
+        entries = [...boundedQueueEntries(current)];
+      } catch (error) {
+        rethrowActivationFailure(error);
+        if ((error instanceof BoundedQueueError || error instanceof PinnedRootError) && error.code === "not_found") return true;
+        // A changed, unreadable, non-regular, or otherwise unsafe queue is
+        // retained as evidence so the next acknowledgement fails closed.
+        return false;
+      }
       if (entries.length === 0) return true;
       for (const entry of entries) {
         if (attempts >= MAX_REJECTED_EVIDENCE_CLEANUP) return false;
@@ -3827,7 +3947,12 @@ function acknowledgeDrainedRuns(root: string, entries: readonly CtoRunDeliveryIn
     if (outboxHasRejectedEvidence(root, entry.run_id, pinnedRoot)) continue;
     const state = runtimeState(runtimeAccess, entry.run_id);
     const stateRevision = state?.state_revision;
-    if (!state || typeof stateRevision !== "number" || !Number.isSafeInteger(stateRevision) || stateRevision < 0 || !outboxIsEmpty(root, entry.run_id, pinnedRoot)) continue;
+    if (!state || typeof stateRevision !== "number" || !Number.isSafeInteger(stateRevision) || stateRevision < 0) continue;
+    // Filesystem emptiness alone cannot prove delivery completion: an
+    // archive-first crash may leave the exact state-owned obligation behind
+    // after the active file has disappeared. Keep ACK fenced until every
+    // durable obligation has been removed through exact identity/CAS recovery.
+    if (runtimeAccess.readOutboxDeliveryObligations(entry.run_id).length > 0 || !outboxIsEmpty(root, entry.run_id, pinnedRoot)) continue;
     try {
       lifecycle?.assertLive?.();
       runtimeAccess.acknowledgeDelivery(entry.run_id, stateRevision, { drained: true });
@@ -4300,7 +4425,7 @@ function quarantineDirectOutboxEntry(root: string, runId: string, entryName: str
     ...(pinnedRoot ? { pinnedRoot } : {}),
   });
   if (!queue) return;
-  const rejectedDirectory = join(".work-state", "cto", runId, "outbox-rejected", reason);
+  const rejectedDirectory = join(".work-state", "cto", runId, "outbox-rejected");
   try {
     try {
       assertLive();
@@ -4324,12 +4449,29 @@ function republishPendingDeliveryObligations(
   pinnedRoot: PinnedProjectRoot,
 ): void {
   if (!runtimeAccess) return;
+  const withinDeadline = (): boolean => {
+    lifecycle?.assertLive?.();
+    return lifecycle === undefined || Date.now() < lifecycle.deadline;
+  };
   for (const entry of entries) {
-    for (const obligation of runtimeAccess.readOutboxDeliveryObligations(entry.run_id)) {
+    if (!withinDeadline()) return;
+    let obligations: ReturnType<RuntimeAccess["readOutboxDeliveryObligations"]>;
+    try {
+      if (!withinDeadline()) return;
+      obligations = runtimeAccess.readOutboxDeliveryObligations(entry.run_id);
+    } catch (error) {
+      if (isDispatcherActivationFailure(error)) throw error;
+      continue;
+    }
+    for (const obligation of obligations) {
+      if (!withinDeadline()) return;
       try {
+        if (!withinDeadline()) return;
         const raw = JSON.parse(decodeUtf8(obligation.json));
+        if (!withinDeadline()) return;
         const routingBinding = currentRoutingBinding(runtimeAccess, raw, pinnedRoot);
         if (!routingBinding) continue;
+        if (!withinDeadline()) return;
         runtimeAccess.publishOutboxDelivery({
           run_id: obligation.run_id,
           state_revision: obligation.state_revision,
@@ -4337,7 +4479,7 @@ function republishPendingDeliveryObligations(
           json: obligation.json,
           routing_binding: routingBinding,
         });
-        lifecycle?.assertLive?.();
+        if (!withinDeadline()) return;
       } catch (error) {
         if (isDispatcherActivationFailure(error)) throw error;
       }
@@ -4542,7 +4684,7 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
       assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation);
       const page = readIndexedRunPage(context.root, lease.runCursor, context.pinnedRoot, opts.runtimeAccess);
       nextCursor = page.nextCursor;
-      const entries = directEntry && !page.entries.some((entry) => entry.run_id === directEntry.run_id)
+      let entries = directEntry && !page.entries.some((entry) => entry.run_id === directEntry.run_id)
         ? [...page.entries, directEntry]
         : page.entries;
       republishPendingDeliveryObligations(entries, opts.runtimeAccess, lifecycle, context.pinnedRoot);
@@ -4550,7 +4692,18 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): Dispatcher
       // last tick is queued AND drained in this same tick. Both consumers
       // receive the exact same canonical run page; no directory discovery.
       assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation);
-      produceWaveDeliveries(context.root, { isOwned, runEntries: entries, pinnedRoot: context.pinnedRoot, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, proofAuthority: opts.proofAuthority });
+      const queuedSummaries = produceWaveDeliveries(context.root, { isOwned, runEntries: entries, pinnedRoot: context.pinnedRoot, runtimeAccess: opts.runtimeAccess, serviceAuthority: opts.serviceAuthority, maxNewDeliveries: 1, proofAuthority: opts.proofAuthority });
+      if (queuedSummaries > 0) {
+        // Recording each new obligation advances that run's state revision.
+        // Re-read the same cursor page before draining so the delivery gate
+        // sees the writer-owned revision instead of the stale pre-publication
+        // projection; otherwise advancing the cursor can strand the page.
+        const refreshed = readIndexedRunPage(context.root, lease.runCursor, context.pinnedRoot, opts.runtimeAccess);
+        nextCursor = refreshed.nextCursor;
+        entries = directEntry && !refreshed.entries.some((entry) => entry.run_id === directEntry.run_id)
+          ? [...refreshed.entries, directEntry]
+          : refreshed.entries;
+      }
       assertDispatcherActivationLive(opts.runtimeAccess, tickPin, opts.liveGuard, lease.activation);
       const drained = await drainOutbox(context.root, drainAdapter, 3, {
         roSinks,
@@ -6732,7 +6885,10 @@ export async function pollInbox(
       opts.lifecycle?.assertLive?.();
       opts.runtimeAccess?.assertLive();
     } catch (error) {
-      if (isDispatcherActivationFailure(error)) throw error;
+      if (isDispatcherActivationFailure(error)) {
+        if (error instanceof DispatcherActivationRevokedError) throw error;
+        throw new DispatcherActivationRevokedError("activation_revoked: " + (error instanceof Error ? error.message : String(error)));
+      }
       throw new DispatcherActivationRevokedError(error instanceof Error ? error.message : "dispatcher activation is no longer live");
     }
     if (!pollPin!.isStable()) throw new DispatcherActivationRevokedError("dispatcher project root identity changed");

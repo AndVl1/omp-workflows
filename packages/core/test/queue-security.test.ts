@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BoundedQueueError, openBoundedQueue } from "../src/specification/queue.js";
@@ -283,11 +283,142 @@ test("moveToIfMatches restores its staged inode when a destination winner appear
   }
 });
 
-test("discardBatch restores its staged inode when a destination winner appears", () => {
-  const root = tempRoot("queue-discard-move-race-");
-  const queue = openBoundedQueue(root, join(".omp", "inbox"));
+test("expected discard rejects duplicate normalized source names before any mutation", () => {
+  const root = tempRoot("queue-discard-duplicate-");
+  let directoryCreateCalls = 0;
+  const pinned = PinnedProjectRoot.open(root, {
+    disableDarwinHelper: true,
+    beforeDirectoryCreate: () => { directoryCreateCalls += 1; },
+  });
+  assert.ok(pinned);
+  if (!pinned) return;
+  try {
+    const inbox = join(root, ".omp", "inbox");
+    const source = join(inbox, "duplicate.json");
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(source, "old");
+    const bytes = Buffer.from("old");
+    const info = lstatSync(source);
+    const expected = {
+      kind: "file" as const,
+      dev: info.dev,
+      ino: info.ino,
+      size: bytes.byteLength,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+    assert.throws(
+      () => pinned.discardBatchIfMatches(".omp/inbox", [
+        { name: "duplicate.json", expected },
+        { name: "duplicate.json", expected: { ...expected, sha256: "0".repeat(64) } },
+      ], ".omp/rejected"),
+      (error: unknown) => error instanceof PinnedRootError && error.code === "invalid",
+    );
+    assert.equal(directoryCreateCalls, 0, "duplicate validation precedes rejected-directory creation");
+    assert.equal(existsSync(join(root, ".omp", "rejected")), false, "duplicate validation does not create rejected storage");
+    assert.equal(readFileSync(source, "utf8"), "old", "duplicate validation preserves the source");
+  } finally {
+    pinned.close();
+    removeRoot(root);
+  }
+});
+
+test("Darwin expected discard restores its operation-owned stage after a lost response", () => {
+  if (process.platform !== "darwin") return;
+  const root = tempRoot("queue-discard-stage-response-loss-");
+  const pinned = PinnedProjectRoot.open(root, { helperProtocolTest: "eof_after_discard_stage" });
+  assert.ok(pinned);
+  if (!pinned) return;
+  const queue = openBoundedQueue(root, join(".omp", "inbox"), { pinnedRoot: pinned });
   assert.ok(queue);
-  if (!queue) return;
+  if (!queue) { pinned.close(); return; }
+  try {
+    const source = join(root, ".omp", "inbox", "lost-response.json");
+    writeFileSync(source, "old");
+    const expected = queue.classify("lost-response.json");
+    assert.throws(
+      () => queue.discardBatch([{ name: "lost-response.json", expected }], ".omp/rejected"),
+      (error: unknown) => error instanceof BoundedQueueError && error.code === "unsupported",
+    );
+    assert.equal(readFileSync(source, "utf8"), "old", "the exact staged source is restored after response loss");
+    assert.equal(readdirSync(join(root, ".omp", "inbox")).some((name) => name.startsWith(".omp-discard-stage-")), false, "restored operation stage leaves no residue");
+  } finally {
+    queue.close();
+    pinned.close();
+    removeRoot(root);
+  }
+});
+
+test("Darwin expected discard preserves a source winner after a lost response", () => {
+  if (process.platform !== "darwin") return;
+  const root = tempRoot("queue-discard-stage-winner-");
+  const pinned = PinnedProjectRoot.open(root, { helperProtocolTest: "eof_after_discard_stage", discardBatchSourceWinner: true });
+  assert.ok(pinned);
+  if (!pinned) return;
+  const queue = openBoundedQueue(root, join(".omp", "inbox"), { pinnedRoot: pinned });
+  assert.ok(queue);
+  if (!queue) { pinned.close(); return; }
+  try {
+    const source = join(root, ".omp", "inbox", "lost-response.json");
+    writeFileSync(source, "old");
+    const expected = queue.classify("lost-response.json");
+    assert.throws(
+      () => queue.discardBatch([{ name: "lost-response.json", expected }], ".omp/rejected"),
+      (error: unknown) => error instanceof BoundedQueueError && error.code === "recovery_required",
+    );
+    assert.equal(readFileSync(source, "utf8"), "winner", "recovery must never clobber a source winner");
+    const stages = readdirSync(join(root, ".omp", "inbox")).filter((name) => name.startsWith(".omp-discard-stage-"));
+    assert.equal(stages.length, 1, "the exact operation-owned stage is preserved for recovery");
+    assert.equal(readFileSync(join(root, ".omp", "inbox", stages[0]!), "utf8"), "old");
+  } finally {
+    queue.close();
+    pinned.close();
+    removeRoot(root);
+  }
+});
+
+test("expected discard preserves a same-inode destination mutation and requires recovery", () => {
+  const root = tempRoot("queue-discard-receipt-race-");
+  const pinned = PinnedProjectRoot.open(root, { discardBatchDestinationMutation: true });
+  assert.ok(pinned);
+  const queue = pinned
+    ? openBoundedQueue(root, join(".omp", "inbox"), { pinnedRoot: pinned })
+    : null;
+  assert.ok(queue);
+  if (!queue) { pinned?.close(); return; }
+  try {
+    const source = join(root, ".omp", "inbox", "mutated.json");
+    const rejected = join(".omp", "rejected");
+    const rejectedPath = join(root, rejected);
+    writeFileSync(source, "old");
+    const expected = queue.classify("mutated.json");
+    let moved: number | undefined;
+    assert.throws(
+      () => { moved = queue.discardBatch([{ name: "mutated.json", expected }], rejected); },
+      (error: unknown) => error instanceof BoundedQueueError && error.code === "recovery_required",
+    );
+    assert.equal(moved, undefined, "receipt mismatch cannot report a successful count");
+    assert.equal(existsSync(source), false, "the published destination owns the staged source inode");
+    const archived = readdirSync(rejectedPath);
+    assert.equal(archived.length, 1, "receipt failure does not create a second destination");
+    assert.equal(readFileSync(join(rejectedPath, archived[0]!), "utf8"), "Xld", "the mutated destination is preserved without clobber");
+  } finally {
+    queue.close();
+    pinned?.close();
+    removeRoot(root);
+  }
+});
+
+test("discardBatch preserves an exact entry when a destination winner appears", () => {
+  const root = tempRoot("queue-discard-move-race-");
+  const pinned = process.platform === "darwin"
+    ? PinnedProjectRoot.open(root, { discardBatchDestinationWinner: true })
+    : undefined;
+  assert.ok(process.platform !== "darwin" || pinned);
+  const queue = pinned
+    ? openBoundedQueue(root, join(".omp", "inbox"), { pinnedRoot: pinned })
+    : openBoundedQueue(root, join(".omp", "inbox"));
+  assert.ok(queue);
+  if (!queue) { pinned?.close(); return; }
   const queueRoot = (queue as unknown as { root: { renameFileExclusive: (source: string, destination: string) => void } }).root;
   const originalRename = queueRoot.renameFileExclusive.bind(queueRoot);
   let stagePath: string | undefined;
@@ -298,6 +429,15 @@ test("discardBatch restores its staged inode when a destination winner appears",
     const rejected = join(".omp", "rejected");
     writeFileSync(source, "old");
     const expected = queue.classify("junk.json");
+    if (process.platform === "darwin") {
+      assert.equal(queue.discardBatch([{ name: "junk.json", expected }], rejected), 1);
+      assert.equal(existsSync(source), false, "the exact entry is archived after a non-clobber destination race");
+      const archived = readdirSync(join(root, rejected));
+      assert.equal(archived.length, 2, "the winner and exact archive both remain durable");
+      assert.ok(archived.some((name) => name.endsWith(".discarded")), "the exact entry is archived under a unique name");
+      assert.ok(archived.some((name) => readFileSync(join(root, rejected, name), "utf8") === "winner"), "the concurrent winner is preserved");
+      return;
+    }
     queueRoot.renameFileExclusive = (sourcePath, destinationPath) => {
       if (sourcePath.endsWith("junk.json")) {
         originalRename(sourcePath, destinationPath);
@@ -321,6 +461,7 @@ test("discardBatch restores its staged inode when a destination winner appears",
   } finally {
     queueRoot.renameFileExclusive = originalRename;
     queue.close();
+    pinned?.close();
     removeRoot(root);
   }
 });

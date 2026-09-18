@@ -23,15 +23,18 @@ import {
   MAX_TELEGRAM_CALLBACK_DATA_UTF8_BYTES,
   type Escalation,
   type EscalationAdapter,
+  type EscalationReceipt,
+  PinnedProjectRoot as PackagePinnedProjectRoot,
 } from "@andvl1/omp-workflows-core";
 import { BoundedQueue, DEFAULT_QUEUE_MAX_ENTRY_BYTES } from "@andvl1/omp-workflows-core/queue";
-import { setCtoPause, buildCtoTerminalSummaryEnvelope, ctoRuntimeRunInitialIdentityDigest, newCtoState, readCtoState, readCtoRunDeliveryCandidatesPinned, setCtoRunDeliveryTestHooks, writeCtoState } from "../../core/src/cto/state.js";
+import { setCtoPause, buildCtoTerminalSummaryEnvelope, ctoRuntimeRunInitialIdentityDigest, newCtoState, readCtoState, readCtoRunDeliveryCandidatesPinned, writeCtoState } from "../../core/src/cto/state.js";
+import { setCtoRunDeliveryTestHooks } from "../../core/dist/cto/state.js";
 import { canonicalDurableIdFileName } from "../../core/src/cto/durable-id.js";
 import { finishWave } from "../../core/src/cto/waves.js";
-import { PinnedProjectRoot } from "../../core/src/specification/pinned-root.js";
+import { drainDarwinHelperClosePromisesForTesting, PinnedProjectRoot } from "../../core/src/specification/pinned-root.js";
 import { PinnedProjectRoot as RuntimePinnedProjectRoot } from "../../core/dist/specification/pinned-root.js";
 import { beginRegistryRegistration, commitRegistryRegistration, rollbackRegistryRegistration } from "@andvl1/omp-workflows-core/registry";
-import { revokeCtoRuntimeServiceMutationAuthority, signCtoRuntimeProof } from "@andvl1/omp-workflows-core/cto-runtime";
+import { revokeCtoRuntimeServiceMutationAuthority, signCtoRuntimeProof, withCtoRuntimeServiceTransaction } from "@andvl1/omp-workflows-core/cto-runtime";
 import { openFullstackRuntimeTest } from "./runtime-access-fixture.js";
 import { bindAuthenticatedAdapterRouting } from "./routing-fixture.js";
 
@@ -65,10 +68,13 @@ function resetRuntimeFor(root: string): void {
   existing.close();
   runtimeFixtures.delete(root);
 }
-test.after(() => {
+async function closeRuntimeFixtures(): Promise<void> {
   for (const runtime of runtimeFixtures.values()) runtime.close();
   runtimeFixtures.clear();
-});
+  await drainDarwinHelperClosePromisesForTesting();
+}
+test.afterEach(closeRuntimeFixtures);
+test.after(closeRuntimeFixtures);
 type DispatcherOptions = Parameters<typeof startDispatcherRaw>[3];
 type PollOptions = NonNullable<Parameters<typeof pollInboxRaw>[4]>;
 type DrainOptions = NonNullable<Parameters<typeof drainOutboxRaw>[3]>;
@@ -81,7 +87,10 @@ function createChannelSet(root: string, capabilities?: Parameters<typeof createC
 
 function startDispatcher(root: string, adapter: Parameters<typeof startDispatcherRaw>[1], intervalMs = 10_000, options: Partial<DispatcherOptions> = {}) {
   const runtime = runtimeFor(root);
-  return startDispatcherRaw(root, adapter, intervalMs, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard, serviceAuthority: options.serviceAuthority ?? runtime.serviceAuthority } as DispatcherOptions);
+  const runtimeAccess = options.runtimeAccess ?? runtime.access;
+  if (adapter) assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtimeAccess), true, "adapter fixture has authenticated routing");
+  for (const sink of options.roSinks ?? []) assert.equal(bindAuthenticatedAdapterRouting(root, sink, runtimeAccess), true, "adapter fixture RO sink has authenticated routing");
+  return startDispatcherRaw(root, adapter, intervalMs, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess, session_id: options.session_id ?? runtime.sessionId, liveGuard: options.liveGuard ?? runtime.liveGuard, serviceAuthority: options.serviceAuthority ?? runtime.serviceAuthority } as DispatcherOptions);
 }
 function pollInbox(root: string, adapter: Parameters<typeof pollInboxRaw>[1], onTask?: Parameters<typeof pollInboxRaw>[2], onAnswer?: Parameters<typeof pollInboxRaw>[3], options: Partial<PollOptions> = {}) {
   const runtime = runtimeFor(root);
@@ -89,7 +98,10 @@ function pollInbox(root: string, adapter: Parameters<typeof pollInboxRaw>[1], on
 }
 function drainOutbox(root: string, adapter: Parameters<typeof drainOutboxRaw>[1], maxRetries = 3, options: Partial<DrainOptions> = {}) {
   const runtime = runtimeFor(root);
-  return drainOutboxRaw(root, adapter, maxRetries, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess: options.runtimeAccess ?? runtime.access } as DrainOptions);
+  const runtimeAccess = options.runtimeAccess ?? runtime.access;
+  if (adapter) assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtimeAccess), true, "adapter fixture has authenticated routing");
+  for (const sink of options.roSinks ?? []) assert.equal(bindAuthenticatedAdapterRouting(root, sink, runtimeAccess), true, "adapter fixture RO sink has authenticated routing");
+  return drainOutboxRaw(root, adapter, maxRetries, { ...options, proofAuthority: runtime.proofAuthority, runtimeAccess } as DrainOptions);
 }
 function handleInboxTask(root: string, task: Parameters<typeof handleInboxTaskRaw>[1], onTask: Parameters<typeof handleInboxTaskRaw>[2] = undefined, options: Partial<HandleOptions> = {}) {
   const runtime = runtimeFor(root);
@@ -307,6 +319,7 @@ function publishTestTerminalSummary(root: string, runId: string): string {
     task: "terminal summary",
     branch: "main",
     autonomous: true,
+    owner_session: runtime.sessionId,
     plan: { id: runId, task: "terminal summary", teams: [], created_at: new Date().toISOString() },
   });
   const wave = {
@@ -320,20 +333,35 @@ function publishTestTerminalSummary(root: string, runId: string): string {
     started_at: new Date(0).toISOString(),
     finished_at: new Date(1_000).toISOString(),
   };
-  state.wave_history = [wave];
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-  setCtoPause(state, "done", "terminal");
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+  state.work_identity = {
+    run_id: runId,
+    wave_id: wave.id,
+    slice_id: "terminal-summary",
+    session_id: runtime.sessionId,
+    workflow: "standard",
+    stage_id: "execution",
+    stage_cursor: "execution",
+    capability_id: "adapter-test",
+    capability_epoch: "1",
+    slot_id: "terminal-summary",
+    task_id: "terminal-summary",
+    dispatch_id: "dispatch-" + runId,
+    attempt: 1,
+    worker_id: "adapter-test",
+  };
+  const initialStateSha256 = ctoRuntimeRunInitialIdentityDigest(state);
+  assert.ok(runtime.access.createRun(state, { source_id: "adapters:" + runId, initial_state_sha256: initialStateSha256 }));
+  runtime.access.withRunTransaction(runId, (transaction) => {
+    const current = transaction.readState();
+    current.wave_history = [wave];
+    setCtoPause(current, "done", "terminal");
+    transaction.writeState(current);
+  });
   const current = runtime.access.readState(runId);
   assert.ok(current, "canonical terminal CTO state exists");
   const summary = buildCtoTerminalSummaryEnvelope(current, wave);
-  const entryName = canonicalDurableIdFileName(summary.id);
-  const published = runtime.access.publishOutboxDelivery({
-    run_id: runId,
-    state_revision: current.state_revision as number,
-    entry_name: entryName,
-    json: JSON.stringify(summary),
-  });
+  assert.equal(runtime.access.markDeliveryPending(runId, current.state_revision, "summary"), true);
+  const published = queueCtoDeliveryRaw(root, runId, summary, undefined, undefined, runtime.access);
   assert.ok(published, "canonical terminal summary publication succeeds");
   return published as string;
 }
@@ -375,6 +403,9 @@ function assertAuthenticatedTelegramMapping(root: string, runId: string, chatId:
   assert.equal(mapping.route?.projection_sha256, snapshot.config_sha256);
   assert.equal(mapping.route?.channel, "telegram");
   assert.equal(mapping.route?.target, chatId);
+  assert.equal(mapping.route?.profile_id, null);
+  assert.equal(mapping.route?.direction, "read-write");
+  assert.equal(mapping.route?.primary, true);
   assert.equal(mapping.delivery?.receipt?.sent, true);
   assert.equal(mapping.delivery?.receipt?.channelRef, `tg:${expectedMessageId}`);
   for (const value of [mapping.delivery?.payload_digest, mapping.delivery?.delivery_digest, mapping.proof]) {
@@ -396,10 +427,7 @@ function assertAuthenticatedTelegramMapping(root: string, runId: string, chatId:
 const INBOX_WORKER_SCRIPT = `
   import { existsSync, writeFileSync } from "node:fs";
   const { handleInboxTask } = await import(process.env.REGISTRY_URL);
-  const { fullstackOwnerForCwd } = await import(process.env.FULLSTACK_OWNER_URL);
-  const { writeFullstackActivationMarker } = await import(process.env.ACTIVATION_MARKER_URL);
-  const { openWorkflowActivation, closeWorkflowActivation } = await import("@andvl1/omp-workflows-core/registry");
-  const { openCtoRuntimeAccess } = await import("@andvl1/omp-workflows-core/cto-runtime");
+  const { openFullstackRuntimeTest } = await import(process.env.RUNTIME_FIXTURE_URL);
   const root = process.env.INBOX_ROOT;
   const runId = process.env.INBOX_RUN_ID;
   const id = process.env.INBOX_TASK_ID;
@@ -407,21 +435,17 @@ const INBOX_WORKER_SCRIPT = `
   const ready = process.env.INBOX_READY;
   const gate = process.env.INBOX_GATE;
   if (!root || !id || text === undefined || !ready || !gate) throw new Error("worker environment incomplete");
-  writeFullstackActivationMarker(root);
-  const activation = openWorkflowActivation(root, ["workflow_registration", "workflow_tools"], fullstackOwnerForCwd(root));
-  if (!activation.ok) throw new Error(String(activation.code) + ": " + String(activation.error));
-  const opened = openCtoRuntimeAccess(activation.registry_context, { sessionId: "inbox-worker-" + String(process.pid), main: true }, root);
-  if (!opened.ok) { closeWorkflowActivation(activation); throw new Error(String(opened.code) + ": " + String(opened.error)); }
+  const runtime = openFullstackRuntimeTest(root, "inbox-worker-" + String(process.pid), undefined, false, false);
+  const opened = runtime.access;
   writeFileSync(ready, "ready");
   while (!existsSync(gate)) await new Promise((resolve) => setTimeout(resolve, 2));
   const task = { id, text, at: new Date().toISOString(), ...(runId ? { runId } : {}) };
-  handleInboxTask(root, task, () => {
+  await handleInboxTask(root, task, () => {
     const wake = process.env.INBOX_WAKE;
     if (wake) writeFileSync(wake, "wake");
     if (process.env.INBOX_CRASH_AFTER_WAKE === "1") process.exit(17);
-  }, { runtimeAccess: opened.access, ...(process.env.INBOX_IDEMPOTENT_WAKE === "1" ? { idempotentWake: true } : {}) });
-  opened.access.close();
-  closeWorkflowActivation(activation);
+  }, { runtimeAccess: opened, serviceAuthority: runtime.serviceAuthority, proofAuthority: runtime.proofAuthority, ...(process.env.INBOX_IDEMPOTENT_WAKE === "1" ? { idempotentWake: true } : {}) });
+  runtime.close();
 `;
 
 function runBarrieredInboxWorker(opts: {
@@ -443,8 +467,7 @@ function runBarrieredInboxWorker(opts: {
       env: {
         ...process.env,
         REGISTRY_URL: registryUrl,
-        FULLSTACK_OWNER_URL: new URL("../src/index.ts", import.meta.url).href,
-        ACTIVATION_MARKER_URL: new URL("../src/activation-marker.ts", import.meta.url).href,
+        RUNTIME_FIXTURE_URL: new URL("./runtime-access-fixture.ts", import.meta.url).href,
         INBOX_ROOT: opts.root,
         ...(opts.runId ? { INBOX_RUN_ID: opts.runId } : {}),
         INBOX_TASK_ID: opts.id,
@@ -467,6 +490,15 @@ function runBarrieredInboxWorker(opts: {
   });
 }
 
+
+function finishInboxWave(root: string, runId: string, waveId: string): void {
+  const runtime = runtimeFor(root);
+  withCtoRuntimeServiceTransaction(runtime.serviceAuthority, runId, (transaction) => {
+    const state = transaction.readState();
+    const next = finishWave(state, { id: waveId, status: "done" });
+    transaction.writeState(next);
+  });
+}
 
 async function releaseInboxWorkers(readyPaths: string[], gate: string): Promise<void> {
   const deadline = Date.now() + 5_000;
@@ -801,41 +833,223 @@ test("adapters: Telegram delivered_unmapped crash replay repairs mapping without
   const root = mkdtempSync(join(tmpdir(), "tg-idempotency-crash-replay-"));
   let sends = 0;
   try {
-    const fetchImpl = (async () => {
-      sends += 1;
-      throw new Error("transport must not be called for a journaled remote receipt");
+    const firstFetch = (async (url: unknown) => {
+      if (String(url).endsWith("/sendMessage")) {
+        sends += 1;
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 91 } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
     }) as typeof fetch;
-    const adapter = authenticatedTelegramAdapter(root, "token", "42", fetchImpl);
+    const firstAdapter = authenticatedTelegramAdapter(root, "token", "42", firstFetch);
     const esc = sampleEscalation({ id: "tg-run/crash-replay" });
     const key = "tg-delivery-crash-replay";
-    const effects = join(root, ".work-state", "cto", "tg-run", "delivery-effects");
-    mkdirSync(effects, { recursive: true });
-    const marker = createHash("sha256").update(key, "utf8").digest("hex") + ".json";
-    writeFileSync(join(effects, marker), JSON.stringify({
-      schema: 1,
-      status: "delivered_unmapped",
-      key,
-      escalation_id: esc.id,
-      payload_digest: createHash("sha256").update(JSON.stringify(esc), "utf8").digest("hex"),
-      message_id: 91,
-      receipt: { sent: true, channelRef: "tg:91" },
-      at: new Date().toISOString(),
-    }));
+    type Mapping = (escId: string, messageId: number, value: Escalation) => void;
+    const internals = firstAdapter as unknown as { recordMapping: Mapping };
+    internals.recordMapping = () => { throw new Error("injected crash after remote acceptance"); };
+    const first = await firstAdapter.sendWithIdempotency(esc, key);
+    assert.deepEqual(first, { sent: false, channelRef: "tg:91:mapping-pending" });
+    assert.equal(sends, 1, "the real first attempt accepts exactly one remote message");
 
-    const [first, replay] = await Promise.all([
+    const effects = join(root, ".work-state", "cto", "tg-run", "delivery-effects");
+    const marker = createHash("sha256").update(key, "utf8").digest("hex") + ".json";
+    const unmapped = JSON.parse(readFileSync(join(effects, marker), "utf8")) as { status: string; proof?: string };
+    assert.equal(unmapped.status, "delivered_unmapped");
+    assert.match(unmapped.proof ?? "", /^[0-9a-f]{64}$/u, "the crash-boundary record is authenticated");
+
+    const replayFetch = (async () => {
+      throw new Error("transport must not be called for a journaled remote receipt");
+    }) as typeof fetch;
+    const adapter = authenticatedTelegramAdapter(root, "token", "42", replayFetch);
+    const [firstReplay, replay] = await Promise.all([
       adapter.sendWithIdempotency(esc, key),
       adapter.sendWithIdempotency(esc, key),
     ]);
-    assert.deepEqual(first, { sent: true, channelRef: "tg:91" });
-    assert.deepEqual(replay, first);
-    assert.equal(sends, 0, "a durable remote receipt must suppress every transport replay");
+    assert.deepEqual(firstReplay, { sent: true, channelRef: "tg:91" });
+    assert.deepEqual(replay, firstReplay);
+    assert.equal(sends, 1, "a durable remote receipt must suppress every transport replay");
     assertAuthenticatedTelegramMapping(root, "tg-run", "42", esc.id, 91, runtimeFor(root));
-    const delivered = JSON.parse(readFileSync(join(effects, marker), "utf8")) as { status: string };
+    const delivered = JSON.parse(readFileSync(join(effects, marker), "utf8")) as { status: string; proof?: string };
     assert.equal(delivered.status, "delivered");
+    assert.match(delivered.proof ?? "", /^[0-9a-f]{64}$/u, "the promoted record is re-signed");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("adapters: forged delivered effects never suppress transport or create mappings", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-idempotency-forged-effects-"));
+  let sends = 0;
+  try {
+    const fetchImpl = (async (url: unknown) => {
+      if (String(url).endsWith("/sendMessage")) sends += 1;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 101 } }), { status: 200 });
+    }) as typeof fetch;
+    const adapter = authenticatedTelegramAdapter(root, "token", "42", fetchImpl);
+    const pin = RuntimePinnedProjectRoot.open(root);
+    assert.ok(pin);
+    const rootIdentity = { canonical_path: pin.canonical_root, dev: pin.dev, ino: pin.ino };
+    pin.close();
+    const route = { channel: "telegram", target: "42", profile_id: null, direction: "read-write", primary: true } as const;
+    const cases = [
+      { runId: "tg-forged-delivered", status: "delivered" as const, messageId: undefined },
+      { runId: "tg-forged-unmapped", status: "delivered_unmapped" as const, messageId: 102 },
+    ];
+    for (const entry of cases) {
+      const esc = sampleEscalation({ id: `${entry.runId}/escalation` });
+      const key = `${entry.runId}-key`;
+      const effects = join(root, ".work-state", "cto", entry.runId, "delivery-effects");
+      mkdirSync(effects, { recursive: true });
+      const marker = createHash("sha256").update(key, "utf8").digest("hex") + ".json";
+      const forged = {
+        schema: 1,
+        status: entry.status,
+        key,
+        escalation_id: esc.id,
+        payload_digest: createHash("sha256").update(JSON.stringify(esc), "utf8").digest("hex"),
+        ...(entry.messageId === undefined ? {} : { message_id: entry.messageId }),
+        ...(entry.status === "delivered" ? { receipt: { sent: true, channelRef: "tg:101" } } : { receipt: { sent: true, channelRef: `tg:${entry.messageId}` } }),
+        at: new Date().toISOString(),
+        root: rootIdentity,
+        route,
+        proof: "0".repeat(64),
+      };
+      const effectPath = join(effects, marker);
+      writeFileSync(effectPath, JSON.stringify(forged));
+      const before = readFileSync(effectPath);
+      await assert.rejects(
+        adapter.sendWithIdempotency(esc, key),
+        (error: unknown) => (error as { code?: string })?.code === "DELIVERY_EFFECT_AMBIGUOUS",
+      );
+      assert.equal(sends, 0, `${entry.status}: forged receipt must not call Telegram`);
+      assert.deepEqual(readFileSync(effectPath), before, `${entry.status}: forged bytes remain untouched`);
+      assert.equal(existsSync(telegramPartitionDir(root, entry.runId, "42")), false, `${entry.status}: forged receipt must not create a mapping`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: Telegram delivery effects reject route and pinned-root replay", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-idempotency-route-replay-"));
+  const copiedRoot = mkdtempSync(join(tmpdir(), "tg-idempotency-root-replay-"));
+  let sends = 0;
+  let copiedSends = 0;
+  try {
+    const fetchImpl = (async (url: unknown) => {
+      if (String(url).endsWith("/sendMessage")) sends += 1;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 201 } }), { status: 200 });
+    }) as typeof fetch;
+    const adapter = authenticatedTelegramAdapter(root, "token", "42", fetchImpl);
+    const esc = sampleEscalation({ id: "tg-replay/escalation" });
+    const key = "tg-replay-key";
+    assert.deepEqual(await adapter.sendWithIdempotency(esc, key), { sent: true, channelRef: "tg:201" });
+    const marker = createHash("sha256").update(key, "utf8").digest("hex") + ".json";
+    const effectPath = join(root, ".work-state", "cto", "tg-replay", "delivery-effects", marker);
+    const original = readFileSync(effectPath);
+
+    const foreignRoute = new TelegramEscalationAdapter({
+      token: "token",
+      chatId: "42",
+      cwd: root,
+      proofAuthority: runtimeFor(root).proofAuthority,
+      runtimeAccess: runtimeFor(root).access,
+      fetchImpl: (async () => { throw new Error("route replay must not reach transport"); }) as typeof fetch,
+      routingProfile: { id: "foreign-profile", direction: "read-write", primary: true },
+    });
+    await assert.rejects(
+      foreignRoute.sendWithIdempotency(esc, key),
+      (error: unknown) => (error as { code?: string })?.code === "DELIVERY_EFFECT_AMBIGUOUS",
+    );
+    assert.equal(sends, 1, "foreign route replay must not call Telegram");
+    assert.deepEqual(readFileSync(effectPath), original, "foreign route replay must not overwrite the effect");
+
+    const copiedEffects = join(copiedRoot, ".work-state", "cto", "tg-replay", "delivery-effects");
+    mkdirSync(copiedEffects, { recursive: true });
+    const copiedPath = join(copiedEffects, marker);
+    writeFileSync(copiedPath, original);
+    const copiedAdapter = authenticatedTelegramAdapter(copiedRoot, "token", "42", (async (url: unknown) => {
+      if (String(url).endsWith("/sendMessage")) copiedSends += 1;
+      throw new Error("root replay must not reach transport");
+    }) as typeof fetch);
+    await assert.rejects(
+      copiedAdapter.sendWithIdempotency(esc, key),
+      (error: unknown) => (error as { code?: string })?.code === "DELIVERY_EFFECT_AMBIGUOUS",
+    );
+    assert.equal(copiedSends, 0, "foreign pinned-root replay must not call Telegram");
+    assert.deepEqual(readFileSync(copiedPath), original, "foreign pinned-root replay must not overwrite the effect");
+    assert.equal(existsSync(telegramPartitionDir(copiedRoot, "tg-replay", "42")), false, "foreign root replay must not create a mapping");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(copiedRoot, { recursive: true, force: true });
+  }
+});
+
+test("adapters: Telegram v2 marker recovers a retry-lane mapping before promotion without resend", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-retry-marker-recovery-"));
+  const runId = "tg-retry-marker";
+  const esc = sampleEscalation({ id: `${runId}/question/recover` });
+  let sends = 0;
+  let sentPayload: Record<string, unknown> | null = null;
+  let committed: number[] = [];
+  try {
+    writeTelegramTestConfig(root, "token", "42");
+    withPendingIndexedRun(root, runId);
+    const baseRuntime = runtimeFor(root);
+    const pendingRuntime = Object.create(baseRuntime.access) as typeof baseRuntime.access;
+    Object.defineProperty(pendingRuntime, "readState", { configurable: true, value: (candidateRunId: string) => {
+      const state = baseRuntime.access.readState(candidateRunId);
+      if (!state || candidateRunId !== runId) return state;
+      return { ...state, teams: [{ id: "team", status: "pending", escalations: { [esc.id]: { status: "pending" } } }] };
+    } });
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const method = String(url).split("/").pop();
+      if (method === "sendMessage") {
+        sends += 1;
+        sentPayload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 77 } }), { status: 200 });
+      }
+      if (method === "getUpdates") {
+        const text = String(sentPayload?.text ?? "");
+        return new Response(JSON.stringify({ ok: true, result: [{ update_id: 1, message: {
+          message_id: 78, date: 1_700_000_000, text: "approved", chat: { id: 42 }, from: { id: 7 },
+          reply_to_message: { message_id: 77, text },
+        } }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+    }) as typeof fetch;
+    const adapter = new TelegramEscalationAdapter({ token: "token", chatId: "42", cwd: root, fetchImpl, runtimeAccess: pendingRuntime, proofAuthority: baseRuntime.proofAuthority });
+    adapter.setUpdateCommitHook((updateId) => { committed.push(updateId); });
+    const internals = adapter as unknown as { recordMapping: (...args: unknown[]) => void };
+    const originalMapping = internals.recordMapping;
+    let failMapping = true;
+    internals.recordMapping = (...args: unknown[]) => {
+      if (failMapping) {
+        failMapping = false;
+        throw new Error("injected mapping persistence failure");
+      }
+      return originalMapping.apply(adapter, args);
+    };
+    const published = publishTestDelivery(root, runId, { ...esc, run_id: runId, intent: "question" });
+    const first = await drainOutbox(root, adapter, 1, { runtimeAccess: pendingRuntime });
+    assert.equal(first.length, 1);
+    assert.equal(first[0]?.sent, false, "mapping failure leaves the delivery retryable");
+    assert.equal(sends, 1, "remote Telegram accepted the message once");
+    assert.match(String(sentPayload?.text), /omp-escalation-ref:v2:/u, "RW primary sends a signed v2 marker");
+    const retryDir = join(root, ".work-state", "cto", runId, "outbox-retry");
+    assert.equal(readdirSync(retryDir).filter((name) => name.endsWith(".json")).length, 1, "the exact obligation is in retry lane");
+    const answers = await adapter.pollOnce(undefined, undefined);
+    assert.equal(answers.length, 1, "the immediate reply is recovered and persisted");
+    assert.equal(answers[0]?.id, esc.id);
+    assert.equal(answers[0]?.answer, "approved");
+    assert.equal(sends, 1, "retry-lane mapping recovery does not resend Telegram");
+    assert.deepEqual(committed, [1], "Telegram commits the recovered update after mapping and answer durability");
+    assert.equal(readPersistedAnswers(root, runId).some((answer) => answer.id === esc.id), true, "answer mapping is durable");
+    assert.equal(existsSync(published), false, "the active publication was moved to retry");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("adapters: Telegram unknown transport outcome keeps prepared ambiguity", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-idempotency-unknown-"));
   let sends = 0;
@@ -1155,23 +1369,24 @@ test("adapters: dispatcher drains outbox, sanitizes (R4), moves to sent/", async
   }
 });
 
-test("adapters: malformed unbound outbox keeps pending run until authoritative recovery", async () => {
+test("adapters: malformed rejected evidence does not strand a missing valid obligation", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-dispatch-malformed-unbound-"));
   let stop: ReturnType<typeof startDispatcher> | undefined;
   try {
     const runId = "run-malformed-unbound";
     withPendingIndexedRun(root, runId);
     const outbox = outboxDir(runId, root);
-    mkdirSync(outbox, { recursive: true });
-    const initialPublished = join(outbox, "initial.json");
-    writeFileSync(initialPublished, "{}", "utf8");
-    unlinkSync(initialPublished);
+    const authorityId = `${runId}/question/authority`;
+    const missingPath = publishTestDelivery(root, runId, { ...sampleEscalation({ id: authorityId }), intent: "question", run_id: runId });
+    unlinkSync(missingPath);
     const malformedPath = join(outbox, "foo.json");
     writeFileSync(malformedPath, "{malformed");
-    let sends = 0;
+    const sentIds: string[] = [];
+    const recordSend = (delivery: Escalation): void => { sentIds.push(delivery.id); };
     const adapter = {
       kind: "malformed-unbound",
-      send: async () => { sends += 1; return { sent: true }; },
+      send: async (delivery: Escalation) => { recordSend(delivery); return { sent: true }; },
+      sendWithIdempotency: async (delivery: Escalation) => { recordSend(delivery); return { sent: true }; },
       cancel: async () => undefined,
       pollOnce: async () => [],
     };
@@ -1181,33 +1396,40 @@ test("adapters: malformed unbound outbox keeps pending run until authoritative r
     assert.equal(failure[0]?.runId, runId, "malformed failure remains correlated to the indexed run");
     assert.equal(failure[0]?.sent, false);
     assert.equal(failure[0]?.error, "outbox delivery is not the current authenticated publication");
-    assert.equal(sends, 0, "unbound malformed data never reaches transport");
+    assert.deepEqual(sentIds, [], "unbound malformed data never reaches transport");
+    const rejected = join(root, ".work-state", "cto", runId, "outbox-rejected");
+    assert.equal(readdirSync(rejected).filter((name) => name.endsWith(".discarded")).length, 1, "malformed evidence remains durably rejected");
+    assert.equal(runtimeFor(root).access.readOutboxDeliveryObligations(runId).length, 1, "the valid missing-file obligation remains durable");
+    const pendingBeforeRecovery = JSON.parse(readFileSync(join(root, ".work-state", "cto", "active-run-index.json"), "utf8")) as { entries: Array<{ run_id: string; pending_outbox: boolean; pending_retry: boolean }> };
+    const beforeEntry = pendingBeforeRecovery.entries.find((item) => item.run_id === runId);
+    assert.equal(beforeEntry?.pending_outbox, true, "rejected evidence fences ACK while the valid obligation is missing");
+    assert.equal(beforeEntry?.pending_retry, false);
 
-    mkdirSync(outbox, { recursive: true });
-    writeFileSync(malformedPath, "{malformed");
+    const recoveredId = `${runId}/question/recovered`;
+    const recoveredPath = publishTestDelivery(root, runId, { ...sampleEscalation({ id: recoveredId }), intent: "question", run_id: runId });
     let polls = 0;
     adapter.pollOnce = async () => { polls += 1; return []; };
     stop = startDispatcher(root, adapter, 5);
     for (let attempt = 0; attempt < 100 && polls < 1; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.ok(polls >= 1, "dispatcher completed a tick for the malformed pending run");
+    assert.ok(polls >= 1, "dispatcher completed a recovery tick with unrelated rejected evidence");
     await stop();
     stop = undefined;
-    const index = JSON.parse(readFileSync(join(root, ".work-state", "cto", "active-run-index.json"), "utf8")) as { entries: Array<{ run_id: string; pending_outbox: boolean; pending_retry: boolean }> };
-    const entry = index.entries.find((item) => item.run_id === runId);
-    assert.equal(entry?.pending_outbox, true, "malformed tick does not acknowledge the pending run");
-    assert.equal(entry?.pending_retry, false, "malformed tick does not create a retry acknowledgement");
-    assert.equal(sends, 0);
 
-    const published = publishTestDelivery(root, runId, { ...sampleEscalation({ id: runId + "/question/recovered" }), intent: "question", run_id: runId });
-    const recovered = await drainOutbox(root, adapter);
-    assert.equal(recovered.length, 1);
-    assert.equal(recovered[0]?.runId, runId);
-    assert.equal(recovered[0]?.sent, true);
-    assert.equal(sends, 1, "authoritative recovery drains exactly once");
-    assert.ok(existsSync(join(outbox, "sent", basename(published))));
+    // Count every transport id, rather than filtering to the newly-created
+    // file: republishing the pre-existing missing obligation must happen once
+    // and must not hide a stale authority duplicate.
+    assert.deepEqual([...sentIds].sort(), [authorityId, recoveredId].sort(), "both valid obligations republish exactly once despite unrelated rejection");
+    assert.equal(runtimeFor(root).access.readOutboxDeliveryObligations(runId).length, 0, "recovery removes every exact durable obligation");
+    const index = JSON.parse(readFileSync(join(root, ".work-state", "cto", "active-run-index.json"), "utf8")) as { entries: Array<{ run_id: string; pending_outbox: boolean; pending_retry: boolean; pending_summary?: boolean }> };
+    const entry = index.entries.find((item) => item.run_id === runId);
+    assert.equal(entry?.pending_outbox, false, "successful recovery clears pending outbox authority");
+    assert.equal(entry?.pending_retry, false, "successful recovery clears pending retry authority");
+    assert.equal(entry?.pending_summary, false, "successful recovery clears pending summary authority");
+    assert.equal(existsSync(rejected) ? readdirSync(rejected).filter((name) => name.endsWith(".discarded")).length : 0, 0, "successful valid recovery resolves prior rejected evidence before ACK");
+    assert.ok(existsSync(join(outbox, "sent", basename(recoveredPath))));
     const replay = await drainOutbox(root, adapter);
-    assert.equal(replay.length, 0, "archived recovery is not replayed");
-    assert.equal(sends, 1);
+    assert.equal(replay.length, 0, "fully recovered obligations are not replayed");
+    assert.deepEqual([...sentIds].sort(), [authorityId, recoveredId].sort(), "recovery does not duplicate either transport id");
   } finally {
     if (stop) await stop();
     rmSync(root, { recursive: true, force: true });
@@ -1270,6 +1492,7 @@ test("adapters: archive-first crash replays durable idempotency without a remote
       },
       cancel: async () => undefined,
     };
+    const runtime = runtimeFor(root);
     let crashOnce = true;
     setCtoRunDeliveryTestHooks({ beforeObligationRemove: () => { if (crashOnce) { crashOnce = false; throw new Error("simulated process stop after archive before obligation clear"); } } }, root);
     const first = await drainOutbox(root, adapter, 1);
@@ -1279,7 +1502,7 @@ test("adapters: archive-first crash replays durable idempotency without a remote
     assert.equal(remoteEffects, 1);
     assert.equal(existsSync(sentPath), true, "confirmed bytes are archived before obligation clear");
     const sentBytes = readFileSync(sentPath);
-    assert.equal(runtimeFor(root).access.readOutboxDeliveryObligations(runId).length, 1, "crash leaves the state obligation durable");
+    assert.equal(runtime.access.readOutboxDeliveryObligations(runId).length, 1, "crash leaves the state obligation durable");
     const stop = startDispatcher(root, adapter, 5);
     try {
       let recovered = false;
@@ -1292,7 +1515,7 @@ test("adapters: archive-first crash replays durable idempotency without a remote
       }
       assert.equal(recovered, true, "restart clears the obligation and exact index flags after idempotent confirmation");
     } finally { await stop(); }
-    assert.equal(idempotentCalls, 2, "restart re-enters the adapter idempotency callback");
+    assert.equal(idempotentCalls, 2, "archive bytes never suppress the authenticated idempotency replay");
     assert.equal(remoteEffects, 1, "idempotent recovery produces exactly one remote effect");
     assert.deepEqual(readFileSync(sentPath), sentBytes, "recovery preserves the exact accepted transport bytes");
   } finally {
@@ -1367,14 +1590,18 @@ test("adapters: drainOutbox quarantines unsafe explicit idempotency keys", async
   const invalidKeys: unknown[] = ["", "   ", "\u001b[31mred", "line\nbreak", "bidi\u202e", "x".repeat(256)];
   const root = mkdtempSync(join(tmpdir(), "cto-dispatch-key-"));
   try {
+    writeTelegramTestConfig(root, "t", "100");
     withPendingIndexedRun(root, "run-keys");
     const outbox = outboxDir("run-keys", root);
     mkdirSync(outbox, { recursive: true });
+    const publishedPaths: string[] = [];
+    for (const [index] of invalidKeys.entries()) {
+      const id = `run-keys/key-${index}`;
+      publishedPaths.push(publishTestDelivery(root, "run-keys", { ...sampleEscalation({ id }), intent: "question" }));
+    }
     for (const [index, key] of invalidKeys.entries()) {
-      writeFileSync(
-        join(outbox, `key-${index}.json`),
-        JSON.stringify({ ...sampleEscalation(), id: `run-keys/key-${index}`, intent: "question", idempotency_key: key }),
-      );
+      const id = `run-keys/key-${index}`;
+      writeFileSync(publishedPaths[index]!, JSON.stringify({ ...sampleEscalation({ id }), intent: "question", idempotency_key: key }));
     }
     let sends = 0;
     const adapter = {
@@ -1530,7 +1757,7 @@ test("adapters: telegram sendMessage + pollOnce writes answer files", async () =
           JSON.stringify({
             ok: true,
             result: [
-              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 42 }, chat: { id: 100 }, from: { id: 100 } } },
+              { update_id: 1, message: { message_id: 100, date: 1_700_000_000, text: "rest", reply_to_message: { message_id: 42 }, chat: { id: 100 }, from: { id: 100 } } },
             ],
           }),
           { status: 200 },
@@ -1540,7 +1767,7 @@ test("adapters: telegram sendMessage + pollOnce writes answer files", async () =
     }) as typeof fetch;
 
     withIndexedRun(root, "run-1");
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "t", "100", fetchImpl);
     const receipt = await adapter.send(sampleEscalation());
     assert.equal(receipt.sent, true);
     assert.equal((sentPayload as { chat_id?: string })?.chat_id, "100");
@@ -1554,6 +1781,7 @@ test("adapters: telegram sendMessage + pollOnce writes answer files", async () =
     assert.equal(answers.length, 1);
     assert.equal(answers[0]?.answer, "rest");
     assert.equal(answers[0]?.by, "telegram:reply");
+    assert.equal(answers[0]?.at, "2023-11-14T22:13:20.000Z", "reply timestamp is derived from Telegram Message.date");
 
     const persisted = readPersistedAnswers(root, "run-1");
     assert.equal(persisted.length, 1);
@@ -1593,7 +1821,7 @@ test("adapters: Telegram emits opaque callbacks and resolves durable token bindi
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
     withIndexedRun(root, runId);
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "t", "100", fetchImpl);
     const receipt = await adapter.send(sampleEscalation({
       id: escId,
       options: [{ id: "approve", label: "Approve", apply: "now" }],
@@ -1630,7 +1858,7 @@ test("adapters: Telegram rejects unsafe and over-limit escalation transport data
       sends += 1;
       return new Response(JSON.stringify({ ok: true, result: { message_id: sends } }), { status: 200 });
     }) as typeof fetch;
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "t", "100", fetchImpl);
     const invalid = [
       sampleEscalation({ id: "run//team" }),
       sampleEscalation({ options: [{ id: "approve::later", label: "Approve", apply: "now" }] }),
@@ -1659,7 +1887,7 @@ test("adapters: Telegram pollOnce skips malformed updates, preserves monotonic o
   let round = 0;
   const message = (id: number, text: string) => ({
     update_id: id,
-    message: { message_id: id, text, chat: { id: 100 }, from: { id: 100 } },
+    message: { message_id: id, date: 1_700_000_000, text, chat: { id: 100 }, from: { id: 100 } },
   });
   const batches: unknown[][] = [
     [
@@ -1715,6 +1943,42 @@ test("adapters: Telegram pollOnce skips malformed updates, preserves monotonic o
   }
 });
 
+test("adapters: Telegram plain messages without a valid Message.date are consumed without waking the handler", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-tg-message-date-"));
+  const offsets: number[] = [];
+  const tasks: string[] = [];
+  let round = 0;
+  try {
+    const updates = [
+      { update_id: 1, message: { message_id: 1, text: "missing date", chat: { id: 100 }, from: { id: 100 } } },
+      { update_id: 2, message: { message_id: 2, date: "1700000000", text: "string date", chat: { id: 100 }, from: { id: 100 } } },
+      { update_id: 3, message: { message_id: 3, date: 1.5, text: "fractional date", chat: { id: 100 }, from: { id: 100 } } },
+      { update_id: 4, message: { message_id: 4, date: Number.MAX_SAFE_INTEGER, text: "out of range date", chat: { id: 100 }, from: { id: 100 } } },
+      { update_id: 5, message: { message_id: 5, date: 1_700_000_000, text: "valid date", chat: { id: 100 }, from: { id: 100 } } },
+    ];
+    const adapter = new TelegramEscalationAdapter({
+      token: "t",
+      chatId: "100",
+      cwd: root,
+      proofAuthority: runtimeFor(root).proofAuthority,
+      runtimeAccess: runtimeFor(root).access,
+      fetchImpl: (async (url: unknown, init: unknown) => {
+        const method = String(url).split("/").pop();
+        if (method !== "getUpdates") throw new Error(`unexpected method: ${method}`);
+        offsets.push((JSON.parse((init as { body: string }).body) as { offset: number }).offset);
+        return new Response(JSON.stringify({ ok: true, result: round++ === 0 ? updates : [] }), { status: 200 });
+      }) as typeof fetch,
+      onPlainMessage: (message) => tasks.push(message.text),
+    });
+    await adapter.pollOnce();
+    await adapter.pollOnce();
+    assert.deepEqual(tasks, ["valid date"], "only the bounded Unix-second timestamp reaches the handler");
+    assert.deepEqual(offsets, [0, 6], "invalid message dates are terminally consumed rather than retried");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("adapters: Telegram pollOnce rejects oversized responses without starving a bounded later update", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-tg-poll-bounds-"));
   const offsets: number[] = [];
@@ -1722,7 +1986,7 @@ test("adapters: Telegram pollOnce rejects oversized responses without starving a
   let round = 0;
   const valid = (id: number, text: string) => ({
     update_id: id,
-    message: { message_id: id, text, chat: { id: 100 }, from: { id: 100 } },
+    message: { message_id: id, date: 1_700_000_000, text, chat: { id: 100 }, from: { id: 100 } },
   });
   const oversizedCount = Array.from({ length: 257 }, (_, index) => valid(index + 1, "count"));
   const oversizedRow = {
@@ -1823,8 +2087,8 @@ test("adapters: Telegram answer filenames preserve same-run IDs across sanitizer
         getUpdatesCalls += 1;
         const result = getUpdatesCalls === 1
           ? [
-            { update_id: 1, message: { message_id: 100, text: "first", reply_to_message: { message_id: 42 }, chat: { id: 100 }, from: { id: 100 } } },
-            { update_id: 2, message: { message_id: 101, text: "second", reply_to_message: { message_id: 43 }, chat: { id: 100 }, from: { id: 100 } } },
+            { update_id: 1, message: { message_id: 100, date: 1_700_000_000, text: "first", reply_to_message: { message_id: 42 }, chat: { id: 100 }, from: { id: 100 } } },
+            { update_id: 2, message: { message_id: 101, date: 1_700_000_000, text: "second", reply_to_message: { message_id: 43 }, chat: { id: 100 }, from: { id: 100 } } },
           ]
           : [{ update_id: 3, callback_query: { id: "hostile", from: { id: 100 }, message: { message_id: 999, chat: { id: 100 } }, data: "../escape::yes" } }];
         return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
@@ -1832,7 +2096,7 @@ test("adapters: Telegram answer filenames preserve same-run IDs across sanitizer
       throw new Error(`unexpected method: ${method}`);
     }) as typeof fetch;
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "t", "100", fetchImpl);
     await adapter.send(sampleEscalation({ id: firstId }));
     await adapter.send(sampleEscalation({ id: secondId }));
     const [first, second] = await Promise.all([adapter.pollOnce(), adapter.pollOnce()]);
@@ -1854,7 +2118,9 @@ test("adapters: Telegram answer filenames preserve same-run IDs across sanitizer
 
 test("adapters: Telegram mapping shard cap enforces bounded configuration", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-tg-map-cap-"));
-  const options = { token: "t", chatId: "100", cwd: root };
+  writeTelegramTestConfig(root, "t", "100");
+  const runtime = runtimeFor(root);
+  const options = { token: "t", chatId: "100", cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access };
   try {
     assert.doesNotThrow(() => new TelegramEscalationAdapter({ ...options, mappingMaxEntryBytes: 128 }));
     assert.doesNotThrow(() => new TelegramEscalationAdapter({
@@ -1884,6 +2150,8 @@ test("adapters: Telegram mapping shard cap enforces bounded configuration", () =
 test("adapters: Telegram uses canonical indexed runs and ignores unindexed maps", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-tg-map-pagination-"));
   try {
+    writeTelegramTestConfig(root, "t", "100");
+    const runtime = runtimeFor(root);
     const ctoRoot = join(root, ".work-state", "cto");
     mkdirSync(ctoRoot, { recursive: true });
     withIndexedRun(root, "run-69");
@@ -1905,8 +2173,8 @@ test("adapters: Telegram uses canonical indexed runs and ignores unindexed maps"
     const adapter = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
-      runtimeAccess: runtimeFor(root).access,
+      cwd: root, proofAuthority: runtime.proofAuthority,
+      runtimeAccess: runtime.access,
       legacyMappingMigration: { tenant: "run-69", chatId: "100" },
       fetchImpl: (async (url: unknown) => {
         if (String(url).endsWith("/getUpdates")) {
@@ -1914,13 +2182,14 @@ test("adapters: Telegram uses canonical indexed runs and ignores unindexed maps"
           return new Response(JSON.stringify({
             ok: true,
             result: getUpdatesCalls === 1
-              ? [{ update_id: 1, message: { message_id: 100, text: "late answer", reply_to_message: { message_id: 9999 }, chat: { id: 100 }, from: { id: 100 } } }]
+              ? [{ update_id: 1, message: { message_id: 100, date: 1_700_000_000, text: "late answer", reply_to_message: { message_id: 9999 }, chat: { id: 100 }, from: { id: 100 } } }]
               : [],
           }), { status: 200 });
         }
         throw new Error("unexpected method");
       }) as typeof fetch,
     });
+    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "indexed-map adapter has authenticated routing");
     assert.equal(
       (adapter as unknown as { escIdOfMessage(messageId: number): string | null }).escIdOfMessage(8888),
       null,
@@ -1940,14 +2209,23 @@ test("adapters: Telegram reverse lookup reaches an older run beyond newer pendin
   const targetEsc = `${targetRun}/team-a/check/1`;
   const messageId = 4242;
   try {
+    writeTelegramTestConfig(root, "t", "100");
+    const runtime = runtimeFor(root);
     const terminalRunIds = [
       targetRun,
       "run-chat-foreign",
       ...Array.from({ length: 63 }, (_, index) => `run-new-${String(index).padStart(2, "0")}`),
     ];
     withTerminalIndexedRuns(root, terminalRunIds);
-    writeTelegramMapFixture(root, targetRun, "100", [{ escId: targetEsc, messageId }]);
-    writeTelegramMapFixture(root, "run-chat-foreign", "999", [{ escId: "run-chat-foreign/team-a/check/1", messageId }]);
+    const mappingWriter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access });
+    assert.equal(bindAuthenticatedAdapterRouting(root, mappingWriter, runtime.access), true, "reverse-map writer has authenticated routing");
+    (mappingWriter as unknown as { recordMapping: (escId: string, messageId: number, esc: Escalation) => void }).recordMapping(targetEsc, messageId, sampleEscalation({ id: targetEsc }));
+    writeTelegramTestConfig(root, "t", "999");
+    const foreignWriter = new TelegramEscalationAdapter({ token: "t", chatId: "999", cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access });
+    assert.equal(bindAuthenticatedAdapterRouting(root, foreignWriter, runtime.access), true, "foreign reverse-map writer has authenticated routing");
+    const foreignEsc = "run-chat-foreign/team-a/check/1";
+    (foreignWriter as unknown as { recordMapping: (escId: string, messageId: number, esc: Escalation) => void }).recordMapping(foreignEsc, messageId, sampleEscalation({ id: foreignEsc }));
+    writeTelegramTestConfig(root, "t", "100");
     const pin = PinnedProjectRoot.open(root);
     assert.ok(pin);
     try {
@@ -1958,14 +2236,19 @@ test("adapters: Telegram reverse lookup reaches an older run beyond newer pendin
     } finally {
       pin.close();
     }
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, runtimeAccess: runtimeFor(root).access, fetchImpl: (async () => new Response(JSON.stringify({ ok: true, result: [] }))) as typeof fetch });
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access, fetchImpl: (async () => new Response(JSON.stringify({ ok: true, result: [] }))) as typeof fetch });
+    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "reverse-map adapter has authenticated routing");
     const internals = adapter as unknown as {
       answerTargetOfMessage(messageId: number, chatId: string): { runId: string; escId: string } | null;
       escIdOfMessage(messageId: number, chatId: string): string | null;
     };
-    assert.deepEqual(internals.answerTargetOfMessage(messageId, "100"), { runId: targetRun, escId: targetEsc }, "older pending terminal mapping remains reachable");
+    assert.deepEqual(internals.answerTargetOfMessage(messageId, "100"), { runId: targetRun, escId: targetEsc, status: "done" }, "older pending terminal mapping remains reachable");
     assert.equal(internals.escIdOfMessage(messageId, "100"), targetEsc, "reverse lookup returns the configured chat mapping");
-    assert.equal(internals.escIdOfMessage(messageId, "999"), "run-chat-foreign/team-a/check/1", "same message ID is resolved only within its chat partition");
+    writeTelegramTestConfig(root, "t", "999");
+    const foreignReader = new TelegramEscalationAdapter({ token: "t", chatId: "999", cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access });
+    assert.equal(bindAuthenticatedAdapterRouting(root, foreignReader, runtime.access), true, "foreign reverse-map reader has authenticated routing");
+    const foreignReaderInternals = foreignReader as unknown as { escIdOfMessage: (messageId: number, chatId?: string) => string | null };
+    assert.equal(foreignReaderInternals.escIdOfMessage(messageId, "999"), foreignEsc, "same message ID is resolved only within its chat partition");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1973,7 +2256,10 @@ test("adapters: Telegram reverse lookup reaches an older run beyond newer pendin
 test("adapters: Telegram mapping queue paginates beyond the bounded 8192 scan cap", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-tg-map-pagination-"));
   try {
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root });
+    writeTelegramTestConfig(root, "t", "100");
+    const runtime = runtimeFor(root);
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access });
+    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "mapping-queue adapter has authenticated routing");
     const internals = adapter as unknown as {
       openMappingQueue: (runId: string, chatId?: string, createDirectory?: boolean) => { listPage: (cursor?: string | null) => { entries: Array<{ name: string; relativePath: string }>; nextCursor: string | null }; close: () => void } | null;
     };
@@ -2004,14 +2290,17 @@ test("adapters: Telegram mapping queue paginates beyond the bounded 8192 scan ca
 test("adapters: Telegram mapping shards rotate, compact, validate identity, and recover on restart", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-tg-map-shards-"));
   try {
+    writeTelegramTestConfig(root, "t", "100");
+    const runtime = runtimeFor(root);
     withIndexedRun(root, "map-run");
     const adapter = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
-      runtimeAccess: runtimeFor(root).access,
-      mappingMaxEntryBytes: 180,
+      cwd: root, proofAuthority: runtime.proofAuthority,
+      runtimeAccess: runtime.access,
+      mappingMaxEntryBytes: 2048,
     });
+    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "mapping-shards adapter has authenticated routing");
     const internals = adapter as unknown as {
       recordMapping: (escId: string, messageId: number, esc: Escalation) => void;
       messageIdOf: (escId: string) => number | null;
@@ -2029,30 +2318,35 @@ test("adapters: Telegram mapping shards rotate, compact, validate identity, and 
     const restarted = new TelegramEscalationAdapter({
       token: "t",
       chatId: "100",
-      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
-      runtimeAccess: runtimeFor(root).access,
-      mappingMaxEntryBytes: 180,
-    }) as unknown as {
+      cwd: root, proofAuthority: runtime.proofAuthority,
+      runtimeAccess: runtime.access,
+      mappingMaxEntryBytes: 2048,
+    });
+    assert.equal(bindAuthenticatedAdapterRouting(root, restarted, runtime.access), true, "restarted mapping-shards adapter has authenticated routing");
+    const restartedInternals = restarted as unknown as {
       messageIdOf: (escId: string) => number | null;
       escIdOfMessage: (messageId: number) => string | null;
     };
-    assert.equal(restarted.messageIdOf("map-run/team/check/0"), 1, "oldest mapping survives restart");
-    assert.equal(restarted.messageIdOf("map-run/team/check/19"), 20, "newest mapping survives restart");
-    assert.equal(restarted.escIdOfMessage(1), "map-run/team/check/0", "message lookup survives restart");
-    assert.equal(restarted.escIdOfMessage(20), "map-run/team/check/19", "reverse lookup reaches the newest shard");
+    assert.equal(restartedInternals.messageIdOf("map-run/team/check/0"), 1, "oldest mapping survives restart");
+    assert.equal(restartedInternals.messageIdOf("map-run/team/check/19"), 20, "newest mapping survives restart");
+    assert.equal(restartedInternals.escIdOfMessage(1), "map-run/team/check/0", "message lookup survives restart");
+    assert.equal(restartedInternals.escIdOfMessage(20), "map-run/team/check/19", "reverse lookup reaches the newest shard");
 
+    writeTelegramTestConfig(root, "t", "other-chat");
     const wrongChat = new TelegramEscalationAdapter({
       token: "t",
       chatId: "other-chat",
       cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
       runtimeAccess: runtimeFor(root).access,
-      mappingMaxEntryBytes: 180,
-    }) as unknown as {
+      mappingMaxEntryBytes: 2048,
+    });
+    assert.equal(bindAuthenticatedAdapterRouting(root, wrongChat, runtime.access), true, "wrong-chat mapping adapter has authenticated routing");
+    const wrongChatInternals = wrongChat as unknown as {
       messageIdOf: (escId: string) => number | null;
       escIdOfMessage: (messageId: number) => string | null;
     };
-    assert.equal(wrongChat.messageIdOf("map-run/team/check/0"), null, "mapping tenant/chat mismatch fails closed");
-    assert.equal(wrongChat.escIdOfMessage(1), null, "reverse lookup cannot cross chats");
+    assert.equal(wrongChatInternals.messageIdOf("map-run/team/check/0"), null, "mapping tenant/chat mismatch fails closed");
+    assert.equal(wrongChatInternals.escIdOfMessage(1), null, "reverse lookup cannot cross chats");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2081,11 +2375,21 @@ test("adapters: Telegram mapping corruption and conflicting remaps fail closed",
 test("adapters: Telegram mapping recovery discards incomplete compaction and commits complete generation", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-tg-map-recovery-"));
   try {
+    writeTelegramTestConfig(root, "t", "100");
+    const runtime = runtimeFor(root);
     withIndexedRun(root, "recover-run");
     const runDir = telegramPartitionDir(root, "recover-run", "100");
     mkdirSync(runDir, { recursive: true });
-    writeFileSync(join(runDir, "tg-map.meta.json"), JSON.stringify({ schema: 2, tenant: "recover-run", chatId: "100" }));
-    writeFileSync(join(runDir, "tg-map.jsonl"), JSON.stringify({ escId: "recover-run/team/check/1", messageId: 41, chatId: "100" }) + "\n");
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access });
+    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "mapping-recovery adapter has authenticated routing");
+    const internals = adapter as unknown as {
+      recordMapping: (escId: string, messageId: number, esc: Escalation) => void;
+      messageIdOf: (escId: string) => number | null;
+      escIdOfMessage: (messageId: number, chatId?: string) => string | null;
+    };
+    const recoverEscId = "recover-run/team/check/1";
+    internals.recordMapping(recoverEscId, 41, sampleEscalation({ id: recoverEscId }));
+    const sourceLine = readFileSync(join(runDir, "tg-map.jsonl"), "utf8").trim();
     writeFileSync(join(runDir, "tg-map.compaction.json"), JSON.stringify({
       schema: 1,
       tenant: "recover-run",
@@ -2096,17 +2400,12 @@ test("adapters: Telegram mapping recovery discards incomplete compaction and com
       targetGeneration: 1,
       expectedShards: 2,
     }));
-    writeFileSync(join(runDir, "tg-map.g00000001.000000.jsonl"), JSON.stringify({ escId: "recover-run/team/check/1", messageId: 41, chatId: "100" }) + "\n");
-
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, runtimeAccess: runtimeFor(root).access }) as unknown as {
-      messageIdOf: (escId: string) => number | null;
-      escIdOfMessage: (messageId: number, chatId?: string) => string | null;
-    };
-    assert.equal(adapter.messageIdOf("recover-run/team/check/1"), 41, "incomplete target generation falls back to the durable source");
+    writeFileSync(join(runDir, "tg-map.g00000001.000000.jsonl"), sourceLine + "\n");
+    assert.equal(internals.messageIdOf("recover-run/team/check/1"), 41, "incomplete target generation falls back to the durable source");
     assert.equal(existsSync(join(runDir, "tg-map.compaction.json")), false, "incomplete compaction marker is cleared");
     assert.equal(existsSync(join(runDir, "tg-map.g00000001.000000.jsonl")), false, "incomplete target shard is discarded");
     writeFileSync(join(runDir, "tg-map.manifest.json"), "{\"schema\":1");
-    assert.equal(adapter.messageIdOf("recover-run/team/check/1"), null, "partial manifest fails closed instead of falling back to stale state");
+    assert.equal(internals.messageIdOf("recover-run/team/check/1"), null, "partial manifest fails closed instead of falling back to stale state");
     rmSync(join(runDir, "tg-map.manifest.json"), { force: true });
 
     writeFileSync(join(runDir, "tg-map.compaction.json"), JSON.stringify({
@@ -2119,9 +2418,9 @@ test("adapters: Telegram mapping recovery discards incomplete compaction and com
       targetGeneration: 1,
       expectedShards: 1,
     }));
-    writeFileSync(join(runDir, "tg-map.g00000001.000000.jsonl"), JSON.stringify({ escId: "recover-run/team/check/1", messageId: 41, chatId: "100" }) + "\n");
-    assert.equal(adapter.messageIdOf("recover-run/team/check/1"), 41, "complete target generation is readable by forward lookup");
-    assert.equal(adapter.escIdOfMessage(41, "100"), "recover-run/team/check/1", "complete target generation is promoted atomically");
+    writeFileSync(join(runDir, "tg-map.g00000001.000000.jsonl"), sourceLine + "\n");
+    assert.equal(internals.messageIdOf("recover-run/team/check/1"), 41, "complete target generation is readable by forward lookup");
+    assert.equal(internals.escIdOfMessage(41, "100"), "recover-run/team/check/1", "complete target generation is promoted atomically");
     assert.equal(existsSync(join(runDir, "tg-map.manifest.json")), true, "generation manifest is durable after recovery");
   } finally {
 
@@ -2131,13 +2430,25 @@ test("adapters: Telegram mapping recovery discards incomplete compaction and com
 test("adapters: Telegram concurrent mapping appends converge through CAS", { timeout: 30_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-tg-map-concurrent-"));
   try {
+    writeTelegramTestConfig(root, "t", "100");
+    const runtime = runtimeFor(root);
     const moduleUrl = new URL("../src/adapters/telegram.ts", import.meta.url).href;
+    const fixtureUrl = new URL("./runtime-access-fixture.ts", import.meta.url).href;
     const worker = `
       const { TelegramEscalationAdapter } = await import(process.env.TG_MODULE);
-      const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: process.env.TG_ROOT, mappingMaxEntryBytes: 180 });
-      const id = process.env.TG_ESC_ID;
-      const esc = { id, level: "question", title: "t", body: "b" };
-      adapter.recordMapping(id, Number(process.env.TG_MESSAGE_ID), esc);
+      const { openFullstackRuntimeTest } = await import(process.env.TG_FIXTURE);
+      const { bindAuthenticatedAdapterRouting } = await import(process.env.TG_ROUTING_FIXTURE);
+      const root = process.env.TG_ROOT;
+      const runtime = openFullstackRuntimeTest(root, "telegram-mapping-worker-" + String(process.pid), undefined, false, false);
+      try {
+        const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access, mappingMaxEntryBytes: 2048 });
+        if (!bindAuthenticatedAdapterRouting(root, adapter, runtime.access)) throw new Error("telegram mapping child routing proof unavailable");
+        const id = process.env.TG_ESC_ID;
+        const esc = { id, level: "question", title: "t", body: "b" };
+        adapter.recordMapping(id, Number(process.env.TG_MESSAGE_ID), esc);
+      } finally {
+        runtime.close();
+      }
     `;
     const children = [1, 2].map((index) => new Promise<number>((resolve, reject) => {
       const child = spawn(process.execPath, ["--import", "tsx", "--eval", worker], {
@@ -2145,6 +2456,8 @@ test("adapters: Telegram concurrent mapping appends converge through CAS", { tim
         env: {
           ...process.env,
           TG_MODULE: moduleUrl,
+          TG_FIXTURE: fixtureUrl,
+          TG_ROUTING_FIXTURE: new URL("./routing-fixture.ts", import.meta.url).href,
           TG_ROOT: root,
           TG_ESC_ID: `concurrent-run/team/check/${index}`,
           TG_MESSAGE_ID: String(index),
@@ -2155,16 +2468,38 @@ test("adapters: Telegram concurrent mapping appends converge through CAS", { tim
       child.once("close", (code) => resolve(code ?? -1));
     }));
     assert.deepEqual(await Promise.all(children), [0, 0], "both concurrent appenders complete");
-
-    const restarted = new TelegramEscalationAdapter({
-      token: "t",
-      chatId: "100",
-      cwd: root, proofAuthority: runtimeFor(root).proofAuthority,
-      runtimeAccess: runtimeFor(root).access,
-      mappingMaxEntryBytes: 180,
-    }) as unknown as { messageIdOf: (escId: string) => number | null };
-    assert.equal(restarted.messageIdOf("concurrent-run/team/check/1"), 1);
-    assert.equal(restarted.messageIdOf("concurrent-run/team/check/2"), 2);
+    const verifier = `
+      const { TelegramEscalationAdapter } = await import(process.env.TG_MODULE);
+      const { openFullstackRuntimeTest } = await import(process.env.TG_FIXTURE);
+      const { bindAuthenticatedAdapterRouting } = await import(process.env.TG_ROUTING_FIXTURE);
+      const root = process.env.TG_ROOT;
+      const runtime = openFullstackRuntimeTest(root, "telegram-mapping-verifier-" + String(process.pid), undefined, false, false);
+      try {
+        const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtime.proofAuthority, runtimeAccess: runtime.access, mappingMaxEntryBytes: 2048 });
+        if (!bindAuthenticatedAdapterRouting(root, adapter, runtime.access)) process.exitCode = 2;
+        const internals = adapter as unknown as { messageIdOf: (escId: string) => number | null };
+        process.stdout.write(JSON.stringify([
+          internals.messageIdOf("concurrent-run/team/check/1"),
+          internals.messageIdOf("concurrent-run/team/check/2"),
+        ]));
+      } finally {
+        runtime.close();
+      }
+    `;
+    const verification = spawnSync(process.execPath, ["--import", "tsx", "--eval", verifier], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        TG_MODULE: moduleUrl,
+        TG_FIXTURE: fixtureUrl,
+        TG_ROUTING_FIXTURE: new URL("./routing-fixture.ts", import.meta.url).href,
+        TG_ROOT: root,
+      },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    assert.equal(verification.status, 0, verification.stderr);
+    assert.deepEqual(JSON.parse(verification.stdout), [1, 2], verification.stderr);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2195,9 +2530,9 @@ test("adapters: Telegram answer conflicts are terminal and continue polling", as
             : current === 2
               ? [{ update_id: 3, callback_query: { id: "exact-replay", from: { id: 100 }, message: { message_id: 7, chat: { id: 100 } }, data: `${escId}::yes` } }]
               : current === 3
-                ? [{ update_id: 4, message: { message_id: 101, text: "plain conflict", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } }]
+                ? [{ update_id: 4, message: { message_id: 101, date: 1_700_000_000, text: "plain conflict", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } }]
                 : current === 4
-                  ? [{ update_id: 5, message: { message_id: 102, text: "later task", chat: { id: 100 }, from: { id: 100 } } }]
+                  ? [{ update_id: 5, message: { message_id: 102, date: 1_700_000_000, text: "later task", chat: { id: 100 }, from: { id: 100 } } }]
                   : [];
         return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
       }
@@ -2270,7 +2605,7 @@ test("adapters: telegram plain message routes to the inbox handler (not an answe
         return new Response(
           JSON.stringify({
             ok: true,
-            result: [{ update_id: 3, message: { message_id: 200, text: "Fix the login bug", chat: { id: 100 }, from: { id: 100 } } }],
+            result: [{ update_id: 3, message: { message_id: 200, date: 1_700_000_000, text: "Fix the login bug", chat: { id: 100 }, from: { id: 100 } } }],
           }),
           { status: 200 },
         );
@@ -2312,7 +2647,7 @@ test("adapters: telegram concurrent pollOnce calls share one getUpdates round", 
           JSON.stringify({
             ok: true,
             result: [
-              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } },
+              { update_id: 1, message: { message_id: 100, date: 1_700_000_000, text: "rest", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } },
             ],
           }),
           { status: 200 },
@@ -2322,7 +2657,7 @@ test("adapters: telegram concurrent pollOnce calls share one getUpdates round", 
     }) as typeof fetch;
     withIndexedRun(root, "run-1");
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "t", "100", fetchImpl);
     await adapter.send(sampleEscalation());
 
     // Both calls are in flight together; the second must reuse the first's
@@ -2358,7 +2693,7 @@ test("adapters: telegram pollOnce keeps the offset on answer persistence failure
           JSON.stringify({
             ok: true,
             result: [
-              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } },
+              { update_id: 1, message: { message_id: 100, date: 1_700_000_000, text: "rest", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } },
             ],
           }),
           { status: 200 },
@@ -2368,7 +2703,7 @@ test("adapters: telegram pollOnce keeps the offset on answer persistence failure
     }) as typeof fetch;
     withIndexedRun(root, "run-1");
 
-    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, proofAuthority: runtimeFor(root).proofAuthority, fetchImpl, runtimeAccess: runtimeFor(root).access });
+    const adapter = authenticatedTelegramAdapter(root, "t", "100", fetchImpl);
     await adapter.send(sampleEscalation());
 
     // Sabotage answer persistence: the answers dir path is occupied by a
@@ -2589,7 +2924,7 @@ test("adapters: barriered processes serialize waves within one run", async () =>
 
     const active = first.wave_history?.find((wave) => wave.status === "active");
     assert.ok(active, "the first admitted wave is active");
-    finishWave(first, { id: active!.id, status: "done" }, root);
+    finishInboxWave(root, runId, active!.id);
     const deferredSpec = specs.find((spec) => spec.id === deferred!.id);
     assert.ok(deferredSpec, "the deferred task identity is retained");
     const deferredIndex = specs.findIndex((spec) => spec.id === deferred!.id);
@@ -2650,7 +2985,7 @@ test("adapters: encoded task ids avoid sanitizer collisions and replay exactly o
 
     const active = first.wave_history?.find((wave) => wave.status === "active");
     assert.ok(active);
-    finishWave(first, { id: active!.id, status: "done" }, root);
+    finishInboxWave(root, runId, active!.id);
     const deferredSpec = specs.find((spec) => spec.id === deferred!.id);
     const deferredIndex = specs.findIndex((spec) => spec.id === deferred!.id);
     assert.ok(deferredSpec);
@@ -2728,31 +3063,31 @@ test("adapters: barriered processes admit an identical task exactly once", async
 test("adapters: a file left before state commit is recovered idempotently", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-inbox-recovery-"));
   try {
+    const runtime = runtimeFor(root);
     const runId = resolveInboxRunId(root);
     const task = { id: "crashed-task", text: "recover this task", at: new Date().toISOString(), runId };
     const hash = inboxIdentityHash(task.id, task.text);
     const statePath = join(root, ".work-state", "cto", runId, "state.json");
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as {
-      inbox_quarantine?: Record<string, unknown>;
-      wave_history?: unknown[];
-    };
-    state.inbox_quarantine = {
-      ...(state.inbox_quarantine ?? {}),
-      [hash]: {
-        id: task.id,
-        hash,
-        received_at: task.at,
-        by: "inbox",
-        status: "quarantined",
-        wake_status: "pending",
-      },
-    };
-    state.wave_history = [
-      ...(state.wave_history ?? []),
-      { id: "wave-pending-wake", source: "inbox", source_id: inboxWaveSourceId(task.id), task: task.text, slice_ids: [], status: "active", started_at: task.at },
-    ];
-    state.active_wave_id = "wave-pending-wake";
-    writeFileSync(statePath, JSON.stringify(state, null, 2));
+    withCtoRuntimeServiceTransaction(runtime.serviceAuthority, runId, (transaction) => {
+      const state = transaction.readState();
+      state.inbox_quarantine = {
+        ...(state.inbox_quarantine ?? {}),
+        [hash]: {
+          id: task.id,
+          hash,
+          received_at: task.at,
+          by: "inbox",
+          status: "quarantined",
+          wake_status: "pending",
+        },
+      };
+      state.wave_history = [
+        ...(state.wave_history ?? []),
+        { id: "wave-pending-wake", source: "inbox", source_id: inboxWaveSourceId(task.id), task: task.text, slice_ids: [], status: "active", started_at: task.at },
+      ];
+      state.active_wave_id = "wave-pending-wake";
+      transaction.writeState(state);
+    });
     mkdirSync(inboxDir(runId, root), { recursive: true });
     writeFileSync(join(inboxDir(runId, root), `${task.id}.json`), JSON.stringify(task, null, 2), { flag: "wx" });
 
@@ -2777,6 +3112,7 @@ test("adapters: a file left before state commit is recovered idempotently", () =
 test("adapters: barriered processes share one standby creation target", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-standby-concurrent-"));
   const gate = join(root, "release-gate");
+  runtimeFor(root);
   const specs = [
     { id: "standby-task-a", text: "standby first task" },
     { id: "standby-task-b", text: "standby second task" },
@@ -2811,7 +3147,7 @@ test("adapters: barriered processes share one standby creation target", async ()
 
     const active = first.wave_history?.find((wave) => wave.status === "active");
     assert.ok(active);
-    finishWave(first, { id: active!.id, status: "done" }, root);
+    finishInboxWave(root, runId, active!.id);
     const deferredIndex = specs.findIndex((spec) => spec.id === deferred!.id);
     const deferredSpec = specs[deferredIndex]!;
     assert.ok(deferredSpec);
@@ -2941,8 +3277,17 @@ test("adapters: standby pin rejects root, ancestor, and symlink swaps at each du
       const displaced = `${root}.opened`;
       const displacedParent = parent ? `${parent}.opened` : null;
       const outside = replacementKind === "symlink" ? mkdtempSync(join(tmpdir(), "cto-boundary-outside-")) : null;
-      const originalOpen = PinnedProjectRoot.open;
-  const runtimeOriginalOpen = RuntimePinnedProjectRoot.open;
+      runtimeFor(root);
+      const runtimePrototype = RuntimePinnedProjectRoot.prototype;
+      const packagePrototype = PackagePinnedProjectRoot.prototype;
+      const originalEnsureDirectories = runtimePrototype.ensureDirectories;
+      const originalWriteAtomic = runtimePrototype.writeAtomic;
+      const originalWriteExclusive = runtimePrototype.writeExclusive;
+      const originalReplaceFileIfMatches = runtimePrototype.replaceFileIfMatches;
+      const originalPackageEnsureDirectories = packagePrototype.ensureDirectories;
+      const originalPackageWriteAtomic = packagePrototype.writeAtomic;
+      const originalPackageWriteExclusive = packagePrototype.writeExclusive;
+      const originalPackageReplaceFileIfMatches = packagePrototype.replaceFileIfMatches;
       let swapped = false;
       try {
         const swap = (): void => {
@@ -2957,19 +3302,42 @@ test("adapters: standby pin rejects root, ancestor, and symlink swaps at each du
           }
         };
         let runId = "unknown";
-        PinnedProjectRoot.open = (projectRoot, hooks = {}) => originalOpen(projectRoot, {
-          ...hooks,
-          beforeDirectoryCreate: (relativePath) => {
-            hooks.beforeDirectoryCreate?.(relativePath);
+        runtimePrototype.ensureDirectories = function (this: InstanceType<typeof RuntimePinnedProjectRoot>, relativePaths: readonly string[]): void {
+          for (const relativePath of relativePaths) {
             if (!swapped && (boundary.name === "run mkdir" || boundary.name === "inbox mkdir") && boundary.trigger(runId, relativePath)) swap();
-          },
-          beforeTempOpen: (relativePath) => {
-            hooks.beforeTempOpen?.(relativePath);
-            if (!swapped && (boundary.name === "state write" || boundary.name === "index write") && boundary.trigger(runId, relativePath)) swap();
-            if (!swapped && boundary.name === "inbox admission" && boundary.trigger(runId, relativePath)) swap();
-          },
-        });
-        RuntimePinnedProjectRoot.open = PinnedProjectRoot.open;
+          }
+          return originalEnsureDirectories.call(this, relativePaths);
+        };
+        runtimePrototype.writeAtomic = function (this: InstanceType<typeof RuntimePinnedProjectRoot>, relativePath: string, content: Parameters<typeof originalWriteAtomic>[1]): void {
+          if (!swapped && (boundary.name === "state write" || boundary.name === "index write" || boundary.name === "inbox admission") && boundary.trigger(runId, relativePath)) swap();
+          return originalWriteAtomic.call(this, relativePath, content);
+        };
+        packagePrototype.ensureDirectories = function (this: InstanceType<typeof PackagePinnedProjectRoot>, relativePaths: readonly string[]): void {
+          for (const relativePath of relativePaths) {
+            if (!swapped && (boundary.name === "run mkdir" || boundary.name === "inbox mkdir") && boundary.trigger(runId, relativePath)) swap();
+          }
+          return originalPackageEnsureDirectories.call(this, relativePaths);
+        };
+        packagePrototype.writeAtomic = function (this: InstanceType<typeof PackagePinnedProjectRoot>, relativePath: string, content: Parameters<typeof originalPackageWriteAtomic>[1]): void {
+          if (!swapped && (boundary.name === "state write" || boundary.name === "index write" || boundary.name === "inbox admission") && boundary.trigger(runId, relativePath)) swap();
+          return originalPackageWriteAtomic.call(this, relativePath, content);
+        };
+        runtimePrototype.writeExclusive = function (this: InstanceType<typeof RuntimePinnedProjectRoot>, relativePath: string, content: Parameters<typeof originalWriteExclusive>[1]): void {
+          if (!swapped && (boundary.name === "state write" || boundary.name === "index write" || boundary.name === "inbox admission") && boundary.trigger(runId, relativePath)) swap();
+          return originalWriteExclusive.call(this, relativePath, content);
+        };
+        runtimePrototype.replaceFileIfMatches = function (this: InstanceType<typeof RuntimePinnedProjectRoot>, relativePath: string, expected: Parameters<typeof originalReplaceFileIfMatches>[1], content: Parameters<typeof originalReplaceFileIfMatches>[2]): void {
+          if (!swapped && (boundary.name === "state write" || boundary.name === "index write" || boundary.name === "inbox admission") && boundary.trigger(runId, relativePath)) swap();
+          return originalReplaceFileIfMatches.call(this, relativePath, expected, content);
+        };
+        packagePrototype.writeExclusive = function (this: InstanceType<typeof PackagePinnedProjectRoot>, relativePath: string, content: Parameters<typeof originalPackageWriteExclusive>[1]): void {
+          if (!swapped && (boundary.name === "state write" || boundary.name === "index write" || boundary.name === "inbox admission") && boundary.trigger(runId, relativePath)) swap();
+          return originalPackageWriteExclusive.call(this, relativePath, content);
+        };
+        packagePrototype.replaceFileIfMatches = function (this: InstanceType<typeof PackagePinnedProjectRoot>, relativePath: string, expected: Parameters<typeof originalPackageReplaceFileIfMatches>[1], content: Parameters<typeof originalPackageReplaceFileIfMatches>[2]): void {
+          if (!swapped && (boundary.name === "state write" || boundary.name === "index write" || boundary.name === "inbox admission") && boundary.trigger(runId, relativePath)) swap();
+          return originalPackageReplaceFileIfMatches.call(this, relativePath, expected, content);
+        };
 
         if (boundary.name === "inbox admission") {
           runId = ensureStandbyRun(root);
@@ -2989,8 +3357,15 @@ test("adapters: standby pin rejects root, ancestor, and symlink swaps at each du
         }
         assert.equal(existsSync(join(root, ".work-state", "cto")), false, `${replacementKind} replacement remains untouched at ${boundary.name}`);
       } finally {
-        PinnedProjectRoot.open = originalOpen;
-    RuntimePinnedProjectRoot.open = runtimeOriginalOpen;
+        runtimePrototype.ensureDirectories = originalEnsureDirectories;
+        runtimePrototype.writeAtomic = originalWriteAtomic;
+        runtimePrototype.writeExclusive = originalWriteExclusive;
+        runtimePrototype.replaceFileIfMatches = originalReplaceFileIfMatches;
+        packagePrototype.ensureDirectories = originalPackageEnsureDirectories;
+        packagePrototype.writeAtomic = originalPackageWriteAtomic;
+        packagePrototype.writeExclusive = originalPackageWriteExclusive;
+        packagePrototype.replaceFileIfMatches = originalPackageReplaceFileIfMatches;
+        resetRuntimeFor(root);
         if (replacementKind === "symlink" && swapped) {
           unlinkSync(root);
           renameSync(displaced, root);
@@ -3020,21 +3395,22 @@ test("adapters: pending wakes replay and crash before ack remains recoverable", 
   const hash = inboxIdentityHash(task.id, task.text);
   const statePath = join(root, ".work-state", "cto", runId, "state.json");
   try {
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as {
-      inbox_quarantine?: Record<string, unknown>;
-    };
-    state.inbox_quarantine = {
-      ...(state.inbox_quarantine ?? {}),
-      [hash]: {
-        id: task.id,
-        hash,
-        received_at: task.at,
-        by: "inbox",
-        status: "admitted",
-        wake_status: "pending",
-      },
-    };
-    writeFileSync(statePath, JSON.stringify(state, null, 2));
+    const runtime = runtimeFor(root);
+    withCtoRuntimeServiceTransaction(runtime.serviceAuthority, runId, (transaction) => {
+      const state = transaction.readState();
+      state.inbox_quarantine = {
+        ...(state.inbox_quarantine ?? {}),
+        [hash]: {
+          id: task.id,
+          hash,
+          received_at: task.at,
+          by: "inbox",
+          status: "admitted",
+          wake_status: "pending",
+        },
+      };
+      transaction.writeState(state);
+    });
     mkdirSync(inboxDir(runId, root), { recursive: true });
     writeFileSync(join(inboxDir(runId, root), `${task.id}.json`), JSON.stringify(task, null, 2), { flag: "wx" });
 
@@ -3044,10 +3420,15 @@ test("adapters: pending wakes replay and crash before ack remains recoverable", 
     const delivered = JSON.parse(readFileSync(statePath, "utf8")) as { inbox_quarantine?: Record<string, { wake_status?: string }> };
     assert.equal(delivered.inbox_quarantine?.[hash]?.wake_status, "delivered");
 
-    const pendingAgain = JSON.parse(readFileSync(statePath, "utf8")) as { inbox_quarantine?: Record<string, { status?: string; wake_status?: string }> };
-    pendingAgain.inbox_quarantine![hash]!.status = "admitted";
-    pendingAgain.inbox_quarantine![hash]!.wake_status = "pending";
-    writeFileSync(statePath, JSON.stringify(pendingAgain, null, 2));
+    withCtoRuntimeServiceTransaction(runtime.serviceAuthority, runId, (transaction) => {
+      const pendingAgain = transaction.readState();
+      const record = pendingAgain.inbox_quarantine?.[hash];
+      assert.ok(record);
+      if (!record) throw new Error("pending wake record unavailable");
+      record.status = "admitted";
+      record.wake_status = "pending";
+      transaction.writeState(pendingAgain);
+    });
     const crashWake = join(root, "crash.wake");
     await runBarrieredInboxWorker({
       root,
@@ -3120,6 +3501,8 @@ test("adapters: poll wake effects keep one pin across reserve, callback, mark, a
         }
       };
       try {
+        resetRuntimeFor(root);
+        runtimeFor(root);
         PinnedProjectRoot.open = (projectRoot, hooks = {}) => originalOpen(projectRoot, {
           ...hooks,
           beforeRename: (relativePath) => {
@@ -3136,8 +3519,6 @@ test("adapters: poll wake effects keep one pin across reserve, callback, mark, a
             if (phase === "mark" && relativePath.includes("wake-effects") && ++wakeRenames === 2) swap();
           },
         });
-        resetRuntimeFor(root);
-        runtimeFor(root);
         runId = resolveInboxRunId(root);
         writeSignedDrop(root, runId, "wake-" + phase, "answer", "answer", "wake-" + phase + ".json");
         const answers: Array<{ id: string; answer: string }> = [];
@@ -3148,7 +3529,7 @@ test("adapters: poll wake effects keep one pin across reserve, callback, mark, a
         try {
           await pollInbox(root, null, undefined, onAnswer, { idempotentWake: true });
         } catch (error) {
-          assert.match(String(error), /activation|identity|changed|unsafe|unavailable|wake callback/i);
+          assert.match(String(error), /activation|identity|changed|unsafe|unavailable|wake callback|revoked|rebound/i);
         }
         if (phase === "reserve" || phase === "mark") assert.equal(swapped, true, replacementKind + "/" + phase + " did not trigger retained-pin swap");
         assert.equal(existsSync(join(root, ".work-state")), false, `${replacementKind}/${phase} replacement remains untouched`);
@@ -3157,6 +3538,7 @@ test("adapters: poll wake effects keep one pin across reserve, callback, mark, a
       } finally {
         PinnedProjectRoot.open = originalOpen;
     RuntimePinnedProjectRoot.open = runtimeOriginalOpen;
+        resetRuntimeFor(root);
         if (replacementKind === "symlink" && swapped) {
           unlinkSync(root);
           renameSync(displaced, root);
@@ -3326,16 +3708,70 @@ test("adapters: drainOutbox RO-only — succeeding sink → archived sent:true (
 });
 
 
+test("adapters: drainOutbox RO-only archive-first uses receiver idempotency", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-ro-archive-first-"));
+  try {
+    const runId = "run-ro-archive-first";
+    const published = publishTestTerminalSummary(root, runId);
+    const entryName = basename(published);
+    const sourceBytes = readFileSync(published);
+    const sentDirectory = join(outboxDir(runId, root), "sent");
+    mkdirSync(sentDirectory, { recursive: true });
+    const archivePath = join(sentDirectory, entryName);
+    writeFileSync(archivePath, sourceBytes);
+    assert.equal(existsSync(published), true, "the active source remains after the archive-first crash");
+    const runtime = runtimeFor(root);
+    assert.equal(runtime.access.readOutboxDeliveryObligations(runId).length, 1, "the exact summary obligation remains pending");
+
+    let sends = 0;
+    let remoteEffects = 0;
+    const receipts = new Map<string, EscalationReceipt>();
+    const sink: EscalationAdapter = {
+      kind: "mock",
+      send: async () => ({ sent: true }),
+      sendWithIdempotency: async (_esc: Escalation, key: string) => {
+        sends += 1;
+        const previous = receipts.get(key);
+        if (previous) return previous;
+        remoteEffects += 1;
+        const receipt = { sent: true as const, channelRef: "mock:archive-first" };
+        receipts.set(key, receipt);
+        return receipt;
+      },
+      cancel: async () => undefined,
+    };
+    const first = await drainOutbox(root, null, 3, { roSinks: [sink] });
+    assert.equal(first.length, 1);
+    assert.equal(first[0]?.sent, true, "exact archive recovery reports the summary as sent");
+    assert.equal(sends, 1, "the copied archive does not suppress an authenticated RO receiver attempt");
+    assert.equal(runtime.access.readOutboxDeliveryObligations(runId).length, 0, "exact obligation clears after archive recovery");
+    assert.equal(existsSync(published), false, "archive recovery settles the active source");
+    assert.deepEqual(readFileSync(archivePath), sourceBytes, "archive recovery preserves the exact durable receipt");
+
+    const replay = await drainOutbox(root, null, 3, { roSinks: [sink] });
+    assert.deepEqual(replay, [], "replay has no pending source to route");
+    assert.equal(sends, 1, "no pending source remains after receiver-confirmed cleanup");
+    assert.equal(remoteEffects, 1, "receiver idempotency keeps one logical sink effect");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("adapters: terminal run drains exact current authenticated ACK once", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-terminal-ack-current-"));
   try {
     const runId = "run-terminal-ack-current";
     withIndexedRun(root, runId);
-    const state = readCtoState(runId, root);
+    const runtime = runtimeFor(root);
+    assert.ok(runtime.access.readState(runId));
+    withCtoRuntimeServiceTransaction(runtime.serviceAuthority, runId, (transaction) => {
+      const current = transaction.readState();
+      setCtoPause(current, "done", "terminal ACK regression");
+      transaction.writeState(current);
+    });
+    const state = runtime.access.readState(runId);
     assert.ok(state);
-    setCtoPause(state, "done", "terminal ACK regression");
-    assert.ok(runtimeFor(root).access.createRun(state, { source_id: `adapters:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
-    assert.equal(runtimeFor(root).access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
+    assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
     const published = publishTestDelivery(root, runId, {
       ...sampleEscalation({ id: `${runId}/ack/current` }),
       intent: "ack",
@@ -3366,12 +3802,20 @@ test("adapters: terminal run rejects stale ACK and non-ACK intents", async () =>
   try {
     const runId = "run-terminal-ack-reject";
     withIndexedRun(root, runId);
-    const state = readCtoState(runId, root);
+    const runtime = runtimeFor(root);
+    assert.ok(runtime.access.readState(runId));
+    withCtoRuntimeServiceTransaction(runtime.serviceAuthority, runId, (transaction) => {
+      const current = transaction.readState();
+      setCtoPause(current, "done", "terminal ACK rejection regression");
+      transaction.writeState(current);
+    });
+    const state = runtime.access.readState(runId);
     assert.ok(state);
-    setCtoPause(state, "done", "terminal ACK rejection regression");
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const revision = state.state_revision;
-    assert.equal(runtimeFor(root).access.markDeliveryPending(runId, revision, "outbox"), true);
+    const authorityPath = publishTestDelivery(root, runId, { ...sampleEscalation({ id: `${runId}/ack/authority` }), intent: "ack", run_id: runId });
+    unlinkSync(authorityPath);
+    const current = runtime.access.readState(runId);
+    assert.ok(current);
+    const revision = current.state_revision;
     const outbox = outboxDir(runId, root);
     mkdirSync(outbox, { recursive: true });
     const staleId = `${runId}/ack/stale`;
@@ -3433,20 +3877,26 @@ test("adapters: direct discovery leaves terminal queue untouched with a corrupt 
     };
     stop = startDispatcher(root, adapter, 5);
     await firstPoll;
-    const state = readCtoState(runId, root);
-    assert.ok(state);
-    setCtoPause(state, "done", "corrupt index direct-discovery regression");
-    assert.ok(runtimeFor(root).access.createRun(state, { source_id: `adapters:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
-    assert.equal(runtimeFor(root).access.markDeliveryPending(runId, state.state_revision, "outbox"), true);
+    const runtime = runtimeFor(root);
+    withCtoRuntimeServiceTransaction(runtime.serviceAuthority, runId, (transaction) => {
+      const state = transaction.readState();
+      assert.ok(state);
+      if (!state) throw new Error("corrupt-index run state unavailable");
+      setCtoPause(state, "done", "corrupt index direct-discovery regression");
+      transaction.writeState(state);
+    });
+    const current = runtime.access.readState(runId);
+    assert.ok(current);
+    if (!current) throw new Error("corrupt-index current state unavailable");
+    assert.equal(runtime.access.markDeliveryPending(runId, current.state_revision, "outbox"), true);
     const directDelivery = {
       ...sampleEscalation({ id: `${runId}/ack/current` }),
       intent: "ack",
       run_id: runId,
-      state_revision: state.state_revision,
+      state_revision: current.state_revision,
       idempotency_key: `${runId}/ack/current`,
     };
-    const published = join(outboxDir(runId, root), canonicalDurableIdFileName(directDelivery.id));
-    writeFileSync(published, JSON.stringify(directDelivery));
+    const published = publishTestDelivery(root, runId, directDelivery);
     const expectedBytes = readFileSync(published);
     writeFileSync(join(root, ".work-state", "cto", "active-run-index.json"), "{corrupt index");
     releaseFirstPoll();
@@ -3469,15 +3919,18 @@ test("adapters: missing index preserves canonical direct bytes until publication
   let stop!: ReturnType<typeof startDispatcher>;
   try {
     const runId = "run-direct-missing-index";
+    const runtime = runtimeFor(root);
     const state = newCtoState({
       id: runId,
       task: "missing index direct publication",
       branch: "main",
       autonomous: true,
+      owner_session: runtime.sessionId,
       plan: { id: runId, task: "missing index direct publication", teams: [], created_at: new Date().toISOString() },
     });
-    writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
-    const revision = state.state_revision;
+    const created = runtime.access.createRun(state, { source_id: `adapters:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) });
+    assert.ok(created);
+    const revision = created.state_revision;
     const outbox = outboxDir(runId, root);
     mkdirSync(outbox, { recursive: true });
     const id = `${runId}/ack/recovered`;
@@ -3493,13 +3946,19 @@ test("adapters: missing index preserves canonical direct bytes until publication
     const expectedBytes = Buffer.from(JSON.stringify(envelope));
     writeFileSync(entryPath, expectedBytes);
     const indexPath = join(root, ".work-state", "cto", "active-run-index.json");
+    const indexProofPath = join(root, ".work-state", "cto", ".active-run-index.proof.json");
     rmSync(indexPath);
+    rmSync(indexProofPath);
     let sends = 0;
     const adapter = {
       kind: "direct-missing-index",
       send: async () => { sends += 1; return { sent: true }; },
       cancel: async () => undefined,
-      pollOnce: async () => { polls += 1; return []; },
+      pollOnce: async () => {
+        polls += 1;
+        if (polls === 1) runtime.access.createRun(state, { source_id: `adapters:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) });
+        return [];
+      },
     };
     stop = startDispatcher(root, adapter, 5);
     for (let attempt = 0; attempt < 100 && polls < 1; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
@@ -3512,7 +3971,7 @@ test("adapters: missing index preserves canonical direct bytes until publication
     assert.equal(sends, 0, "missing pending authority never reaches the adapter");
     await stop();
     stop = undefined as unknown as ReturnType<typeof startDispatcher>;
-    assert.equal(runtimeFor(root).access.markDeliveryPending(runId, revision, "outbox"), true, "publication authority is restored explicitly");
+    assert.equal(runtime.access.markDeliveryPending(runId, revision, "outbox"), true, "publication authority is restored explicitly");
     unlinkSync(entryPath);
     const recoveredPath = publishTestDelivery(root, runId, {
       ...sampleEscalation({ id }),
@@ -3538,11 +3997,11 @@ test("adapters: drain preserves bytes when current authority disappears during v
     withIndexedRun(root, runId);
     const published = publishTestDelivery(root, runId, { ...sampleEscalation({ id: `${runId}/question/current` }), intent: "question", run_id: runId });
     const expectedBytes = readFileSync(published);
-    const outbox = outboxDir(runId, root);
     const statePath = join(root, ".work-state", "cto", runId, "state.json");
     const indexPath = join(root, ".work-state", "cto", "active-run-index.json");
     const stateBytes = readFileSync(statePath);
     const indexBytes = readFileSync(indexPath);
+    const outbox = outboxDir(runId, root);
     const index = JSON.parse(indexBytes.toString("utf8")) as { entries: Array<{ run_id: string; state_revision: number; status: "active" | "standby" | "done" | "failed"; updated_at: string; pending_summary: boolean; pending_outbox: boolean; pending_retry: boolean; summary_digest: string }> };
     const runEntry = index.entries.find((entry) => entry.run_id === runId);
     assert.ok(runEntry);
@@ -3585,30 +4044,27 @@ test("adapters: drain preserves bytes when current authority disappears during v
 test("adapters: transport authority outage inside sendWithRetry preserves publication", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-send-authority-outage-"));
   try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify({ adapter: "http", http: { url: "http://outage.invalid/" } }));
     const runId = "run-send-authority-outage";
     withIndexedRun(root, runId);
     const published = publishTestDelivery(root, runId, { ...sampleEscalation({ id: runId + "/question/current" }), intent: "question", run_id: runId });
     const expectedBytes = readFileSync(published);
-    const statePath = join(root, ".work-state", "cto", runId, "state.json");
-    const indexPath = join(root, ".work-state", "cto", "active-run-index.json");
-    const stateBytes = readFileSync(statePath);
-    const indexBytes = readFileSync(indexPath);
     const runtime = runtimeFor(root);
     let statusCalls = 0;
     const disappearingRuntime = Object.create(runtime.access) as typeof runtime.access;
     Object.defineProperty(disappearingRuntime, "currentOutboxDeliveryStatus", { configurable: true, value: (input: Parameters<typeof runtime.access.currentOutboxDeliveryStatus>[0]): ReturnType<typeof runtime.access.currentOutboxDeliveryStatus> => {
       statusCalls += 1;
       if (statusCalls === 1) return runtime.access.currentOutboxDeliveryStatus(input);
-      rmSync(statePath);
-      rmSync(indexPath);
       return "unavailable";
     }, });
     let sends = 0;
     const adapter = {
-      kind: "send-authority-outage",
+      kind: "http",
       send: async () => { sends += 1; return { sent: true }; },
       cancel: async () => undefined,
     };
+    assert.equal(bindAuthenticatedAdapterRouting(root, adapter, runtime.access), true, "outage adapter has authenticated routing");
     const first = await drainOutbox(root, adapter, 1, { runtimeAccess: disappearingRuntime });
     assert.equal(first.length, 1);
     assert.equal(first[0]?.sent, false);
@@ -3616,8 +4072,6 @@ test("adapters: transport authority outage inside sendWithRetry preserves public
     assert.equal(statusCalls, 2, "sendWithRetry performs its own authority check");
     assert.equal(sends, 0, "transport is not called after authority disappears");
     assert.deepEqual(readFileSync(published), expectedBytes);
-    writeFileSync(statePath, stateBytes);
-    writeFileSync(indexPath, indexBytes);
     const second = await drainOutbox(root, adapter, 1);
     assert.equal(second[0]?.sent, true);
     assert.equal(sends, 1, "restored authority sends the retained publication once");
@@ -4094,14 +4548,15 @@ test("adapters: bridge lock — alive while pid lives, stale after exit", () => 
   const root = mkdtempSync(join(tmpdir(), "cto-lock-"));
   try {
     assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "no lock -> not alive");
-    // lock with a dead pid -> stale, treated as not alive
-    mkdirSync(join(root, ".omp"), { recursive: true });
-    writeFileSync(bridgeLockPath(root), JSON.stringify({ pid: 99999999 }));
-    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "stale lock (dead pid) ignored");
-    // lock with OUR live pid -> alive
-    writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
+    // A signed expired lease is stale and reclaimable; malformed legacy bytes
+    // remain an unknown owner and are never overwritten.
+    signDeadBridgeLease(root);
+    assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "stale lease (dead pid) ignored");
+    // A fresh signed lease from this process is live.
+    const liveHandle = writeBridgeLock(root, undefined, runtimeFor(root).proofAuthority);
+    assert.equal(liveHandle.owned, true, "live bridge lease is acquired");
     assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), true, "live lock -> bridge owns the bot");
-    clearBridgeLock(root, undefined, undefined, runtimeFor(root).proofAuthority);
+    clearBridgeLock(root, liveHandle, undefined, runtimeFor(root).proofAuthority);
     assert.equal(isBridgeAlive(root, undefined, runtimeFor(root).proofAuthority), false, "cleared on shutdown");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -4192,16 +4647,31 @@ test("adapters: bridge teardown leaves old secret fenced when lexical root becom
   }
 });
 
-test("adapters: bridge lease cache refuses a sixty-fifth live root", () => {
+test("adapters: bridge lease cache refuses a sixty-fifth live root", async () => {
   const roots = Array.from({ length: MAX_BRIDGE_LEASES + 1 }, (_, index) => mkdtempSync(join(tmpdir(), `cto-bridge-cap-${index}-`)));
   const handles: Array<{ root: string; handle: ReturnType<typeof writeBridgeLock> }> = [];
   try {
-    for (const candidate of roots) handles.push({ root: candidate, handle: writeBridgeLock(candidate, undefined, runtimeFor(candidate).proofAuthority) });
+    for (const [index, candidate] of roots.entries()) {
+      const runtime = openFullstackRuntimeTest(candidate, `bridge-cap-${index}`, undefined, true, false);
+      const handle = writeBridgeLock(candidate, undefined, runtime.proofAuthority);
+      handles.push({ root: candidate, handle });
+      // The bridge lease proof is durable in the lock bytes; close the fixture
+      // immediately so the test exercises the bridge cache limit, not the
+      // bounded runtime-authority fixture pool.
+      runtime.close();
+      await drainDarwinHelperClosePromisesForTesting();
+    }
     assert.equal(handles.filter(({ handle }) => handle.owned).length, MAX_BRIDGE_LEASES, "live bridge lease cache stays bounded");
     assert.equal(handles.at(-1)?.handle.owned, false, "the over-cap root is rejected before lock ownership");
   } finally {
-    for (const { root, handle } of handles) if (handle.owned) clearBridgeLock(root, handle, undefined, runtimeFor(root).proofAuthority);
+    // Remove roots first, then sweep the process-local lease cache without a
+    // revoked root-bound proof authority. Finally remove each exact secret.
     for (const candidate of roots) rmSync(candidate, { recursive: true, force: true });
+    for (const { root, handle } of handles) if (handle.owned) clearBridgeLock(root, handle);
+    for (const candidate of roots) {
+      const secret = join(homedir(), ".omp", "runtime-secrets", createHash("sha256").update(candidate, "utf8").digest("hex") + ".json");
+      rmSync(secret, { force: true });
+    }
   }
 });
 
@@ -4626,7 +5096,7 @@ test("adapters: only one dispatcher owns a cwd across live sessions", async () =
             const state = readCtoState(runId, root);
             const active = state?.wave_history?.find((wave) => wave.status === "active");
             if (state && active) {
-              finishWave(state, { id: active.id, status: "done" }, root);
+              finishInboxWave(root, runId, active.id);
               handler?.(tasks[1]!);
               released = true;
               releaseSecondWave?.();
@@ -4667,35 +5137,64 @@ test("adapters: only one dispatcher owns a cwd across live sessions", async () =
 test("adapters: stale dispatcher lease is reclaimed", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-dispatch-stale-"));
   let stop: (() => Promise<void>) | undefined;
+  let seedStop: (() => Promise<void>) | undefined;
   try {
-    mkdirSync(join(root, ".omp"), { recursive: true });
-    const staleAt = new Date(Date.now() - 60_000).toISOString();
-    writeFileSync(
-      dispatcherLockPath(root),
-      JSON.stringify({ pid: process.pid, token: "stale", startedAt: staleAt, heartbeatAt: staleAt }),
-    );
-
+    const runtime = runtimeFor(root);
     let polls = 0;
-    stop = startDispatcher(
-      root,
-      {
-        kind: "telegram",
-        send: async () => ({ sent: false }),
-        cancel: async () => undefined,
-        pollOnce: async () => {
-          polls += 1;
-          return [];
-        },
-      } as unknown as TelegramEscalationAdapter,
-      5,
-    );
-    await Promise.resolve();
-    await Promise.resolve();
-    stop?.();
+    const adapter = {
+      kind: "telegram",
+      send: async () => ({ sent: false }),
+      cancel: async () => undefined,
+      pollOnce: async () => {
+        polls += 1;
+        return [];
+      },
+    } as unknown as TelegramEscalationAdapter;
 
+    // Seed one fully authenticated dispatcher lease, then age its heartbeat
+    // and re-sign the exact record. Production never reclaims malformed bytes.
+    seedStop = startDispatcher(root, adapter, 60_000);
+    assert.equal(seedStop.claimed, true, "seed dispatcher acquires a valid lease");
+    const seeded = JSON.parse(readFileSync(dispatcherLockPath(root), "utf8")) as Record<string, any>;
+    await seedStop();
+    seedStop = undefined;
+    const staleAt = new Date(Date.now() - 60_000).toISOString();
+    const unsigned = { ...seeded, heartbeatAt: staleAt };
+    delete unsigned.proof;
+    const proofPayload = JSON.stringify({
+      schema: unsigned.schema,
+      activation: unsigned.activation,
+      config: { lease_ttl_ms: 30_000, clock_skew_ms: 5_000 },
+      owner: { pid: unsigned.pid, start_identity: unsigned.start_identity },
+      acquired_at: unsigned.startedAt,
+      expires_at: new Date(Date.parse(unsigned.heartbeatAt) + 30_000).toISOString(),
+      pid: unsigned.pid,
+      start_identity: unsigned.start_identity,
+      root_identity: unsigned.root_identity,
+      root_dev: unsigned.root_dev,
+      root_ino: unsigned.root_ino,
+      token: unsigned.token,
+      session_id: unsigned.session_id ?? null,
+      generation: unsigned.epoch,
+      startedAt: unsigned.startedAt,
+      heartbeatAt: unsigned.heartbeatAt,
+      run_cursor: unsigned.run_cursor ?? null,
+      outbox_run_id: unsigned.outbox_run_id ?? null,
+      outbox_cursor: unsigned.outbox_cursor ?? null,
+    });
+    const proof = signCtoRuntimeProof(runtime.proofAuthority, "cto-dispatcher-lease-v1", proofPayload);
+    assert.equal(typeof proof, "string", "stale dispatcher fixture remains authenticated");
+    writeFileSync(dispatcherLockPath(root), JSON.stringify({ ...unsigned, proof }));
+
+    stop = startDispatcher(root, adapter, 5);
+    const deadline = Date.now() + 2_000;
+    while (polls < 1 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.ok(polls >= 1, "a stale owner must not block the next dispatcher");
+    await stop();
+    stop = undefined;
   } finally {
-    stop?.();
+    await stop?.();
+    await seedStop?.();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -4726,6 +5225,7 @@ test("adapters: active Telegram answer cannot wake after same-lexical root repla
           update_id: 1,
           message: {
             message_id: 100,
+            date: 1_700_000_000,
             text: "use grpc",
             reply_to_message: { message_id: 42 },
             chat: { id: 100 },
@@ -4883,7 +5383,7 @@ test("cto-safety: quarantine keeps identical text distinct across ids", () => {
     assert.equal(pendingRecords.filter((record) => record.status === "quarantined").length, 1, "the second task remains pending");
     const active = pending.wave_history?.find((wave) => wave.status === "active");
     assert.ok(active);
-    finishWave(pending, { id: active!.id, status: "done" }, root);
+    finishInboxWave(root, runId, active!.id);
     const replayed = handleInboxTask(root, { id: "t2", text: "Ship the fix", at }, () => undefined);
     assert.ok(replayed, "the deferred task is admitted after the active wave completes");
 
@@ -4953,10 +5453,12 @@ test("cto-safety: wake rollback preserves a same-id replacement between read and
   const root = mkdtempSync(join(tmpdir(), "cto-q-wake-replacement-race-"));
   let armed = false;
   let replaced = false;
+  runtimeFor(root);
+  const runId = resolveInboxRunId(root);
   const originalRead = BoundedQueue.prototype.read;
   BoundedQueue.prototype.read = function(name: string) {
     const observed = originalRead.call(this, name);
-    if (armed && !replaced && this.relativeDirectory.endsWith("/inbox") && name === inboxMessageFileName("t-race")) {
+    if (armed && !replaced && this.relativeDirectory.split(/[\\/]/u).at(-1) === "inbox" && name === canonicalDurableIdFileName("t-race")) {
       replaced = true;
       this.writeAtomic(name, JSON.stringify({
         id: "t-race",
@@ -4968,7 +5470,6 @@ test("cto-safety: wake rollback preserves a same-id replacement between read and
     return observed;
   };
   try {
-    const runId = resolveInboxRunId(root);
     const task = { id: "t-race", text: "original body", at: new Date().toISOString(), runId };
     assert.throws(
       () => handleInboxTask(root, task, () => {
@@ -4978,7 +5479,7 @@ test("cto-safety: wake rollback preserves a same-id replacement between read and
       /wake failed/,
     );
     assert.equal(replaced, true, "replacement was injected after the rollback read");
-    const inboxPath = join(inboxDir(runId, root), inboxMessageFileName(task.id));
+    const inboxPath = join(inboxDir(runId, root), canonicalDurableIdFileName(task.id));
     assert.equal(existsSync(inboxPath), true, "the concurrent replacement remains durable");
     assert.equal((JSON.parse(readFileSync(inboxPath, "utf8")) as { text?: string }).text, "replacement body");
   } finally {
@@ -5060,7 +5561,7 @@ test("adapters: Telegram update commit hook runs after durable callback and befo
     const fetchImpl = (async (_url: unknown, init: unknown) => {
       const body = JSON.parse(String((init as { body?: unknown })?.body ?? "{}")) as { offset?: number };
       offsets.push(Number(body.offset));
-      return new Response(JSON.stringify({ ok: true, result: [{ update_id: 7, message: { message_id: 7, text: "task", chat: { id: 100 }, from: { id: 1 } } }] }), {
+      return new Response(JSON.stringify({ ok: true, result: [{ update_id: 7, message: { message_id: 7, date: 1_700_000_000, text: "task", chat: { id: 100 }, from: { id: 1 } } }] }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });

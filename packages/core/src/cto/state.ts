@@ -1228,24 +1228,28 @@ function preparationFieldsValid(state: Record<string, unknown>): boolean {
 const MAX_PENDING_DELIVERY_OBLIGATIONS = 256;
 const MAX_PENDING_DELIVERY_ENVELOPE_BYTES = 64 * 1024;
 const MAX_PENDING_DELIVERY_TOTAL_BYTES = 2 * 1024 * 1024;
-const MAX_TERMINAL_SUMMARY_EVIDENCE = 256;
-
 function terminalSummaryEvidenceValid(value: unknown, runId: string): value is CtoTerminalSummaryEvidence[] {
   if (value === undefined) return true;
-  if (!Array.isArray(value) || value.length > MAX_TERMINAL_SUMMARY_EVIDENCE) return false;
+  if (!Array.isArray(value) || value.length > MAX_PERSISTED_STATE_ARRAY) return false;
   const waves = new Set<string>();
   let totalBytes = 0;
   for (const candidate of value) {
-    if (!objectHasExactKeys(candidate, ["wave_id", "source_revision", "envelope_sha256", "envelope"])) return false;
+    if (!objectHasExactKeys(candidate, ["wave_id", "source_revision", "envelope_sha256"], ["envelope"])) return false;
     const item = candidate as Record<string, unknown>;
     if (!isSafeCtoExecutionId(item.wave_id) || waves.has(item.wave_id as string)
       || !Number.isSafeInteger(item.source_revision) || (item.source_revision as number) < 0
-      || !isSha256Hex(item.envelope_sha256) || typeof item.envelope !== "string") return false;
-    const bytes = Buffer.from(item.envelope, "utf8");
+      || !isSha256Hex(item.envelope_sha256)) return false;
+    const envelope = item.envelope;
+    if (envelope !== undefined && typeof envelope !== "string") return false;
+    if (envelope === undefined) {
+      waves.add(item.wave_id as string);
+      continue;
+    }
+    const bytes = Buffer.from(envelope, "utf8");
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_PENDING_DELIVERY_ENVELOPE_BYTES || (totalBytes += bytes.byteLength) > MAX_PENDING_DELIVERY_TOTAL_BYTES
       || createHash("sha256").update(bytes).digest("hex") !== item.envelope_sha256) return false;
     let parsed: unknown;
-    try { parsed = JSON.parse(item.envelope); } catch { return false; }
+    try { parsed = JSON.parse(envelope); } catch { return false; }
     if (!validCtoDelivery(parsed, runId) || !parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
     const delivery = parsed as Record<string, unknown>;
     if (delivery.id !== `${runId}/wave/${item.wave_id}/summary` || delivery.intent !== "summary"
@@ -4237,6 +4241,34 @@ function validCtoDeliveryProof(
     return Buffer.from(read.bytes).equals(expected);
   } catch { return false; }
 }
+function authenticatedCtoDeliveryProofBindingPinned(
+  pinnedRoot: PinnedProjectRoot,
+  runId: string,
+  entryName: string,
+  envelopeId: string,
+  delivery: Record<string, unknown>,
+  bytes: Buffer,
+): CtoOutboxDeliveryRoutingBinding | null {
+  try {
+    const read = pinnedRoot.readFile(ctoDeliveryProofRelativePath(runId, entryName), { maxBytes: 16 * 1024 });
+    const raw = JSON.parse(decodeUtf8(read.bytes)) as Record<string, unknown>;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const routingBinding = normalizeCtoOutboxDeliveryRoutingBinding({
+      config_sha256: raw.routing_config_sha256,
+      snapshot_sha256: raw.routing_snapshot_sha256,
+      channel: raw.routing_channel,
+      target: raw.routing_target,
+      canonical_root: raw.routing_canonical_root,
+      root_dev: raw.routing_root_dev,
+      root_ino: raw.routing_root_ino,
+    });
+    if (!routingBinding) return null;
+    const expected = ctoDeliveryProofBytes(pinnedRoot, runId, entryName, envelopeId, delivery, bytes, routingBinding);
+    return expected && Buffer.from(read.bytes).equals(expected) ? routingBinding : null;
+  } catch {
+    return null;
+  }
+}
 function removeCtoDeliveryProofIfSettled(
   pinnedRoot: PinnedProjectRoot,
   runId: string,
@@ -4396,12 +4428,14 @@ export interface CtoOutboxDeliveryObligationRead {
   /** Current revision used to bind this publication in the index/authority. */
   state_revision: number;
   json: Uint8Array;
+  /** Routing binding authenticated by the obligation proof sidecar. */
+  routing_binding: CtoOutboxDeliveryRoutingBinding;
 }
 
 function immutableSummaryEvidenceEnvelope(state: CtoState, delivery: Record<string, unknown>): Buffer | null {
   if (delivery.intent !== "summary" || typeof delivery.wave_id !== "string") return null;
   const evidence = (state.terminal_summary_evidence ?? []).find((candidate) => candidate.wave_id === delivery.wave_id);
-  if (!evidence) return null;
+  if (!evidence || typeof evidence.envelope !== "string") return null;
   let stored: unknown;
   try { stored = JSON.parse(evidence.envelope); } catch { return null; }
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;
@@ -4464,7 +4498,9 @@ export function recordCtoOutboxDeliveryObligation(
         const reboundDelivery = JSON.parse(decodeUtf8(rebound)) as Record<string, unknown>;
         const proofValid = validCtoDeliveryProof(pinnedRoot, input.run_id, input.entry_name, envelopeId, reboundDelivery, rebound, routingBinding);
         if (!proofValid && !rebindCtoDeliveryProof(pinnedRoot, input.run_id, input.entry_name, envelopeId, reboundDelivery, rebound, routingBinding)) return;
-        result = { run_id: input.run_id, entry_name: existing.entry_name, envelope_id: existing.envelope_id, intent: existing.intent, source_revision: existing.created_revision, created_revision: existing.created_revision, state_revision: currentRevision, json: rebound };
+        const authenticatedBinding = authenticatedCtoDeliveryProofBindingPinned(pinnedRoot, input.run_id, input.entry_name, envelopeId, reboundDelivery, rebound);
+        if (!authenticatedBinding) return;
+        result = { run_id: input.run_id, entry_name: existing.entry_name, envelope_id: existing.envelope_id, intent: existing.intent, source_revision: existing.created_revision, created_revision: existing.created_revision, state_revision: currentRevision, json: rebound, routing_binding: authenticatedBinding };
         return;
       }
       if (obligations.length >= MAX_PENDING_DELIVERY_OBLIGATIONS) throw new CtoDeliveryObligationCapacityError();
@@ -4491,6 +4527,8 @@ export function recordCtoOutboxDeliveryObligation(
         envelope: decodeUtf8(canonicalBytes),
       };
       if (isCtoRuntimeDeliveryCapability(capability) && !ensureCtoDeliveryProof(pinnedRoot, input.run_id, input.entry_name, envelopeId, canonicalCandidate, canonicalBytes, routingBinding)) return;
+      const authenticatedBinding = authenticatedCtoDeliveryProofBindingPinned(pinnedRoot, input.run_id, input.entry_name, envelopeId, canonicalCandidate, canonicalBytes);
+      if (!authenticatedBinding) return;
       if (obligation.intent === "summary" && typeof canonicalCandidate.wave_id === "string" && !current.terminal_summary_evidence?.some((item) => item.wave_id === canonicalCandidate.wave_id)) {
         current.terminal_summary_evidence = [...(current.terminal_summary_evidence ?? []), {
           wave_id: canonicalCandidate.wave_id,
@@ -4507,7 +4545,7 @@ export function recordCtoOutboxDeliveryObligation(
         throw new CtoDeliveryObligationRecoveryRequiredError();
       }
       findCtoRunDeliveryHook(pinnedRoot, root)?.afterObligationRecord?.({ root, run_id: input.run_id, entry_name: input.entry_name });
-      result = { run_id: input.run_id, entry_name: input.entry_name, envelope_id: envelopeId, intent: obligation.intent, source_revision: sourceRevision, created_revision: sourceRevision, state_revision: nextRevision, json: canonicalBytes };
+      result = { run_id: input.run_id, entry_name: input.entry_name, envelope_id: envelopeId, intent: obligation.intent, source_revision: sourceRevision, created_revision: sourceRevision, state_revision: nextRevision, json: canonicalBytes, routing_binding: authenticatedBinding };
     }, { pinnedRoot });
     return result;
   } finally {
@@ -4527,9 +4565,16 @@ export function readCtoOutboxDeliveryObligationsPinned(root: string, runId: stri
     const stateRevision: number = stateRevisionValue;
     return (state.pending_delivery_obligations ?? []).flatMap((obligation) => {
       const json = Buffer.from(obligation.envelope, "utf8");
-      return json.byteLength > 0 && json.byteLength <= MAX_PENDING_DELIVERY_ENVELOPE_BYTES
-        ? [{ run_id: runId, entry_name: obligation.entry_name, envelope_id: obligation.envelope_id, intent: obligation.intent, source_revision: obligation.created_revision, created_revision: obligation.created_revision, state_revision: stateRevision, json }]
-        : [];
+      if (json.byteLength === 0 || json.byteLength > MAX_PENDING_DELIVERY_ENVELOPE_BYTES) return [];
+      let parsed: unknown;
+      try { parsed = JSON.parse(decodeUtf8(json)); } catch { return []; }
+      if (!validCtoDelivery(parsed, runId) || !parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+      const delivery = parsed as Record<string, unknown>;
+      if (durableEnvelopeId(json) !== obligation.envelope_id || canonicalDurableIdFileName(obligation.envelope_id) !== obligation.entry_name
+        || delivery.intent !== obligation.intent || delivery.state_revision !== obligation.created_revision) return [];
+      const routingBinding = authenticatedCtoDeliveryProofBindingPinned(pinnedRoot, runId, obligation.entry_name, obligation.envelope_id, delivery, json);
+      if (!routingBinding) return [];
+      return [{ run_id: runId, entry_name: obligation.entry_name, envelope_id: obligation.envelope_id, intent: obligation.intent, source_revision: obligation.created_revision, created_revision: obligation.created_revision, state_revision: stateRevision, json, routing_binding: routingBinding }];
     });
   } finally {
     if (!providedRoot) pinnedRoot.close();
@@ -4586,6 +4631,26 @@ function reconcileCtoRunDeliveryIndexAfterObligationRemoval(state: CtoState, pin
   );
 }
 
+function exactSentSummaryArchiveMatchesPinned(
+  pinnedRoot: PinnedProjectRoot,
+  state: CtoState,
+  entryName: string,
+  envelopeId: string,
+  envelope: string,
+): boolean {
+  const sentPath = join(ctoRunOutboxRelativePath(state.id), "sent", entryName);
+  try {
+    const first = pinnedRoot.readFile(sentPath, { maxBytes: MAX_CTO_OUTBOX_ENVELOPE_BYTES });
+    const firstBytes = Buffer.from(first.bytes);
+    if (!firstBytes.equals(Buffer.from(envelope, "utf8")) || durableEnvelopeId(firstBytes) !== envelopeId
+      || !isDeterministicCtoTerminalSummaryDelivery(state, envelopeId, firstBytes, true)) return false;
+    const second = pinnedRoot.readFile(sentPath, { maxBytes: MAX_CTO_OUTBOX_ENVELOPE_BYTES });
+    return first.dev === second.dev && first.ino === second.ino && firstBytes.equals(Buffer.from(second.bytes));
+  } catch {
+    return false;
+  }
+}
+
 /** CAS-remove one exact state-owned obligation after transport success. */
 export function removeCtoOutboxDeliveryObligation(root: string, runId: string, entryName: string, envelopeId: string, providedRoot?: PinnedProjectRoot, capability?: unknown): boolean {
   if (!isCtoRuntimeDeliveryCapability(capability)) return false;
@@ -4601,7 +4666,25 @@ export function removeCtoOutboxDeliveryObligation(root: string, runId: string, e
       const removedObligation = current?.pending_delivery_obligations?.find((entry) => entry.entry_name === entryName && entry.envelope_id === envelopeId);
       if (!removedObligation || !current) return;
       removedEnvelope = removedObligation.envelope;
+      let compactSummaryWaveId: string | null = null;
+      if (removedObligation.intent === "summary") {
+        try {
+          const removedDelivery = JSON.parse(removedObligation.envelope) as Record<string, unknown>;
+          const waveId = removedDelivery.wave_id;
+          if (typeof waveId === "string" && exactSentSummaryArchiveMatchesPinned(pinnedRoot, current, entryName, envelopeId, removedObligation.envelope)) {
+            const evidence = (current.terminal_summary_evidence ?? []).find((candidate) => candidate.wave_id === waveId);
+            if (evidence?.envelope === removedObligation.envelope) compactSummaryWaveId = waveId;
+          }
+        } catch {
+          compactSummaryWaveId = null;
+        }
+      }
       current.pending_delivery_obligations = (current.pending_delivery_obligations ?? []).filter((entry) => !(entry.entry_name === entryName && entry.envelope_id === envelopeId));
+      if (compactSummaryWaveId !== null) {
+        current.terminal_summary_evidence = (current.terminal_summary_evidence ?? []).map((evidence) => evidence.wave_id === compactSummaryWaveId
+          ? { wave_id: evidence.wave_id, source_revision: evidence.source_revision, envelope_sha256: evidence.envelope_sha256 }
+          : evidence);
+      }
       findCtoRunDeliveryHook(pinnedRoot, root)?.beforeObligationRemove?.({ root, run_id: runId, entry_name: entryName, envelope_id: envelopeId });
       writeCtoStateLocked(current, pinnedRoot.canonical_root, { pinnedRoot });
       if (!writeCtoRuntimeStateProof(pinnedRoot, current)) throw new CtoDeliveryObligationRecoveryRequiredError();
@@ -4728,14 +4811,27 @@ function terminalSummaryDeliveredPinned(pinnedRoot: PinnedProjectRoot, state: Ct
     try {
       const first = pinnedRoot.readFile(sentPath, { maxBytes: 64 * 1024 });
       const firstBytes = Buffer.from(first.bytes);
-      if (!isDeterministicCtoTerminalSummaryDelivery(state, envelopeId, firstBytes, true)) return false;
       let parsed: unknown;
       try { parsed = JSON.parse(decodeUtf8(firstBytes)); } catch { return false; }
-      const evidence = immutableSummaryEvidenceEnvelope(state, parsed as Record<string, unknown>);
-      const parsedRevision = parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? (parsed as Record<string, unknown>).state_revision
-        : undefined;
-      if (parsedRevision !== state.state_revision && (!evidence || !evidence.equals(firstBytes))) return false;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+      const parsedRevision = (parsed as Record<string, unknown>).state_revision;
+      if (!Number.isSafeInteger(parsedRevision) || (parsedRevision as number) < 0) return false;
+      const currentRevision = state.state_revision;
+      if (!Number.isSafeInteger(currentRevision) || (currentRevision as number) < 0) return false;
+      if (parsedRevision === currentRevision) {
+        if (!isDeterministicCtoTerminalSummaryDelivery(state, envelopeId, firstBytes, false)) return false;
+      } else {
+        const evidence = (state.terminal_summary_evidence ?? []).find((candidate) => candidate.wave_id === wave.id);
+        if (!evidence || !Number.isSafeInteger(evidence.source_revision) || evidence.source_revision < 0 || !isSha256Hex(evidence.envelope_sha256)
+          || parsedRevision !== evidence.source_revision
+          || !isDeterministicCtoTerminalSummaryDelivery(state, envelopeId, firstBytes, true)) return false;
+        if (typeof evidence.envelope === "string") {
+          const evidenceBytes = immutableSummaryEvidenceEnvelope(state, parsed as Record<string, unknown>);
+          if (!evidenceBytes || !evidenceBytes.equals(firstBytes)) return false;
+        } else if (createHash("sha256").update(firstBytes).digest("hex") !== evidence.envelope_sha256) {
+          return false;
+        }
+      }
       const second = pinnedRoot.readFile(sentPath, { maxBytes: 64 * 1024 });
       return first.dev === second.dev && first.ino === second.ino && firstBytes.equals(Buffer.from(second.bytes));
     } catch {
