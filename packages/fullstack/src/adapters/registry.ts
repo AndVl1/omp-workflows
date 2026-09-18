@@ -2067,6 +2067,7 @@ export async function drainOutbox(
         immediateFirstRetry,
         opts.runtimeAccess,
         drainFence,
+        opts.retryMatchStateStore,
       );
       let rejectedDuringPromotion = false;
       const removeArchivedObligation = (entryName: string, storedBytes: Uint8Array): void => {
@@ -2081,11 +2082,37 @@ export async function drainOutbox(
         if (runEntry.pending_retry || !queueHasActiveWork(outboxQueue, "sent")) {
           // A retry marker is an additive recovery obligation; attempt
           // promotion even when another active entry is present.
-          promoteRetryEntries(root, activeDirectory, retryDirectory, rejectedDirectory, "outbox", retryClockNow(opts.now), pinnedRoot, undefined, opts.runtimeAccess, opts.lifecycle, runId, runEntry.state_revision, () => { rejectedDuringPromotion = true; }, opts.retryCursorStore);
+          promoteRetryEntries(root, activeDirectory, retryDirectory, rejectedDirectory, "outbox", retryClockNow(opts.now), pinnedRoot, undefined, opts.runtimeAccess, opts.lifecycle, runId, currentStateRevision, (entryName, reason) => { rejectedDuringPromotion = true; results.push({ runId, escId: entryName, sent: false, error: reason }); }, opts.retryCursorStore, opts.retryMatchStateStore);
         }
         let activeWork = 0;
-        const discoveredQueueEntries = [...boundedQueueEntries(outboxQueue)];
+        // The active queue is itself bounded to one page. Rotate that page
+        // across ticks so promoted retries cannot occupy the same lexical
+        // prefix forever and starve canonical work later in the directory.
+        const activeMatchCursorKey = runId + "\u0000" + activeDirectory;
+        const activeMatchCursor = opts.retryMatchCursorStore?.get(activeMatchCursorKey) ?? null;
         const directEntryName = directEntryForRun?.name;
+        // A direct recovery candidate is already authenticated by its state-owned obligation.
+        // Do not enumerate an attacker-controlled overfull directory before using it:
+        // the direct path is intentionally one-entry bounded work, and subsequent
+        // ticks resume the indexed page once the fast candidate is archived.
+        opts.retryMatchCursorStore?.set(activeMatchCursorKey, activeMatchCursor);
+        const discoveredQueueEntries = directEntryForRun
+          ? (() => {
+            try {
+              return opts.runtimeAccess!.readOutboxDeliveryObligations(runId).map((obligation) => ({
+                name: obligation.entry_name,
+                relativePath: outboxQueue.path(obligation.entry_name),
+              }));
+            } catch (error) {
+              rethrowActivationFailure(error);
+              return [];
+            }
+          })()
+          : outboxQueue.listPage(activeMatchCursor).entries.sort((left, right) => {
+            const leftRetry = (opts.retryMatchStateStore?.has(runId + "\u0000" + left.name) ?? false) || retryActiveMetadata(left.name) !== null;
+            const rightRetry = (opts.retryMatchStateStore?.has(runId + "\u0000" + right.name) ?? false) || retryActiveMetadata(right.name) !== null;
+            return leftRetry === rightRetry ? 0 : leftRetry ? 1 : -1;
+          });
         const directQueueEntry = directEntryName === undefined
           ? null
           : { name: directEntryName, relativePath: outboxQueue.path(directEntryName) };
@@ -2219,7 +2246,9 @@ export async function drainOutbox(
               // Every sink subscription-skipped this topic — honest no-op:
               // nothing was attempted, archive as sent with no sinkErrors.
               if (!ensureCurrentPublicationBeforeMutation()) continue;
+              clearPromotedRetryEntries(root, retryDirectory, name, storedBytes!, pinnedRoot, drainFence, opts.retryMatchStateStore?.get(runId + "\u0000" + name));
               archiveOutboxEntry(root, outboxQueue, activeDirectory, name, archiveName, archiveText, pinnedRoot, drainFence);
+              opts.retryMatchStateStore?.delete(runId + "\u0000" + name);
               removeArchivedObligation(name, storedBytes!);
               clearRejectedEvidenceAfterSuccess();
               results.push({ runId, escId, sent: true });
@@ -2235,7 +2264,9 @@ export async function drainOutbox(
               // At least one sink succeeded — archive the summary; partial
               // sink failures are recorded (today's behavior).
               if (!ensureCurrentPublicationBeforeMutation()) continue;
+              clearPromotedRetryEntries(root, retryDirectory, name, storedBytes!, pinnedRoot, drainFence, opts.retryMatchStateStore?.get(runId + "\u0000" + name));
               archiveOutboxEntry(root, outboxQueue, activeDirectory, name, archiveName, archiveText, pinnedRoot, drainFence);
+              opts.retryMatchStateStore?.delete(runId + "\u0000" + name);
               removeArchivedObligation(name, storedBytes!);
               clearRejectedEvidenceAfterSuccess();
               const result: DrainOutboxResult = { runId, escId, sent: true };
@@ -2293,6 +2324,7 @@ export async function drainOutbox(
             }
           }
           if (!ensureCurrentPublicationBeforeMutation()) continue;
+          clearPromotedRetryEntries(root, retryDirectory, name, storedBytes!, pinnedRoot, drainFence, opts.retryMatchStateStore?.get(runId + "\u0000" + name));
           archiveOutboxEntry(root, outboxQueue, activeDirectory, name, archiveName, archiveText, pinnedRoot, drainFence);
           removeArchivedObligation(name, storedBytes!);
           clearRejectedEvidenceAfterSuccess();
@@ -2336,6 +2368,21 @@ export async function drainOutbox(
               results.push({ runId, escId, sent: false, error: error instanceof Error ? error.message : String(error) });
             }
           }
+        }
+        if (opts.retryMatchCursorStore && activePage.entries.length > 0) {
+          let pageAdvanced = false;
+          for (const entry of activePage.entries) {
+            try {
+              outboxQueue.classify(entry.name);
+            } catch (error) {
+              rethrowActivationFailure(error);
+              if (error instanceof BoundedQueueError && error.code === "not_found") pageAdvanced = true;
+            }
+          }
+          const retryStatePrefix = runId + "\u0000";
+          const hasRetryStateForRun = opts.retryMatchStateStore !== undefined
+            && [...opts.retryMatchStateStore.keys()].some((key) => key.startsWith(retryStatePrefix));
+          if (!pageAdvanced || !hasRetryStateForRun) opts.retryMatchCursorStore.set(activeMatchCursorKey, null);
         }
       } finally {
         outboxQueue.close();
@@ -3139,6 +3186,7 @@ function moveRetryableEntry(
   immediateFirstRetry = false,
   runtimeAccess?: RuntimeAccess,
   fence?: MutationFence,
+  retryMatchStateStore?: Map<string, unknown>,
 ): boolean {
   let source: { dev: number; ino: number; bytes: Uint8Array };
   let originalName: string;
@@ -3175,10 +3223,18 @@ function moveRetryableEntry(
         rethrowActivationFailure(error);
       }
     }
-    const previousAttempt = matchingRetries.reduce((max, item) => Math.max(max, item.metadata.attempt), 0);
+    const retryStateKey = runId + "\u0000" + originalName;
+    const storedState = retryMatchStateStore?.get(retryStateKey);
+    const storedAttempt = typeof storedState === "number"
+      ? storedState
+      : storedState && typeof storedState === "object" && typeof (storedState as { attempt?: unknown }).attempt === "number"
+        ? (storedState as { attempt: number }).attempt
+        : 0;
+    const previousAttempt = Math.max(matchingRetries.reduce((max, item) => Math.max(max, item.metadata.attempt), 0), Number.isSafeInteger(storedAttempt) ? storedAttempt : 0);
     const attempt = Math.min(RETRY_MAX_ATTEMPT, previousAttempt + 1);
     const dueAt = immediateFirstRetry && previousAttempt === 0 ? now : retryDueAt(attempt, now);
     const retryName = retryLaneEntryName(originalName, attempt, dueAt);
+    retryMatchStateStore?.set(retryStateKey, { attempt, retryName });
     const writeSameOrExclusive = (entryName: string): boolean => {
       try {
         retryQueue!.writeExclusive(entryName, sourceBytes);
@@ -3242,6 +3298,62 @@ function moveRetryableEntry(
   }
 }
 
+function clearPromotedRetryEntries(
+  root: string,
+  retryDirectory: string,
+  originalName: string,
+  sourceBytes: Uint8Array,
+  pinnedRoot?: PinnedProjectRoot,
+  fence?: MutationFence,
+  retryState?: unknown,
+): void {
+  const retryQueue = openBoundedQueue(pinnedRoot?.canonical_root ?? root, retryDirectory, { ...ACTIVE_QUEUE_OPTIONS, createDirectory: false, ...(pinnedRoot ? { pinnedRoot } : {}) });
+  if (!retryQueue) return;
+  const retainedRetryName = retryState && typeof retryState === "object" && typeof (retryState as { retryName?: unknown }).retryName === "string"
+    ? (retryState as { retryName: string }).retryName
+    : undefined;
+  try {
+    const expectedHash = retryOriginalNameHash(originalName);
+    let cursor: string | null = null;
+    for (let pageIndex = 0; pageIndex < 1_024; pageIndex += 1) {
+      let page: { entries: Array<{ name: string; relativePath: string }>; nextCursor: string | null };
+      try {
+        page = retainedRetryName
+          ? { entries: [{ name: retainedRetryName, relativePath: retryQueue.path(retainedRetryName) }], nextCursor: null }
+          : retryQueue.listPage(cursor);
+      } catch (error) {
+        rethrowActivationFailure(error);
+        if ((error instanceof BoundedQueueError && error.code === "not_found") || String(error).includes("anchored path does not exist")) return;
+        throw error;
+      }
+      for (const entry of page.entries) {
+        const metadata = parseRetryLaneEntry(entry.name);
+        if (!metadata || metadata.version !== "r2" || metadata.originalNameHash !== expectedHash) continue;
+        let observed: { dev: number; ino: number; bytes: Uint8Array };
+        try {
+          observed = retryQueue.read(entry.name);
+        } catch (error) {
+          rethrowActivationFailure(error);
+          continue;
+        }
+        if (!Buffer.from(observed.bytes).equals(Buffer.from(sourceBytes))) continue;
+        try {
+          assertMutationLive(fence);
+          retryQueue.removeIfMatches(entry.name, queueExpected(observed));
+          assertMutationLive(fence);
+        } catch (error) {
+          rethrowActivationFailure(error);
+          if (!(error instanceof BoundedQueueError) || error.code !== "not_found") throw error;
+        }
+      }
+      if (retainedRetryName || page.nextCursor === null) break;
+      cursor = page.nextCursor;
+    }
+  } finally {
+    retryQueue.close();
+  }
+}
+
 function promoteOutboxRetryEntry(
   root: string,
   activeDirectory: string,
@@ -3254,12 +3366,13 @@ function promoteOutboxRetryEntry(
   runtimeAccess?: RuntimeAccess,
   runId?: string,
   stateRevision?: number,
-  onRejected?: () => void,
+  onRejected?: (entryName: string, reason: string) => void,
+  retryMatchStateStore?: Map<string, unknown>,
 ): boolean {
   let entryExpected: BoundedQueueEntryExpectation | undefined;
   try { entryExpected = retryQueue.classify(entryName); } catch (error) { rethrowActivationFailure(error); }
   if (metadata.version !== "r2" || !runtimeAccess || !runId || !Number.isSafeInteger(stateRevision)) {
-    if (metadata.version === "r1") quarantineQueueEntry(retryQueue, entryName, entryExpected, rejectedDirectory, fence); onRejected?.();
+    if (metadata.version === "r1") { quarantineQueueEntry(retryQueue, entryName, entryExpected, rejectedDirectory, fence); onRejected?.(entryName, "legacy retry wrapper is not authenticated"); }
     return metadata.version === "r1";
   }
   const authenticatedStateRevision = stateRevision as number;
@@ -3285,7 +3398,7 @@ function promoteOutboxRetryEntry(
   } catch (error) {
     rethrowActivationFailure(error);
     if (error instanceof UnauthorizedDeliveryError) {
-      quarantineQueueEntry(retryQueue, entryName, observed?.expectation, rejectedDirectory, fence); onRejected?.();
+      quarantineQueueEntry(retryQueue, entryName, observed?.expectation, rejectedDirectory, fence); onRejected?.(entryName, "outbox delivery is not the current authenticated publication");
       return true;
     }
     // Parse, structural, and authority failures without a definitive core
@@ -3294,9 +3407,6 @@ function promoteOutboxRetryEntry(
   }
   if (!observed) return false;
   const observedEntry = observed;
-  const removeRetryRecord = (): void => {
-    try { retryQueue.removeIfMatches(entryName, queueExpected(observedEntry)); } catch (error) { rethrowActivationFailure(error); }
-  };
   const activeQueue = openBoundedQueue(pinnedRoot?.canonical_root ?? root, activeDirectory, { ...ACTIVE_QUEUE_OPTIONS, ...(pinnedRoot ? { pinnedRoot } : {}) });
   if (!activeQueue) return false;
   try {
@@ -3311,7 +3421,7 @@ function promoteOutboxRetryEntry(
       if (!(error instanceof BoundedQueueError) || (error.code !== "not_found" && error.code !== "write_failed")) return false;
     }
     if (existing && !Buffer.from(existing.bytes).equals(Buffer.from(observedEntry.bytes))) {
-      quarantineQueueEntry(retryQueue, entryName, observedEntry.expectation, rejectedDirectory, fence); onRejected?.();
+      quarantineQueueEntry(retryQueue, entryName, observedEntry.expectation, rejectedDirectory, fence); onRejected?.(entryName, "outbox retry conflicts with an active delivery");
       return true;
     }
     if (!existing) {
@@ -3346,9 +3456,11 @@ function promoteOutboxRetryEntry(
       // and additive pending flags for the next tick.
       return false;
     }
-    // Remove only the authenticated retry source after promotion. The active
-    // copy is still sent through the adapter; any sent/ copy is ignored.
-    removeRetryRecord();
+    // Keep the authenticated retry source beside the promoted active copy
+    // until transport success. If the send fails, the next retry wrapper can
+    // derive the monotonic attempt without an in-memory context; success
+    // removes the exact retained wrapper before archival.
+    retryMatchStateStore?.set(runId + "\u0000" + originalName, { attempt: metadata.attempt, retryName: entryName });
     assertMutationLive(fence);
     return true;
   } catch (error) {
@@ -3371,9 +3483,10 @@ function queueHasActiveWork(queue: BoundedQueue, archiveDirectory: "sent" | "pro
   }
 }
 
-function promoteRetryEntries(root: string, activeDirectory: string, retryDirectory: string, rejectedDirectory: string, kind: "outbox" | "inbox", now = Date.now(), pinnedRoot?: PinnedProjectRoot, retrySecret?: string | null | (() => string | null), runtimeAccess?: RuntimeAccess, lifecycle?: AdapterOperationContext, deliveryRunId?: string, deliveryStateRevision?: number, onRejected?: () => void, retryCursorStore?: Map<string, string | null>): number {
+function promoteRetryEntries(root: string, activeDirectory: string, retryDirectory: string, rejectedDirectory: string, kind: "outbox" | "inbox", now = Date.now(), pinnedRoot?: PinnedProjectRoot, retrySecret?: string | null | (() => string | null), runtimeAccess?: RuntimeAccess, lifecycle?: AdapterOperationContext, deliveryRunId?: string, deliveryStateRevision?: number, onRejected?: (entryName: string, reason: string) => void, retryCursorStore?: Map<string, string | null>, retryMatchStateStore?: Map<string, unknown>): number {
   const fence: MutationFence = { pinnedRoot, runtimeAccess, lifecycle };
-  void retryCursorStore;
+  const retryCursorKey = retryDirectory;
+  const retryCursor = retryCursorStore?.get(retryCursorKey) ?? null;
   assertMutationLive(fence);
   const retryQueue = openBoundedQueue(pinnedRoot?.canonical_root ?? root, retryDirectory, { ...ACTIVE_QUEUE_OPTIONS, createDirectory: false, ...(pinnedRoot ? { pinnedRoot } : {}) });
   if (!retryQueue) return 0;
@@ -3386,7 +3499,9 @@ function promoteRetryEntries(root: string, activeDirectory: string, retryDirecto
     return resolvedRetrySecret;
   };
   try {
-    const retryEntries = [...boundedQueueEntries(retryQueue)];
+    const retryPage = retryQueue.listPage(retryCursor);
+    const retryEntries = retryPage.entries;
+    retryCursorStore?.set(retryCursorKey, retryPage.nextCursor);
     for (const entry of retryEntries) {
       let entryExpected: BoundedQueueEntryExpectation | undefined;
       try { entryExpected = retryQueue.classify(entry.name); } catch (error) { rethrowActivationFailure(error); }
@@ -3395,7 +3510,7 @@ function promoteRetryEntries(root: string, activeDirectory: string, retryDirecto
         // Retry lanes are self-describing by their bounded r2 filename. Raw
         // canonical files outside that grammar are legacy/forged records and
         // must never become an authenticated publication.
-        quarantineQueueEntry(retryQueue, entry.name, entryExpected, rejectedDirectory, fence); onRejected?.();
+        quarantineQueueEntry(retryQueue, entry.name, entryExpected, rejectedDirectory, fence); onRejected?.(entry.name, "retry entry is not authenticated");
         continue;
       }
       let verified: VerifiedInboxRetry | null = null;
@@ -3414,7 +3529,7 @@ function promoteRetryEntries(root: string, activeDirectory: string, retryDirecto
             ? retryOriginalNameHash(verified.wrapper.original_name) === metadata.originalNameHash
             : verified.wrapper.original_name === metadata.originalName);
         if (!verified || !nameMatches || verified.wrapper.attempt !== metadata.attempt || verified.wrapper.due_at !== metadata.dueAt) {
-          quarantineQueueEntry(retryQueue, entry.name, entryExpected, rejectedDirectory, fence); onRejected?.();
+          quarantineQueueEntry(retryQueue, entry.name, entryExpected, rejectedDirectory, fence); onRejected?.(entry.name, "retry entry is not authenticated");
           continue;
         }
       } else if (metadata.version === "r2") {
@@ -3425,19 +3540,19 @@ function promoteRetryEntries(root: string, activeDirectory: string, retryDirecto
             : null;
           const originalName = id === null ? null : canonicalDurableIdFileName(id);
           if (!originalName || retryOriginalNameHash(originalName) !== metadata.originalNameHash) {
-            quarantineQueueEntry(retryQueue, entry.name, entryExpected, rejectedDirectory, fence); onRejected?.();
+            quarantineQueueEntry(retryQueue, entry.name, entryExpected, rejectedDirectory, fence); onRejected?.(entry.name, "retry entry is not authenticated");
             continue;
           }
         } catch (error) {
           rethrowActivationFailure(error);
-          quarantineQueueEntry(retryQueue, entry.name, entryExpected, rejectedDirectory, fence); onRejected?.();
+          quarantineQueueEntry(retryQueue, entry.name, entryExpected, rejectedDirectory, fence); onRejected?.(entry.name, "retry entry is not authenticated");
           continue;
         }
       }
       assertMutationLive(fence);
       if (metadata.dueAt > now) continue;
       if (kind === "outbox") {
-        const moved = promoteOutboxRetryEntry(root, activeDirectory, rejectedDirectory, retryQueue, entry.name, metadata, pinnedRoot, fence, runtimeAccess, deliveryRunId, deliveryStateRevision, onRejected);
+        const moved = promoteOutboxRetryEntry(root, activeDirectory, rejectedDirectory, retryQueue, entry.name, metadata, pinnedRoot, fence, runtimeAccess, deliveryRunId, deliveryStateRevision, onRejected, retryMatchStateStore);
         if (moved) promoted += 1;
         continue;
       }

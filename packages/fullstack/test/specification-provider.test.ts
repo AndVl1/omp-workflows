@@ -91,6 +91,7 @@ test("native assets are idempotent and preserve built-in renderer/recognizer ord
 
 test("SpecKit root fixture resolves with provider provenance, native template hash, and no writes", () => {
   const root = mkdtempSync(join(tmpdir(), "spec-provider-"));
+  const registration = registerNativeSpecificationAssetsForTest(root);
   try {
     const relative = SPECKIT_CONSTITUTION_RELATIVE_PATH;
     const path = join(root, relative);
@@ -117,6 +118,7 @@ test("SpecKit root fixture resolves with provider provenance, native template ha
     assert.deepEqual(readFileSync(path), beforeBytes, "discovery must be read-only");
     assert.deepEqual(readdirSync(join(root, ".specify", "memory")), beforeTree, "discovery must not create sibling assets");
   } finally {
+    registration.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

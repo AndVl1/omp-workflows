@@ -84,7 +84,7 @@ function resolveInboxRunId(root: string, pinnedRoot?: Parameters<typeof registry
   return registry.resolveInboxRunId(root, pinnedRoot, runtimeAccess ?? runtimeFor(root).access);
 }
 function produceWaveDeliveries(root: string, options: RunOptions = {}) {
-  return registry.produceWaveDeliveries(root, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access });
+  return registry.produceWaveDeliveries(root, { ...options, runtimeAccess: options.runtimeAccess ?? runtimeFor(root).access, proofAuthority: runtimeFor(root).proofAuthority });
 }
 
 const { outboxDir, inboxDir } = registry;
@@ -160,6 +160,8 @@ function withRunState(
     state.channel_profile = { direction: "rw", transport: "telegram", adapter: "telegram", primary: true, ackTarget: opts.ackTarget };
   }
   const runtime = runtimeFor(root);
+  state.owner_session = runtime.sessionId;
+  state.work_identity = { run_id: runId, wave_id: "outbound-producer-wave", slice_id: "outbound-producer-slice", session_id: runtime.sessionId, workflow: "standard", stage_id: "execution", stage_cursor: "execution", capability_id: "outbound-producer-capability", capability_epoch: "outbound-producer-epoch", slot_id: "outbound-producer-slot", task_id: runId, dispatch_id: "outbound-producer-dispatch", attempt: 1, worker_id: "outbound-producer-worker" };
   assert.ok(runtime.access.createRun(state, { source_id: `outbound-producer:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
   if (opts.waves.some((wave) => (wave.status === "done" || wave.status === "failed") && wave.finished_at)) {
     assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "summary"), true, "completed wave summary obligation is indexed");
@@ -549,21 +551,7 @@ test("outbound: non-array wave_history state publishes nothing for itself and do
   try {
     withConfig(root, { channels: [{ id: "ctrl", adapter: "mock", direction: "read-write", primary: true }] });
     const now = new Date().toISOString();
-    // Create the corrupt indexed run before the valid one. Its malformed
-    // candidate is isolated and must not mutate or publish for this tenant.
-    const corruptRunId = "run-corrupt-container";
-    const corruptDir = join(root, ".work-state", "cto", corruptRunId);
-    withRunState(root, corruptRunId, { waves: [] });
-    assert.equal(runtimeFor(root).access.markDeliveryPending(corruptRunId, runtimeFor(root).access.readState(corruptRunId)?.state_revision, "summary"), true, "corrupt run retains an indexed pending obligation");
-    // The typed withRunState helper CANNOT express an agent-written
-    // non-array wave_history; preserve the canonical revision/index identity
-    // and corrupt only that persisted field.
-    const corruptState = JSON.parse(readFileSync(join(corruptDir, "state.json"), "utf8")) as Record<string, unknown>;
-    corruptState.wave_history = {}; // non-array container: for..of throws TypeError pre-fix
-    writeFileSync(join(corruptDir, "state.json"), JSON.stringify(corruptState, null, 2));
 
-    // A valid run is also present. It must continue independently while the
-    // malformed run remains unreadable.
     const validRunId = "run-valid";
     withRunState(root, validRunId, {
       waves: [
@@ -571,9 +559,29 @@ test("outbound: non-array wave_history state publishes nothing for itself and do
         { id: "wave-active", source_id: "t-active", task: "Active wave", status: "active" }, // NO finished_at — active waves stay unsummarized
       ],
     });
+    const validEntry = runtimeFor(root).access.readDeliveryIndexPage().entries.find((entry) => entry.run_id === validRunId);
+    assert.ok(validEntry, "valid run is present in the authenticated delivery page");
+    const corruptRunId = "run-corrupt-container";
+    const corruptDir = join(root, ".work-state", "cto", corruptRunId);
+    mkdirSync(corruptDir, { recursive: true });
+    // This tenant is intentionally unindexed: an agent-written malformed
+    // state must not be able to invalidate the authenticated delivery index.
+    // The explicit runEntries page below still exercises producer isolation.
+    const corruptState = { schema: 2, id: corruptRunId, wave_history: {} };
+    writeFileSync(join(corruptDir, "state.json"), JSON.stringify(corruptState, null, 2));
+    const corruptEntry = {
+      run_id: corruptRunId,
+      state_revision: 0,
+      status: "active",
+      updated_at: now,
+      pending_summary: true,
+      pending_outbox: false,
+      pending_retry: false,
+      summary_digest: "",
+    } as NonNullable<typeof validEntry>;
 
     const corruptStateBytes = readFileSync(join(corruptDir, "state.json"));
-    const queued = produceWaveDeliveries(root);
+    const queued = produceWaveDeliveries(root, { runEntries: [corruptEntry, validEntry] });
     assert.equal(queued, 1, "corrupt run is isolated while the valid pending run publishes one summary");
     assert.equal(existsSync(outboxDir(corruptRunId, root)), false, "malformed run publishes no corrupt-tenant outbox");
     assert.equal(existsSync(join(outboxDir(corruptRunId, root), "sent")), false, "malformed run has no sent archive");
@@ -585,7 +593,7 @@ test("outbound: non-array wave_history state publishes nothing for itself and do
     const validSummary = JSON.parse(readFileSync(validSummaryPath, "utf8")) as { id?: string; run_id?: string };
     assert.equal(validSummary.id, validSummaryId, "summary id remains tenant/run scoped");
     assert.equal(validSummary.run_id, validRunId, "summary envelope carries the valid tenant run id");
-    assert.equal(produceWaveDeliveries(root), 0, "active canonical publication is stable on the next tick");
+    assert.equal(produceWaveDeliveries(root, { runEntries: [corruptEntry, validEntry] }), 0, "active canonical publication is stable on the next tick");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

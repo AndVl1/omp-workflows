@@ -16,7 +16,7 @@ import { z } from "zod";
 import { TEST_CONTEXT } from "../../core/test/fixtures/registrar-host.js";
 import { beginHeldRegistration, type HeldRegistration } from "./fixtures/guarded-registration.js";
 import { ensureProjectConstitution } from "../../core/src/specification/prerequisite.js";
-import { registerTestConstitutionGate } from "../../core/test/fixtures/registry-activation.js";
+import { registerTestConstitutionGate, writeTestRegistryMarker } from "../../core/test/fixtures/registry-activation.js";
 
 type RegisteredTool = {
   name: string;
@@ -70,6 +70,7 @@ function makeNativeStartFixture(config: Record<string, unknown> = { roles: { "sp
 
   const constitution = "# Project Constitution v1.0.0\n\n## I. Quality\n\nShip tested work.\n";
   writeFileSync(join(root, "CONSTITUTION.md"), constitution);
+  writeTestRegistryMarker(root);
   registerTestConstitutionGate(root, "fullstack-native-start-mapping-gate");
   const profile = loadProfile("spec-preparation");
   assert.ok(profile);
@@ -260,4 +261,3 @@ test("fullstack native start blocks on mapping refresh failure without dispatch"
     rmSync(fixture.root, { recursive: true, force: true });
   }
 });
-

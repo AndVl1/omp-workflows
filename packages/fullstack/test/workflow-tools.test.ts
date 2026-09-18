@@ -27,6 +27,7 @@ import {
   isMainSessionContext,
 } from "../src/index.js";
 import { registerLectureAcquireTool } from "../src/tools/lecture-acquire.js";
+import { refreshFullstackAgentMappings } from "../src/agent-mapping.js";
 import { closeWorkflowActivation, openWorkflowActivation } from "@andvl1/omp-workflows-core/registry";
 import { beginHeldRegistration, type HeldRegistration } from "./fixtures/guarded-registration.js";
 import { writeFullstackActivationMarker } from "../src/activation-marker.js";
@@ -282,6 +283,7 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     writeSpecificationBeginFixture(root);
     publishMapping(root);
+    await refreshFullstackAgentMappings(root, async () => ({ agents: [{ name: "analyst" }] }));
     const tools = new Map<string, RegisteredTool>();
     registration = registerWorkflowToolsForTest(root, {
       zod: { z },

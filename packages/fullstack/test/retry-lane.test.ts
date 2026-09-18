@@ -94,6 +94,22 @@ function persistRuntimeState(root: string, state: ReturnType<typeof newCtoState>
   const existing = readCtoState(state.id, root);
   if (!existing) {
     state.owner_session = "retry-lane-test";
+    state.work_identity = {
+      run_id: state.id,
+      wave_id: "retry-lane-test-wave",
+      slice_id: "retry-lane-test-slice",
+      session_id: "retry-lane-test",
+      workflow: "standard",
+      stage_id: "execution",
+      stage_cursor: "execution",
+      capability_id: "retry-lane-test-capability",
+      capability_epoch: "retry-lane-test-epoch",
+      slot_id: "retry-lane-test-slot",
+      task_id: state.id,
+      dispatch_id: "retry-lane-test-dispatch",
+      attempt: 1,
+      worker_id: "retry-lane-test-worker",
+    };
     access.createRun(state, { source_id: "retry-fixture:" + state.id, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) });
     return;
   }
@@ -390,7 +406,10 @@ test("retry lane quarantines legacy r1 wrappers without external delivery", { ti
     const legacyOriginalName = "legacy-source.json";
     const legacyActiveName = `r1a.1.${randomUUID()}.${Buffer.from(legacyOriginalName, "utf8").toString("base64url")}.json`;
     writeFileSync(join(active, legacyActiveName), JSON.stringify(envelope));
-    assert.equal(runtimeFor(root).markDeliveryPending(runId, undefined, "retry"), true);
+    assert.equal(runtimeFor(root).markDeliveryPending(runId, readCtoState(runId, root)?.state_revision, "retry"), true);
+    const currentState = readCtoState(runId, root);
+    assert.ok(currentState);
+    const runEntry = { run_id: runId, state_revision: currentState.state_revision, status: "running" as const, updated_at: currentState.updated_at, pending_outbox: true, pending_retry: true, pending_summary: false, summary_digest: "" };
     const encodedOriginalName = Buffer.from(legacyActiveName, "utf8").toString("base64url");
     const retryName = `r1.1.${Date.now() - 1}.${randomUUID()}.${encodedOriginalName}.json`;
     writeFileSync(join(retryDirectory, retryName), JSON.stringify(envelope));
@@ -404,8 +423,8 @@ test("retry lane quarantines legacy r1 wrappers without external delivery", { ti
       },
       cancel: async () => undefined,
     };
-    const first = await drainOutbox(root, adapter, 1, { now: () => Date.now() });
-    const second = await drainOutbox(root, adapter, 1, { now: () => Date.now() });
+    const first = await drainOutbox(root, adapter, 1, { now: () => Date.now(), runEntries: [runEntry] });
+    const second = await drainOutbox(root, adapter, 1, { now: () => Date.now(), runEntries: [runEntry] });
     assert.ok(first.length + second.length > 0);
     assert.equal(first.some((entry) => entry.sent) || second.some((entry) => entry.sent), false);
     assert.equal(sends, 0, "legacy wrappers never authorize an external send");
@@ -425,7 +444,10 @@ test("retry lane quarantines malformed legacy retries until authoritative recove
   const rejectedEntries = (): string[] => existsSync(rejectedDirectory) ? readdirSync(rejectedDirectory) : [];
   try {
     createIndexedPendingRun(root, runId);
-    assert.equal(runtimeFor(root).markDeliveryPending(runId, undefined, "retry"), true);
+    assert.equal(runtimeFor(root).markDeliveryPending(runId, readCtoState(runId, root)?.state_revision, "retry"), true);
+    const currentState = readCtoState(runId, root);
+    assert.ok(currentState);
+    const runEntry = { run_id: runId, state_revision: currentState.state_revision, status: "running" as const, updated_at: currentState.updated_at, pending_outbox: true, pending_retry: true, pending_summary: false, summary_digest: "" };
     mkdirSync(retryDirectory, { recursive: true });
     const encodedName = (name: string): string => Buffer.from(name, "utf8").toString("base64url");
     const malformedName = "legacy-malformed.json";
@@ -449,12 +471,12 @@ test("retry lane quarantines malformed legacy retries until authoritative recove
       cancel: async () => undefined,
       pollOnce: async () => { polls += 1; return []; },
     };
-    await drainOutbox(root, adapter, 1, { now: () => Date.now() });
+    await drainOutbox(root, adapter, 1, { now: () => Date.now(), runEntries: [runEntry] });
     assert.equal(sends, 0);
     assert.equal(jsonCount(retryDirectory), 0);
     assert.equal(rejectedEntries().length, 2, "malformed legacy retries leave durable rejected evidence");
     assert.deepEqual(readDeliveryEntry(root, runId), { pending_outbox: true, pending_retry: true, pending_summary: false });
-    await drainOutbox(root, adapter, 1, { now: () => Date.now() });
+    await drainOutbox(root, adapter, 1, { now: () => Date.now(), runEntries: [runEntry] });
     assert.equal(sends, 0);
     assert.equal(rejectedEntries().length, 2);
     assert.deepEqual(readDeliveryEntry(root, runId), { pending_outbox: true, pending_retry: true, pending_summary: false });
@@ -467,7 +489,7 @@ test("retry lane quarantines malformed legacy retries until authoritative recove
     }
     assert.ok(polls >= 1, "dispatcher observes malformed retry evidence");
     assert.equal(sends, 0, "malformed retries never reach transport");
-    assert.deepEqual(readDeliveryEntry(root, runId), { pending_outbox: true, pending_retry: true, pending_summary: false });
+    assert.deepEqual(readDeliveryEntry(root, runId), { pending_outbox: false, pending_retry: false, pending_summary: false });
     assert.equal(rejectedEntries().length, 2, "dispatcher does not clear rejected evidence without recovery");
 
     const recoveredEnvelope = publishCurrentDelivery(root, runId, {
@@ -718,7 +740,7 @@ test("retry lane preserves active attempt metadata across three failures and arc
   }
 });
 
-test("retry lane direct API without persistent context defers without resetting", { timeout: 60_000 }, async () => {
+test("retry lane direct API with authenticated context advances one persistent wrapper without resetting", { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-retry-context-required-"));
   const runId = "retry-context-required";
   try {
@@ -727,15 +749,25 @@ test("retry lane direct API without persistent context defers without resetting"
     const adapter: EscalationAdapter = { kind: "retry-context-required", send: async () => ({ sent: false }), cancel: async () => undefined };
     const access = runtimeFor(root);
     assert.equal(bindAuthenticatedAdapterRouting(root, adapter, access), true);
-    const options = { runtimeAccess: access, proofAuthority: proofFor(root), now: () => 1_000_000 };
+    let now = 1_000_000;
+    const options = { runtimeAccess: access, proofAuthority: proofFor(root), now: () => now };
     const first = await drainOutboxRaw(root, adapter, 1, options);
     assert.equal(first[0]?.sent, false);
     const retryDirectory = join(root, ".work-state", "cto", runId, "outbox-retry");
-    assert.equal(jsonCount(retryDirectory), 0, "without a persistent scan context no retry wrapper is created");
-    assert.equal(existsSync(join(outboxDir(runId, root), canonicalDurableIdFileName(String(delivery.id)))), true, "authenticated active source remains durable");
+    const retryNames = (): string[] => jsonEntries(retryDirectory).filter((entry) => entry.startsWith("r2."));
+    const retryAttempt = (): number => {
+      const names = retryNames();
+      assert.equal(names.length, 1, "direct runtime access keeps one retry wrapper");
+      return Number(names[0]!.split(".")[1]);
+    };
+    assert.equal(retryAttempt(), 1, "the first direct failure records attempt one");
+    assert.equal(existsSync(join(outboxDir(runId, root), canonicalDurableIdFileName(String(delivery.id)))), false, "the authenticated source moves into the retry lane");
+    const firstRetry = retryNames()[0]!;
+    now = Number(firstRetry.split(".")[2]);
     const second = await drainOutboxRaw(root, adapter, 1, options);
     assert.equal(second[0]?.sent, false);
-    assert.equal(jsonCount(retryDirectory), 0, "repeated context-less ticks cannot reset or duplicate attempts");
+    assert.equal(retryAttempt(), 2, "the second direct failure advances the existing wrapper");
+    assert.equal(existsSync(join(outboxDir(runId, root), canonicalDurableIdFileName(String(delivery.id)))), false, "retries do not recreate a duplicate active source");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1018,18 +1050,18 @@ test("inbox retry persistence preserves a replacement after source CAS", async (
       at: new Date().toISOString(),
       by: "bridge",
       run_id: runId,
-    });
+    }, undefined, proofFor(root));
     writeFileSync(join(active, "cas-race.json"), JSON.stringify(envelope));
     let attempts = 0;
-    const originalMove = BoundedQueue.prototype.moveToIfMatches;
+    const originalReplace = BoundedQueue.prototype.replaceIfMatches;
     let replaced = false;
-    BoundedQueue.prototype.moveToIfMatches = function(name: string, expected: BoundedQueueEntryExpectation, destination: string): void {
+    BoundedQueue.prototype.replaceIfMatches = function(name: string, expected: BoundedQueueEntryExpectation, content: string | Uint8Array): void {
       if (!replaced && this.relativeDirectory === ".omp/inbox") {
         const current = this.read(name);
         this.writeAtomic(name, current.bytes);
         replaced = true;
       }
-      return originalMove.call(this, name, expected, destination);
+      return originalReplace.call(this, name, expected, content);
     };
     try {
       await pollInbox(root, null, undefined, () => {
@@ -1037,7 +1069,7 @@ test("inbox retry persistence preserves a replacement after source CAS", async (
         throw new Error("transient wake failure");
       }, { now: () => Date.now() });
     } finally {
-      BoundedQueue.prototype.moveToIfMatches = originalMove;
+      BoundedQueue.prototype.replaceIfMatches = originalReplace;
     }
     assert.equal(replaced, true, "the replacement was injected after retry-wrapper CAS");
     assert.equal(attempts, 1);
@@ -1063,7 +1095,7 @@ test("inbox retry promotion preserves a concurrent replacement after its receipt
       at: new Date().toISOString(),
       by: "bridge",
       run_id: runId,
-    });
+    }, undefined, proofFor(root));
     writeFileSync(join(active, "receipt-race.json"), JSON.stringify(envelope));
     let attempts = 0;
     const firstNow = Date.now();
@@ -1076,20 +1108,20 @@ test("inbox retry promotion preserves a concurrent replacement after its receipt
     const retryNames = jsonEntries(retryDirectory);
     const retryName = retryNames[0];
     assert.ok(retryName);
-    const originalMove = BoundedQueue.prototype.moveToIfMatches;
+    const originalMove = BoundedQueue.prototype.moveAtomically;
     let replaced = false;
-    BoundedQueue.prototype.moveToIfMatches = function(name: string, expected: BoundedQueueEntryExpectation, destination: string): void {
+    BoundedQueue.prototype.moveAtomically = function(name: string, destination: string): void {
       if (this.relativeDirectory === ".omp/inbox-retry") {
         const current = this.read(name);
         this.writeAtomic(name, current.bytes);
         replaced = true;
       }
-      return originalMove.call(this, name, expected, destination);
+      return originalMove.call(this, name, destination);
     };
     try {
       await pollInbox(root, null, undefined, () => { throw new Error("must not wake replaced source"); }, { now: () => firstNow + 60_000 });
     } finally {
-      BoundedQueue.prototype.moveToIfMatches = originalMove;
+      BoundedQueue.prototype.moveAtomically = originalMove;
     }
     assert.equal(replaced, true, "the adversarial replacement was injected at the promotion boundary");
     assert.equal(attempts, 1, "a replaced retry source is not delivered");
@@ -1201,7 +1233,7 @@ test("retry lane rejects a copied same-lexical-root retry wrapper", async () => 
       at: new Date().toISOString(),
       by: "bridge",
       run_id: runId,
-    });
+    }, undefined, proofFor(root));
     const active = join(root, ".omp", "inbox");
     mkdirSync(active, { recursive: true });
     writeFileSync(join(active, "replacement-retry.json"), JSON.stringify(envelope));

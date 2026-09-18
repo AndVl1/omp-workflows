@@ -32,6 +32,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ctoRuntimeRunInitialIdentityDigest, newCtoState, readCtoState } from "../../core/src/cto/state.js";
 
+import { PinnedProjectRoot } from "@andvl1/omp-workflows-core";
 import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
 
 const runtimeFixtures = new Map<string, FullstackRuntimeTestFixture>();
@@ -45,6 +46,35 @@ function runtimeFixtureFor(root: string): FullstackRuntimeTestFixture {
 function runtimeFor(root: string) {
   return runtimeFixtureFor(root).access;
 }
+function createAuthenticatedRun(root: string, runId: string, task: string): ReturnType<typeof newCtoState> {
+  const runtime = runtimeFixtureFor(root);
+  const state = newCtoState({
+    id: runId,
+    task,
+    branch: "main",
+    autonomous: true,
+    plan: { id: runId, task, teams: [], created_at: new Date().toISOString() },
+  });
+  state.owner_session = runtime.sessionId;
+  state.work_identity = {
+    run_id: runId,
+    wave_id: "rw-channel-live-wave",
+    slice_id: "rw-channel-live-slice",
+    session_id: runtime.sessionId,
+    workflow: "standard",
+    stage_id: "execution",
+    stage_cursor: "execution",
+    capability_id: "rw-channel-live-capability",
+    capability_epoch: "rw-channel-live-epoch",
+    slot_id: "rw-channel-live-slot",
+    task_id: runId,
+    dispatch_id: "rw-channel-live-dispatch",
+    attempt: 1,
+    worker_id: "rw-channel-live-worker",
+  };
+  assert.ok(runtime.access.createRun(state, { source_id: `rw-channel-live:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+  return state;
+}
 test.afterEach(() => {
   for (const fixture of runtimeFixtures.values()) fixture.close();
   runtimeFixtures.clear();
@@ -54,6 +84,7 @@ import {
   createEscalationAdapter,
   loadEscalationConfig,
   sha256Hex,
+  bindEscalationAdapterRouting,
   startChannelDispatcher,
   startDispatcher,
   writeBridgeLock,
@@ -274,15 +305,8 @@ test("D: answer follow-up delivered via the same RW channel, exactly once", asyn
   try {
     const dir = "rw";
     const runId = "run-x";
-    const state = newCtoState({
-      id: runId,
-      task: "live answer follow-up",
-      branch: "main",
-      autonomous: true,
-      plan: { id: runId, task: "live answer follow-up", teams: [], created_at: new Date().toISOString() },
-    });
+    const state = createAuthenticatedRun(root, runId, "live answer follow-up");
     const runtime = runtimeFixtureFor(root);
-    assert.ok(runtime.access.createRun(state, { source_id: `rw-channel-live:${runId}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
     assert.equal(runtime.access.markDeliveryPending(runId, state.state_revision, "outbox"), true, "canonical active run index is established");
     assert.equal(readCtoState(runId, root)?.id, runId, "canonical run state is readable before answer polling");
     const { stop, answers } = startLiveDispatcher(root, RW_CHANNEL(dir));
@@ -341,17 +365,23 @@ test("F: legacy single-adapter config unchanged — mock rw preserved, no fan-ou
   const root = mkdtempSync(join(tmpdir(), "rw-live-legacy-"));
   try {
     // NO channels[]: the pre-channel-set single-adapter shape.
+    const legacyState = createAuthenticatedRun(root, "legacy-run", "legacy persisted inbound");
+    assert.equal(runtimeFor(root).markDeliveryPending(legacyState.id, legacyState.state_revision, "outbox"), true, "legacy active run index is established");
     const config = { adapter: "mock", mock: { persisted: true, dir: "legacy" } };
     withConfig(root, config);
     const runtime = runtimeFor(root);
     const adapter = createEscalationAdapter(loadEscalationConfig(root, { kind: "mock", runtimeAccess: runtime })!, root, undefined, runtime, runtimeFixtureFor(root).proofAuthority);
     assert.ok(adapter instanceof MockEscalationAdapter, "legacy config builds the mock adapter");
+    const adapterPin = PinnedProjectRoot.open(root);
+    assert.ok(adapterPin);
+    assert.equal(bindEscalationAdapterRouting(adapter!, runtime, adapterPin!), true, "legacy adapter receives the authenticated routing binding");
+    adapterPin!.close();
     const tasks: InboxTask[] = [];
     // Legacy single-adapter dispatcher (the adapter-direct path): the mock's
     // rw inbound surface is wired and polled as before — unchanged by the
     // channel-set world.
     const fixture = runtimeFixtureFor(root);
-    const stop = startDispatcher(root, adapter, 50, { runtimeAccess: fixture.access, session_id: fixture.sessionId, liveGuard: fixture.liveGuard, serviceAuthority: fixture.serviceAuthority, onTask: (t) => tasks.push(t) });
+    const stop = startDispatcher(root, adapter, 50, { runtimeAccess: fixture.access, proofAuthority: fixture.proofAuthority, session_id: fixture.sessionId, liveGuard: fixture.liveGuard, serviceAuthority: fixture.serviceAuthority, onTask: (t) => tasks.push(t) });
     try {
       dropFile(join(root, "legacy", "inbound"), "task-1.json", {
         id: "t1",

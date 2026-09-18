@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PinnedProjectRoot } from "@andvl1/omp-workflows-core";
-import { newCtoState, writeCtoState, type CtoState } from "../../core/src/cto/state.js";
+import { ctoRuntimeRunInitialIdentityDigest, newCtoState, writeCtoState, type CtoState } from "../../core/src/cto/state.js";
 import { openFullstackRuntimeTest, type FullstackRuntimeTestFixture } from "./runtime-access-fixture.js";
 import {
   classifyIncoming as classifyIncomingRaw,
@@ -18,12 +18,21 @@ import {
 import { inboxMessageFileName } from "../src/adapters/registry.js";
 
 const runtimeFixtures = new Map<string, FullstackRuntimeTestFixture>();
-function runtimeFor(root: string) {
+function runtimeFixtureFor(root: string): FullstackRuntimeTestFixture {
   const existing = runtimeFixtures.get(root);
-  if (existing) return existing.access;
+  if (existing) return existing;
   const fixture = openFullstackRuntimeTest(root, "telegram-bridge-test");
   runtimeFixtures.set(root, fixture);
-  return fixture.access;
+  return fixture;
+}
+function runtimeFor(root: string) { return runtimeFixtureFor(root).access; }
+function authenticatedState(root: string, id: string, task: string): CtoState {
+  const fixture = runtimeFixtureFor(root);
+  const state = newCtoState({ id, task, branch: "main", autonomous: true, plan: { id, task, teams: [], created_at: new Date().toISOString() } });
+  state.owner_session = fixture.sessionId;
+  state.work_identity = { run_id: id, wave_id: "telegram-bridge-wave", slice_id: "telegram-bridge-slice", session_id: fixture.sessionId, workflow: "standard", stage_id: "execution", stage_cursor: "execution", capability_id: "telegram-bridge-capability", capability_epoch: "telegram-bridge-epoch", slot_id: "telegram-bridge-slot", task_id: id, dispatch_id: "telegram-bridge-dispatch", attempt: 1, worker_id: "telegram-bridge-worker" };
+  assert.ok(fixture.access.createRun(state, { source_id: `telegram-bridge:${id}`, initial_state_sha256: ctoRuntimeRunInitialIdentityDigest(state) }));
+  return state;
 }
 test.afterEach(() => {
   for (const fixture of runtimeFixtures.values()) fixture.close();
@@ -32,7 +41,8 @@ test.afterEach(() => {
 
 function classifyIncoming(...args: Parameters<typeof classifyIncomingRaw>): ReturnType<typeof classifyIncomingRaw> {
   const [cwd, message, suppliedPin] = args;
-  return classifyIncomingRaw(cwd, message, suppliedPin, runtimeFor(cwd));
+  const fixture = runtimeFixtureFor(cwd);
+  return classifyIncomingRaw(cwd, message, suppliedPin, fixture.access, fixture.proofAuthority);
 }
 function findCompletedSummary(...args: Parameters<typeof findCompletedSummaryRaw>): ReturnType<typeof findCompletedSummaryRaw> {
   const [cwd, suppliedPin] = args;
@@ -40,25 +50,22 @@ function findCompletedSummary(...args: Parameters<typeof findCompletedSummaryRaw
 }
 function writeTaskDrop(...args: Parameters<typeof writeTaskDropRaw>): ReturnType<typeof writeTaskDropRaw> {
   const [cwd, message, runId, suppliedPin] = args;
-  return writeTaskDropRaw(cwd, message, runId, suppliedPin, runtimeFor(cwd));
+  const fixture = runtimeFixtureFor(cwd);
+  return writeTaskDropRaw(cwd, message, runId, suppliedPin, fixture.access, fixture.proofAuthority);
 }
 function writeAnswerMarker(...args: Parameters<typeof writeAnswerMarkerRaw>): ReturnType<typeof writeAnswerMarkerRaw> {
   const [cwd, answer, suppliedPin] = args;
-  return writeAnswerMarkerRaw(cwd, answer, suppliedPin, runtimeFor(cwd));
+  const fixture = runtimeFixtureFor(cwd);
+  return writeAnswerMarkerRaw(cwd, answer, suppliedPin, fixture.access, fixture.proofAuthority);
 }
 
 function activeRun(root: string): void {
-  const state = newCtoState({
-    id: "run-one",
-    task: "Active task",
-    branch: "main",
-    autonomous: true,
-    plan: { id: "run-one", task: "Active task", teams: [], created_at: new Date().toISOString() },
-  });
-  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+  const state = authenticatedState(root, "run-one", "Active task");
+  assert.equal(runtimeFor(root).markDeliveryPending(state.id, state.state_revision, "outbox"), true);
 }
 
 function finishedRun(root: string): void {
+  const state = authenticatedState(root, "run-done", "Done task");
   const runDir = join(root, ".work-state", "cto", "run-done");
   mkdirSync(runDir, { recursive: true });
   const now = new Date().toISOString();
@@ -73,22 +80,10 @@ function finishedRun(root: string): void {
       },
     }),
   );
-  writeFileSync(
-    join(runDir, "state.json"),
-    JSON.stringify({
-      schema: 1,
-      id: "run-done",
-      task: "Done task",
-      branch: "main",
-      autonomous: true,
-      plan: { id: "run-done", task: "Done task", teams: [], created_at: now },
-      teams: [],
-      integration: { status: "done" },
-      pause: { kind: "done", reason: "" },
-      updated_at: now,
-    }),
-  );
-  writeCtoState(JSON.parse(readFileSync(join(runDir, "state.json"), "utf8")), root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
+  state.integration.status = "done";
+  state.pause = { kind: "done", reason: "" };
+  state.updated_at = now;
+  writeCtoState(state, root, { preCommit: ({ pinnedRoot }) => pinnedRoot.assertStable() });
 }
 
 function finishedRunWithWave(root: string): void {
@@ -477,7 +472,7 @@ test("bridge: persistence failures propagate instead of looking like duplicate d
     mkdirSync(drop, { recursive: true });
     // A directory at the deterministic task path proves the write was not
     mkdirSync(join(drop, inboxMessageFileName(MSG.id)));
-    assert.throws(() => writeTaskDrop(root, MSG), /EEXIST|EISDIR|directory|is a directory|already exists/i);
+    assert.throws(() => writeTaskDrop(root, MSG), /EEXIST|EISDIR|directory|is a directory|already exists|regular file|anchored target/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
