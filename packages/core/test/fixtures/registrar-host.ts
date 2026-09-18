@@ -1,4 +1,3 @@
-import { join } from "node:path";
 import { writeTestRegistryMarker } from "./registry-activation.js";
 
 export const TEST_OWNER = (cwd: string) => {
@@ -19,7 +18,9 @@ const TEST_SESSION_GENERATION = "registrar-test-session-generation";
 export const TEST_SESSION_MANAGER = {
   cwd: ".",
   getSessionId: () => "registrar-test-session",
-  getSessionFile: () => join(TEST_SESSION_MANAGER.cwd, "registrar-test-session.jsonl"),
+  // The transcript belongs to the test host session, not to whichever fixture
+  // project happens to be mounted through its mutable cwd.
+  getSessionFile: () => "registrar-test-session.jsonl",
   getSessionGeneration: () => TEST_SESSION_GENERATION,
   getCwd: () => TEST_SESSION_MANAGER.cwd,
 };
