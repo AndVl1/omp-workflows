@@ -685,6 +685,7 @@ function seedReadyFeature(
   scratch: Scratch,
   featureId: string,
   runKey: string,
+  gateId: string,
   binding: ConstitutionBinding,
 ): SeededFeature {
   const profile = loadProfile("spec-preparation");
@@ -798,7 +799,7 @@ function seedReadyFeature(
     language: fixtureWorkspace.language,
     template_set: fixtureTemplateSelection(),
     phases,
-    constitution_gate_ref: null,
+    constitution_gate_ref: gateId,
     constitution_binding: binding,
     handoff_ref: handoff.handoff_id,
     execution_claim_ref: null,
@@ -821,6 +822,7 @@ function seedReadyFeature(
   const loaded = resolveFeatureWorkspace(scratch.root, { feature_id: featureId, run_key: runKey });
   assert.ok(loaded.ok, loaded.ok ? "" : loaded.error);
   if (!loaded.ok) throw new Error(loaded.error);
+  assert.equal(loaded.value.constitution_gate_ref, gateId, featureId + " retains the exact constitution gate reference before readiness");
   assertCanonicalPhaseFixture(scratch.root, featureId, runKey, binding);
   if (featureId.endsWith('-passing')) materializePassingFixture(scratch.root, featureId);
   const readiness = evaluateHandoffReadiness(handoff, { current_constitution_binding: loaded.value.constitution_binding });
@@ -1867,7 +1869,7 @@ test('passing fixture: readable specification refs and executable deliverable ar
     });
     assert.ok(constitution.ok && constitution.value.binding, constitution.ok ? 'fixture constitution binding must be available' : constitution.error);
     if (!constitution.ok || constitution.value.binding === null) throw new Error('fixture constitution prerequisite failed');
-    const seeded = seedReadyFeature(scratch, featureId, 'fixture-passing-run', constitution.value.binding);
+    const seeded = seedReadyFeature(scratch, featureId, 'fixture-passing-run', constitution.value.gate_id, constitution.value.binding);
     assertPassingFixture(scratch.root, featureId, seeded.handoff);
   } finally {
     if (!scratch.exact) rmSync(scratch.parent, { recursive: true, force: true });
@@ -2031,13 +2033,13 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
     if (!gate.ok || gate.value.binding === null) throw new Error(gate.ok ? "constitution gate has no approved binding" : gate.error);
     removeConstitutionBootstrapWorkspace(scratch.root);
     const binding = gate.value.binding;
-    passing = seedReadyFeature(scratch, passingId, passingRun, binding);
-    blocked = seedReadyFeature(scratch, blockedId, blockedRun, binding);
+    passing = seedReadyFeature(scratch, passingId, passingRun, gate.value.gate_id, binding);
+    blocked = seedReadyFeature(scratch, blockedId, blockedRun, gate.value.gate_id, binding);
     assertPassingFixture(scratch.root, passingId, passing.handoff);
     assertTypedConformanceEvidenceTask(passing.handoff, passingId);
     assertTypedConformanceEvidenceTask(blocked.handoff, blockedId);
-    stale = seedReadyFeature(scratch, staleId, staleRun, binding);
-    claimed = seedReadyFeature(scratch, claimedId, claimedRun, binding);
+    stale = seedReadyFeature(scratch, staleId, staleRun, gate.value.gate_id, binding);
+    claimed = seedReadyFeature(scratch, claimedId, claimedRun, gate.value.gate_id, binding);
     const staleRevision = applyManualEdits(stale.workspace, { feature_id: staleId, phase: 'plan', version: 1, documents: { 'plan.md': { expected_sha256: fixtureSha256('plan.v1'), actual_sha256: fixtureSha256('plan.edited'), matches: false } } }, 'approved Plan changed after handoff');
     assert.ok(staleRevision.stale_artifacts.length > 0);
     staleSnapshot = stale.snapshot;
