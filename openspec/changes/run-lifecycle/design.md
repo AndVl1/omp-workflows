@@ -32,6 +32,8 @@ Design обязателен: меняются публичные контрак�
 - Параллельная изменяющая работа нескольких независимых запусков в одном worktree; несколько worktrees остаются отдельными областями исполнения.
 - Новый scheduler, фоновое восстановление OMP, retry/cancel taxonomy, изменение hard-human правил или headless-полномочий.
 - Миграция CTO portfolio state, общая переработка package layout и выпуск релиза в рамках planning.
+- Отдельные archive tool/status для ordinary run. Архив legacy при миграции и snapshots rework сохраняются, но не вводят обязательную архивацию между задачами.
+- Переработка UI или модели графа visualization: допускается только локальная адаптация canonical reader, иначе viewer для нового формата отключается до отдельного change.
 
 ## Decisions
 
@@ -49,11 +51,13 @@ Design обязателен: меняются публичные контрак�
 
 Host adapter добавляет trusted caller/session context и idempotency `request_id`; модель не задаёт доверенный session ID. При точном replay одного `request_id` возвращается тот же результат; другой payload с тем же ID отвергается. Повторный явный пользовательский запуск получает новый request ID, даже если текст идентичен. Для natural-language intake request ID создаётся адаптером команды до отправки промпта и проверяется при prepare.
 
+Один tool `workflow_prepare` с явным mode достаточен; отдельные new/resume/rework tools не вводятся. Успешный ответ содержит operation, previous/selected run IDs и названия, итоговые статусы и точку продолжения. Host показывает этот receipt пользователю; отказ показывает отсутствие перехода. Данные результата соответствуют committed state, exact replay не изображает новое переключение. При new после quiescent A явно показывается «A отсоединён, прогресс сохранён → B создан и выбран», не «A успешно завершён/архивирован».
+
 Отказ от альтернатив: branch+counter не решает выбор task/session и коллизии slug; timestamp не является достаточной identity; автоматический resume по наличию state повторяет текущий дефект.
 
 ### 2. Пользовательский выбор без обязательного знания stageId
 
-Сохраняются `/do-work` и alias `/team`. Добавляются явные leading options:
+Основной UX — `/do-work продолжи экспорт отчётов` либо просьба продолжить текущую фичу без UUID; при неоднозначности — выбор из списка названий, веток, статусов и этапов. Сохраняются `/do-work` и alias `/team`. Технические leading options остаются для точного управления и автоматизации:
 
 - `/do-work --new <task>`;
 - `/do-work --resume [--run <id>]`;
@@ -62,9 +66,11 @@ Host adapter добавляет trusted caller/session context и idempotency `r
 
 `--` завершает разбор options; флаги внутри текста не интерпретируются. Невалидное сочетание режимов отвергается до мутаций. Без флага main agent классифицирует **намерение запроса**, а не наличие state: независимая задача — `new`, явное «продолжи» — `resume`, «исправь результат предыдущей задачи» — `rework`. Явный command mode обязателен для модели. Неоднозначность действительно влияющая на выбор задачи разрешается до старта, а не через угадывание.
 
-Для existing-run режимов порядок: явный ID → совместимый selected run сессии → единственный подходящий кандидат текущей ветки. Завершённый run исключается для resume, но подходит для rework. Несколько кандидатов возвращают `run_selection_required` с ID/задачей/веткой/статусом; никаких latest-by-mtime fallback. Ошибка явного ID не включает fallback.
+Для existing-run режимов порядок: явный selector (технический ID, название или пункт показанного списка) → совместимый selected run сессии → единственный подходящий кандидат текущей ветки. Название не уникальная identity: оно берётся из сохранённой задачи; совпадения требуют выбора, а не создания второго slug-namespace. Явный текстовый selector фильтрует подходящие задачи (нормализованный регистр/пробелы, точное название либо однозначный фрагмент); модель не имеет права подменить ноль/несколько совпадений «самым похожим» run. Завершённый run исключается для resume, но подходит для rework. Несколько кандидатов возвращают `run_selection_required` с понятными подписями и внутренними ID; никаких latest-by-mtime fallback. Ошибка явного selector не включает fallback.
 
 Это два разных уровня API: CLI допускает отсутствие `--run`, но read-only selection resolver возвращает конкретный run ID или список кандидатов **до** вызова `workflow_prepare`. Prepare union выше всегда получает точный ID для resume/rework и повторно проверяет его под lock; отсутствие ID в mutation не включает неявный поиск. Taskless `--resume`/`--list` обрабатываются до нынешней проверки непустого текста задачи.
+
+Выбор номера/пункта связан с конкретным показанным snapshot списка и его run ID; добавление run или новая сортировка не переназначают номер. Утрата snapshot после restart требует показать список заново. Resolver проверяет существование и eligibility выбранного run под lock перед мутацией. UUID доступен для диагностики и automation, но не требуется для обычного new/resume/rework. До перехода видны выбранные задача/операция, после commit — результат tool; отдельное подтверждение человека требуется лишь для неоднозначности или действующих policy gates.
 
 `affected_stage` — машинный результат сопоставления feedback текущему профилю; пользователю не предлагается придумывать stageId. Engine проверяет существование стадии и вычисляет затронутый downstream по текущим зависимостям профиля; в линейном профиле это выбранная стадия и последующие. Неоднозначное содержательное сопоставление выясняется до rework.
 
@@ -125,6 +131,8 @@ Worktree claim содержит owner kind (`workflow` или `cto`), точны
 
 Resume сохраняет cursor, classification, artifacts, capability identity/epoch и существующие dispatch. Секрет handoff при необходимости безопасно переиздаётся существующим механизмом, но worker не запускается повторно. Coordinator session ownership обновляется отдельно от исторического `WorkIdentity.session_id` уже созданных dispatch. Новые dispatch получают новый coordinator binding; старые results продолжают сверяться с исходным dispatch.
 
+При resume в чистой host-сессии `workflow_instructions` формирует контекст из canonical state и текущего профиля: задача/классификация, cursor и pause, ограничения/checkpoints, принятые решения и manifest обязательных входов текущего этапа с источниками завершённых стадий. Агент читает обязательные входные артефакты до следующей изменяющей работы и сообщает восстановленный этап. Это не восстановление старой переписки и не новый frozen bundle: используется существующий stage input/artifact contract, данные перечитываются из авторитетных файлов. Проверка разрешимости и существующих evidence-инвариантов обязательна; missing/invalid required input даёт `recovery_required` с конкретной ссылкой и блокирует зависимое действие. Summary не заменяет исходный обязательный артефакт; случайный файл в каталоге не доказывает завершение этапа. E2E должен доказать, что продолжение использовало конкретное сохранённое решение, отсутствующее в новой переписке.
+
 Текущий `TaskCaller` имеет `call/batch`, но не verified reconnect API. Поэтому resume сначала сверяет сохранённые dispatch и durable/native receipts и **не вызывает** `walkProfile`/`task.call`/`task.batch` для незавершённых или уже успешно выполненных slots. При доступной доставке результата adapter продолжает наблюдение того же dispatch. Если host не предоставляет транспорт/receipt после restart, возвращается честное `background_wait` с `transport_reconnect` и recovery diagnostic; замена worker, таймерное объявление успеха и выдуманный attach API запрещены. После доставки проверяемого результата следующий resume продолжает join/advance. Автоматическое восстановление недоступного транспорта относится к roadmap C, не обещается этим change.
 
 Rework допускается только без незавершённых dispatch затрагиваемой работы. Перед изменением сохраняется immutable snapshot state и evidence в `revisions/<id>` с manifest/checksums. Затем увеличивается `rework_generation`, добавляется feedback/history, инвалидируются затронутые текущие ссылки, capability/epoch/loop/checkpoint scopes; сохраняются только валидные upstream outputs. Старые файлы больше не удаляются до snapshot commit и не выдаются как текущие. Output paths текущей версии могут остаться `artifacts/`, чтобы не заставлять все validators понимать дерево поколений; просмотр истории получает собственный resolver base из revision manifest. Snapshot — копия, не hardlink на изменяемые файлы.
@@ -159,12 +167,14 @@ Scope результата не даёт права возобновить side 
 | `engine/durable.ts`, `stage.ts`, `checkpoints.ts` | Run-targeted переходы, resume без reopen, rework snapshot, capture callback binding; правила разрешений не меняются |
 | `gates/classification.ts`, `dispatch.ts`, `monotonic.ts`, `dod-backstop.ts`, `orchestrator-write.ts`, `validation.ts` | Убрать независимые active-feature readers; разделить selected-run enforcement и глобальную safety/claim защиту |
 | `cto/slice-gate.ts`, CTO start/finalize, `fullstack/src/messenger-channel.ts` | Scoped CTO selection и общий execution claim; не блокировать ordinary history по чужой latest wave |
-| `report/session-source.ts`, `report/types.ts`, `visualize/snapshot.ts`, `observability/{hooks,recorder,events}.ts` | Run/revision selector, listing, cache key по run, rotate/flush при смене selection; не смешивать event logs |
+| `report/session-source.ts`, `report/types.ts`, `visualize/snapshot.ts`, `observability/{hooks,recorder,events}.ts` | Обязательные run/revision selectors для status/report, listing, cache key по run, rotate/flush при смене selection; visualization — локальный reader cutover либо отключение входов для нового формата |
 | `fullstack/src/workflow-commands.ts`, `index.ts`, tools/commands status/report/view | Передать общий controller/read selector; сохранить bundle ownership |
 | `omp-workflows-internal/src/index.ts`, `pool.ts` | Те же core exports; async callbacks захватывают context, workspace agent mapping не превращается в run authority |
 | `packages/e2e` и `packages/*/test` | Публичные new/resume/rework сценарии вместо branch-path/текста prompt assertions |
 
 Имена файлов этой таблицы — карта затронутых потребителей, не инструкция менять всё содержимое. Перед экспортируемыми refactors в apply — symbol references и перевод всех реальных callers; здесь production-код не меняется.
+
+Граница visualization: локальная адаптация означает смену reader/selector и binding без переработки UI, graph model или renderer. Если этого недостаточно, не начинать переписывание в этом change: скрыть команды/кнопки/ссылки запуска viewer для canonical формата; прямой вызов возвращает явное сообщение о недоступности и ссылки/действия status/report. Shared entry point для других поддерживаемых форматов сохраняется, но неподдерживаемый run не рендерится. Текстовые list/status/report и доступ к evidence обязательны независимо от viewer; рабочий viewer использует только canonical reader. Для приёмки 6.5 отключение несовместимого viewer считается завершённым consumer cutover, а оставленный legacy fallback — нет. Переработка покрывается отдельной будущей спецификацией, её реализация не входит в эти tasks.
 
 ### 10. Совместимость и ошибки
 
@@ -201,6 +211,7 @@ Scope результата не даёт права возобновить side 
 
 - Постоянные regressions оправданы для независимых runs одной ветки, resume без повторного dispatch, rework evidence, двухпроцессной гонки claim, late-result isolation, stale selection и interrupted migration.
 - Использовать существующие `run-continuation.test.ts`, `do-work-autonomy.test.ts`, `control-plane-contract.test.ts`, `approval-closure.test.ts`, checkpoint/dispatch/report coverage. Тесты только на текст prompt или прежний path layout удалить; проверять наблюдаемые transitions, данные и отказ без мутаций.
-- Live OMP через существующий e2e terminal harness: A → B на той же ветке → C на другой → возврат к A для rework; отдельная сессия resume с сохранённым pending identity. Проверять реальный registered `/do-work`, не только прямой `run()`.
+- Live OMP через существующий e2e terminal harness: A → B на той же ветке → C на другой → возврат к A для rework; проверить видимые transition receipts. Отдельно закрыть сессию после сохранённого этапа и в новой без старого чата продолжить фичу по названию/списку: следующая реализация учитывает решение из артефакта, завершённые этапы не повторяются. Проверить неоднозначные названия, стабильность выбора из показанного списка, missing required input и resume с сохранённым pending identity. Использовать реальный registered `/do-work`, не только прямой `run()`.
 - Подтвердить изоляцию обычной сессии от terminal истории и совместимость shared CTO hooks без миграции CTO модели.
+- Для viewer проверить выбранную ветвь scope: либо правильный canonical run/revision, либо скрытые входы и явный отказ прямого вызова при работающих status/report. Недоступность viewer не отменяет lifecycle-приёмку и не оправдывает потерю evidence.
 - После интеграции выполнить `npm run build`, `npm run typecheck`, `npm test`; live evidence отдельно. Невозможность live-проверки фиксируется как невыполненная приёмка, а не заменяется зелёным unit suite.
