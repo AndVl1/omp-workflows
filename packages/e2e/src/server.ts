@@ -1717,15 +1717,23 @@ function prepareOmpIsolationHome(scratchDir: string): { readonly home: string; r
   const hostOmpDir = join(homedir(), '.omp');
   try {
     for (const entry of readdirSync(hostOmpDir, { withFileTypes: true })) {
-      // This is the one ambient surface deliberately excluded. Every other
-      // host state entry (auth, model DB, caches) remains available by
-      // identity-preserving symlink under the isolated home.
-      if (entry.name === 'plugins') continue;
+      // Host runtime secrets are root-bound credentials. They must never be
+      // inherited by symlink: the isolated HOME needs its own private store.
+      // Plugins are also deliberately excluded so legacy extension discovery
+      // cannot observe stale host state.
+      if (entry.name === 'plugins' || entry.name === 'runtime-secrets') continue;
       const source = join(hostOmpDir, entry.name);
       const target = join(ompDir, entry.name);
       if (existsSync(target)) continue;
       symlinkSync(source, target, entry.isDirectory() ? 'dir' : 'file');
     }
+    const runtimeSecretsDir = join(ompDir, 'runtime-secrets');
+    mkdirSync(runtimeSecretsDir, { recursive: true, mode: SESSION_DIR_MODE });
+    const runtimeSecretsInfo = lstatSync(runtimeSecretsDir);
+    if (runtimeSecretsInfo.isSymbolicLink() || !runtimeSecretsInfo.isDirectory()) {
+      throw new Error('runtime-secrets isolation target must be a regular directory');
+    }
+    chmodSync(runtimeSecretsDir, SESSION_DIR_MODE);
     if (!existsSync(agentDir)) {
       symlinkSync(join(hostOmpDir, 'agent'), agentDir, 'dir');
     }

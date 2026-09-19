@@ -2416,6 +2416,9 @@ export function migrateLegacySpecificationWorkspace(input: LegacySpecificationMi
             project_root_dev: rootSnapshot.dev,
             project_root_ino: rootSnapshot.ino,
             source_digest: sourceSha256,
+            source_path: read.relative_path,
+            source_dev: read.dev,
+            source_ino: read.ino,
             legacy_inputs: sanitizedLegacyInputs(parsed),
             constitution_binding: fullBinding,
         };

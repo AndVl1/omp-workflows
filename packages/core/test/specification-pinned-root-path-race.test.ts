@@ -195,6 +195,21 @@ test("Darwin helper startup publishes ready before concurrent multi-root request
   }
 });
 
+test("Darwin helper permits a bounded cold interpreter start", async () => {
+  if (process.platform !== "darwin") return;
+  const root = fs.mkdtempSync(join(tmpdir(), "pinned-helper-cold-start-"));
+  const slowPython = join(root, "slow-python3");
+  fs.writeFileSync(slowPython, "#!/bin/sh\n/bin/sleep 1.25\nexec /usr/bin/python3 \"$@\"\n", { mode: 0o700 });
+  const pinned = PinnedProjectRoot.open(root, { helperExecutable: slowPython });
+  assert.ok(pinned);
+  try {
+    assert.equal(pinned.pathEntryExists("missing.txt"), false);
+  } finally {
+    await pinned.closeAsync();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Darwin helper rejects an IPC FIFO symlink swap without touching its target", async () => {
   if (process.platform !== "darwin") return;
   const root = await fsPromises.mkdtemp(join(tmpdir(), "spec-pinned-fifo-symlink-"));

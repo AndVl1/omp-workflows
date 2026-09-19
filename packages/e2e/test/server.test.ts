@@ -5,7 +5,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import * as http from 'node:http';
 import * as net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -1484,13 +1484,17 @@ test('server: ws rejects a mismatched port on the loopback alias', async t => {
 });
 
 
-test('server: OMP startup isolates ambient plugins while preserving explicit runtime provenance', async () => {
+test('server: OMP startup isolates ambient plugins and runtime secrets', async () => {
   const scratch = makeScratch();
+  const hostHome = mkdtempSync(join(tmpdir(), 'ux-e2e-runtime-secret-host-'));
+  mkdirSync(join(hostHome, '.omp', 'runtime-secrets'), { recursive: true, mode: 0o700 });
+  const previousHome = process.env.HOME;
+  process.env.HOME = hostHome;
   const script = join(scratch, 'record-home.sh');
   writeFileSync(script, `#!/bin/sh
-if [ "$1" = "--version" ]; then printf 'omp isolation\\n'; exit 0; fi
-printf '%s\\n' "$HOME" > "${scratch}/child-home.txt"
-if [ -e "$HOME/.omp/plugins" ]; then printf 'ambient-present\\n' > "${scratch}/ambient.txt"; fi
+if [ "$1" = "--version" ]; then printf 'omp isolation\n'; exit 0; fi
+printf '%s\n' "$HOME" > "${scratch}/child-home.txt"
+if [ -e "$HOME/.omp/plugins" ]; then printf 'ambient-present\n' > "${scratch}/ambient.txt"; fi
 sleep 3
 exit 0
 `);
@@ -1501,9 +1505,17 @@ exit 0
     const isolation = raw['extension_isolation'] as Record<string, unknown>;
     assert.equal(isolation['ambient_discovery_disabled'], true);
     assert.equal(typeof isolation['home'], 'string');
+    const isolatedRuntimeSecrets = join(String(isolation['home']), '.omp', 'runtime-secrets');
+    const runtimeSecretsInfo = lstatSync(isolatedRuntimeSecrets);
+    assert.equal(runtimeSecretsInfo.isSymbolicLink(), false, 'root-bound runtime secrets must not follow the host HOME');
+    assert.equal(runtimeSecretsInfo.isDirectory(), true);
+    assert.equal(runtimeSecretsInfo.mode & 0o777, 0o700);
     assert.equal(existsSync(join(String(isolation['home']), '.omp', 'plugins')), false);
     await session.close();
   } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
     rmSync(scratch, { recursive: true, force: true });
+    rmSync(hostHome, { recursive: true, force: true });
   }
 });

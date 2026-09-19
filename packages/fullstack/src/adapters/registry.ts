@@ -2096,19 +2096,25 @@ export async function drainOutbox(
         // the direct path is intentionally one-entry bounded work, and subsequent
         // ticks resume the indexed page once the fast candidate is archived.
         opts.retryMatchCursorStore?.set(activeMatchCursorKey, activeMatchCursor);
-        const discoveredQueueEntries = directEntryForRun
+        const activePage = directEntryForRun
           ? (() => {
             try {
-              return opts.runtimeAccess!.readOutboxDeliveryObligations(runId).map((obligation) => ({
-                name: obligation.entry_name,
-                relativePath: outboxQueue.path(obligation.entry_name),
-              }));
+              return {
+                entries: opts.runtimeAccess!.readOutboxDeliveryObligations(runId).map((obligation) => ({
+                  name: obligation.entry_name,
+                  relativePath: outboxQueue.path(obligation.entry_name),
+                })),
+                nextCursor: null,
+              };
             } catch (error) {
               rethrowActivationFailure(error);
-              return [];
+              return { entries: [], nextCursor: null };
             }
           })()
-          : outboxQueue.listPage(activeMatchCursor).entries.sort((left, right) => {
+          : outboxQueue.listPage(activeMatchCursor);
+        const discoveredQueueEntries = directEntryForRun
+          ? activePage.entries
+          : activePage.entries.sort((left, right) => {
             const leftRetry = (opts.retryMatchStateStore?.has(runId + "\u0000" + left.name) ?? false) || retryActiveMetadata(left.name) !== null;
             const rightRetry = (opts.retryMatchStateStore?.has(runId + "\u0000" + right.name) ?? false) || retryActiveMetadata(right.name) !== null;
             return leftRetry === rightRetry ? 0 : leftRetry ? 1 : -1;

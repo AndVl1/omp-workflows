@@ -185,7 +185,7 @@ readonly sha256: string;}const descriptorReceipts = new WeakMap<PinnedRootWriteD
 // derive it from the validated frame size below; ordinary helper calls retain
 // the short default deadline.
 const DARWIN_HELPER_TRANSFER_TIMEOUT_CAP_MS = 90_000;const DARWIN_HELPER_TRANSFER_COMPLETION_MARGIN_MS = 5_000;const DARWIN_HELPER_TRANSFER_THRESHOLD_BYTES = 1 * 1024 * 1024;const DARWIN_HELPER_TRANSFER_BYTES_PER_MS = 1 * 1024;const DARWIN_HELPER_READ_RESPONSE_ENVELOPE_BYTES = 4 * 1024;const DARWIN_HELPER_TRANSFER_OPERATIONS = new Set([
-"write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches", "read", "read_prefix", "read_batch", "discard_batch", "discard_batch_expected",]);const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;const DARWIN_HELPER_START_TIMEOUT_MS = 1_000;const DARWIN_HELPER_CLOSE_TIMEOUT_MS = 1_000;const DARWIN_HELPER_POLL_MS = 2;const MAX_PINNED_ROOT_WRITE_BYTES = 64 * 1024 * 1024;interface DarwinHelperSession {
+"write_exclusive", "write_atomic", "prepare_write_exclusive", "prepare_write_atomic", "commit_prepared_write", "ack_prepared_write", "abort_prepared_write", "rollback_prepared_write", "finalize_prepared_write", "lock_acquire", "batch", "batch_atomic", "replace_if_matches", "read", "read_prefix", "read_batch", "discard_batch", "discard_batch_expected",]);const DARWIN_HELPER_MAX_INPUT = 96 * 1024 * 1024;const DARWIN_HELPER_START_TIMEOUT_MS = 4_000;const DARWIN_HELPER_CLOSE_TIMEOUT_MS = 1_000;const DARWIN_HELPER_POLL_MS = 2;const MAX_PINNED_ROOT_WRITE_BYTES = 64 * 1024 * 1024;interface DarwinHelperSession {
 readonly directory: string;
 readonly requestPath: string;
 readonly responsePath: string;
@@ -6122,6 +6122,7 @@ private startDarwinHelper(executable: string, deadline: number): DarwinHelperSes
 const directory = mkdtempSync(join(tmpdir(), ".omp-darwin-helper-"));
 let requestFd: number | null = null;
 let responseFd: number | null = null;
+let authFd: number | null = null;
 let child: ChildProcess | null = null;
 let startupError: Error | null = null;
 let sessionRef: DarwinHelperSession | null = null;
@@ -6134,11 +6135,42 @@ const directoryInfo = lstatSync(directory);
 if (!directoryInfo.isDirectory() || (directoryInfo.mode & 0o777) !== 0o700) throw new PinnedRootError("unsupported", "descriptor helper IPC directory is unsafe");
 const requestPath = join(directory, "request.fifo");
 const responsePath = join(directory, "response.fifo");
+const authPath = join(directory, "auth");
 const readyNonce = randomUUID();
 const helperAuthKey = randomBytes(32);
 const helperSessionId = randomUUID();
+const helperUid = process.getuid?.();
+if (helperUid === undefined) throw new PinnedRootError("unsupported", "descriptor helper credential ownership cannot be verified");
+const credentialNofollow = constants.O_NOFOLLOW;
+if (!Number.isInteger(credentialNofollow)) throw new PinnedRootError("unsupported", "descriptor helper credential no-follow operations are unavailable");
+const credentials = Buffer.from(
+[helperAuthKey.toString("hex"), DARWIN_JOURNAL_AUTH_KEY.toString("hex"), helperSessionId].join("\n") + "\n",
+"ascii",
+);
+let authWriteFd: number | null = null;
+try {
+authWriteFd = openSync(authPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | credentialNofollow, 0o600);
+let offset = 0;
+while (offset < credentials.byteLength) {
+const written = writeSync(authWriteFd, credentials, offset, credentials.byteLength - offset);
+if (written <= 0) throw new PinnedRootError("unsupported", "descriptor helper credential write was incomplete");
+offset += written;
+}
+fchmodSync(authWriteFd, 0o600);
+fsyncSync(authWriteFd);
+} finally {
+closeQuietly(authWriteFd);
+}
+authFd = openSync(authPath, constants.O_RDONLY | credentialNofollow);
+const authInfo = fstatSync(authFd);
+const authPathInfo = lstatSync(authPath);
+if (!authInfo.isFile() || authInfo.dev !== authPathInfo.dev || authInfo.ino !== authPathInfo.ino
+|| (authInfo.mode & 0o777) !== 0o600 || authInfo.uid !== helperUid) {
+throw new PinnedRootError("unsupported", "descriptor helper credential channel is unsafe");
+}
+unlinkSync(authPath);
 child = spawn(executable, ["-I", "-c", DARWIN_HELPER_SOURCE], {
-stdio: ["ignore", "ignore", "ignore", this.rootFd, "pipe"],
+stdio: ["ignore", "ignore", "ignore", this.rootFd, authFd],
 env: {
 OMP_DARWIN_HELPER_REQUEST_FIFO: requestPath,
 OMP_DARWIN_HELPER_RESPONSE_FIFO: responsePath,
@@ -6148,12 +6180,8 @@ LANG: "C",
 TZ: "UTC",
 },
 });
-const authPipe = child.stdio[4];
-const authWriter = authPipe as unknown as { end: (chunk: Buffer) => void };
-if (!authPipe || typeof authWriter.end !== "function") throw new PinnedRootError("unsupported", "descriptor helper authentication pipe is unavailable");
-const credentials = [helperAuthKey.toString("hex"), DARWIN_JOURNAL_AUTH_KEY.toString("hex"), helperSessionId].join("\n") + "\n";
-authPipe.once("error", (error: Error) => { startupError ??= error; });
-authWriter.end(Buffer.from(credentials, "ascii"));
+closeQuietly(authFd);
+authFd = null;
 // Register both handlers before any startup polling. A failed spawn is
 // always observed and converted to a poisoned, fail-closed session.
 child.once("error", (error) => {
@@ -6177,7 +6205,6 @@ this.poisonDarwinHelper();
 }
 });
 const startupDeadline = Math.min(deadline, Date.now() + DARWIN_HELPER_START_TIMEOUT_MS);
-const helperUid = process.getuid?.();
 if (helperUid === undefined) throw new PinnedRootError("unsupported", "descriptor helper FIFO ownership cannot be verified");
 let requestInfo: Stats | null = null;
 let responseInfo: Stats | null = null;
@@ -6251,6 +6278,7 @@ activeDarwinHelperSessions.delete(sessionRef);
 removeLiveDarwinHelperSession(sessionRef);
 }
 closeQuietly(requestFd);
+closeQuietly(authFd);
 closeQuietly(responseFd);
 if (child && child.pid !== undefined) {
 try { child.kill("SIGTERM"); } catch { /* preserve primary failure */ }

@@ -61,18 +61,20 @@ import { closePinnedDirectory, pinDirectory, readPinnedFileFull } from '../src/f
 import { readSessionInfo, startTestSession, type TestSession } from '../src/server.js';
 import { acquireExecutionClaim, readExecutionClaimStore } from '../../core/src/specification/claims.js';
 import { canonicalHandoffDigest, evaluateHandoffReadiness } from '../../core/src/specification/handoff.js';
-import { materializeImplementationHandoff } from '../../core/src/specification/materialize.js';
+import { materializeFeatureDocuments, materializeImplementationHandoff, materializePhaseValidation } from '../../core/src/specification/materialize.js';
 import { createFeatureWorkspace, persistFeatureWorkspace, resolveFeatureWorkspace, applyManualEdits, featureArtifactsDir } from '../../core/src/specification/workspace.js';
 import { writeTestArtifact } from '../../core/test/fixtures/artifacts.js';
 import { ensureProjectConstitution, readProjectConstitutionGate } from '../../core/src/specification/prerequisite.js';
-import { drainDarwinHelperClosePromisesForTesting, PinnedProjectRoot } from '../../core/src/specification/pinned-root.js';
 import { readPinnedCurrentConstitution } from '../../core/src/specification/constitution-identities.js';
-import type { ConstitutionBinding, FeatureWorkspace, ImplementationHandoff, WorkspacePhase, WorkspaceUpstreamVersion } from '../../core/src/specification/types.js';
+import { drainDarwinHelperClosePromisesForTesting, PinnedProjectRoot } from '../../core/src/specification/pinned-root.js';
+import { deterministicValidationMatchesArtifact, parseConstitutionPrincipleIdentities, readCanonicalPhaseArtifact, renderCanonicalPhaseDocument } from '../../core/src/specification/phase.js';
+import { digestOf as canonicalDigestOf, sha256Hex as canonicalSha256Hex, validateNativePhase, type NativePhaseValidationInput } from '../../core/src/specification/validation.js';
+import { resolveSpecificationTemplateSet, SHIPPED_SPECIFICATION_TEMPLATE_IDS } from '../../core/src/specification/templates.js';
+import type { ConstitutionBinding, FeatureWorkspace, ImplementationHandoff, SpecificationSemanticModel, WorkspacePhase, WorkspaceUpstreamVersion } from '../../core/src/specification/types.js';
 import { bindFeatureWorkspaceToRoot, validFeatureWorkspace, validImplementationHandoff, sha256 as fixtureSha256 } from '../../core/test/fixtures/specification-fixtures.js';
 import { loadProfile, profileHash } from '../../core/src/engine/profile.js';
 import { loadTeamDefs } from '../../core/src/cto/plan.js';
 import { FULLSTACK_ACTIVATION_MARKER_BYTES } from '../../fullstack/src/activation-marker.js';
-import { digestOf as canonicalDigestOf } from '../../core/src/specification/validation.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCENARIO_PATH = join(HERE, '..', 'scenarios', 'spec-cto-execution.json');
@@ -697,8 +699,6 @@ function seedReadyFeature(
   });
   assert.ok(created.ok, created.ok ? "" : created.error);
   if (!created.ok) throw new Error(created.error);
-  if (featureId.endsWith('-passing')) materializePassingFixture(scratch.root, featureId);
-
   const fixtureHandoff = validImplementationHandoff({ featureId });
   const handoff: ImplementationHandoff = { ...fixtureHandoff, schema_version: 1 };
   handoff.constitution_binding = binding;
@@ -724,7 +724,7 @@ function seedReadyFeature(
         "Persist the canonical conformance_evidence envelope at .work-state/features/<feature_id>/artifacts/<artifact_id>.json and reference that exact feature-local path; do not use a team-level .work-state/artifacts mirror.",
         "Canonical conformance_evidence envelope has exactly schema_version, artifact_id, and entries; do not add top-level provenance.",
         "The CTO conformance call wraps every submitted evidence entry with an artifact: CompletionArtifactRef, and every executed_test entry has test.evidence_ref: CompletionArtifactRef.",
-        "Pass this evidence contract verbatim from the lead to both implementation and QA evidence workers.",
+        "Pass this evidence contract from the lead verbatim to both implementation and QA evidence workers.",
       ],
     }));
     handoff.verification = handoff.verification.map(verification => ({
@@ -739,16 +739,6 @@ function seedReadyFeature(
       statement: 'Running node src/passing/index.js with no arguments exits with code 0 and emits exactly {"status":"completed","outcome":"requested outcome completed"} followed by a newline.',
       source_refs: [`specs/${featureId}/spec.md#requirements`],
     }));
-    handoff.artifact_versions = handoff.artifact_versions.map(artifact => ({
-      ...artifact,
-      sha256: artifact.kind === 'specify'
-        ? fixtureSha256(PASSING_SPECIFICATION)
-        : artifact.kind === 'plan'
-          ? fixtureSha256(PASSING_PLAN)
-          : artifact.kind === 'tasks'
-            ? fixtureSha256(PASSING_TASKS)
-            : artifact.sha256,
-    }));
     handoff.tasks = handoff.tasks.map(task => ({
       ...task,
       completion_evidence: [
@@ -761,6 +751,11 @@ function seedReadyFeature(
       expected_evidence: 'Run node src/passing/index.js; record exit code 0 and the exact JSON output. The lead passes the exact conformance_evidence envelope schema guidance to implementation and QA evidence workers; the CTO conformance call wraps every entry with CompletionArtifactRef and every executed_test has test.evidence_ref: CompletionArtifactRef.',
     }));
   }
+  const canonicalPhaseArtifacts = materializeCanonicalPhaseFixture(scratch.root, featureId, runKey, binding);
+  handoff.artifact_versions = handoff.artifact_versions.map(artifact => {
+    const phaseArtifact = canonicalPhaseArtifacts.get(artifact.kind);
+    return phaseArtifact === undefined ? artifact : { ...artifact, sha256: canonicalDigestOf(phaseArtifact) };
+  });
   handoff.handoff_digest = canonicalHandoffDigest(handoff);
   const handoffDir = join(featureArtifactsDir(scratch.root, featureId), "implementation_handoff");
   writeTestArtifact(scratch.root, handoffDir, handoff.handoff_id, handoff);
@@ -801,7 +796,7 @@ function seedReadyFeature(
     project_root: fixtureWorkspace.project_root,
     project_root_identity: fixtureWorkspace.project_root_identity,
     language: fixtureWorkspace.language,
-    template_set: fixtureWorkspace.template_set,
+    template_set: fixtureTemplateSelection(),
     phases,
     constitution_gate_ref: null,
     constitution_binding: binding,
@@ -826,6 +821,8 @@ function seedReadyFeature(
   const loaded = resolveFeatureWorkspace(scratch.root, { feature_id: featureId, run_key: runKey });
   assert.ok(loaded.ok, loaded.ok ? "" : loaded.error);
   if (!loaded.ok) throw new Error(loaded.error);
+  assertCanonicalPhaseFixture(scratch.root, featureId, runKey, binding);
+  if (featureId.endsWith('-passing')) materializePassingFixture(scratch.root, featureId);
   const readiness = evaluateHandoffReadiness(handoff, { current_constitution_binding: loaded.value.constitution_binding });
   assert.equal(readiness.ok, true, featureId + " passes the production handoff readiness API before launch");
   const snapshot = snapshotWorkspace(scratch.root, featureId);
@@ -833,71 +830,189 @@ function seedReadyFeature(
 }
 
 function materializePassingFixture(root: string, featureId: string): void {
-  const specificationDir = join(root, 'specs', featureId);
-  mkdirSync(specificationDir, { recursive: true });
-  writeFileSync(join(specificationDir, 'spec.md'), PASSING_SPECIFICATION);
-  writeFileSync(join(specificationDir, 'plan.md'), PASSING_PLAN);
-  writeFileSync(join(specificationDir, 'tasks.md'), PASSING_TASKS);
   const sourceDir = join(root, 'src', 'passing');
   mkdirSync(sourceDir, { recursive: true });
   writeFileSync(join(sourceDir, 'index.js'), PASSING_SOURCE);
 }
 
-function assertPassingFixture(
-  root: string,
-  featureId: string,
-  handoff: ImplementationHandoff,
-): void {
-  const specificationDir = join(root, 'specs', featureId);
-  const expectedDocuments = new Map([
-    ['specify', { path: join(specificationDir, 'spec.md'), contents: PASSING_SPECIFICATION }],
-    ['plan', { path: join(specificationDir, 'plan.md'), contents: PASSING_PLAN }],
-    ['tasks', { path: join(specificationDir, 'tasks.md'), contents: PASSING_TASKS }],
-  ]);
-  for (const document of expectedDocuments.values()) {
-    assert.equal(existsSync(document.path), true, `${featureId} fixture document exists: ${document.path}`);
-    assert.equal(readFileSync(document.path, 'utf8'), document.contents, `${featureId} fixture document is deterministic: ${document.path}`);
-  }
-  assert.equal(
-    readFileSync(join(root, 'src', 'passing', 'index.js'), 'utf8'),
-    PASSING_SOURCE,
-    `${featureId} fixture has the deterministic isolated source deliverable`,
-  );
-  for (const requirement of handoff.requirements) {
-    for (const sourceRef of requirement.source_refs) {
-      const path = sourceRef.split('#', 1)[0] ?? sourceRef;
-      assert.equal(existsSync(join(root, path)), true, `${featureId} handoff source ref exists: ${sourceRef}`);
+function assertCanonicalPhaseFixture(root: string, featureId: string, runKey: string, binding: ConstitutionBinding): void {
+  const pinned = PinnedProjectRoot.open(root);
+  assert.ok(pinned, `${featureId} fixture root can be pinned for canonical phase verification`);
+  if (!pinned) throw new Error(`${featureId} fixture root cannot be pinned`);
+  try {
+    for (const phase of CANONICAL_PHASE_ORDER) {
+      const artifact = readCanonicalPhaseArtifact(root, { feature_id: featureId, run_key: runKey, phase, version: 1 }, pinned);
+      assert.ok(artifact, `${featureId} has a canonical ${phase}.v1 artifact bound to its run`);
+      if (!artifact) continue;
+      assert.deepEqual(artifact.constitution_binding, binding, `${featureId} ${phase}.v1 preserves the exact constitution binding`);
+      assert.equal(artifact.upstream_versions.length, phase === 'specify' ? 0 : phase === 'plan' ? 1 : 2, `${featureId} ${phase}.v1 has complete upstream closure`);
+      const validationPath = join(root, '.work-state', 'features', featureId, 'artifacts', `validation.${phase}.v1.json`);
+      const validation = JSON.parse(readFileSync(validationPath, 'utf8')) as Record<string, unknown>;
+      assert.equal(validation.status, 'pass', `${featureId} ${phase}.v1 has passing validation evidence`);
+      assert.equal(validation.validation_id, `validation.${phase}.v1`);
+      assert.equal(validation.artifact_version, `${phase}.v1`);
+      assert.equal(deterministicValidationMatchesArtifact(artifact, validation, pinned), true, `${featureId} ${phase}.v1 validation is production-deterministic and digest-bound`);
     }
+  } finally {
+    pinned.close();
   }
-  for (const artifact of handoff.artifact_versions) {
-    const document = expectedDocuments.get(artifact.kind);
-    assert.ok(document !== undefined, `${featureId} handoff pins a seeded ${artifact.kind} document`);
-    if (document === undefined) continue;
-    assert.equal(artifact.sha256, fixtureSha256(document.contents), `${featureId} handoff digest matches ${artifact.kind} document`);
+}
+
+function fixtureTemplateSelection() {
+  const resolved = resolveSpecificationTemplateSet({ template_ids: SHIPPED_SPECIFICATION_TEMPLATE_IDS });
+  assert.equal(resolved.ok, true, resolved.ok ? '' : resolved.error);
+  if (!resolved.ok) throw new Error(resolved.error);
+  return resolved.value.selection;
+}
+
+function fixturePhaseModel(
+  phase: WorkspacePhase,
+  featureId: string,
+  runKey: string,
+  binding: ConstitutionBinding,
+  upstreamVersions: Array<{ artifact_id: string; version: number; hash: string }>,
+  dispatchId: string,
+  constitutionDocument: string,
+): SpecificationSemanticModel {
+  const principles = parseConstitutionPrincipleIdentities(constitutionDocument);
+  const requirement = {
+    requirement_id: 'FR-1',
+    statement: 'Running node src/passing/index.js with no arguments exits with code 0 and emits the requested completed outcome.',
+    acceptance_ids: ['AC-1'],
+    source_refs: [`specs/${featureId}/spec.md#requirements`],
+    testable: true,
+    untestable_reason: null,
+  };
+  const decisions = [{ decision_id: 'D-1', decision: 'Use the deterministic standalone runtime entrypoint.', rationale: 'The passing fixture must be independently executable.', requirement_ids: ['FR-1'] }];
+  const tasks = PASSING_TASK_GRAPH.map((task) => ({
+    id: task.task_id,
+    title: task.title,
+    requirement_ids: [...task.requirement_ids],
+    acceptance_ids: ['AC-1'],
+    decision_ids: ['D-1'],
+    verification_ids: ['V-1'],
+    depends_on: [...task.depends_on],
+    expected_outcome: task.expected_outcome,
+    affected_scope: [...task.affected_scope],
+    completion_evidence: [...task.completion_evidence],
+    parallel_safe: task.parallel_safe,
+  }));
+  const verification = [{
+    verification_id: 'V-1',
+    requirement_ids: ['FR-1'],
+    acceptance_ids: ['AC-1'],
+    task_ids: phase === 'tasks' ? tasks.map((task) => task.id) : [],
+    observable_behavior: true,
+    expected_evidence: 'Run node src/passing/index.js and record the exact completed JSON output.',
+  }];
+  const sectionSets: Record<WorkspacePhase, Record<string, string>> = {
+    specify: {
+      problem: PASSING_SPECIFICATION,
+      scope: 'Only src/passing/ is in scope for the deterministic executable outcome.',
+      non_goals: 'No unrelated refactors or external state changes.',
+      actors: 'The fixture runtime, CTO orchestrator, implementation lead, and QA evidence worker.',
+      journeys: 'The selected handoff is validated, claimed, executed, and closed with feature-local evidence.',
+      requirements: requirement.statement,
+      edge_cases: 'Arguments other than the empty argument list must remain outside the passing path.',
+      assumptions: 'The scratch project root and constitution binding remain stable during preparation.',
+      dependencies: 'Node.js ESM execution and the canonical specification artifact reader.',
+      success_criteria: 'The exact JSON completion line is observable and independently verifiable.',
+    },
+    plan: {
+      repository_grounding: PASSING_PLAN,
+      decisions: decisions.map((decision) => `${decision.decision_id}: ${decision.decision} — ${decision.rationale}`).join('\n'),
+      alternatives: 'Do not introduce a second execution engine or mutable fixture state.',
+      contracts: 'Phase artifacts, validation, handoff, and execution evidence remain feature-local and digest-bound.',
+      data_flow: 'Specification -> canonical phase artifacts -> validation -> frozen handoff -> execution evidence.',
+      control_flow: 'Validate each phase in order, then admit only the exact frozen handoff.',
+      migration: 'No migration is required for this scratch fixture.',
+      security: 'Pinned root reads and canonical digests reject stale or cross-feature references.',
+      operations: 'The focused node command is the only runtime operation in scope.',
+      verification_strategy: verification[0]!.expected_evidence,
+      constitution_recheck: 'Every phase keeps the exact constitution binding selected for the run.',
+    },
+    tasks: {
+      task_graph: PASSING_TASKS,
+      dependencies: 'T-SCHEMA-VALIDATOR depends on T-LOADER; shared-defaults writes use one serialized path.',
+      expected_outcomes: tasks.map((task) => `${task.id}: ${task.expected_outcome}`).join('\n'),
+    },
+  };
+  return {
+    schema_version: 1, feature_id: featureId, run_key: runKey, phase, version: 1,
+    worker: { role: phase === 'specify' ? 'specification-analyst' : 'specification-architect', agent: 'specification-worker', dispatch_id: dispatchId },
+    constitution_binding: binding,
+    upstream_versions: upstreamVersions,
+    sections: sectionSets[phase],
+    requirements: [requirement],
+    decisions: phase === 'specify' ? [] : decisions,
+    tasks: phase === 'tasks' ? tasks : [],
+    verification,
+    contradictions: [],
+    constitution_principles: principles.map((principle) => ({ principle_id: principle.principle_id, title: principle.title, applicability: 'applicable' as const, status: 'pass' as const, evidence: 'Every change ships with behavioral tests and deterministic verification.', binding })),
+  } as unknown as SpecificationSemanticModel;
+}
+
+function materializeCanonicalPhaseFixture(root: string, featureId: string, runKey: string, binding: ConstitutionBinding): Map<string, Record<string, unknown>> {
+  const templateSet = resolveSpecificationTemplateSet({ template_ids: SHIPPED_SPECIFICATION_TEMPLATE_IDS });
+  assert.equal(templateSet.ok, true, templateSet.ok ? '' : templateSet.error);
+  if (!templateSet.ok) throw new Error(templateSet.error);
+  const templates = new Map(templateSet.value.templates.map((template) => [template.template_id, template]));
+  const languageHash = canonicalDigestOf({ language: 'en-US' });
+  const templateHash = canonicalDigestOf({ template_set: 'specification-default' });
+  const artifacts = new Map<string, Record<string, unknown>>();
+  let upstreamVersions: Array<{ artifact_id: string; version: number; hash: string }> = [];
+  for (const phase of CANONICAL_PHASE_ORDER) {
+    const dispatchId = `fixture-${featureId}-${phase}-dispatch`;
+    const model = fixturePhaseModel(phase, featureId, runKey, binding, upstreamVersions, dispatchId, readFileSync(join(root, binding.path), 'utf8'));
+    const template = templates.get(phase);
+    assert.ok(template, `shipped ${phase} template exists`);
+    if (!template) throw new Error(`missing shipped ${phase} template`);
+    const documentPath = phase === 'specify' ? 'spec.md' : `${phase}.md`;
+    const document = renderCanonicalPhaseDocument(phase, model, template);
+    const sourceArtifact = {
+      schema_version: 1, feature_id: featureId, run_key: runKey, version: 1,
+      worker: model.worker, constitution_binding: binding, semantic_model: model,
+      document_sha256: canonicalSha256Hex(document), upstream_versions: upstreamVersions,
+    };
+    const requestDigest = canonicalDigestOf({ feature_id: featureId, run_key: runKey, phase, version: 1, request_id: `fixture-${featureId}-${phase}-request`, dispatch_id: dispatchId, source_artifact: sourceArtifact, documents: [{ path: documentPath, content: document }], semantic_sections: model.sections, constitution_binding: binding, upstream_versions: upstreamVersions, template_hash: templateHash, language_hash: languageHash });
+    const workIdentity = {
+      run_id: runKey, wave_id: `fixture-${featureId}-wave`, slice_id: featureId, session_id: `fixture-${featureId}-session`, workflow: 'spec-preparation', stage_id: phase, stage_cursor: phase, capability_id: `fixture-${featureId}-capability`, capability_epoch: `fixture-${featureId}-epoch`, slot_id: phase === 'specify' ? 'specification-analyst' : 'specification-architect', task_id: `fixture-${featureId}-${phase}-task`, dispatch_id: dispatchId, attempt: 1, worker_id: 'specification-worker',
+    };
+    const artifact: Record<string, unknown> = {
+      schema_version: 1, feature_id: featureId, run_key: runKey, request_id: `fixture-${featureId}-${phase}-request`, request_digest: requestDigest, source_artifact_id: phase === 'specify' ? 'specify_draft' : phase === 'plan' ? 'plan_draft' : 'task_graph', source_artifact: sourceArtifact, artifact_id: `${phase}.v1`, phase, version: 1, dispatch_id: dispatchId, work_identity: workIdentity, capability_epoch: workIdentity.capability_epoch, source_artifact_hash: canonicalDigestOf(sourceArtifact), semantic_model: model, document_paths: [documentPath], document_hashes: { [documentPath]: canonicalSha256Hex(document) }, semantic_section_hashes: Object.fromEntries(Object.entries(model.sections).sort(([left], [right]) => left.localeCompare(right)).map(([marker, content]) => [marker, canonicalSha256Hex(content)])), template_hash: templateHash, language_hash: languageHash, upstream_versions: upstreamVersions, created_at: '2026-09-01T00:00:00.000Z', constitution_binding: binding,
+    };
+    const materialized = materializeFeatureDocuments(root, { feature_id: featureId, run_key: runKey, phase, version: 1, documents: [{ path: documentPath, content: document }], binding: { language_hash: languageHash, template_hash: templateHash, artifact_id: `${phase}.v1`, dispatch_id: dispatchId, work_identity: workIdentity as never, constitution_binding: binding, upstream_versions: upstreamVersions } }, { validateBeforeWrite: () => { const pinned = PinnedProjectRoot.open(root); if (!pinned) throw new Error('fixture root cannot be pinned'); try { const current = readPinnedCurrentConstitution(root, pinned, binding); if (!current.ok) throw new Error(current.error); } finally { pinned.close(); } } });
+    assert.ok(materialized.ok, materialized.ok ? '' : materialized.error);
+    if (!materialized.ok) throw new Error(materialized.error);
+    writeTestArtifact(root, featureArtifactsDir(root, featureId), `${phase}.v1`, artifact);
+    const validationInput: NativePhaseValidationInput = { validation_id: `validation.${phase}.v1`, feature_id: featureId, run_key: runKey, phase, version: 1, artifact_version: `${phase}.v1`, document_path: documentPath, document_sha256: canonicalSha256Hex(document), sections: model.sections, upstream_versions: model.upstream_versions, expected_upstream_versions: model.upstream_versions, constitution_binding: binding, expected_constitution_binding: binding, constitution_principles: model.constitution_principles.map((principle) => ({ principle_id: principle.principle_id, status: principle.status, evidence: principle.evidence })), requirements: model.requirements, decisions: model.decisions, tasks: model.tasks.map((task) => ({ ...task, task_id: task.id })), verification: model.verification, contradictions: model.contradictions, validated_at: '2026-09-01T00:00:00.000Z' };
+    const validation = { ...validateNativePhase(validationInput), artifact_digest: canonicalDigestOf(artifact) };
+    assert.equal(validation.status, 'pass', `${featureId} ${phase}.v1 fixture validation passes: ${JSON.stringify(validation.blocking_findings)}`);
+    writeTestArtifact(root, featureArtifactsDir(root, featureId), `validation.${phase}.v1`, validation);
+    const projected = materializePhaseValidation(root, featureId, validation, { beforeWrite: () => undefined });
+    assert.ok(projected.ok, projected.ok ? '' : projected.error);
+    if (!projected.ok) throw new Error(projected.error);
+    artifacts.set(phase, artifact);
+    upstreamVersions = [...upstreamVersions, { artifact_id: `${phase}.v1`, version: 1, hash: canonicalDigestOf(artifact) }];
   }
-  assert.deepEqual(
-    handoff.tasks.map(task => task.task_id).sort(),
-    PASSING_TASK_GRAPH.map(task => task.task_id).sort(),
-    `${featureId} handoff preserves the complete typed execution graph`,
-  );
-  const auditLog = handoff.tasks.find(candidate => candidate.task_id === 'T-AUDIT-LOG');
-  const metrics = handoff.tasks.find(candidate => candidate.task_id === 'T-METRICS');
-  const loader = handoff.tasks.find(candidate => candidate.task_id === 'T-LOADER');
-  const validator = handoff.tasks.find(candidate => candidate.task_id === 'T-SCHEMA-VALIDATOR');
-  const sharedA = handoff.tasks.find(candidate => candidate.task_id === 'T-SHARED-DEFAULTS-A');
-  const sharedB = handoff.tasks.find(candidate => candidate.task_id === 'T-SHARED-DEFAULTS-B');
-  assert.ok(auditLog && metrics && loader && validator && sharedA && sharedB, `${featureId} has every serialization fixture task`);
-  if (auditLog && metrics && loader && validator && sharedA && sharedB) {
-    assert.deepEqual(auditLog.affected_scope, ['src/passing/audit-log.json']);
-    assert.deepEqual(metrics.affected_scope, ['src/passing/metrics.json']);
-    assert.deepEqual(loader.affected_scope, ['src/passing/loader.js']);
-    assert.deepEqual(validator.depends_on, ['T-LOADER']);
-    assert.deepEqual(sharedA.affected_scope, ['src/passing/shared-defaults.json']);
-    assert.deepEqual(sharedB.affected_scope, ['src/passing/shared-defaults.json']);
-    assert.ok(auditLog.parallel_safe && metrics.parallel_safe, `${featureId} JSON slices are parallel-safe`);
-    assert.match(auditLog.expected_outcome, /audit-log/iu);
-    assert.match(metrics.expected_outcome, /metrics/iu);
-    assert.match(validator.expected_outcome, /T-LOADER/iu);
+  return artifacts;
+}
+
+function assertPassingFixture(root: string, featureId: string, handoff: ImplementationHandoff): void {
+  const specificationDir = join(root, 'specs', featureId);
+  assert.equal(existsSync(join(specificationDir, 'spec.md')), true, `${featureId} canonical spec document exists`);
+  assert.equal(existsSync(join(specificationDir, 'plan.md')), true, `${featureId} canonical plan document exists`);
+  assert.equal(existsSync(join(specificationDir, 'tasks.md')), true, `${featureId} canonical tasks document exists`);
+  assert.equal(readFileSync(join(root, 'src', 'passing', 'index.js'), 'utf8'), PASSING_SOURCE, `${featureId} executable fixture is deterministic`);
+  const state = readState(root, featureId);
+  assert.equal(typeof state.run_key, 'string');
+  const workspace = resolveFeatureWorkspace(root, { feature_id: featureId, run_key: String(state.run_key) });
+  assert.ok(workspace.ok, workspace.ok ? '' : workspace.error);
+  if (!workspace.ok || !workspace.value.constitution_binding) throw new Error(workspace.ok ? 'passing fixture constitution binding missing' : workspace.error);
+  assertCanonicalPhaseFixture(root, featureId, String(state.run_key), workspace.value.constitution_binding);
+  for (const artifact of handoff.artifact_versions.filter((entry) => entry.kind === 'specify' || entry.kind === 'plan' || entry.kind === 'tasks')) {
+    const parsed = JSON.parse(readFileSync(join(root, '.work-state', 'features', featureId, 'artifacts', `${artifact.artifact_id}.json`), 'utf8')) as Record<string, unknown>;
+    assert.equal(artifact.sha256, canonicalDigestOf(parsed), `${artifact.artifact_id} handoff digest is bound to canonical artifact bytes`);
   }
 }
 
@@ -1869,7 +1984,7 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
   assert.equal(param("dependent_tasks"), "T-LOADER->T-SCHEMA-VALIDATOR", "scenario names the loader dependency");
   assert.equal(param("shared_serial_tasks"), "T-SHARED-DEFAULTS-A,T-SHARED-DEFAULTS-B", "scenario names the shared-defaults pair");
   assert.equal(param("expected_admitted_task_count"), String(PASSING_TASK_GRAPH.length + 1), "scenario dispatch count covers passing graph plus blocked task");
-  const ctoRequest = `/cto --spec ${passingId} --run-key ${passingRun} --spec ${blockedId} --run-key ${blockedRun} --spec ${staleId} --run-key ${staleRun} --spec ${claimedId} --run-key ${claimedRun} Execute the selected handoffs in one resident CTO wave. Preserve this exact immutable full selector array in the selector-only cto_prepare request; let the engine derive canonical task, DoD, and TeamDef candidates, obtain the mapping confirmation, and emit the eligible-only preflight descriptor. Keep stale and claimed selectors selected for readiness exclusion, report their blocked findings verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor without reconstructing selectors or repeating excluded rows. Report blocked findings and complete each admitted worker with real evidence before closing. The blocked handoff intentionally has no concrete observable contract and its src/blocked/** prerequisite is absent; do not invent behavior or repair that fixture. Give its implementation/QA workers one bounded attempt, record the unresolved blocker under FR-1/AC-1, and return one terminal blocked summary without rewriting DoD or re-dispatching repair workers. The admitted passing slices T-AUDIT-LOG and T-METRICS are independent and must dispatch in parallel; T-SCHEMA-VALIDATOR depends on T-LOADER; T-SHARED-DEFAULTS-A and T-SHARED-DEFAULTS-B share src/passing/shared-defaults.json and must serialize. Preserve every original FR-1/AC-1/V-1 task mapping, and require each lead to produce implementation and QA evidence before returning.`;
+  const ctoRequest = (ctoRunId: string): string => `/cto --spec ${passingId} --run-key ${passingRun} --spec ${blockedId} --run-key ${blockedRun} --spec ${staleId} --run-key ${staleRun} --spec ${claimedId} --run-key ${claimedRun} Execute the selected handoffs in one resident CTO wave. Immediately execute the mounted cto_prepare tool by writing its JSON payload to xd://cto_prepare (never read that device or its documentation). The JSON object written to xd://cto_prepare MUST have exactly these four top-level keys and no others: cto_run_id, task, branch, selections. MUST NOT include teams, dod, team_defs, classification, workflow, or any other key. Use cto_run_id=${ctoRunId}, branch=main, and selections exactly equal to the four selector pairs above; use this request text as the task verbatim; do not invent DoD, TeamDef, or other derived fields before that selector-only request. Preserve this exact immutable full selector array in the selector-only cto_prepare request; let the engine derive canonical task, DoD, and TeamDef candidates, obtain the mapping confirmation, and emit the eligible-only preflight descriptor. Keep stale and claimed selectors selected for readiness exclusion, report their blocked findings verbatim, and never claim either excluded selector. Execute the engine-issued eligible-only preflight descriptor without reconstructing selectors or repeating excluded rows. Report blocked findings and complete each admitted worker with real evidence before closing. The blocked handoff intentionally has no concrete observable contract and its src/blocked/** prerequisite is absent; do not invent behavior or repair that fixture. Give its implementation/QA workers one bounded attempt, record the unresolved blocker under FR-1/AC-1, and return one terminal blocked summary without rewriting DoD or re-dispatching repair workers. The admitted passing slices T-AUDIT-LOG and T-METRICS are independent and must dispatch in parallel; T-SCHEMA-VALIDATOR depends on T-LOADER; T-SHARED-DEFAULTS-A and T-SHARED-DEFAULTS-B share src/passing/shared-defaults.json and must serialize. Preserve every original FR-1/AC-1/V-1 task mapping, and require each lead to produce implementation and QA evidence before returning.`;
   const scratch = makeScratch({ allowExact: true });
   let passing!: SeededFeature;
   let blocked!: SeededFeature;
@@ -1934,7 +2049,7 @@ test('T094 runtime: one confirmed CTO wave executes the eligible passing/blocked
     open = await openSession(scratch.root, scenario);
     assertRuntimePluginRegistry(open.session, scratch.root);
     const log = new TranscriptLog(open.session.transcriptPath);
-    await submit(open.driver, ctoRequest);
+    await submit(open.driver, ctoRequest("cto-execution-" + open.session.sessionId));
     const mapping = await answerCheckpoint(
       open,
       'mapping|confirm|execution',

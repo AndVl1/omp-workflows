@@ -43,7 +43,7 @@ import { resolveWorkflowContract, validateTypedControlPlane, type TerminalConfor
 import { artifactSchemaFor } from "./engine/artifact-contract.js";
 import { resolveRuntimeConfigPath, rollbackRuntimeConfigReceipt, writeConfig, type RuntimeConfigWriteToken } from "./runtime-config.js";
 import { loadTeamDefsPinned } from "./cto/plan.js";
-import { authorizeCtoSpecificationExecutionTask, prepareCtoSpecificationExecution, reconcileCtoSpecificationExecutionTeams, type CtoSpecificationExecutionPreparationInput, type PrepareCtoSpecificationExecutionOptions } from "./cto/specification-execution.js";
+import { authorizeCtoSpecificationExecutionTask, filterCtoSpecificationExecutionSelections, prepareCtoSpecificationExecution, reconcileCtoSpecificationExecutionTeams, type CtoSpecificationExecutionPreparationInput, type PrepareCtoSpecificationExecutionOptions } from "./cto/specification-execution.js";
 import {
   closeCtoSpecificationExecutionWave,
   deriveCtoSpecificationPreparationTeams,
@@ -5861,13 +5861,17 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
         try {
           const input = params as Omit<CtoSpecificationExecutionPreparationInput, "classification" | "teams">;
           const defs = loadTeamDefsPinned(checked.cwd, pinnedRoot);
-          const derived = deriveCtoSpecificationPreparationTeams(checked.cwd, input.selections, defs, pinnedRoot);
+          const eligibility = filterCtoSpecificationExecutionSelections(pinnedRoot.canonical_root, input.cto_run_id, input.selections, pinnedRoot);
+          const derived = deriveCtoSpecificationPreparationTeams(checked.cwd, eligibility.eligible, defs, pinnedRoot);
           if (derived.teams.length === 0) {
             const excluded = input.selections
               .map((selection) => ({
                 feature_id: selection.feature_id,
                 run_key: selection.run_key,
-                findings: derived.findings.filter((finding) => finding.startsWith(`${selection.feature_id}/`)),
+                findings: [
+                  ...(eligibility.excluded.find((entry) => entry.feature_id === selection.feature_id && entry.run_key === selection.run_key)?.findings ?? []),
+                  ...derived.findings.filter((finding) => finding.startsWith(selection.feature_id + "/")),
+                ],
               }))
               .filter((entry) => entry.findings.length > 0);
             return toolResult({
@@ -5875,9 +5879,9 @@ export function registerCtoTools(pi: ExtensionAPI, options: CtoToolAdapterOption
               prepared: false,
               dispatched: false,
               requested_selections: input.selections.map((selection) => ({ ...selection })),
-              eligible_selections: [],
+              eligible_selections: eligibility.eligible.map((selection) => ({ ...selection })),
               excluded,
-              findings: derived.findings.length > 0 ? derived.findings : ["no canonical handoff task rows could be derived"],
+              findings: [...eligibility.excluded.flatMap((entry) => entry.findings), ...derived.findings],
               ...(derived.unresolved.length > 0 ? { unresolved_team_scopes: derived.unresolved } : {}),
             });
           }

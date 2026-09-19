@@ -645,7 +645,7 @@ export function persistFeatureWorkspace(
 // This is intentionally not exported from the package index.  It accepts no
 // legacy object, status, workflow, stage, or control-plane fields; the public
 // migration boundary must reduce those values before calling it.
-const LEGACY_PROJECTION_KEYS = ["feature_id", "run_key", "project_root", "project_root_dev", "project_root_ino", "source_digest", "legacy_inputs", "constitution_binding"] as const;
+const LEGACY_PROJECTION_KEYS = ["feature_id", "run_key", "project_root", "project_root_dev", "project_root_ino", "source_digest", "source_path", "source_dev", "source_ino", "legacy_inputs", "constitution_binding"] as const;
 const SAFE_RUN_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SAFE_PROVENANCE_ENTRY_RE = /^(?:active_feature|branch)=[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u;
 interface LegacyWorkspaceProjection {
@@ -655,10 +655,13 @@ interface LegacyWorkspaceProjection {
   project_root_dev: number;
   project_root_ino: number;
   source_digest: string;
+  source_path?: string;
+  source_dev?: number;
+  source_ino?: number;
   legacy_inputs: string[];
   constitution_binding: ConstitutionBinding;
 }
-interface MigrationIdentity extends Omit<LegacyWorkspaceProjection, "legacy_inputs" | "constitution_binding"> {
+interface MigrationIdentity extends Omit<LegacyWorkspaceProjection, "legacy_inputs" | "constitution_binding" | "source_path" | "source_dev" | "source_ino"> {
   workspace_path: string;
   state_path: string;
 }
@@ -699,6 +702,7 @@ const MIGRATION_RECEIPT_KEYS = [
   "id", "status", "feature_id", "run_key", "project_root", "project_root_dev", "project_root_ino",
   "workspace_path", "state_path", "source_digest", "legacy_inputs", "migrated_at",
 ] as const;
+const MIGRATION_RECEIPT_WITH_SOURCE_KEYS = [...MIGRATION_RECEIPT_KEYS, "source_path", "source_dev", "source_ino"] as const;
 const MIGRATION_RECEIPT_PUBLIC_KEYS = [
   ...MIGRATION_RECEIPT_KEYS,
   "receipt_id", "outcome", "source_sha256", "source_path", "source_dev", "source_ino",
@@ -773,10 +777,12 @@ function isStrictMigrationReceipt(value: unknown): value is MigrationReceipt {
   if (migrationReceiptShapeError(value) !== null || !isRecord(value)) return false;
   const keys = Object.getOwnPropertyNames(value).sort();
   const internalKeys = [...MIGRATION_RECEIPT_KEYS].sort();
+  const internalSourceKeys = [...MIGRATION_RECEIPT_WITH_SOURCE_KEYS].sort();
   const publicKeys = [...MIGRATION_RECEIPT_PUBLIC_KEYS].sort();
   const isInternal = keys.length === internalKeys.length && keys.every((key, index) => key === internalKeys[index]);
+  const isInternalWithSource = keys.length === internalSourceKeys.length && keys.every((key, index) => key === internalSourceKeys[index]);
   const isPublic = keys.length === publicKeys.length && keys.every((key, index) => key === publicKeys[index]);
-  if (!isInternal && !isPublic) return false;
+  if (!isInternal && !isInternalWithSource && !isPublic) return false;
   if (typeof value.id !== "string" || !MIGRATION_RECEIPT_ID_RE.test(value.id) || value.status !== "complete" || !isSafeFeatureId(value.feature_id) || typeof value.run_key !== "string" || !SAFE_RUN_KEY_RE.test(value.run_key)) return false;
   if (typeof value.project_root !== "string" || !value.project_root.startsWith("/") || value.project_root.includes("//") || value.project_root.split("/").includes("..")) return false;
   if (!Number.isSafeInteger(value.project_root_dev) || (value.project_root_dev as number) < 0 || !Number.isSafeInteger(value.project_root_ino) || (value.project_root_ino as number) < 0) return false;
@@ -785,6 +791,9 @@ function isStrictMigrationReceipt(value: unknown): value is MigrationReceipt {
   if (typeof value.migrated_at !== "string") return false;
   const migratedAt = Date.parse(value.migrated_at);
   if (!Number.isFinite(migratedAt) || new Date(migratedAt).toISOString() !== value.migrated_at) return false;
+  if (isInternalWithSource && (!safeMigrationReceiptRelativePath(value.source_path)
+    || !Number.isSafeInteger(value.source_dev) || (value.source_dev as number) < 0
+    || !Number.isSafeInteger(value.source_ino) || (value.source_ino as number) < 0)) return false;
   if (!isPublic) return true;
   if (value.receipt_id !== value.id || value.outcome !== "migrated" || !isSha256Hex(value.source_sha256) || value.source_sha256 !== value.source_digest
     || !safeMigrationReceiptRelativePath(value.source_path)
@@ -860,6 +869,11 @@ function validateLegacyProjection(value: unknown, root: WorkspaceRootSnapshot): 
   if (!Number.isSafeInteger(value.project_root_dev) || (value.project_root_dev as number) < 0 || value.project_root_dev !== root.dev) return { ok: false, error: "legacy migration projection project-root device identity changed" };
   if (!Number.isSafeInteger(value.project_root_ino) || (value.project_root_ino as number) < 0 || value.project_root_ino !== root.ino) return { ok: false, error: "legacy migration projection project-root inode identity changed" };
   if (!isSha256Hex(value.source_digest)) return { ok: false, error: "legacy migration projection source digest is invalid" };
+  const sourcePath = value.source_path;
+  const sourceDev = value.source_dev;
+  const sourceIno = value.source_ino;
+  const hasSourceProvenance = sourcePath !== undefined || sourceDev !== undefined || sourceIno !== undefined;
+  if (hasSourceProvenance && (typeof sourcePath !== "string" || !safeMigrationReceiptRelativePath(sourcePath) || !Number.isSafeInteger(sourceDev) || (sourceDev as number) < 0 || !Number.isSafeInteger(sourceIno) || (sourceIno as number) < 0)) return { ok: false, error: "legacy migration projection source provenance is invalid" };
   if (!isRecord(value.constitution_binding) || validateConstitutionBinding(value.constitution_binding, "$.constitution_binding").length > 0) return { ok: false, error: "legacy migration projection constitution binding is invalid" };
   if (!Array.isArray(value.legacy_inputs) || value.legacy_inputs.length > 16 || value.legacy_inputs.some((entry) => typeof entry !== "string" || !SAFE_PROVENANCE_ENTRY_RE.test(entry))) return { ok: false, error: "legacy migration projection provenance is not bounded safe metadata" };
   const featureId = value.feature_id;
@@ -869,7 +883,7 @@ function validateLegacyProjection(value: unknown, root: WorkspaceRootSnapshot): 
   const projectRootIno = value.project_root_ino as number;
   const sourceDigest = value.source_digest;
   const legacyInputs = value.legacy_inputs as string[];
-  return { ok: true, value: { feature_id: featureId, run_key: runKey, project_root: projectRoot, project_root_dev: projectRootDev, project_root_ino: projectRootIno, source_digest: sourceDigest, legacy_inputs: [...legacyInputs], constitution_binding: { ...(value.constitution_binding as unknown as ConstitutionBinding) } } };
+  return { ok: true, value: { feature_id: featureId, run_key: runKey, project_root: projectRoot, project_root_dev: projectRootDev, project_root_ino: projectRootIno, source_digest: sourceDigest, ...(hasSourceProvenance ? { source_path: sourcePath as string, source_dev: sourceDev as number, source_ino: sourceIno as number } : {}), legacy_inputs: [...legacyInputs], constitution_binding: { ...(value.constitution_binding as unknown as ConstitutionBinding) } } };
 }
 
 /** @internal: called only by specification/migration.ts after closed validation. */
@@ -901,7 +915,18 @@ function persistLegacyWorkspaceProjectionUnlocked(rootSnapshot: WorkspaceRootSna
   }
   const identity = migrationIdentity(rootSnapshot, input, input.source_digest);
   const receiptId = migrationReceiptId(identity);
-  const receipt: MigrationReceipt = { id: receiptId, status: "complete", ...identity, legacy_inputs: [...input.legacy_inputs], migrated_at: new Date().toISOString() };
+  const receipt: MigrationReceipt = {
+    id: receiptId,
+    status: "complete",
+    ...identity,
+    legacy_inputs: [...input.legacy_inputs],
+    migrated_at: new Date().toISOString(),
+    ...(input.source_path !== undefined ? {
+      source_path: input.source_path,
+      source_dev: input.source_dev,
+      source_ino: input.source_ino,
+    } : {}),
+  };
   const receiptBytes = Buffer.from(JSON.stringify(receipt, null, 2) + "\n", "utf8");
   let attemptReceipt: PinnedRootWriteReceipt | null = null;
   const rollbackAttemptReceipt = (): void => {

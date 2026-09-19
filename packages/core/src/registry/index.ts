@@ -39,6 +39,7 @@ export {
   registryRegistrationProjectRoot,
   releaseWorkflowOwner,
   releaseWorkflowOwners,
+  workflowOwnerFor,
   requireRegistryRegistration,
   rollbackRegistryRegistration,
 } from "./owner.js";

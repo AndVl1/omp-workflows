@@ -9,7 +9,7 @@ import {
 	type WorkflowCapability,
 	type WorkflowOwnerIdentity,
 } from "@andvl1/omp-workflows-core";
-import { openWorkflowActivation, releaseWorkflowOwners } from "@andvl1/omp-workflows-core/registry";
+import { openWorkflowActivation, releaseWorkflowOwners, workflowOwnerFor } from "@andvl1/omp-workflows-core/registry";
 
 import ompWorkflowsInternal, {
 	resolveGatedCommandCwd,
@@ -200,24 +200,20 @@ test("in a marked workspace workflow_registration is claimed first, then all thr
 	assert.ok(handlers.length >= 2, "core claim handler + engine activation handler expected");
 
 	// Step 1: core's namespaced-command session_start handler claims the
-	// registration capability first. A foreign activation must observe the
-	// conflict while the remaining capabilities are still available.
+	// registration capability first. The remaining capabilities must remain
+	// unclaimed until the engine activation handler runs.
 	handlers[0]?.({}, { cwd: root });
 	const registrationProbe = openForeignActivation(root, ["workflow_registration"]);
 	assert.equal(registrationProbe.ok, false);
 	if (!registrationProbe.ok) assert.equal(registrationProbe.code, "owner_conflict");
 	for (const capability of ["workflow_tools", "config_writer"] as const) {
-		const probe = openForeignActivation(root, [capability]);
-		assert.equal(probe.ok, true, `${capability} remains available before engine activation`);
-		if (probe.ok) releaseWorkflowOwners(probe.release_token, probe.leased_capabilities);
+		assert.equal(workflowOwnerFor(root, capability), undefined, `${capability} remains available before engine activation`);
 	}
 
 	// Step 2: the engine activation handler idempotently claims all three.
 	for (const handler of handlers.slice(1)) handler({}, { cwd: root });
 	for (const capability of CAPABILITIES) {
-		const probe = openForeignActivation(root, [capability]);
-		assert.equal(probe.ok, false, `${capability} must be claimed after engine activation`);
-		if (!probe.ok) assert.equal(probe.code, "owner_conflict");
+		assert.equal(workflowOwnerFor(root, capability)?.owner.owner_id, OMP_INTERNAL_BUNDLE_ID, `${capability} must be claimed after engine activation`);
 	}
 	assert.equal(isRegisteredWorkflow("omp-feature"), true);
 	assert.equal(isRegisteredWorkflow("omp-validate"), true);

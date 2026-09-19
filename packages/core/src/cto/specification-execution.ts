@@ -825,6 +825,27 @@ function evaluateSelectionEligibility(
   if (!loaded.ok) return { ok: false, findings: [loaded.error] };
   return { ok: true, value: loaded };
 }
+/**
+ * Read-only eligibility partition used by selector-only preparation callers.
+ * Team derivation must run only for eligible selectors so the eight-team cap
+ * cannot be consumed by stale or already-claimed audit rows.
+ */
+export function filterCtoSpecificationExecutionSelections(
+  root: string,
+  ctoRunId: string,
+  selections: readonly CtoSpecificationExecutionSelection[],
+  pinnedRoot: PinnedProjectRoot,
+): { eligible: CtoSpecificationExecutionSelection[]; excluded: CtoSpecificationExecutionExcludedSelection[] } {
+  const eligible: CtoSpecificationExecutionSelection[] = [];
+  const excluded: CtoSpecificationExecutionExcludedSelection[] = [];
+  for (const selection of selections) {
+    const result = evaluateSelectionEligibility(root, ctoRunId, selection, pinnedRoot);
+    if (result.ok) eligible.push({ ...selection });
+    else excluded.push({ ...selection, findings: [...result.findings] });
+  }
+  return { eligible, excluded };
+}
+
 type ReplayTeamExpectation = {
   input: CtoSpecificationPreparationTeam;
   def: TeamDef;
@@ -1459,8 +1480,8 @@ function canonicalPreparationScope(values: readonly unknown[]): string[] | null 
   }
   return normalized.sort();
 }
-function preparationScopeWithinPolicy(scope: string, policy: readonly string[]): boolean {
-  return policy.some((candidate) => scope === candidate || scope.startsWith(candidate + "/"));
+function preparationScopeWithinPolicy(scope: string, policy: readonly string[], featureId?: string): boolean {
+  return policy.some((candidate) => candidate === featureId || scope === candidate || scope.startsWith(candidate + "/"));
 }
 
 const MAX_CTO_HOST_TOOL_CALL_ID_BYTES = 512;
@@ -1628,7 +1649,7 @@ export function prepareCtoSpecificationExecution(
       const policyScope = canonicalPreparationScope(def.scope);
       const requestedScope = canonicalPreparationScope(team.scope === undefined ? (derivedScope ?? []) : team.scope);
       if (!derivedScope || !policyScope || !requestedScope || canonicalJson(requestedScope) !== canonicalJson(derivedScope)) return blockedWithSelectionReport(requestedSelections, eligibleSelections, excluded, [`${label}.scope must exactly match the authenticated pinned task affected scope`]);
-      if (derivedScope.some((scope) => !preparationScopeWithinPolicy(scope, policyScope))) return blockedWithSelectionReport(requestedSelections, eligibleSelections, excluded, [`${label}.scope is outside authenticated TeamDef '${def.id}' scope policy`]);
+      if (derivedScope.some((scope) => !preparationScopeWithinPolicy(scope, policyScope, taskRef.feature_id))) return blockedWithSelectionReport(requestedSelections, eligibleSelections, excluded, [`${label}.scope is outside authenticated TeamDef '${def.id}' scope policy`]);
       let dod: DoD;
       try {
         const normalized = normalizeDod(team.dod, label);

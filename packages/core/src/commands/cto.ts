@@ -311,10 +311,10 @@ export function deriveCtoSpecificationPreparationTeams(
       teams.push({
         team: team.id,
         task_ref: unresolvedRow.task_ref,
-        scope: [...team.scope],
+        scope: [...unresolvedRow.affected_scope],
         profile: team.profile,
         worktree: "same_branch",
-        depends_on: unresolvedRow.depends_on,
+        depends_on: [],
         classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "standard" },
         workflow: "standard",
         dod,

@@ -35,6 +35,7 @@ import {
 import type { CtoSpecificationMappingDispatchOptions, CtoSpecificationExecutionWaveCloseOptions } from "../src/commands/cto.js";
 import {
   buildCtoPrompt,
+  deriveCtoSpecificationPreparationTeams,
   deriveCtoSpecificationMappingAskInput,
   parseEnvelope,
   prepareCtoSpecificationMappingAsk,
@@ -909,15 +910,17 @@ function writeMountedPreparationFixture(root: string, featureId: string, runKey:
 }
 test("direct CTO preparation rejects expanded and cross-task scopes without artifacts", () => {
   const cases = [
-    { name: "expanded", scope: ["src/expanded.ts"], addSecondTask: false },
-    { name: "cross-task", scope: ["src/other.ts"], addSecondTask: true },
+    { name: "expanded", scope: ["src/expanded.ts"], addSecondTask: false, policy: "path" as const },
+    { name: "cross-task", scope: ["src/other.ts"], addSecondTask: true, policy: "path" as const },
+    { name: "exact-feature-fallback", scope: ["src/feature.ts"], addSecondTask: false, policy: "feature" as const },
+    { name: "wrong-feature-fallback", scope: ["src/feature.ts"], addSecondTask: false, policy: "wrong-feature" as const },
   ] as const;
   for (const testCase of cases) {
     const root = makeProject();
     const featureId = "scope-boundary-" + testCase.name;
     const runKey = "run-" + featureId + "-1";
     const runId = "CTO-SCOPE-BOUNDARY-" + testCase.name.toUpperCase();
-    const teamDef = { id: "team-standard", name: "Standard", scope: ["src"], profile: "standard", lead: "developer", roster: ["developer"] };
+    const teamDef = { id: "team-standard", name: "Standard", scope: testCase.policy === "feature" ? [featureId] : testCase.policy === "wrong-feature" ? ["other-feature"] : ["src"], profile: "standard", lead: "developer", roster: ["developer"] };
     try {
       writeFeature(root, featureId, runKey);
       if (testCase.addSecondTask) rewriteHandoff(root, featureId, (handoff) => {
@@ -934,9 +937,15 @@ test("direct CTO preparation rejects expanded and cross-task scopes without arti
         dod: { items: [{ id: "dod-1-" + index, source: "handoff", criterion: "works", verify_method: "focused test", status: "pending", evidence: "" }], type_requirements_met: true },
       }));
       const result = prepareCtoSpecificationExecution(root, { cto_run_id: runId, task: "scope boundary", branch: "main", classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "standard" }, selections: [{ feature_id: featureId, run_key: runKey }], teams }, { defs: [teamDef], ...preparationRuntimeOptions(root) });
-      assert.equal(result.status, "blocked", JSON.stringify(result));
-      assert.match(JSON.stringify(result), /scope|affected|authenticated/i);
-      assert.equal(existsSync(join(root, ".work-state", "cto", runId, "state.json")), false);
+      const expectedStatus = testCase.policy === "feature" ? "ready" : "blocked";
+      assert.equal(result.status, expectedStatus, JSON.stringify(result));
+      if (expectedStatus === "ready") {
+        const state = readCtoState(runId, root);
+        assert.deepEqual(state?.plan?.teams[0]?.scope, ["src/feature.ts"], "feature fallback must preserve exact task scope");
+      } else {
+        assert.match(JSON.stringify(result), /scope|affected|authenticated/i);
+        assert.equal(existsSync(join(root, ".work-state", "cto", runId, "state.json")), false);
+      }
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
 });
@@ -3735,6 +3744,50 @@ test("mounted workflow_prepare rejects oversized generic inputs before execution
   }
 });
 
+test("mounted cto_prepare filters ineligible selectors before the eight-team derivation cap", async () => {
+  const root = makeProject();
+  const eligibleFeatureIds = Array.from({ length: 8 }, (_, index) => `cap-eligible-${index}`);
+  const excludedFeatureId = "cap-stale";
+  const featureIds = [...eligibleFeatureIds, excludedFeatureId];
+  const runKeys = new Map(featureIds.map((featureId) => [featureId, `run-${featureId}-1`]));
+  const runId = "cap-filtered-prepare-run";
+  try {
+    for (const featureId of featureIds) {
+      writeFeature(root, featureId, runKeys.get(featureId)!, { stale: featureId === excludedFeatureId });
+    }
+    for (const featureId of featureIds) rewriteHandoff(root, featureId, (handoff) => {
+      (handoff.tasks as Json[])[0]!.affected_scope = [`src/${featureId}.ts`];
+      handoff.scope = { ...(handoff.scope as Json), constraints: [] };
+    });
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "teams.json"), JSON.stringify(featureIds.map((featureId) => ({
+      id: `team-${featureId}`,
+      name: featureId,
+      scope: featureId === eligibleFeatureIds[0] ? [`src/${featureId}.ts`, "src/shared.ts"] : [`src/${featureId}.ts`],
+      profile: "standard",
+      lead: "developer",
+      roster: ["developer"],
+    }))), "utf8");
+    const payload = {
+      cto_run_id: runId,
+      task: "prepare cap-filtered selectors",
+      branch: "main",
+      selections: featureIds.map((featureId) => ({ feature_id: featureId, run_key: runKeys.get(featureId)! })),
+    };
+    const tool = publicCtoTools(root, { resolveCwd: (ctx) => (ctx as { cwd: string }).cwd }).get("cto_prepare")!;
+    const result = mountedDetails(await tool.execute("cap-filtered-prepare", payload, undefined, undefined, { cwd: root, sessionManager: TEST_SESSION_MANAGER }));
+    assert.equal(result.status, "ready", JSON.stringify(result));
+    assert.deepEqual(result.requested_selections, payload.selections);
+    assert.equal((result.eligible_selections as Json[]).length, 8);
+    assert.deepEqual((result.excluded as Json[]).map((entry) => entry.feature_id), [excludedFeatureId]);
+    const state = readCtoState(runId, root);
+    assert.equal(state?.teams.length, 8, "only eligible task rows may consume the team cap");
+    assert.deepEqual(state?.plan?.teams.find((team) => team.team_def_id === "team-cap-eligible-0")?.scope, ["src/cap-eligible-0.ts"], "execution scope must stay pinned to the task affected_scope, not broaden to TeamDef scope");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    projectFeatures.delete(root);
+  }
+});
 test("mounted cto_prepare partitions mixed selectors and preflights only eligible rows", async () => {
   const root = makeProject();
   const featureIds = ["readable-cto-passing", "readable-cto-blocked", "readable-cto-stale", "readable-cto-claimed"] as const;
@@ -4790,14 +4843,18 @@ test("multi-task same TeamDef preparation creates unique execution instances and
     assert.ok(statSync(featureStatePath).size > 1024 * 1024, "fixture must be writer-valid and exceed the retired 1MiB preparation cap");
     const stateBeforePreparation = readFileSync(featureStatePath);
     const classification = { type: "FEATURE" as const, complexity: "MEDIUM" as const, confidence: "HIGH" as const, autonomous: true };
-    const dod = { items: [{ id: "dod-1", source: "handoff", criterion: "works", verify_method: "focused test", status: "pending", evidence: "" }], type_requirements_met: true };
+    const pinnedRoot = PinnedProjectRoot.open(root);
+    assert.ok(pinnedRoot, "dependency fixture root must be pinnable");
+    if (!pinnedRoot) return;
+    const derived = deriveCtoSpecificationPreparationTeams(root, [selection(featureId)], [teamDef], pinnedRoot);
+    pinnedRoot.close();
+    assert.deepEqual(derived.findings, []);
+    assert.equal(derived.teams.length, 2);
+    assert.deepEqual(derived.teams.map((team) => team.depends_on), [[], []], "selector-derived candidates must leave dependencies unset; handoff task dependencies are resolved canonically");
     const preparationInput = {
       cto_run_id: preparationRun, task: "prepare multi-task execution", branch: "main", classification,
       selections: [selection(featureId)],
-      teams: [
-        { team: teamDef.id, task_ref: { feature_id: featureId, task_id: "T-1" }, scope: ["src/feature.ts"], classification, workflow: "standard", profile: "standard", worktree: "same_branch", depends_on: [], dod },
-        { team: teamDef.id, task_ref: { feature_id: featureId, task_id: "T-2" }, scope: ["src/other.ts"], classification, workflow: "standard", profile: "standard", worktree: "same_branch", depends_on: [], dod },
-      ],
+      teams: derived.teams,
     };
     let injected = false;
     setCtoSpecificationPreparationTestHooks({
@@ -4825,6 +4882,7 @@ test("multi-task same TeamDef preparation creates unique execution instances and
     assert.equal(new Set(preparedState.plan.teams.map((team) => team.team)).size, 2);
     assert.deepEqual(preparedState.plan.teams.map((team) => team.team_def_id), [teamDef.id, teamDef.id]);
     assert.deepEqual(preparedState.plan.teams[1]!.depends_on, [preparedState.plan.teams[0]!.team]);
+    assert.equal(preparedState.plan.teams[1]!.depends_on.includes("T-1"), false, "plan dependencies must not leak handoff task ids");
     assert.deepEqual(preparedState.teams.map((team) => team.team_def_id), [teamDef.id, teamDef.id]);
 
   } finally {
