@@ -16,6 +16,7 @@ import {
   buildTeamPlan,
   validateDecompositionDepth,
   runCto,
+  finalizeCtoExecution,
   ctoRunId,
   newCtoState,
   writeCtoState,
@@ -51,7 +52,11 @@ import {
   validateRefinement,
   evaluateDissent,
   dissentGate,
+  readRunControl,
+  acquireExecutionClaim,
+  LifecycleError,
 } from "@andvl1/omp-workflows-core";
+import type { TrustedExecutionContext } from "../src/engine/types.js";
 
 function sampleDefs(): Record<string, TeamDef> {
   return {
@@ -92,6 +97,10 @@ function sampleEscalation(overrides: Partial<Escalation> = {}): Escalation {
     timeoutMs: 3_600_000,
     ...overrides,
   };
+}
+
+function executionContext(root: string, sessionId = "cto-test-session", branch = "main"): TrustedExecutionContext {
+  return { session_id: sessionId, caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" };
 }
 
 test("cto-engine: buildTeamPlan accepts a valid decomposition", () => {
@@ -197,6 +206,7 @@ test("cto-engine: runCto persists state and returns the plan", () => {
       autonomous: false,
       teams: [{ team: "kotlin-backend", slice: "server" }, { team: "frontend", slice: "web" }],
       defs: sampleDefs(),
+      execution: executionContext(root, "cto-engine-auth", "feat/auth"),
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
@@ -206,6 +216,86 @@ test("cto-engine: runCto persists state and returns the plan", () => {
     const reloaded = readCtoState(res.plan.id, root);
     assert.ok(reloaded);
     assert.equal(reloaded?.task, "Add OAuth");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-engine: runCto rejects missing execution before CTO state write", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-missing-execution-"));
+  try {
+    assert.throws(
+      () => runCto({
+        task: "missing execution",
+        cwd: root,
+        branch: "main",
+        autonomous: false,
+        teams: [{ team: "frontend", slice: "s" }],
+        defs: sampleDefs(),
+      } as never),
+      (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict",
+    );
+    assert.equal(existsSync(join(root, ".work-state", "cto")), false, "missing execution must not create CTO state");
+    assert.equal(readRunControl(root).execution_claim, null, "missing execution must not create a claim");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-engine: ordinary claim blocks trusted CTO start without partial state", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-ordinary-contention-"));
+  try {
+    const ordinary = acquireExecutionClaim(root, {
+      run_id: "11111111-1111-4111-8111-111111111111",
+      context: executionContext(root, "ordinary-owner"),
+      owner_kind: "workflow",
+    });
+    assert.throws(
+      () => runCto({
+        task: "blocked CTO",
+        cwd: root,
+        branch: "main",
+        autonomous: false,
+        teams: [{ team: "frontend", slice: "s" }],
+        defs: sampleDefs(),
+        execution: executionContext(root, "cto-owner"),
+      }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.equal(existsSync(join(root, ".work-state", "cto")), false, "run_busy must not publish CTO state");
+    assert.deepEqual(readRunControl(root).execution_claim, ordinary.claim, "ordinary claim remains unchanged");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-engine: terminal CTO release permits a later ordinary claim", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-terminal-release-"));
+  try {
+    const res = runCto({
+      task: "terminal CTO",
+      cwd: root,
+      branch: "main",
+      autonomous: false,
+      teams: [{ team: "frontend", slice: "s" }],
+      defs: sampleDefs(),
+      execution: executionContext(root, "cto-terminal-owner"),
+    });
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const claim = readRunControl(root).execution_claim;
+    assert.ok(claim);
+    assert.equal(claim?.owner_kind, "cto");
+    setCtoPause(res.state, "done", "finished", root);
+    finalizeCtoExecution(root, res.plan.id, claim!.token);
+    assert.equal(readRunControl(root).execution_claim, null, "terminal CTO release clears the common claim");
+
+    const ordinary = acquireExecutionClaim(root, {
+      run_id: "22222222-2222-4222-8222-222222222222",
+      context: executionContext(root, "ordinary-after-cto"),
+      owner_kind: "workflow",
+    });
+    assert.equal(ordinary.claim.owner_kind, "workflow");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -228,6 +318,7 @@ test("cto-engine: state transitions persist and are readable", () => {
       autonomous: false,
       teams: [{ team: "frontend", slice: "s" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
@@ -285,6 +376,7 @@ test("cto-engine: integrationDoD requires every team done with a complete DoD", 
       autonomous: false,
       teams: [{ team: "frontend", slice: "s" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
@@ -320,6 +412,7 @@ test("cto-engine: ctoBackstop blocks a done-claim with incomplete team DoD", () 
       autonomous: false,
       teams: [{ team: "frontend", slice: "s" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;

@@ -10,7 +10,8 @@
 
 import { buildTeamPlan, validateDecompositionDepth, type PlanTeamInput } from "./plan.js";
 import { newCtoState, writeCtoState, readCtoState } from "./state.js";
-import { acquireExecutionClaim, releaseExecutionClaim } from "../engine/run-store.js";
+import { acquireExecutionClaim, releaseExecutionClaim, type ClaimResult } from "../engine/run-store.js";
+import { assertTrustedExecutionContext, LifecycleError } from "../engine/run-lifecycle.js";
 import type { ModelClassification } from "../engine/run.js";
 import type { TrustedExecutionContext } from "../engine/types.js";
 import type { CtoState, TeamDef, TeamPlan } from "./types.js";
@@ -37,7 +38,8 @@ export interface RunCtoOptions {
   standby?: boolean;
   /** Session owning this interactive task run (foreign sessions do not amend it). */
   owner_session?: string;
-  execution?: TrustedExecutionContext;
+  /** Trusted host execution context; required for the common worktree claim. */
+  execution: TrustedExecutionContext;
   log?: (line: string) => void;
 }
 
@@ -60,18 +62,23 @@ export function ctoRunId(task: string): string {
 }
 
 export function runCto(opts: RunCtoOptions): RunCtoResult {
+  if (!opts.execution) throw new LifecycleError("lifecycle_request_conflict", "trusted execution context is required for CTO lifecycle mutation");
+  assertTrustedExecutionContext(opts.execution);
+  if (opts.execution.worktree !== opts.cwd) {
+    throw new LifecycleError("run_context_mismatch", "trusted execution context does not match the CTO worktree", { branch: opts.branch });
+  }
+  if (opts.execution.branch !== opts.branch) {
+    throw new LifecycleError("run_context_mismatch", "trusted execution context does not match the CTO branch", { branch: opts.branch });
+  }
+
   const built = buildTeamPlan({ id: ctoRunId(opts.task), task: opts.task, teams: opts.teams }, opts.defs);
   if (!built.ok) return built;
 
   const depth = validateDecompositionDepth(built.plan, opts.profileDepth);
   if (!depth.ok) return { ok: false, reason: depth.reason };
 
-  let claim: ReturnType<typeof acquireExecutionClaim> | undefined;
-  try {
-    if (opts.execution) claim = acquireExecutionClaim(opts.cwd, { run_id: built.plan.id, context: opts.execution, owner_kind: "cto" });
-  } catch (error) {
-    return { ok: false, reason: String(error) };
-  }
+  let claim: ClaimResult | undefined;
+  claim = acquireExecutionClaim(opts.cwd, { run_id: built.plan.id, context: opts.execution, owner_kind: "cto" });
   const state = newCtoState({
     id: built.plan.id,
     task: opts.task,

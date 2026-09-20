@@ -1014,6 +1014,34 @@ test("fullstack: workflow_checkpoint_ask fails closed without UI, for unauthenti
  * exactly as the installed host does: the extension runner is initialized
  * with the runtime mode and UI context before session_start fires.
  */
+type WorkflowMutationSnapshot = {
+  stateRaw: string;
+  controlRaw: string;
+  runCount: number;
+  claim: unknown;
+};
+
+function workflowMutationSnapshot(root: string, runId: string): WorkflowMutationSnapshot {
+  const statePath = runTarget(root, runId).statePath;
+  if (!statePath) throw new Error("canonical run state path is unavailable");
+  const controlPath = join(root, ".work-state", "run-control.json");
+  const controlRaw = readFileSync(controlPath, "utf8");
+  const control = JSON.parse(controlRaw) as { runs?: Record<string, unknown>; execution_claim?: unknown };
+  return {
+    stateRaw: readFileSync(statePath, "utf8"),
+    controlRaw,
+    runCount: Object.keys(control.runs ?? {}).length,
+    claim: control.execution_claim,
+  };
+}
+
+function assertWorkflowMutationUnchanged(before: WorkflowMutationSnapshot, after: WorkflowMutationSnapshot, label: string): void {
+  assert.equal(after.runCount, before.runCount, label + ": run count changed");
+  assert.equal(after.stateRaw, before.stateRaw, label + ": state bytes changed");
+  assert.equal(after.controlRaw, before.controlRaw, label + ": control bytes changed");
+  assert.deepEqual(after.claim, before.claim, label + ": execution claim changed");
+}
+
 function registerToolsWithSessionSink(): {
   tools: Map<string, RegisteredTool>;
   fireSessionStart: (ctx: Record<string, unknown>) => Promise<void>;
@@ -1118,10 +1146,20 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
       ui: { select: async () => undefined },
     } as never);
     assert.equal((rpcUi.details as { ok?: boolean; error?: string }).ok, true, (rpcUi.details as { error?: string }).error);
+    const mutationBeforeHeadless = workflowMutationSnapshot(root, hostRunId);
 
     // json and print (headless single-shot) sessions never own the tools.
     for (const mode of ["json", "print"]) {
       await fireSessionStart({ mode, hasUI: false, cwd: root, ui: {} });
+      const deniedPrepare = await prepare.execute("headless-" + mode, {
+        mode: "new",
+        task: "headless " + mode + " must not mutate workflow state",
+        branch: "main",
+        classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      }, undefined, undefined, { cwd: root, hasUI: false } as never);
+      const deniedPrepareDetails = deniedPrepare.details as { code?: string; error?: string };
+      assert.equal(deniedPrepareDetails.code, "WORKFLOW_CONTEXT_REJECTED", mode + ": " + deniedPrepareDetails.error);
+      assertWorkflowMutationUnchanged(mutationBeforeHeadless, workflowMutationSnapshot(root, hostRunId), mode);
       const headless = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
       assert.equal((headless.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED", mode);
     }
@@ -1131,6 +1169,53 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     // fail closed exactly like headless runs.
     const worker = await status.execute("worker", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
     assert.equal((worker.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
+
+    // A later trusted primary start re-enables the mode-less RPC fallback;
+    // the deny profile must not release or replace the shared controller.
+    await fireSessionStart({ mode: "rpc", hasUI: true, cwd: root, ui: { select: async () => undefined } });
+    const reenabled = await status.execute("test-reenabled", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
+    assert.equal((reenabled.details as { ok?: boolean; error?: string }).ok, true, (reenabled.details as { error?: string }).error);
+    const replayed = await prepare.execute("test-reenabled-prepare", {
+      mode: "resume",
+      run_id: hostRunId,
+      branch: "main",
+    }, undefined, undefined, {
+      cwd: root,
+      hasUI: false,
+      mode: "rpc",
+      session_id: "session-direct",
+      sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
+    } as never);
+    assert.equal((replayed.details as { ok?: boolean; error?: string }).ok, true, (replayed.details as { error?: string }).error);
+
+    // A foreign worker start must not poison the still-trusted primary profile.
+    await fireSessionStart({ mode: "print", hasUI: false, cwd: root, session_id: "worker-session", ui: {} });
+    const mutationBeforeWorker = workflowMutationSnapshot(root, hostRunId);
+    const deniedWorkerPrepare = await prepare.execute("worker-prepare", {
+      mode: "new",
+      task: "foreign worker must not mutate workflow state",
+      branch: "main",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+    }, undefined, undefined, {
+      cwd: root,
+      hasUI: false,
+      mode: "print",
+      session_id: "worker-session",
+      sessionManager: { getCwd: () => root, getSessionId: () => "worker-session" },
+    } as never);
+    const deniedWorkerPrepareDetails = deniedWorkerPrepare.details as { code?: string; error?: string };
+    assert.equal(deniedWorkerPrepareDetails.code, "WORKFLOW_CONTEXT_REJECTED", deniedWorkerPrepareDetails.error);
+    assertWorkflowMutationUnchanged(mutationBeforeWorker, workflowMutationSnapshot(root, hostRunId), "foreign worker");
+    const workerContext = await status.execute("worker-context", {}, undefined, undefined, {
+      cwd: root,
+      hasUI: false,
+      mode: "print",
+      session_id: "worker-session",
+      sessionManager: { getCwd: () => root, getSessionId: () => "worker-session" },
+    } as never);
+    assert.equal((workerContext.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
+    const primaryAfterWorker = await status.execute("primary-after-worker", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
+    assert.equal((primaryAfterWorker.details as { ok?: boolean; error?: string }).ok, true, (primaryAfterWorker.details as { error?: string }).error);
   } finally {
     await fireSessionStop({ cwd: root, hasUI: true, mode: "tui" });
     rmSync(root, { recursive: true, force: true });

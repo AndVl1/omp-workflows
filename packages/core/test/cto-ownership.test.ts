@@ -23,6 +23,11 @@ import {
   ctoBackstop,
   type TeamDef,
 } from "@andvl1/omp-workflows-core";
+import type { TrustedExecutionContext } from "../src/engine/types.js";
+
+function executionContext(root: string, sessionId = "cto-owner-session", branch = "main"): TrustedExecutionContext {
+  return { session_id: sessionId, caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" };
+}
 
 function sampleDefs(): Record<string, TeamDef> {
   return {
@@ -41,6 +46,7 @@ test("cto-owner: same-session task runs amend, foreign sessions get a fresh cont
       autonomous: false,
       teams: [{ team: "backend", slice: "s1" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
       owner_session: "sess-A",
     });
     assert.ok(res);
@@ -92,6 +98,7 @@ test("cto-owner: all teams done plus integration done is terminal without pause 
       autonomous: false,
       teams: [{ team: "backend", slice: "s1" }, { team: "frontend", slice: "s2" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
     });
     assert.ok(res);
     assert.equal(isCtoRunTerminal(res.state), false, "fresh run is not terminal");
@@ -121,6 +128,7 @@ test("cto-owner: state without pause is non-terminal and never crashes detection
       autonomous: false,
       teams: [{ team: "backend", slice: "s1" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
     });
     assert.ok(res);
 

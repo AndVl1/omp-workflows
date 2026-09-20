@@ -257,9 +257,12 @@ const subagentTreeRef: { current: SubagentTreeController | null } = { current: n
 const dispatcherStopsByCwd = new Map<string, () => void>();
 /** One lifecycle controller for the trusted host session currently bound to this bundle. */
 type CapturedHostSession = { cwd: string; sessionId: string; mode: "tui" | "rpc" };
+type PrimaryHostSessionProfile = CapturedHostSession | { cwd: string; sessionId: string; mode: "headless" };
 const workflowSessionRef: { current: WorkflowSessionController | null } = { current: null };
 const workflowSessionCapturedAtHostStart = { current: false };
 const capturedHostSessionRef: { current: CapturedHostSession | null } = { current: null };
+/** Latest primary host profile; headless marks an explicit fail-closed boundary. */
+const primaryHostSessionRef: { current: PrimaryHostSessionProfile | null } = { current: null };
 
 function contextSessionId(ctx: unknown): string | undefined {
   if (!ctx || typeof ctx !== "object") return undefined;
@@ -294,6 +297,45 @@ function authoritativeHostSession(ctx: unknown): { cwd: string; sessionId: strin
       : undefined;
   } catch {
     return undefined;
+  }
+}
+
+function sameHostSessionIdentity(
+  left: { cwd: string; sessionId: string },
+  right: { cwd: string; sessionId: string },
+): boolean {
+  try {
+    return left.sessionId === right.sessionId && resolve(left.cwd) === resolve(right.cwd);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Track only the primary host session. A noninteractive start for that same
+ * manager identity denies the stale interactive fallback without releasing
+ * its controller; foreign worker/lead starts are ignored.
+ */
+function observePrimaryHostSession(ctx: unknown): void {
+  const authoritative = authoritativeHostSession(ctx);
+  const current = primaryHostSessionRef.current;
+  if (!authoritative || !current || !sameHostSessionIdentity(current, authoritative)) return;
+  const value = ctx as { mode?: unknown; hasUI?: unknown };
+  const mode = value.mode;
+  if (value.hasUI === true && (mode === "tui" || mode === "rpc")) {
+    primaryHostSessionRef.current = { ...authoritative, mode };
+    return;
+  }
+  if (value.hasUI === false && (mode === undefined || mode === "json" || mode === "print")) {
+    primaryHostSessionRef.current = { ...authoritative, mode: "headless" };
+  }
+}
+
+function clearPrimaryHostSession(ctx: unknown): void {
+  const authoritative = authoritativeHostSession(ctx);
+  const current = primaryHostSessionRef.current;
+  if (authoritative && current && sameHostSessionIdentity(current, authoritative)) {
+    primaryHostSessionRef.current = null;
   }
 }
 
@@ -377,6 +419,7 @@ function releaseWorkflowSession(ctx: unknown): void {
     workflowSessionRef.current = null;
     workflowSessionCapturedAtHostStart.current = false;
     capturedHostSessionRef.current = null;
+    clearPrimaryHostSession(ctx);
   } catch {
     // Preserve the controller and claim on failure; clearing it would hide a
     // live ownership conflict and permit an unsafe replacement.
@@ -402,6 +445,8 @@ function capturedHostControllerForTool(
     !ctx ||
     typeof ctx !== "object"
   ) return undefined;
+  const primary = primaryHostSessionRef.current;
+  if (!primary || primary.mode === "headless" || !sameHostSessionIdentity(primary, captured)) return undefined;
   if (resolve(captured.cwd) !== resolve(cwd)) return undefined;
   if (requestedSession && requestedSession !== captured.sessionId) return undefined;
   const value = ctx as { mode?: unknown; hasUI?: unknown };
@@ -430,6 +475,7 @@ function captureTrustedProfile(
   if (captured) {
     capturedHostSessionRef.current = captured;
     workflowSessionCapturedAtHostStart.current = true;
+    primaryHostSessionRef.current = captured;
   }
 }
 
@@ -482,6 +528,13 @@ function getFullstackWorkflowToolSessionController(
 ): WorkflowSessionController | undefined {
   return getFullstackWorkflowSessionController(ctx, cwd)
     ?? capturedHostControllerForTool(ctx, cwd, contextSessionId(ctx));
+}
+
+function registerWorkflowSessionProfile(pi: ExtensionAPI): void {
+  if (typeof (pi as { on?: unknown }).on !== "function") return;
+  pi.on("session_start", (_event: unknown, ctx: unknown) => observePrimaryHostSession(ctx));
+  pi.on("session_stop", (_event: unknown, ctx: unknown) => clearPrimaryHostSession(ctx));
+  pi.on("session_shutdown", (_event: unknown, ctx: unknown) => clearPrimaryHostSession(ctx));
 }
 
 function registerWorkflowSessionController(pi: ExtensionAPI): void {
@@ -542,6 +595,7 @@ const fullstackWorkflowToolAdapter: WorkflowToolAdapter = createWorkflowToolAdap
 
 /** Fullstack keeps only bundle-specific adaptation; core owns tool behavior. */
 export function registerWorkflowTools(pi: ExtensionAPI): void {
+  registerWorkflowSessionProfile(pi);
   fullstackWorkflowToolAdapter.register(pi);
 }
 

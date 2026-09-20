@@ -24,6 +24,7 @@ import {
   isCtoRunTerminal,
   type TeamDef,
 } from "@andvl1/omp-workflows-core";
+import type { TrustedExecutionContext } from "../src/engine/types.js";
 
 function sampleDefs(): Record<string, TeamDef> {
   return {
@@ -31,6 +32,10 @@ function sampleDefs(): Record<string, TeamDef> {
     frontend: { id: "frontend", name: "Frontend", scope: ["frontend"], profile: "lightweight", lead: "team-lead", roster: ["frontend"] },
     "cli-go": { id: "cli-go", name: "CLI Go", scope: ["go"], profile: "lightweight", lead: "team-lead", roster: ["go"] },
   };
+}
+
+function executionContext(root: string, sessionId = "cto-amend-session", branch = "main"): TrustedExecutionContext {
+  return { session_id: sessionId, caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" };
 }
 
 function startRun(root: string) {
@@ -41,6 +46,7 @@ function startRun(root: string) {
     autonomous: false,
     teams: [{ team: "backend", slice: "s1" }, { team: "frontend", slice: "s2" }],
     defs: sampleDefs(),
+    execution: executionContext(root),
   });
   assert.equal(res.ok, true);
   return res.ok ? res : null;
@@ -60,17 +66,15 @@ test("cto-amend: findActiveCtoRun finds an active run and ignores finished ones"
   try {
     const first = startRun(root);
     assert.ok(first);
-    // A second, finished run must not shadow the active one.
-    const done = runCto({
+    // A manually terminal run must not shadow the active one.
+    const done = newCtoState({
+      id: "done-run",
       task: "Done run",
-      cwd: root,
       branch: "main",
       autonomous: false,
-      teams: [{ team: "cli-go", slice: "s" }],
-      defs: sampleDefs(),
+      plan: { id: "done-run", task: "Done run", teams: [], created_at: new Date().toISOString() },
     });
-    assert.equal(done.ok, true);
-    if (done.ok) setCtoPause(done.state, "done", "finished", root);
+    setCtoPause(done, "done", "finished", root);
 
     const active = findActiveCtoRun(root);
     assert.equal(active?.runId, first.plan.id, "active run found even with a finished run present");

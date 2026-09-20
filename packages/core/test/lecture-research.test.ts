@@ -63,8 +63,13 @@ import {
   type ResolvedVideoSource,
   type TimestampedTranscriptSegment,
 } from "@andvl1/omp-workflows-core";
+import type { TrustedExecutionContext } from "../src/engine/types.js";
 import { dodBackstop } from "../src/gates/dod-backstop.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
+
+function executionContext(root: string, sessionId = "lecture-cto-session", branch = "main"): TrustedExecutionContext {
+  return { session_id: sessionId, caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" };
+}
 
 const COMPLEXITIES: Complexity[] = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"];
 const FLAGS: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
@@ -584,6 +589,7 @@ test("lecture-research: fresh and amend CTO prompts keep the research-only human
       defs: {
         backend: { id: "backend", name: "Backend", scope: ["backend-kotlin"], profile: "lightweight", lead: "team-lead", roster: ["backend-kotlin"] } satisfies TeamDef,
       },
+      execution: executionContext(root),
     });
     assert.equal(res.ok, true, "amend fixture: runCto starts a run in the temp root");
     if (!res.ok) return;

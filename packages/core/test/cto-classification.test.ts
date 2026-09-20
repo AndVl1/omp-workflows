@@ -21,6 +21,11 @@ import {
   resolveCtoAutonomous,
   type TeamDef,
 } from "@andvl1/omp-workflows-core";
+import type { TrustedExecutionContext } from "../src/engine/types.js";
+
+function executionContext(root: string, sessionId = "cto-class-session", branch = "main"): TrustedExecutionContext {
+  return { session_id: sessionId, caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" };
+}
 
 function sampleDefs(): Record<string, TeamDef> {
   return {
@@ -45,6 +50,7 @@ test("cto-class: runCto persists the model classification; classification.autono
       },
       teams: [{ team: "backend", slice: "fix 500" }],
       defs: sampleDefs(),
+      execution: executionContext(root, "cto-class-fix-login", "fix/login"),
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;
@@ -76,6 +82,7 @@ test("cto-class: runCto without classification keeps the legacy top-level flag (
       autonomous: false,
       teams: [{ team: "backend", slice: "s" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
     });
     assert.equal(res.ok, true);
     if (!res.ok) return;

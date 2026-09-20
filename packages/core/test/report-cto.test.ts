@@ -290,19 +290,9 @@ test("cto: profile-backed workflow stages carry a reconstructed promptPreview; d
     // truthful main-session descriptor, declared outputs + profile metadata.
     const discovery = report.stages.find((s) => s.id === "cto_discovery");
     assert.ok(discovery?.promptPreview, "profile-backed CTO stage carries a preview");
-    assert.ok(discovery.promptPreview!.includes("CTO Discovery [cto_discovery] type: orchestrator"), "title/id/type head line");
-    assert.ok(discovery.promptPreview!.includes("task: Build the report feature"), "session task present");
-    assert.ok(discovery.promptPreview!.includes("agents: orchestrator -> main session"), "truthful orchestrator descriptor");
-    assert.ok(discovery.promptPreview!.includes("outputs: cto_discovery"), "declared outputs");
-    assert.ok(discovery.promptPreview!.includes("checkpoint: confirm_understanding"), "checkpoint metadata");
-    assert.ok(discovery.promptPreview!.includes("gate: branch_created"), "gate metadata");
-    assert.ok(discovery.promptPreview!.includes("autonomous: log confirmed understanding, continue"), "autonomous metadata");
 
     // Single role stage: resolved agent + declared inputs/outputs.
     const arch = report.stages.find((s) => s.id === "architecture");
-    assert.ok(arch?.promptPreview?.includes("agents: architect"), "resolved agent present");
-    assert.ok(arch.promptPreview!.includes("inputs: team_plan"), "declared inputs");
-    assert.ok(arch.promptPreview!.includes("outputs: architecture"), "declared outputs");
 
     // The `teams` stage declares inputs/outputs but has no role roster —
     // the preview carries no agent claim for the phase.

@@ -3,35 +3,12 @@
  *
  * Renders the workflow specification view as a self-contained offline bundle
  * under `.work-state/visualize` (hub Markdown/HTML, manifest.json, and one
- * Markdown+HTML page per session):
+ * Markdown+HTML page per session).
  *
- *   /workflow-view [do-work|cto|legacy] [id=<slug|runId>] [--all] [--full]
- *
- *   bare            latest discoverable session (feature/legacy/CTO)
- *   do-work         latest do-work session (feature or legacy)
- *   cto             latest CTO run
- *   legacy          the legacy root session (team-state.json)
- *   id=<slug|runId> pick a specific session id (unsafe ids are rejected)
- *   --all           complete view: every discoverable session
- *   --full          embed redacted full artifact bodies (bounded caps)
- *
- * Selection modes (frozen contract): `selected`/`latest` renders ONE session
- * and a visibly PARTIAL hub; `--all` is the completeness mode. `--all` is
- * mutually exclusive with `id=`. At most one selector kind, one id, one
- * `--all` and one `--full` are accepted; duplicate/unknown/unsafe arguments
- * return `ERROR:` plus usage and write nothing.
- *
- * The command is a thin orchestration shell over the core visualize APIs:
- * `listSessions` (discovery) → `buildSessionSnapshots` (one-read normalized
- * model, redaction/caps) → `buildManifest` (deterministic manifest) →
- * Markdown/HTML serializers (pure projections) → `preflightLinks`
- * (fresh-output zero-dead-link gate) → `publishVisualize` (whole-tree
- * atomic swap, 0600, boundary checks). It never hooks engine transitions,
- * never dispatches agents, never reads excluded inputs (events.jsonl,
- * vibe-report, prior visualize output) and never mutates canonical state.
- *
- * Status output is safe by construction: relative paths and counts only —
- * never absolute paths, raw OS/parser errors, secrets or bodies.
+ * Ordinary workflow state is addressed only by an explicit canonical run id
+ * and optional revision. CTO state is a separate namespace: an exact
+ * `cto id=<id>` or `cto --all` request is allowed, while a bare CTO request
+ * never guesses the newest run. Legacy feature/session readers are not used.
  */
 
 import type { CustomCommand, CustomCommandAPI } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
@@ -46,15 +23,19 @@ import {
   buildSessionSnapshots,
   isSafePathKey,
   listCanonicalRunSources,
-  listSessions,
+  listCtoSources,
   preflightLinks,
   publishVisualize,
   renderHubHtml,
   renderHubMarkdown,
   renderSessionHtml,
   renderSessionMarkdown,
+  resolveCanonicalRunSource,
+  resolveCtoSource,
   sessionPagePath,
-  type SessionSourceEntry,
+  type CanonicalRunReportListEntry,
+  type CanonicalRunReportSource,
+  type CtoSessionSource,
   type VisualizeBundleFile,
   type VisualizePublishResult,
   type VisualizationScope,
@@ -62,13 +43,14 @@ import {
   type VisualizationSnapshot,
 } from "@andvl1/omp-workflows-core";
 
-/** Selector kinds understood by the command (frozen grammar). */
+/** Selector kinds understood by the command. */
 export type WorkflowViewKind = "do-work" | "cto" | "legacy";
 
 export interface WorkflowViewSelector {
   kind?: WorkflowViewKind;
   id?: string;
-  /** --all: completeness mode; mutually exclusive with id=. */
+  revision?: string;
+  /** --all: completeness mode; mutually exclusive with id=/revision=. */
   all?: boolean;
 }
 
@@ -84,10 +66,10 @@ export interface ParsedWorkflowViewArgs {
 }
 
 /**
- * Parse `/workflow-view [do-work|cto|legacy] [id=<slug|runId>] [--all] [--full]`.
- * Accepts at most one kind, one id, one `--all` and one `--full`; duplicate,
- * unknown, empty or unsafe tokens return an error string (with usage handled
- * by the caller). `--all` combined with `id=` is rejected.
+ * Parse `/workflow-view [do-work|cto|legacy] [id=<runId>] [revision=<id>] [--all] [--full]`.
+ * Empty, duplicate, unknown and unsafe tokens are rejected before any read or
+ * write. A revision is an ordinary canonical-run selector and cannot be used
+ * with `--all`.
  */
 export function parseWorkflowViewArgs(args: string[]): ParsedWorkflowViewArgs {
   const selector: WorkflowViewSelector = {};
@@ -120,93 +102,120 @@ export function parseWorkflowViewArgs(args: string[]): ParsedWorkflowViewArgs {
       selector.id = id;
       continue;
     }
+    const revisionMatch = /^revision=(.*)$/.exec(token);
+    if (revisionMatch) {
+      const revision = revisionMatch[1]!.trim();
+      if (!revision) return { selector, options, error: "empty revision= value" };
+      if (selector.revision !== undefined) return { selector, options, error: `duplicate revision: ${token}` };
+      if (!isSafePathKey(revision)) return { selector, options, error: `unsafe revision: ${revision}` };
+      selector.revision = revision;
+      continue;
+    }
     return { selector, options, error: `unknown argument: ${token}` };
   }
   if (selector.all !== undefined && selector.id !== undefined) {
     return { selector, options, error: "--all is mutually exclusive with id=" };
   }
+  if (selector.all !== undefined && selector.revision !== undefined) {
+    return { selector, options, error: "--all is mutually exclusive with revision=" };
+  }
   return { selector, options };
 }
 
 const USAGE = [
-  "Usage: /workflow-view [do-work|cto|legacy] [id=<runId>] [--all] [--full]",
+  "Usage: /workflow-view [do-work|cto] [id=<runId>] [revision=<revisionId>] [--all] [--full]",
   "",
-  "  (bare)      choose an explicit canonical run or CTO namespace",
-  "  do-work     canonical ordinary run (graph view may be unavailable)",
-  "  cto         CTO run in the explicit CTO namespace",
-  "  legacy      migration input only; runtime viewer is unavailable",
-  "  id=<runId>  pick a specific canonical run or CTO run",
-  "  --all       complete view for supported non-canonical sessions",
-  "  --full      embed redacted full artifact bodies (bounded caps)",
+  "  do-work id=<runId>  one canonical ordinary run (optional revision=)",
+  "  cto id=<runId>      one exact CTO JSON run",
+  "  cto --all           deterministic list of exact CTO JSON runs",
+  "  --all               complete canonical-run/CTO list snapshot",
+  "  --full              embed redacted full artifact bodies (bounded caps)",
   "",
-  "Writes a self-contained offline view (index.md, index.html, manifest.json +",
-  "session pages) under .work-state/visualize.",
+  "Legacy ordinary state is import-only and cannot be rendered at runtime.",
+  "Writes a self-contained offline view under .work-state/visualize.",
 ].join("\n");
 
-/** Safe kind label of one discovered source entry (feature/legacy/cto). */
-function displayKindOf(entry: SessionSourceEntry): "feature" | "legacy" | "cto" {
-  if (entry.kind === "cto") return "cto";
-  return entry.isLegacy ? "legacy" : "feature";
+const CANONICAL_RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+type WorkflowViewEntry = CanonicalRunReportListEntry | CanonicalRunReportSource | CtoSessionSource;
+type WorkflowViewSource = CanonicalRunReportSource | CtoSessionSource;
+
+function entryId(entry: WorkflowViewEntry): string {
+  return entry.kind === "run" ? entry.run_id : entry.id;
 }
 
-/** Whether an entry matches the requested selector kind. */
-function matchesKind(kind: WorkflowViewKind, entry: SessionSourceEntry): boolean {
+function displayKindOf(entry: WorkflowViewEntry): "feature" | "cto" {
+  return entry.kind === "cto" ? "cto" : "feature";
+}
+
+function matchesKind(kind: WorkflowViewKind, entry: WorkflowViewEntry): boolean {
   if (kind === "cto") return entry.kind === "cto";
-  if (kind === "legacy") return entry.kind === "do-work" && entry.isLegacy;
-  return entry.kind === "do-work";
+  if (kind === "legacy") return false;
+  return entry.kind === "run";
 }
 
-/** Discoverable sessions as safe `kind/id` labels (E-2 error listing). */
-function discoverableLabels(entries: readonly SessionSourceEntry[]): string {
-  return entries.map((e) => `${displayKindOf(e)}/${e.id}`).join(", ");
+/** Discoverable sessions as safe `kind/id` labels for selector errors. */
+function discoverableLabels(entries: readonly WorkflowViewEntry[]): string {
+  return entries.map((entry) => `${displayKindOf(entry)}/${entryId(entry)}`).join(", ");
 }
 
 interface Selection {
-  entries: SessionSourceEntry[];
+  entries: WorkflowViewEntry[];
   scope: VisualizationScope;
   error?: string;
+  errorCode?: "migration_required" | "canonical-unavailable";
 }
 
 /**
- * Resolve the selector against the discovered sessions (deterministic total
- * order from `listSessions`). latest = first in total order; selected =
- * exact kind/id (the legacy root wins `id=legacy`, matching the report
- * selector); `--all` = every session (optionally of one kind). Unknown ids
- * return an error listing discoverable ids; empty workspaces error (E-1).
+ * Resolve only explicit ids or an explicit list snapshot. There is no latest,
+ * active-feature, slug or filesystem-order fallback in this helper.
  */
-export function selectWorkflowSessions(entries: SessionSourceEntry[], selector: WorkflowViewSelector): Selection {
-  const applyKind = (list: SessionSourceEntry[]): SessionSourceEntry[] =>
-    selector.kind === undefined ? list : list.filter((e) => matchesKind(selector.kind!, e));
+export function selectWorkflowSessions(entries: WorkflowViewEntry[], selector: WorkflowViewSelector): Selection {
+  const applyKind = (list: WorkflowViewEntry[]): WorkflowViewEntry[] =>
+    selector.kind === undefined ? list : list.filter((entry) => matchesKind(selector.kind!, entry));
 
+  if (selector.kind === "legacy") {
+    return {
+      entries: [],
+      scope: "selected",
+      error: "legacy workflow state is import-only; select its canonical run before using workflow-view",
+      errorCode: "migration_required",
+    };
+  }
   if (selector.all !== undefined) {
-    return { entries: applyKind(entries), scope: "all" };
+    const selected = applyKind(entries);
+    if (selected.length === 0) {
+      return {
+        entries: [],
+        scope: "all",
+        error: selector.kind === "cto" ? "no exact CTO runs are available for workflow-view" : "no canonical ordinary runs are available for workflow-view",
+        errorCode: "migration_required",
+      };
+    }
+    return { entries: selected, scope: "all" };
   }
   if (selector.id !== undefined) {
-    const matches = entries.filter((e) => e.id === selector.id && (selector.kind === undefined || matchesKind(selector.kind, e)));
+    const matches = entries.filter((entry) => entryId(entry) === selector.id && (selector.kind === undefined || matchesKind(selector.kind, entry)));
     if (matches.length === 0) {
       const kindPart = selector.kind === undefined ? "" : ` (kind ${selector.kind})`;
-      const listed = entries.length > 0 ? `; discoverable sessions: ${discoverableLabels(entries)}` : "";
-      return { entries: [], scope: "selected", error: `session not found: ${selector.id}${kindPart}${listed}` };
-    }
-    // id=legacy is reserved for the legacy root (report selector parity);
-    // the degraded feature literally named "legacy" never shadows it.
-    if (selector.id === "legacy") {
-      const root = matches.find((e) => e.kind === "do-work" && e.isLegacy);
-      if (root !== undefined) return { entries: [root], scope: "selected" };
-    }
-    return { entries: matches.slice(0, 1), scope: "selected" };
-  }
-  if (selector.kind !== undefined) {
-    const matches = applyKind(entries);
-    if (matches.length === 0) {
-      return { entries: [], scope: "selected", error: `no ${selector.kind} session found under .work-state` };
+      const listed = entries.length > 0 ? `; available: ${discoverableLabels(entries)}` : "";
+      return {
+        entries: [],
+        scope: "selected",
+        error: `explicit session '${selector.id}' was not found${kindPart}${listed}`,
+        errorCode: selector.kind === "cto" ? "canonical-unavailable" : "migration_required",
+      };
     }
     return { entries: matches.slice(0, 1), scope: "selected" };
   }
-  if (entries.length === 0) {
-    return { entries: [], scope: "selected", error: "no workflow sessions found under .work-state (nothing to visualize)" };
-  }
-  return { entries: entries.slice(0, 1), scope: "selected" };
+
+  return {
+    entries: [],
+    scope: "selected",
+    error: selector.kind === "cto"
+      ? "CTO workflow-view requires an explicit id=<runId> or --all; latest selection is unavailable"
+      : "workflow-view requires an explicit canonical run id or --all; legacy/latest selection is unavailable",
+    errorCode: selector.kind === "cto" ? "canonical-unavailable" : "migration_required",
+  };
 }
 
 function plural(count: number, word: string): string {
@@ -221,7 +230,7 @@ function plural(count: number, word: string): string {
 export function formatWorkflowViewStatus(snapshot: VisualizationSnapshot, result: VisualizePublishResult): string {
   const counts = snapshot.manifest.counts;
   const scopeLabel = snapshot.scope === "all" ? "all sessions (complete)" : "selected/latest (partial)";
-  const sessionWarnings = snapshot.sessions.reduce((n, s) => n + s.warnings.length, 0);
+  const sessionWarnings = snapshot.sessions.reduce((n, session) => n + session.warnings.length, 0);
   const warnings = sessionWarnings + result.warnings.length;
   const sessionPageCount = snapshot.sessions.length * 2;
   const lines = [
@@ -233,75 +242,102 @@ export function formatWorkflowViewStatus(snapshot: VisualizationSnapshot, result
   lines.push("Open .work-state/visualize/index.html in a browser to view the bundle.");
   return lines.join("\n");
 }
-const CANONICAL_RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function migrationError(message: string): string {
+  return `ERROR [migration_required]: ${message}\n\n${USAGE}`;
+}
+
+function canonicalUnavailable(message: string): string {
+  return `ERROR [canonical-unavailable]: ${message}\n\n${USAGE}`;
+}
+
+function resolveCanonicalEntries(cwd: string, revision: string | undefined): WorkflowViewSource[] {
+  const entries = listCanonicalRunSources(cwd);
+  return entries.map((entry) => resolveCanonicalRunSource(cwd, {
+    run_id: entry.run_id,
+    ...(revision ? { revision_id: revision } : {}),
+  }));
+}
+
+function explicitCanonicalSource(cwd: string, id: string, revision: string | undefined): CanonicalRunReportSource | null {
+  if (!CANONICAL_RUN_ID.test(id)) return null;
+  try {
+    return resolveCanonicalRunSource(cwd, { run_id: id, ...(revision ? { revision_id: revision } : {}) });
+  } catch {
+    return null;
+  }
+}
+
+function sourceEntriesForRequest(cwd: string, selector: WorkflowViewSelector): { entries: WorkflowViewSource[]; error?: string } {
+  if (selector.kind === "legacy") return { entries: [], error: migrationError("legacy workflow state is import-only; select its canonical run before using workflow-view.") };
+  if (selector.all !== undefined) {
+    if (selector.revision !== undefined) return { entries: [], error: migrationError("revision= requires one explicit canonical run id; it cannot be combined with --all.") };
+    try {
+      if (selector.kind === "cto") return { entries: listCtoSources(cwd) };
+      if (selector.kind === "do-work") return { entries: resolveCanonicalEntries(cwd, undefined) };
+      return { entries: [...resolveCanonicalEntries(cwd, undefined), ...listCtoSources(cwd)] };
+    } catch {
+      return { entries: [], error: canonicalUnavailable("the requested canonical list snapshot is unavailable") };
+    }
+  }
+  if (selector.id === undefined) {
+    return {
+      entries: [],
+      error: selector.kind === "cto"
+        ? canonicalUnavailable("CTO workflow-view requires an explicit id=<runId> or --all; latest selection is unavailable")
+        : migrationError("workflow-view requires an explicit canonical run id or --all; legacy/latest selection is unavailable"),
+    };
+  }
+  if (selector.kind === "cto") {
+    if (selector.revision !== undefined) return { entries: [], error: canonicalUnavailable("revision= is only valid for canonical ordinary runs") };
+    const source = resolveCtoSource(cwd, selector.id);
+    return source ? { entries: [source] } : { entries: [], error: canonicalUnavailable(`exact CTO run '${selector.id}' was not found`) };
+  }
+  const source = explicitCanonicalSource(cwd, selector.id, selector.revision);
+  return source
+    ? { entries: [source] }
+    : { entries: [], error: migrationError(`'${selector.id}' is not an explicit canonical run id; import/select a canonical run before using workflow-view`) };
+}
 
 const factory = (api: CustomCommandAPI): CustomCommand => ({
   name: "workflow-view",
   description:
-    "Render supported CTO workflow state as a self-contained offline bundle under .work-state/visualize. Canonical ordinary graph rendering is currently unavailable. /workflow-view [do-work|cto|legacy] [id=<runId>] [--all] [--full]",
+    "Render explicitly selected canonical ordinary or CTO workflow state as a self-contained offline bundle under .work-state/visualize. /workflow-view [do-work|cto] [id=<runId>] [revision=<revisionId>] [--all] [--full]",
   async execute(args: string[], ctx: HookCommandContext): Promise<string> {
     const cwd = ctx.cwd ?? api.cwd;
     if (!cwd) return "ERROR: no cwd available.";
 
     const parsed = parseWorkflowViewArgs(args);
     if (parsed.error) return `ERROR: ${parsed.error}\n\n${USAGE}`;
-    const canonicalRuns = listCanonicalRunSources(cwd);
-    if (parsed.selector.kind === "legacy") {
-      return "ERROR [migration_required]: legacy workflow state is import-only; select its canonical run before using workflow-view.";
-    }
-    if (parsed.selector.kind !== "cto" && canonicalRuns.length === 0) {
-      return (
-        "ERROR [migration_required]: no canonical ordinary run is available for workflow-view. " +
-        "Import/select a canonical run first; legacy state is not a runtime fallback."
-      );
-    }
-    const canonicalScope = parsed.selector.kind !== "cto";
-    if (canonicalScope && (canonicalRuns.length > 0 || (parsed.selector.id !== undefined && CANONICAL_RUN_ID.test(parsed.selector.id)))) {
-      if (parsed.selector.id) {
-        const canonical = canonicalRuns.find(entry => entry.run_id === parsed.selector.id);
-        if (!canonical) {
-          return `ERROR: canonical run '${parsed.selector.id}' was not found; choose one of: ${canonicalRuns.map(entry => entry.run_id).join(", ")}`;
-        }
-        return (
-          `ERROR: workflow-view is unavailable for canonical run '${canonical.run_id}' because its graph renderer is not adapted. ` +
-          `Use /session-report do-work id=${canonical.run_id} or workflow_status with selector.run_id.`
-        );
-      }
-      return (
-        "ERROR: workflow-view is unavailable for canonical runs because its graph renderer is not adapted. " +
-        `Use /session-report with an explicit run id; available runs: ${canonicalRuns.map(entry => `${entry.title} [${entry.run_id}]`).join(", ")}`
-      );
-    }
 
-    const discovered = listSessions(cwd);
-    const selection = selectWorkflowSessions(discovered, parsed.selector);
-    if (selection.error) return `ERROR: ${selection.error}\n\n${USAGE}`;
+    const requested = sourceEntriesForRequest(cwd, parsed.selector);
+    if (requested.error) return requested.error;
+    const selection = selectWorkflowSessions(requested.entries, parsed.selector);
+    if (selection.error) {
+      const error = selection.errorCode === "canonical-unavailable" ? canonicalUnavailable(selection.error) : migrationError(selection.error);
+      return error;
+    }
     if (selection.entries.length === 0) {
-      return "ERROR: no workflow sessions found under .work-state (nothing to visualize)\n\n" + USAGE;
+      return migrationError("no canonical workflow sessions are available for this request");
     }
 
     const generatedAt = new Date().toISOString();
     let sessions: VisualizationSession[];
     try {
-      sessions = buildSessionSnapshots(cwd, selection.entries, generatedAt, { generatedAt, full: parsed.options.full });
+      sessions = buildSessionSnapshots(cwd, selection.entries as WorkflowViewSource[], generatedAt, {
+        generatedAt,
+        full: parsed.options.full,
+      });
     } catch {
-      // Snapshot building degrades per session by contract; an unexpected
-      // whole-build throw is surfaced as a category-only error (never raw).
-      return "ERROR: could not build the workflow view: unexpected build failure\n\n" + USAGE;
+      return canonicalUnavailable("the selected canonical source could not be rendered");
     }
     if (sessions.length === 0) {
-      return "ERROR: no workflow sessions found under .work-state (nothing to visualize)\n\n" + USAGE;
+      return migrationError("no canonical workflow sessions are available for this request");
     }
 
-    // F2: in selected/latest scope the hub metadata must report the TOTAL
-    // discovered count (not the number of selected entries) so the bundle is
-    // honestly partial; generatedSessions stays the selected count. --all
-    // generates every discovered session in scope, so discovered == generated
-    // there and selection.entries.length remains the correct value.
     const manifest = buildManifest(sessions, selection.scope, {
       generatedAt,
-      discoveredSessions: selection.scope === "all" ? selection.entries.length : discovered.length,
+      discoveredSessions: requested.entries.length,
     });
     const snapshot: VisualizationSnapshot = {
       schema: 1,
@@ -330,7 +366,6 @@ const factory = (api: CustomCommandAPI): CustomCommand => ({
       htmlPages[htmlPath] = html;
     }
 
-    // Fresh-output link gate: zero dead internal links before any write.
     const preflight = preflightLinks(htmlPages);
     if (preflight.deadLinks.length > 0) {
       return `ERROR: workflow view link preflight failed (${preflight.deadLinks.length} dead link(s)); nothing written.`;
