@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
@@ -129,5 +130,28 @@ test("explicit corrupt or missing canonical markers fail closed while no marker 
     assert.equal(allowed, undefined, "a task without a canonical marker keeps the compatibility behavior");
   } finally {
     rmSync(absentRoot, { recursive: true, force: true });
+  }
+});
+
+
+test("an explicit old-run marker rejects a branch-mismatched state without mutation", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-gate-branch-mismatch-"));
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "branch-a"], { stdio: "ignore" });
+    execFileSync("git", ["-C", root, "checkout", "--quiet", "-b", "branch-b"], { stdio: "ignore" });
+    writeCanonicalState(root, { ...minimalState(), branch: "branch-a" });
+    const runsDir = join(root, ".work-state", "runs");
+    const statePath = join(runsDir, RUN_ID, "state.json");
+    const beforeState = readFileSync(statePath, "utf8");
+    const beforeRuns = readdirSync(runsDir);
+    const marker = `<!-- omp-dispatch run=${RUN_ID} stage=implementation kind=single cursor=epoch roles=worker -->`;
+
+    const blocked = dispatchGate({ toolName: "task", input: { task: marker } }, { cwd: root });
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /branch \x27branch-a\x27 does not match active branch \x27branch-b\x27/);
+    assert.equal(readFileSync(statePath, "utf8"), beforeState, "the old branch state remains byte-identical");
+    assert.deepEqual(readdirSync(runsDir), beforeRuns, "no current-branch run is created");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

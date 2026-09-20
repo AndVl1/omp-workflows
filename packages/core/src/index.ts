@@ -30,16 +30,18 @@ import { safetyGuard } from "./gates/safety.js";
 import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
 import { ctoSliceTaskGate } from "./cto/slice-gate.js";
-import { registerObservabilityHooks, recordToolCallAttempt } from "./observability/index.js";
+import { registerObservabilityHooks, recordToolCallAttempt, setObservabilityRun } from "./observability/index.js";
 import { authorizeDispatchTrusted, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, recordCheckpointDecision, validateCheckpointAsk, commitCheckpointAnswer, hashDispatchSecret } from "./engine/durable.js";
 import { loadProfile, registerWorkflowProfiles } from "./engine/profile.js";
 import { prepareWorkflowState, type ModelClassification, type WorkflowPrepareOptions } from "./engine/run.js";
 import { resolveActiveBranch } from "./engine/state.js";
 import { findCurrentCheckpointDecision } from "./engine/checkpoints.js";
 import { resolveWorkflowContract } from "./engine/workflow-contract.js";
+import { LifecycleError } from "./engine/run-lifecycle.js";
 import { createWorkflowSessionController, type WorkflowSessionController } from "./engine/host-controller.js";
 import { createWorkflowReadSelector } from "./engine/read-selector.js";
-import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, locateDispatchByToolCall, locateDispatchesByToolCall, readSelectionSnapshot, readRunControl, readRunState, resolveRunSelection, listRuns, runStatePath, type DispatchOrigin } from "./engine/run-store.js";
+import { readDispatchOriginLocator, rememberDispatchOriginLocator } from "./dispatch-origin-locator.js";
+import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, readRunControl, readRunState, resolveRunSelection, listRuns, runStatePath, type DispatchOrigin } from "./engine/run-store.js";
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector } from "./engine/types.js";
 import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
@@ -573,7 +575,23 @@ function taskOutcomeRows(
   return { mapped, unresolved };
 }
 
-function taskMarkerFilter(input: unknown): { runId: string; capabilityId?: string; stageId: string; cursorEpoch: string } | undefined {
+type TaskMarkerFilter = { runId: string; capabilityId?: string; stageId: string; cursorEpoch: string };
+
+type PersistedDispatchOriginRecord = {
+  id: string;
+  tool_call_id?: string;
+  origin_session_id?: string;
+  work_identity?: {
+    run_id?: string;
+    capability_id?: string;
+    stage_id?: string;
+    capability_epoch?: string;
+    slot_id?: string;
+    task_id?: string;
+  };
+};
+
+function taskMarkerFilter(input: unknown): TaskMarkerFilter | undefined {
   if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
   const markers = taskMarkers(input);
   if (!markers) return undefined;
@@ -585,6 +603,70 @@ function taskMarkerFilter(input: unknown): { runId: string; capabilityId?: strin
     || (marker!.capability_id ?? "") !== (first.capability_id ?? "")
     || JSON.stringify([...marker!.roles].sort()) !== JSON.stringify([...first.roles].sort()))) return undefined;
   return { runId: first.run, ...(first.capability_id ? { capabilityId: first.capability_id } : {}), stageId: first.stage, cursorEpoch: first.cursor };
+}
+
+function persistedDispatchOrigin(cwd: string, runId: string, dispatch: PersistedDispatchOriginRecord): DispatchOrigin | undefined {
+  const identity = dispatch.work_identity;
+  if (identity?.run_id !== undefined && identity.run_id !== runId) return undefined;
+  return {
+    cwd: resolve(cwd),
+    run_id: runId,
+    dispatch_id: dispatch.id,
+    ...(dispatch.origin_session_id ? { origin_session_id: dispatch.origin_session_id } : {}),
+    ...(identity ? {
+      capability_id: identity.capability_id,
+      stage_id: identity.stage_id,
+      cursor_epoch: identity.capability_epoch,
+      slot_id: identity.slot_id,
+      task_id: identity.task_id,
+    } : {}),
+  };
+}
+
+/**
+ * Rebuild a task origin only after the host-owned locator discovers a
+ * candidate workspace. The locator is discovery metadata, never authority:
+ * canonical state is re-read there and every dispatch/marker binding is
+ * checked before any result can mutate state. No current selection, callback
+ * session, or callback cwd is consulted.
+ */
+function durableTaskOrigins(toolCallId: string, markerFilter: TaskMarkerFilter): DispatchOrigin[] {
+  const discovered = readDispatchOriginLocator(toolCallId).filter((entry) => entry.run_id === markerFilter.runId);
+  if (discovered.length === 0) return [];
+  const workspaces = new Set(discovered.map((entry) => `${entry.cwd}\u0000${entry.run_id}`));
+  if (workspaces.size !== 1) return [];
+  const cwd = discovered[0]!.cwd;
+  const state = readRunState(cwd, markerFilter.runId);
+  if (!state || state.schema !== 2 || state.run_id !== markerFilter.runId || state.run_key !== markerFilter.runId) return [];
+  const origins: DispatchOrigin[] = [];
+  const discoveredIds = new Set(discovered.map((entry) => entry.dispatch_id));
+  for (const dispatch of state.dispatch_capability?.dispatches ?? []) {
+    if (!discoveredIds.has(dispatch.id) || dispatch.tool_call_id !== toolCallId) continue;
+    const entries = discovered.filter((entry) => entry.dispatch_id === dispatch.id);
+    if (entries.length !== 1) return [];
+    const located = entries[0]!;
+    if (located.origin_session_id !== undefined && located.origin_session_id !== dispatch.origin_session_id) return [];
+    const origin = persistedDispatchOrigin(cwd, markerFilter.runId, dispatch);
+    if (!origin
+      || origin.stage_id !== markerFilter.stageId
+      || origin.cursor_epoch !== markerFilter.cursorEpoch
+      || (markerFilter.capabilityId !== undefined && origin.capability_id !== markerFilter.capabilityId)
+      || (located.capability_id !== undefined && located.capability_id !== origin.capability_id)
+      || (located.stage_id !== undefined && located.stage_id !== origin.stage_id)
+      || (located.cursor_epoch !== undefined && located.cursor_epoch !== origin.cursor_epoch)
+      || (located.slot_id !== undefined && located.slot_id !== origin.slot_id)
+      || (located.task_id !== undefined && located.task_id !== origin.task_id)) continue;
+    origins.push(origin);
+  }
+  if (origins.length === 0 || new Set(origins.map((origin) => origin.dispatch_id)).size !== discoveredIds.size) return [];
+  for (const origin of origins) rememberDispatchOrigin(toolCallId, origin);
+  return origins;
+}
+
+function taskOriginsForResult(toolCallId: string, markerFilter: TaskMarkerFilter | undefined): DispatchOrigin[] {
+  if (!markerFilter) return [];
+  const known = knownDispatchOrigins(toolCallId, markerFilter);
+  return known.length > 0 ? known : durableTaskOrigins(toolCallId, markerFilter);
 }
 
 export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
@@ -640,7 +722,9 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c));
     run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c));
     run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], { ...c, controller: sharedController }));
-    let eventRunId = sharedController?.selectedRunId();
+    const selectedRunId = sharedController?.selectedRunId();
+    let eventRunId = event.toolName === "task" ? undefined : selectedRunId;
+    let eventRunIdTrusted = event.toolName !== "task" && typeof selectedRunId === "string" && selectedRunId.length > 0;
     if (!result && event.toolName === "task") {
       const authorization = trustedDispatchRequests(
         event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
@@ -650,14 +734,18 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         run({ block: true, reason: authorization.reason });
       } else {
         for (const request of authorization.requests) {
-          if (request.run_id) eventRunId = request.run_id;
+          if (request.run_id) {
+            eventRunId = request.run_id;
+            eventRunIdTrusted = true;
+          }
           const authorized = authorizeDispatchTrusted(c.cwd, request);
           if (!authorized.ok) {
             run({ block: true, reason: `dispatch authorization failed: ${authorized.error}` });
             break;
           }
-          if (authorized.record?.tool_call_id && request.run_id) {
-            rememberDispatchOrigin(authorized.record.tool_call_id, {
+          const toolCallId = authorized.record?.tool_call_id ?? event.toolCallId;
+          if (toolCallId && request.run_id && authorized.record) {
+            const origin = {
               cwd: c.cwd,
               run_id: request.run_id,
               dispatch_id: authorized.record.id,
@@ -669,14 +757,18 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
                 slot_id: authorized.record.work_identity.slot_id,
                 task_id: authorized.record.work_identity.task_id,
               } : {}),
-            });
+            };
+            rememberDispatchOrigin(toolCallId, origin);
+            rememberDispatchOriginLocator(toolCallId, origin);
           }
         }
       }
     }
     if (!result && opts.observability !== false) {
+      if (eventRunIdTrusted && eventRunId) setObservabilityRun(c.cwd, eventRunId);
       recordToolCallAttempt(c.cwd, { ...(event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }), ...(eventRunId ? { runId: eventRunId } : {}) }, "allowed");
     } else if (opts.observability !== false) {
+      if (eventRunIdTrusted && eventRunId) setObservabilityRun(c.cwd, eventRunId);
       recordToolCallAttempt(c.cwd, { ...(event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }), ...(eventRunId ? { runId: eventRunId } : {}) }, "blocked", result?.reason);
     }
     return result;
@@ -702,7 +794,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     // canonical run only to select an already persisted dispatch origin; the
     // marker itself never authorizes or invents a dispatch.
     const markerFilter = taskMarkerFilter(event.input);
-    const origins = markerFilter ? knownDispatchOrigins(event.toolCallId, markerFilter) : [];
+    const origins = taskOriginsForResult(event.toolCallId, markerFilter);
     if (origins.length === 0) {
       console.warn(`omp workflow task reconciliation rejected: no exact origin for tool call ${event.toolCallId}`);
       return;
@@ -765,11 +857,11 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     enabled: opts.observability,
     toolCall: false,
     getRunId: (ctx, cwd) => opts.getSessionController?.(ctx, cwd)?.selectedRunId(),
-    getEventScope: (event, _ctx, _cwd) => {
+    getEventScope: (event, _ctx, cwd) => {
       const value = event && typeof event === "object" ? event as { toolCallId?: string; toolName?: string; input?: unknown } : {};
       if (value.toolName !== "task" || !value.toolCallId) return undefined;
       const markerFilter = taskMarkerFilter(value.input);
-      const origins = markerFilter ? knownDispatchOrigins(value.toolCallId, markerFilter) : [];
+      const origins = taskOriginsForResult(value.toolCallId, markerFilter);
       const origin = origins[0];
       return origin ? { cwd: origin.cwd, runId: origin.run_id, ...(origin.origin_session_id ? { originSessionId: origin.origin_session_id } : {}) } : undefined;
     },
@@ -823,9 +915,32 @@ interface HostSessionProfile {
 }
 
 type WorkflowToolResult = { content: [{ type: "text"; text: string }]; details: unknown };
+type LifecycleBoundaryError = LifecycleError & { candidates?: readonly unknown[]; snapshot?: unknown };
 
 function toolResult(value: unknown): WorkflowToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
+}
+
+function lifecycleCandidatesForBoundary(cwd: string, mode: "resume" | "rework" | undefined, error: unknown): unknown[] | undefined {
+  if (!mode || !(error instanceof LifecycleError) || !["run_not_found", "run_selection_required", "run_terminal"].includes(error.code)) return undefined;
+  try {
+    const branch = resolveActiveBranch(cwd);
+    return listRuns(cwd, { branch, includeTerminal: mode === "rework" });
+  } catch {
+    return undefined;
+  }
+}
+
+function lifecycleFailure(code: string, error: unknown, candidates?: readonly unknown[]): WorkflowToolResult {
+  if (!(error instanceof LifecycleError)) return toolResult({ ok: false, code, error: String(error) });
+  const boundaryError = error as LifecycleBoundaryError;
+  const exactCandidates = boundaryError.candidates ?? candidates;
+  const details = {
+    ...error.toJSON(),
+    ...(exactCandidates !== undefined ? { candidates: [...exactCandidates] } : {}),
+    ...(boundaryError.snapshot !== undefined ? { snapshot: boundaryError.snapshot } : {}),
+  };
+  return toolResult({ ok: false, code, error: String(error), details });
 }
 
 function workflowStateSummary(cwd: string, mappingSummary?: (cwd: string) => unknown, runId?: string, _requireSelectedRun = false): unknown {
@@ -873,7 +988,12 @@ function resolveToolRunId(cwd: string, selector?: LifecycleSelector, controller?
   const candidates = listRuns(cwd, { branch, includeTerminal: true });
   const snapshot = selector.list_item ? readSelectionSnapshot(cwd, selector.list_item.snapshot_id) : undefined;
   const resolved = resolveRunSelection({ mode: "rework", candidates, currentBranch: branch, selector, snapshot });
-  if (!resolved.ok) throw resolved.error;
+  if (!resolved.ok) {
+    const boundaryError = resolved.error as LifecycleBoundaryError;
+    boundaryError.candidates = resolved.candidates;
+    if (resolved.snapshot) boundaryError.snapshot = resolved.snapshot;
+    throw boundaryError;
+  }
   return resolved.candidate.run_id;
 }
 
@@ -898,11 +1018,22 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   if (typeof (pi as { on?: unknown }).on === "function") {
     pi.on("session_start", (_event: unknown, ctx: unknown) => {
       const c = ctx as { mode?: unknown; hasUI?: unknown; ui?: unknown; cwd?: unknown; session_id?: unknown; sessionId?: unknown } | undefined;
+      const incomingMode = typeof c?.mode === "string" ? c.mode : "print";
+      const incomingHasUI = c?.hasUI === true;
+      const incomingTrusted = incomingHasUI && (incomingMode === "tui" || incomingMode === "rpc");
+      const currentTrusted = hostSession !== null
+        && hostSession.hasUI
+        && (hostSession.mode === "tui" || hostSession.mode === "rpc");
+      // Task workers and print sessions can emit lifecycle starts through the
+      // same extension runner. They must not replace an already-bound host
+      // session; a trusted interactive start still has the host's historical
+      // replacement semantics.
+      if (currentTrusted && !incomingTrusted) return;
       const cwd = typeof c?.cwd === "string" ? c.cwd : options.cwd;
       const sessionId = typeof c?.session_id === "string" ? c.session_id : typeof c?.sessionId === "string" ? c.sessionId : undefined;
       hostSession = {
-        mode: typeof c?.mode === "string" ? c.mode : "print",
-        hasUI: c?.hasUI === true,
+        mode: incomingMode,
+        hasUI: incomingHasUI,
         ui: c?.ui,
         ...(sessionId ? { session_id: sessionId } : {}),
         ...(cwd ? { cwd } : {}),
@@ -918,7 +1049,19 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         }
       }
     });
-    pi.on("session_stop", () => {
+    pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
+      const controllerContext = (() => {
+        try { return sessionController?.context(); } catch { return undefined; }
+      })();
+      const expectedSessionId = hostSession?.session_id ?? controllerContext?.session_id;
+      const stoppedSessionId = sessionIdFromContext(event) ?? sessionIdFromContext(ctx);
+      // OMP may route a worker/foreign stop through the same extension runner.
+      // An explicit identity is authoritative; an absent identity remains
+      // accepted for older direct harnesses that supplied no event context.
+      if (stoppedSessionId && (!expectedSessionId || stoppedSessionId !== expectedSessionId)) return;
+      const expectedCwd = hostSession?.cwd ?? controllerContext?.worktree;
+      const stoppedCwd = resolveCwdFromContext(ctx);
+      if (stoppedCwd && (!expectedCwd || resolve(stoppedCwd) !== resolve(expectedCwd))) return;
       try { sessionController?.release("host-session-stop"); } finally { sessionController = null; hostSession = null; }
     });
   }
@@ -993,6 +1136,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       task: z.string().min(1).optional(),
       branch: z.string().min(1).optional(),
       run_id: z.string().min(1).optional(),
+      command_intent_id: z.string().min(1).optional(),
       selector: z.object({
         run_id: z.string().min(1).optional(),
         title: z.string().min(1).optional(),
@@ -1014,6 +1158,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         task?: string;
         branch?: string;
         run_id?: string;
+        command_intent_id?: string;
         selector?: LifecycleSelector;
         feedback?: string;
         affected_stage?: string;
@@ -1022,6 +1167,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         issue?: number | { number: number; url?: string } | null;
       };
       const mode = input.mode ?? "new";
+      const selectionMode: "resume" | "rework" | undefined = mode === "new" ? undefined : mode;
       if (mode === "new" && (!input.task || !input.classification)) {
         return toolResult({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "new workflow preparation requires task and complete classification" });
       }
@@ -1030,6 +1176,23 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       }
       try {
         const controller = controllerFor(ctx, cwd);
+        const commandIntent = controller.consumeCommandIntent({
+          command_intent_id: input.command_intent_id,
+          mode,
+          ...(input.run_id ? { run_id: input.run_id } : {}),
+        });
+        // Probe an explicit selector before prepare so the host boundary keeps
+        // the resolver's exact candidates/snapshot; prepare still resolves it
+        // again under its mutation lock and remains authoritative.
+        if (selectionMode && input.selector && !input.run_id) {
+          const resolved = controller.readSelector().resolve(selectionMode, input.selector);
+          if (!resolved.ok) {
+            const boundaryError = resolved.error as LifecycleBoundaryError;
+            boundaryError.candidates = resolved.candidates;
+            if (resolved.snapshot) boundaryError.snapshot = resolved.snapshot;
+            throw boundaryError;
+          }
+        }
         const prepared = controller.prepare({
           mode,
           task: input.task,
@@ -1043,6 +1206,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
           issue: typeof input.issue === "number" ? { number: input.issue } : input.issue ?? null,
           request_id: typeof _id === "string" && _id.length > 0 ? _id : undefined,
         });
+        if (commandIntent) controller.commitCommandIntent(commandIntent.intent_id);
         return toolResult({
           ok: true,
           transition: prepared.transition,
@@ -1053,7 +1217,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
           state: workflowStateSummary(cwd, options.mappingSummary, prepared.state.run_id),
         });
       } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_PREPARE_FAILED", error: String(error) });
+        return lifecycleFailure("WORKFLOW_PREPARE_FAILED", error, lifecycleCandidatesForBoundary(cwd, selectionMode, error));
       }
     },
   });
@@ -1121,7 +1285,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         const controller = controllerFor(ctx, cwd);
         return toolResult(workflowStateSummary(cwd, options.mappingSummary, resolveToolRunId(cwd, input.selector, controller), true));
       } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_STATUS_FAILED", error: String(error) });
+        return lifecycleFailure("WORKFLOW_STATUS_FAILED", error, lifecycleCandidatesForBoundary(cwd, "rework", error));
       }
     },
   });
@@ -1142,7 +1306,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no workflow run is selected for this trusted session" });
         return toolResult(resolveWorkflowContract(cwd, { runId, branch: resolveActiveBranch(cwd) }));
       } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_RESOLUTION_FAILED", error: String(error) });
+        return lifecycleFailure("WORKFLOW_RESOLUTION_FAILED", error, lifecycleCandidatesForBoundary(cwd, "rework", error));
       }
     },
   });

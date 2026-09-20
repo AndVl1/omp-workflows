@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { EventRecorder, rollupFromEvents, readObservabilityPointer } from "../../src/observability/recorder.js";
+import { EventRecorder, rollupFromEvents, readCanonicalObservabilityPointer, readObservabilityPointer } from "../../src/observability/recorder.js";
 import type { ObservabilityEvent } from "../../src/observability/events.js";
 import type { CompletionEnvelope, WorkIdentity } from "../../src/engine/types.js";
 
@@ -30,7 +30,7 @@ function makeIdGen(prefix = "e"): () => string {
   return () => `${prefix}-${(++n).toString(36)}`;
 }
 const workIdentity: WorkIdentity = {
-  run_id: "run-1",
+  run_id: "run-observability-test",
   wave_id: "wave-1",
   slice_id: "slice-1",
   session_id: "session-1",
@@ -75,7 +75,7 @@ function completionEnvelope(
 test("recorder: appends one event per call as a single jsonl line", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-a", nextId: makeIdGen() });
+    const r = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test", nextId: makeIdGen() });
     await r.append({ kind: "session_start", ts: ts(0) });
     await r.append({ kind: "agent_start", ts: ts(100) });
     await r.append({ kind: "agent_end", ts: ts(200), messageCount: 3 });
@@ -122,26 +122,26 @@ test("recorder: rollupFromEvents aggregates per agent, tool, error, skill", () =
   assert.equal(rollup.durationMs, 60);
 });
 
-test("recorder: readObservabilityPointer is null when feature has no event log", () => {
+test("recorder: canonical pointer is null when run has no event log", () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const result = readObservabilityPointer(cwd, "no-such-feature");
+    const result = readCanonicalObservabilityPointer(cwd, "no-such-feature");
     assert.equal(result, null);
   } finally {
     cleanup();
   }
 });
 
-test("recorder: readObservabilityPointer returns the rollup for an existing feature", async () => {
+test("recorder: canonical recorder rebuilds the rollup for an existing run", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const r1 = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-x" });
+    const r1 = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test" });
     await r1.append({ kind: "session_start", ts: ts(0) });
     await r1.append({ kind: "tool_call", ts: ts(10), toolName: "read" });
     await r1.append({ kind: "tool_result", ts: ts(20), toolName: "read", isError: true });
-    // Construct a second recorder against the same feature — it should
+    // Construct a second recorder against the same run — it should
     // re-aggregate from the persisted log.
-    const r2 = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-x" });
+    const r2 = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test" });
     const pointer = r2.buildPointer();
     assert.equal(pointer.rollup.totalToolCalls, 1);
     assert.equal(pointer.rollup.totalToolErrors, 1);
@@ -156,7 +156,7 @@ test("recorder: readObservabilityPointer returns the rollup for an existing feat
 test("recorder: append under concurrent calls is serialized", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-parallel" });
+    const r = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test" });
     const promises: Array<Promise<unknown>> = [];
     for (let i = 0; i < 10; i++) {
       promises.push(r.append({ kind: "agent_start", ts: ts(i) }));
@@ -173,10 +173,10 @@ test("recorder: append under concurrent calls is serialized", async () => {
 test("recorder: readAll skips corrupt lines instead of throwing", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-corrupt" });
+    const r = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test" });
     await r.append({ kind: "session_start", ts: ts(0) });
     // Append a deliberately corrupt line
-    mkdirSync(join(cwd, ".work-state", "features", "feat-corrupt", "observability"), { recursive: true });
+    mkdirSync(join(cwd, ".work-state", "runs", "run-observability-test", "observability"), { recursive: true });
     writeFileSync(r.path, readFileSync(r.path, "utf8") + "this is not json\n", "utf8");
     await r.append({ kind: "agent_start", ts: ts(10) });
     const all = r.readAll();
@@ -198,7 +198,7 @@ test("recorder: empty event log yields a zeroed rollup with sensible defaults", 
 test("recorder: strips prompts and secrets while retaining bounded relative artifact evidence", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-private", nextId: makeIdGen() });
+    const r = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test", nextId: makeIdGen() });
     const secretPrompt = "PROMPT transcript secret=top-secret api_key=do-not-persist";
     await r.append({
       kind: "artifact_written",
@@ -228,7 +228,7 @@ test("recorder: strips prompts and secrets while retaining bounded relative arti
 test("recorder: persists canonical identity tuple and profile/policy bindings", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-identity", nextId: makeIdGen() });
+    const r = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test", nextId: makeIdGen() });
     const profileHash = "c".repeat(64);
     const policyHash = "d".repeat(64);
     const envelope = completionEnvelope(workIdentity, "failed", "provider_terminal");
@@ -259,7 +259,7 @@ test("recorder: persists canonical identity tuple and profile/policy bindings", 
 test("recorder: exact terminal replay is idempotent and does not repeat the event", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-replay", nextId: makeIdGen() });
+    const r = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test", nextId: makeIdGen() });
     const event: Omit<ObservabilityEvent, "id" | "branch"> = {
       kind: "work_terminal",
       ts: ts(0),
@@ -282,7 +282,7 @@ test("recorder: exact terminal replay is idempotent and does not repeat the even
 test("recorder: terminal replacement requires identity evidence or explicit retry linkage", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-replacement", nextId: makeIdGen() });
+    const r = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test", nextId: makeIdGen() });
     await r.append({
       kind: "work_terminal",
       ts: ts(0),
@@ -334,7 +334,7 @@ test("recorder: terminal replacement requires identity evidence or explicit retr
 test("recorder: neutral pending reasons stay active while provider terminal signals are terminal", async () => {
   const { cwd, cleanup } = withTempDir();
   try {
-    const r = new EventRecorder({ cwd, branch: "main", featureSlug: "feat-lifecycle", nextId: makeIdGen() });
+    const r = new EventRecorder({ cwd, branch: "main", runId: "run-observability-test", nextId: makeIdGen() });
     const pendingReasons = ["provider_running", "awaiting_result", "transport_reconnect"] as const;
     for (const [index, reason] of pendingReasons.entries()) {
       const identity = { ...workIdentity, dispatch_id: `pending-${index + 1}` };
@@ -385,6 +385,26 @@ test("recorder: neutral pending reasons stay active while provider terminal sign
       }),
       /cannot claim a terminal signal/,
     );
+  } finally {
+    cleanup();
+  }
+});
+
+
+test("recorder: legacy feature scopes fail closed and cannot supplement canonical logs", () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    mkdirSync(join(cwd, ".work-state", "features", "legacy", "observability"), { recursive: true });
+    writeFileSync(join(cwd, ".work-state", "features", "legacy", "observability", "events.jsonl"), JSON.stringify({ kind: "agent_start", ts: ts(0), id: "legacy", branch: "main" }) + "\n", "utf8");
+    assert.throws(
+      () => new EventRecorder({ cwd, branch: "main", featureSlug: "legacy" }),
+      /migration_required/,
+    );
+    assert.throws(
+      () => readObservabilityPointer(cwd, "legacy"),
+      /migration_required/,
+    );
+    assert.equal(readCanonicalObservabilityPointer(cwd, "run-observability-test"), null);
   } finally {
     cleanup();
   }

@@ -19,6 +19,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { observabilityHooks, flushRecorder } from "../../src/observability/hooks.js";
+import { registerObservabilityHooks } from "../../src/observability/index.js";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { readCanonicalObservabilityPointer } from "../../src/observability/recorder.js";
 import { writeStateBootstrap } from "../../src/engine/state.js";
 import { runTarget } from "../../src/engine/run-store.js";
@@ -180,6 +182,90 @@ test("integration: subagent task tool with batch input captures the first agent 
     assert.ok(pointer);
     assert.equal(pointer!.rollup.subagents["developer-go"], 1);
     assert.equal(pointer!.rollup.subagents["qa"], undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+
+test("integration: admitted run identity survives selection switch and unknown workers are dropped", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const runA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const runB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let selected = runB;
+    type Handler = (event: unknown, ctx: unknown) => void;
+    const handlers = new Map<string, Handler>();
+    const pi = {
+      on(event: string, handler: Handler): void {
+        handlers.set(event, handler);
+      },
+    } as unknown as ExtensionAPI;
+    registerObservabilityHooks(pi, {
+      getRunId: () => selected,
+    });
+
+    const beforeAgentStart = handlers.get("before_agent_start")!;
+    const toolResult = handlers.get("tool_result")!;
+    const admittedA = { systemPrompt: [], admission: "A" };
+    // The event was admitted with A; selection is already B when the host
+    // invokes this callback, so getRunId() must not redirect the event.
+    beforeAgentStart(admittedA, { cwd, run_id: runA });
+    beforeAgentStart({ systemPrompt: [] }, { cwd, run_id: runB });
+    toolResult({ toolName: "task", toolCallId: "unknown-worker-result" }, { cwd, actor: "worker" });
+    await flushRecorder(cwd);
+
+    const pointerA = readCanonicalObservabilityPointer(cwd, runA);
+    const pointerB = readCanonicalObservabilityPointer(cwd, runB);
+    assert.ok(pointerA);
+    assert.ok(pointerB);
+    assert.equal(pointerA!.rollup.agentInvocations, 0);
+    assert.deepEqual(pointerA!.rollup.skills, {});
+
+    assert.equal(pointerB!.rollup.agentInvocations, 0);
+    assert.equal(pointerB!.rollup.totalToolCalls, 0);
+    assert.equal(pointerB!.rollup.totalToolErrors, 0);
+
+    const aLines = readFileSync(join(cwd, ".work-state", "runs", runA, "observability", "events.jsonl"), "utf8").trim().split("\n");
+    const bLines = readFileSync(join(cwd, ".work-state", "runs", runB, "observability", "events.jsonl"), "utf8").trim().split("\n");
+    assert.equal(aLines.length, 1, "the admitted A event remains in A after switching to B");
+    assert.equal(bLines.length, 1, "B owns only its own event");
+    assert.equal((JSON.parse(aLines[0]!) as { runId: string; kind: string }).runId, runA);
+    assert.equal((JSON.parse(aLines[0]!) as { runId: string; kind: string }).kind, "before_agent_start");
+    assert.equal((JSON.parse(bLines[0]!) as { runId: string; kind: string }).runId, runB);
+  } finally {
+    cleanup();
+  }
+});
+
+
+test("integration: session stop stays on the run captured at session start", async () => {
+  const { cwd, cleanup } = withTempDir();
+  try {
+    const runA = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const runB = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let selected = runA;
+    type Handler = (event: unknown, ctx: unknown) => void;
+    const handlers = new Map<string, Handler>();
+    const pi = {
+      on(event: string, handler: Handler): void {
+        handlers.set(event, handler);
+      },
+    } as unknown as ExtensionAPI;
+    registerObservabilityHooks(pi, { getRunId: () => selected });
+    const sessionStart = handlers.get("session_start")!;
+    const sessionStop = handlers.get("session_stop")!;
+    sessionStart({ session_id: "session-captured" }, { cwd });
+    selected = runB;
+    sessionStop({ session_id: "session-captured" }, { cwd });
+    await flushRecorder(cwd);
+
+    const pointerA = readCanonicalObservabilityPointer(cwd, runA);
+    assert.ok(pointerA);
+
+    assert.equal(readCanonicalObservabilityPointer(cwd, runB), null);
+    const lines = readFileSync(join(cwd, ".work-state", "runs", runA, "observability", "events.jsonl"), "utf8").trim().split("\n");
+    assert.deepEqual(lines.map((line) => (JSON.parse(line) as { kind: string }).kind), ["session_start", "session_stop"]);
   } finally {
     cleanup();
   }

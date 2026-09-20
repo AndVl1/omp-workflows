@@ -63,8 +63,9 @@ type CommandPromptBuilder = (
 	args: string,
 	ctx: ExtensionCommandContext,
 	cwd: string | undefined,
+	commandIntentId?: string,
 ) => string;
-type BeforeCommandExecute = (cwd: string | undefined, ctx: ExtensionCommandContext) => void;
+type BeforeCommandExecute = (args: string, cwd: string | undefined, ctx: ExtensionCommandContext) => string | undefined;
 
 function registerPromptCommand(
 	pi: ExtensionAPI,
@@ -87,8 +88,8 @@ function registerPromptCommand(
 			// Resolve once and pass this exact value through both authorization and
 			// prompt construction. The context may drift while a session is active.
 			const cwd = resolveCwd(ctx);
-			beforeExecute?.(cwd, ctx);
-			pi.sendUserMessage(buildPrompt(normalizedArgs, ctx, cwd));
+			const commandIntentId = beforeExecute?.(normalizedArgs, cwd, ctx);
+			pi.sendUserMessage(buildPrompt(normalizedArgs, ctx, cwd, commandIntentId));
 		},
 	});
 }
@@ -106,6 +107,7 @@ function buildDoWorkCommandPrompt(
 	display: { doWork: string; team: string },
 	promptBuilder: (envelope: ParsedWorkEnvelope, cwd: string) => string,
 	cwd: string | undefined,
+	commandIntentId?: string,
 ): string {
 	const displayName = variant === "do-work" ? display.doWork : display.team;
 	if (!args) {
@@ -138,7 +140,12 @@ function buildDoWorkCommandPrompt(
 	}
 	const parsed = parseWorkEnvelope(command.task, cwd);
 	if (command.mode === "new" && !parsed.task) return "ERROR: empty task after stripping prefix.";
-	const envelope: ParsedWorkEnvelope = { ...parsed, mode: command.mode, ...(command.run_id ? { run_id: command.run_id } : {}) };
+	const envelope: ParsedWorkEnvelope = {
+		...parsed,
+		mode: command.mode,
+		...(command.run_id ? { run_id: command.run_id } : {}),
+		...(commandIntentId ? { command_intent_id: commandIntentId } : {}),
+	};
 	ctx.ui.notify(`${displayName}: ${envelope.task || command.mode} (workflow pending)`, "info");
 	return promptBuilder(envelope, cwd);
 }
@@ -174,10 +181,34 @@ function claimCommandOwner(options: WorkflowCommandOptions, cwd: string): void {
 	if (!claim.ok) throw new Error(`${claim.code}: ${claim.error}`);
 }
 
-function bindCommandController(options: WorkflowCommandOptions, cwd: string | undefined, ctx: ExtensionCommandContext): void {
-	if (!options.getSessionController) return;
+function bindCommandController(options: WorkflowCommandOptions, cwd: string | undefined, ctx: ExtensionCommandContext): WorkflowSessionController | undefined {
+	if (!options.getSessionController) return undefined;
 	if (!cwd) throw new Error("WORKFLOW_CONTEXT_REJECTED: workflow cwd unavailable");
-	if (!options.getSessionController(ctx, cwd)) throw new Error("WORKFLOW_CONTEXT_REJECTED: trusted session identity is unavailable");
+	const controller = options.getSessionController(ctx, cwd);
+	if (!controller) throw new Error("WORKFLOW_CONTEXT_REJECTED: trusted session identity is unavailable");
+	return controller;
+}
+
+function issueCommandIntent(
+	options: WorkflowCommandOptions,
+	args: string,
+	cwd: string | undefined,
+	ctx: ExtensionCommandContext,
+): string | undefined {
+	const controller = bindCommandController(options, cwd, ctx);
+	if (!controller) return undefined;
+	const command = parseWorkflowCommand(args);
+	if (!command.ok || !command.explicit_mode || !command.mode || command.mode === "list") {
+		// Implicit commands and list output must not inherit an older binding.
+		controller.clearCommandIntent();
+		return undefined;
+	}
+	return controller.issueCommandIntent(command.mode, command.run_id).intent_id;
+}
+
+function clearCommandIntent(options: WorkflowCommandOptions, cwd: string | undefined, ctx: ExtensionCommandContext): undefined {
+	if (options.getSessionController && cwd) options.getSessionController(ctx, cwd)?.clearCommandIntent();
+	return undefined;
 }
 
 /** Register workflow entry points during extension load, before OMP snapshots slash suggestions. */
@@ -211,18 +242,18 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			pi,
 			names.doWork,
 			options.doWorkDescription ?? doWorkDescription(names.doWork, names.team),
-			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "do-work", names, promptBuilder, cwd),
+			(args, ctx, cwd, commandIntentId) => buildDoWorkCommandPrompt(args, ctx, "do-work", names, promptBuilder, cwd, commandIntentId),
 			resolveEffectiveCwd,
-			(cwd, ctx) => { claimForCommand?.(cwd); bindCommandController(options, cwd, ctx); },
+			(args, cwd, ctx) => { claimForCommand?.(cwd); return issueCommandIntent(options, args, cwd, ctx); },
 			preflightWorkflowCommand,
 		);
 		registerPromptCommand(
 			pi,
 			names.team,
 			options.teamDescription ?? teamDescription(names.doWork),
-			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "team", names, promptBuilder, cwd),
+			(args, ctx, cwd, commandIntentId) => buildDoWorkCommandPrompt(args, ctx, "team", names, promptBuilder, cwd, commandIntentId),
 			resolveEffectiveCwd,
-			(cwd, ctx) => { claimForCommand?.(cwd); bindCommandController(options, cwd, ctx); },
+			(args, cwd, ctx) => { claimForCommand?.(cwd); return issueCommandIntent(options, args, cwd, ctx); },
 			preflightWorkflowCommand,
 		);
 		registerPromptCommand(
@@ -231,7 +262,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			options.ctoDescription ?? ctoDescription(names.cto),
 			(args, ctx, cwd) => buildCtoCommandPrompt(args, ctx, names.cto, cwd),
 			resolveEffectiveCwd,
-			(cwd, ctx) => { claimForCommand?.(cwd); bindCommandController(options, cwd, ctx); },
+			(_args, cwd, ctx) => { claimForCommand?.(cwd); return clearCommandIntent(options, cwd, ctx); },
 		);
 	};
 
