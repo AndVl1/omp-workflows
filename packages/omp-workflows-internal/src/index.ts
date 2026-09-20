@@ -182,11 +182,15 @@ function buildTrustedController(
  * supplies one.
  */
 function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
+	const interactive = trustedInteractiveSession(ctx);
+	// Noninteractive and untrusted lifecycle events can come from a worker
+	// sharing this extension instance; they must not release or replace the
+	// trusted host controller.
+	if (!interactive) return;
 	if (!releaseSessionBinding(pi, "host-session-replaced")) return;
 
 	const sessionId = sessionIdFromContext(ctx);
-	const interactive = trustedInteractiveSession(ctx);
-	const controller = interactive && sessionId ? buildTrustedController(cwd, sessionId) : undefined;
+	const controller = sessionId ? buildTrustedController(cwd, sessionId) : undefined;
 	sessionBindings.set(pi, {
 		cwd,
 		interactive,

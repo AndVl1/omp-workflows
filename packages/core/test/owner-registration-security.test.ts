@@ -276,6 +276,44 @@ test("owner-aware command handlers remain fail-closed after an owner conflict", 
   }
 });
 
+test("conflicting lifecycle flags reject before owner and controller side effects", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-command-lifecycle-conflict-"));
+  let ownerCalls = 0;
+  let controllerCalls = 0;
+  try {
+    const harness = commandHarness();
+    registerWorkflowCommands(harness.pi as never, {
+      owner: (cwd) => {
+        ownerCalls += 1;
+        return owner("bundle-conflict", cwd);
+      },
+      resolveCwd: () => root,
+      getSessionController: () => {
+        controllerCalls += 1;
+        return {} as never;
+      },
+    });
+    const handler = harness.commands.get("do-work")?.handler;
+    assert.ok(handler);
+
+    await handler("--new --resume conflicting task", {
+      cwd: root,
+      sessionManager: { getCwd: () => root },
+      ui: { notify() {} },
+    });
+
+    assert.deepEqual(harness.prompts, [
+      "ERROR [lifecycle_request_conflict]: conflicting lifecycle modes: new, resume",
+    ]);
+    assert.equal(ownerCalls, 0);
+    assert.equal(controllerCalls, 0);
+    assert.equal(workflowOwnerFor(root, "workflow_registration"), undefined);
+  } finally {
+    resetWorkflowOwners(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("owner-aware command registration is idempotent across repeated session_start events", () => {
   const root = mkdtempSync(join(tmpdir(), "omp-command-idempotent-"));
   try {

@@ -73,17 +73,30 @@ function registerPromptCommand(
 	buildPrompt: CommandPromptBuilder,
 	resolveCwd: (ctx: ExtensionCommandContext) => string | undefined,
 	beforeExecute?: BeforeCommandExecute,
+	preflight?: (args: string) => string | undefined,
 ): void {
 	pi.registerCommand(name, {
 		description,
 		handler: async (args, ctx) => {
+			const normalizedArgs = args.trim();
+			const preflightError = preflight?.(normalizedArgs);
+			if (preflightError) {
+				pi.sendUserMessage(preflightError);
+				return;
+			}
 			// Resolve once and pass this exact value through both authorization and
 			// prompt construction. The context may drift while a session is active.
 			const cwd = resolveCwd(ctx);
 			beforeExecute?.(cwd, ctx);
-			pi.sendUserMessage(buildPrompt(args.trim(), ctx, cwd));
+			pi.sendUserMessage(buildPrompt(normalizedArgs, ctx, cwd));
 		},
 	});
+}
+
+function preflightWorkflowCommand(args: string): string | undefined {
+	const command = parseWorkflowCommand(args);
+	if (command.ok) return undefined;
+	return `ERROR [${command.code}]: ${command.error}`;
 }
 
 function buildDoWorkCommandPrompt(
@@ -201,6 +214,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "do-work", names, promptBuilder, cwd),
 			resolveEffectiveCwd,
 			(cwd, ctx) => { claimForCommand?.(cwd); bindCommandController(options, cwd, ctx); },
+			preflightWorkflowCommand,
 		);
 		registerPromptCommand(
 			pi,
@@ -209,6 +223,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "team", names, promptBuilder, cwd),
 			resolveEffectiveCwd,
 			(cwd, ctx) => { claimForCommand?.(cwd); bindCommandController(options, cwd, ctx); },
+			preflightWorkflowCommand,
 		);
 		registerPromptCommand(
 			pi,

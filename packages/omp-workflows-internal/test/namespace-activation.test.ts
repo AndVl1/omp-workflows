@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -198,6 +199,44 @@ test("repeated session_start in a marked workspace stays idempotent under the si
 	);
 	assert.equal(fingerprints.size, 1, "all three claims share one owner fingerprint");
 	assert.equal(host.errors.length, 0, "marked workspace produces no gated refusals");
+});
+
+test("trusted host controller survives a worker session_start without being exposed to the worker", async () => {
+	resetWorkflowOwners();
+	const root = markedRoot();
+	execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+	const host = makePi();
+	ompWorkflowsInternal(host.pi as never);
+
+	const hostContext = {
+		cwd: root,
+		mode: "tui",
+		hasUI: true,
+		sessionManager: { getCwd: () => root, getSessionId: () => "trusted-host-session" },
+		ui: { notify() {} },
+	};
+	const workerContext = {
+		cwd: root,
+		mode: "print",
+		hasUI: false,
+		actor: "worker",
+		sessionManager: { getCwd: () => root, getSessionId: () => "worker-session" },
+		ui: { notify() {} },
+	};
+
+	host.fireSessionStart(hostContext);
+	host.fireSessionStart(workerContext);
+
+	const command = host.commands.get("omp-do-work");
+	assert.ok(command);
+	await assert.rejects(
+		command.handler("worker task", workerContext),
+		/trusted session identity is unavailable/,
+		"worker ingress must not borrow the trusted host controller",
+	);
+	await command.handler("host task", hostContext);
+	assert.equal(host.sent.length, 1, "only the trusted host command may dispatch");
+	assert.match(host.sent[0] ?? "", /host task/);
 });
 
 // ── Resolver and owner-source units ──────────────────────────────────────────

@@ -28,7 +28,7 @@ import { runTarget } from "../src/engine/run-store.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 
-const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
+const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 const RUN_ID = "88888888-8888-4888-8888-888888888888";
 
 
@@ -52,6 +52,7 @@ function initGit(root: string): void {
 function advanceAuthOf(issued: IssuedCapability) {
   return {
     run_id: RUN_ID,
+    branch: issued.state.issued_for!.branch,
     token: issued.advance_token,
     capability_id: issued.capability_id,
     run_key: issued.state.issued_for!.run_key,

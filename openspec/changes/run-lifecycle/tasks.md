@@ -12,7 +12,7 @@
 
 Зависит от группы 1. Владелец core; не включать новый writer в публичный runtime до consumer cutover. Основание: `run-state-migration` и `run-context-isolation`.
 
-- [ ] 2.1 В `run-store.ts` и `state.ts` реализовать run-ID target resolution, versioned `run-control.json`, read-only listing и session selections; сохранить containment/lock/CAS. Проверка: два runs одной ветки читаются раздельно, stale selection не меняет явный selector, listing не импортирует legacy и не мутирует данные.
+- [x] 2.1 В `run-store.ts` и `state.ts` реализовать run-ID target resolution, versioned `run-control.json`, read-only listing и session selections; сохранить containment/lock/CAS. Проверка: два runs одной ветки читаются раздельно, stale selection не меняет явный selector, listing не импортирует legacy и не мутирует данные.
 - [ ] 2.2 Расширить существующую transaction/artifact journal границу для lifecycle intent, commit marker и recovery state/control/artifact updates. Проверка: process interruption до и после publication не показывает частичную authority, повтор recovery идемпотентен, CAS conflict сохраняет исходные данные.
 - [ ] 2.3 Реализовать атомарный worktree execution claim и coordinator handover, различая coordinator liveness и pending workers. Использовать trusted release receipt либо проверенный ESRCH, не выдавать PID-проверку за session fingerprint; повторно сверять ownership token под lock. Проверка: два процесса не получают claim одновременно, живой/unknown владелец не вытесняется, смерть координатора разрешает resume того же run, но не независимый new при незавершённых workers.
 
