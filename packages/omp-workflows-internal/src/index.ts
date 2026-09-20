@@ -511,7 +511,11 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event: unknown, ctx: unknown) => {
 		const cwd = resolveSessionCwd(ctx);
 		if (!cwd || !detectWorkspaceMarkers(cwd).ok) {
-			releaseSessionBinding(pi, "host-session-unavailable");
+			// Only a trusted interactive lifecycle event can end the host binding
+			// here; untrusted/noninteractive events preserve it even without cwd.
+			if (trustedInteractiveSession(ctx)) {
+				releaseSessionBinding(pi, "host-session-unavailable");
+			}
 			return;
 		}
 		// Capture trusted host/session identity before kicking off any async

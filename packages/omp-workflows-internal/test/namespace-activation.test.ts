@@ -201,7 +201,7 @@ test("repeated session_start in a marked workspace stays idempotent under the si
 	assert.equal(host.errors.length, 0, "marked workspace produces no gated refusals");
 });
 
-test("trusted host controller survives a worker session_start without being exposed to the worker", async () => {
+test("trusted host controller survives worker, marker-missing, and cwd-less session_start events", async () => {
 	resetWorkflowOwners();
 	const root = markedRoot();
 	execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
@@ -223,9 +223,29 @@ test("trusted host controller survives a worker session_start without being expo
 		sessionManager: { getCwd: () => root, getSessionId: () => "worker-session" },
 		ui: { notify() {} },
 	};
+	const foreignRoot = plainRoot();
+	const markerMissingWorkerContext = {
+		cwd: foreignRoot,
+		mode: "print",
+		hasUI: false,
+		actor: "worker",
+		sessionManager: { getCwd: () => foreignRoot, getSessionId: () => "foreign-worker-session" },
+		ui: { notify() {} },
+	};
+	const cwdlessWorkerContext = {
+		mode: "print",
+		hasUI: false,
+		actor: "worker",
+		sessionManager: { getSessionId: () => "cwdless-worker-session" },
+		ui: { notify() {} },
+	};
 
 	host.fireSessionStart(hostContext);
 	host.fireSessionStart(workerContext);
+	// A foreign worker session can also report an unmarked cwd; this must not
+	// release the trusted controller captured for the host workspace.
+	host.fireSessionStart(markerMissingWorkerContext);
+	host.fireSessionStart(cwdlessWorkerContext);
 
 	const command = host.commands.get("omp-do-work");
 	assert.ok(command);
