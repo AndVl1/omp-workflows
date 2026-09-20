@@ -709,36 +709,56 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], { ...c, ...(run_id ? { run_id } : {}) });
   });
   pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string; hasUI?: boolean; actor?: "orchestrator" | "worker" | "lead"; session_id?: string; sessionId?: string };
-    const sharedController = c.cwd ? opts.getSessionController?.(ctx, c.cwd) : undefined;
-    const gateContext = { ...c, ...(sharedController?.selectedRunId() ? { run_id: sharedController.selectedRunId() } : {}) };
+    const c = ctx as { cwd?: string; hasUI?: boolean; actor?: "orchestrator" | "worker" | "lead"; session_id?: string; sessionId?: string };
+    // Resolve admission exactly once. The configured bundle resolver is the
+    // authority (fullstack resolves sessionManager.getCwd() before any stale
+    // copied context value); never substitute the process cwd or selection.
+    const admissionCwd = opts.cwd ?? resolveCwd(ctx);
+    const sharedController = admissionCwd ? opts.getSessionController?.(ctx, admissionCwd) : undefined;
+    const selectedRunId = sharedController?.selectedRunId();
+    const gateContext = admissionCwd
+      ? { ...c, cwd: admissionCwd, ...(selectedRunId ? { run_id: selectedRunId } : {}) }
+      : undefined;
     let result: { block?: boolean; reason?: string } | undefined;
     const run = (candidate: { block?: boolean; reason?: string } | void) => { if (!result && candidate?.block) result = candidate; };
+    if (!admissionCwd && (event.toolName === "ask" || event.toolName === "task" || event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")) {
+      run({ block: true, reason: "workflow cwd unavailable" });
+    }
+    // This guard has no workspace-state dependency and still applies without
+    // an authoritative cwd; protected tool classes above fail closed first.
     run(ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]));
-    run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c));
-    run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], gateContext));
-    run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], gateContext));
-    run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...c, writeScope: opts.writeScope }));
-    run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c));
-    run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c));
-    run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], { ...c, controller: sharedController }));
-    const selectedRunId = sharedController?.selectedRunId();
+    // These gates read workspace state before they inspect the tool name. A
+    // missing authoritative cwd therefore skips them rather than passing
+    // undefined into path/state consumers. Cwd-independent guards still run.
+    if (gateContext) {
+      run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], gateContext));
+      run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], gateContext));
+      run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], gateContext));
+      run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...gateContext, writeScope: opts.writeScope }));
+      run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], gateContext));
+      run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], { ...gateContext, controller: sharedController }));
+    }
+    run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], (gateContext ?? c) as Parameters<typeof safetyGuard>[1]));
     let eventRunId = event.toolName === "task" ? undefined : selectedRunId;
     let eventRunIdTrusted = event.toolName !== "task" && typeof selectedRunId === "string" && selectedRunId.length > 0;
     if (!result && event.toolName === "task") {
-      const authorization = trustedDispatchRequests(
-        event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
-        { ...c, session_id: c.session_id ?? c.sessionId, controller: sharedController },
-      );
+      const authorization = gateContext
+        ? trustedDispatchRequests(
+            event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
+            { ...gateContext, session_id: c.session_id ?? c.sessionId, controller: sharedController },
+          )
+        : { ok: true as const, requests: [] };
       if (!authorization.ok) {
         run({ block: true, reason: authorization.reason });
+      } else if (!admissionCwd) {
+        run({ block: true, reason: "dispatch authorization failed: workflow cwd unavailable" });
       } else {
         for (const request of authorization.requests) {
           if (request.run_id) {
             eventRunId = request.run_id;
             eventRunIdTrusted = true;
           }
-          const authorized = authorizeDispatchTrusted(c.cwd, request);
+          const authorized = authorizeDispatchTrusted(admissionCwd, request);
           if (!authorized.ok) {
             run({ block: true, reason: `dispatch authorization failed: ${authorized.error}` });
             break;
@@ -746,7 +766,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
           const toolCallId = authorized.record?.tool_call_id ?? event.toolCallId;
           if (toolCallId && request.run_id && authorized.record) {
             const origin = {
-              cwd: c.cwd,
+              cwd: admissionCwd,
               run_id: request.run_id,
               dispatch_id: authorized.record.id,
               ...(request.origin_session_id ? { origin_session_id: request.origin_session_id } : {}),
@@ -764,19 +784,14 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         }
       }
     }
-    if (!result && opts.observability !== false) {
-      if (eventRunIdTrusted && eventRunId) setObservabilityRun(c.cwd, eventRunId);
-      recordToolCallAttempt(c.cwd, { ...(event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }), ...(eventRunId ? { runId: eventRunId } : {}) }, "allowed");
-    } else if (opts.observability !== false) {
-      if (eventRunIdTrusted && eventRunId) setObservabilityRun(c.cwd, eventRunId);
-      recordToolCallAttempt(c.cwd, { ...(event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }), ...(eventRunId ? { runId: eventRunId } : {}) }, "blocked", result?.reason);
+    if (admissionCwd && opts.observability !== false) {
+      if (eventRunIdTrusted && eventRunId) setObservabilityRun(admissionCwd, eventRunId);
+      recordToolCallAttempt(admissionCwd, { ...(event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }), ...(eventRunId ? { runId: eventRunId } : {}) }, result ? "blocked" : "allowed", result?.reason);
     }
     return result;
   });
-  pi.on("tool_result", (event: ToolResultEvent, ctx: unknown) => {
+  pi.on("tool_result", (event: ToolResultEvent, _ctx: unknown) => {
     if (event.toolName !== "task") return;
-    const c = ctx as { cwd?: string };
-    if (!c.cwd) return;
     if (nativeMigrationIngress(event.input) || nativeMigrationIngress(event.details) || nativeMigrationIngress(event.content)) {
       console.warn(`omp workflow task reconciliation rejected: migration-only completion provenance for tool call ${event.toolCallId}`);
       return;

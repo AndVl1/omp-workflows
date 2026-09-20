@@ -33,6 +33,7 @@ import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, dispatchTaskId, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
 import { registerTeamWorkflow, registerWorkflowTools } from "../src/index.js";
+import { flushRecorder } from "../src/observability/hooks.js";
 
 import { runTarget } from "../src/engine/run-store.js";
 import type { TeamState, TrustedExecutionContext } from "../src/engine/types.js";
@@ -194,6 +195,136 @@ function registeredWorkflowTools(root: string): Map<string, RegisteredWorkflowTo
   } as never, { cwd: root, isMainSession: () => true, getSessionController: () => controller });
   return tools;
 }
+
+test("host admission resolves session-manager cwd for mounted read and workflow tools", async () => {
+  const root = mkdtempSync(join(tmpdir(), "host-admission-session-cwd-"));
+  try {
+    writeImplementationState(root);
+    const runId = activeRunId(root);
+    const controller = selectedController(root);
+    const tools = new Map<string, RegisteredWorkflowTool>();
+    const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    const admittedCwds: string[] = [];
+    const sessionId = trustedContext(root).session_id;
+    const sessionContext = {
+      sessionManager: { getCwd: () => root, getSessionId: () => sessionId },
+      hasUI: true,
+      session_id: sessionId,
+    };
+    const resolveSessionCwd = (ctx: unknown): string | undefined => {
+      if (!ctx || typeof ctx !== "object") return undefined;
+      const manager = (ctx as { sessionManager?: { getCwd?: () => unknown } }).sessionManager;
+      try {
+        const cwd = manager?.getCwd?.();
+        return typeof cwd === "string" && cwd.length > 0 ? cwd : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const getController = (ctx: unknown, cwd: string) => {
+      admittedCwds.push(cwd);
+      return cwd === root ? controller : undefined;
+    };
+    const pi = {
+      zod: { z },
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (handlers[name] ??= []).push(handler);
+      },
+      registerTool(tool: RegisteredWorkflowTool) {
+        tools.set(tool.name, tool);
+      },
+    };
+    registerTeamWorkflow(pi as never, {
+      observability: true,
+      resolveCwd: resolveSessionCwd,
+      getSessionController: getController,
+    });
+    registerWorkflowTools(pi as never, {
+      resolveCwd: resolveSessionCwd,
+      isMainSession: () => true,
+      getSessionController: getController,
+    });
+
+    const readEvent = {
+      toolName: "read",
+      toolCallId: "read-xd-workflow-instructions",
+      input: { path: "xd://workflow_instructions" },
+    };
+    const toolCallHandlers = handlers.tool_call ?? [];
+    assert.ok(toolCallHandlers.length > 0, "registered tool_call hook is required");
+    assert.doesNotThrow(() => {
+      for (const handler of toolCallHandlers) {
+        const result = handler(readEvent, sessionContext);
+        assert.notEqual(result && typeof result === "object" ? (result as { block?: unknown }).block : undefined, true);
+      }
+    });
+    assert.ok(admittedCwds.length > 0, "the active run must reach controller-backed admission");
+    assert.ok(admittedCwds.every((cwd) => cwd === root), JSON.stringify(admittedCwds));
+    await flushRecorder(root);
+    const eventsPath = join(root, ".work-state", "runs", runId, "observability", "events.jsonl");
+    assert.match(readFileSync(eventsPath, "utf8"), /read-xd-workflow-instructions/);
+
+    const prepare = tools.get("workflow_prepare");
+    const instructions = tools.get("workflow_instructions");
+    assert.ok(prepare && instructions, "workflow tools must be registered");
+    const prepared = await prepare.execute(
+      "session-manager-cwd-prepare",
+      { mode: "resume", branch: "main", run_id: runId },
+      undefined,
+      undefined,
+      sessionContext as never,
+    );
+    const preparedDetails = prepared.details as { ok?: boolean; error?: string };
+    assert.equal(preparedDetails.ok, true, preparedDetails.error);
+    const instructionResponse = await instructions.execute(
+      "session-manager-cwd-instructions",
+      {},
+      undefined,
+      undefined,
+      sessionContext as never,
+    );
+    const contract = instructionResponse.details as {
+      workflow?: string;
+      stage?: { id?: string; roles?: Array<{ role?: string; agent?: string }> };
+    };
+    assert.equal(contract.workflow, "debug-cycle");
+    assert.equal(contract.stage?.id, "implementation");
+    assert.deepEqual(contract.stage?.roles, [{ role: "developer-kotlin", agent: "developer-kotlin" }]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("host admission blocks cwd-required tools when the resolver has no workspace", () => {
+  const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+  const pi = {
+    setLabel() {},
+    on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+      (handlers[name] ??= []).push(handler);
+    },
+  };
+  registerTeamWorkflow(pi as never, {
+    observability: false,
+    resolveCwd: () => undefined,
+    getSessionController: () => {
+      throw new Error("missing cwd must not resolve a session controller");
+    },
+  });
+  const toolCall = handlers.tool_call?.[0];
+  assert.ok(toolCall, "registered tool_call hook is required");
+  const context = {
+    sessionManager: { getCwd: () => undefined, getSessionId: () => "missing-cwd-session" },
+    hasUI: true,
+    session_id: "missing-cwd-session",
+  };
+  for (const toolName of ["ask", "task", "write", "edit", "bash"]) {
+    const result = toolCall!({ toolName, toolCallId: "missing-cwd-" + toolName, input: {} }, context);
+    assert.deepEqual(result, { block: true, reason: "workflow cwd unavailable" }, toolName);
+  }
+  const readResult = toolCall!({ toolName: "read", toolCallId: "missing-cwd-read", input: { path: "xd://workflow_instructions" } }, context);
+  assert.equal(readResult, undefined, "read remains harmless without an authoritative workspace");
+});
 
 function writeImplementationState(root: string): void {
   const profile = loadProfile("debug-cycle");
@@ -1541,6 +1672,10 @@ test("native task result reconciles its immutable origin after the manager moves
 
 
     const beforeB = readFileSync(runTarget(rootB, b.runId).statePath!, "utf8");
+    const lateResultContext = {
+      sessionManager: { getCwd: () => rootB, getSessionId: () => b.sessionId },
+      session_id: b.sessionId,
+    };
     const migrationReport = JSON.stringify({ source: "migration", migration_id: "migration-root-1", status: "imported" });
     const resultEvent = {
       toolName: "task",
@@ -1562,24 +1697,24 @@ test("native task result reconciles its immutable origin after the manager moves
         }],
       },
     };
-    invoke("tool_result", resultEvent, { cwd: rootB, session_id: b.sessionId });
+    invoke("tool_result", resultEvent, lateResultContext);
     const afterA = selectedState(rootA);
     assert.equal(afterA.dispatch_capability?.dispatches[0]?.status, "succeeded");
     assert.equal(afterA.dispatch_capability?.dispatches[0]?.completion?.evidence, migrationReport);
     assert.equal(readFileSync(runTarget(rootB, b.runId).statePath!, "utf8"), beforeB, "the moved manager must not mutate B");
 
     const afterFirstResultA = readFileSync(runTarget(rootA, a.runId).statePath!, "utf8");
-    invoke("tool_result", resultEvent, { cwd: rootB, session_id: b.sessionId });
+    invoke("tool_result", resultEvent, lateResultContext);
     assert.equal(readFileSync(runTarget(rootA, a.runId).statePath!, "utf8"), afterFirstResultA, "replayed result must not add mutation");
 
     const mismatchedInput = {
       ...resultEvent,
       input: b.taskInput,
     };
-    invoke("tool_result", mismatchedInput, { cwd: rootB, session_id: b.sessionId });
+    invoke("tool_result", mismatchedInput, lateResultContext);
     assert.equal(readFileSync(runTarget(rootA, a.runId).statePath!, "utf8"), afterFirstResultA, "mismatched origin input must be rejected");
     const beforeUnknown = readFileSync(runTarget(rootB, b.runId).statePath!, "utf8");
-    invoke("tool_result", { ...resultEvent, toolCallId: "unknown-origin" }, { cwd: rootB, session_id: b.sessionId });
+    invoke("tool_result", { ...resultEvent, toolCallId: "unknown-origin" }, lateResultContext);
     assert.equal(readFileSync(runTarget(rootB, b.runId).statePath!, "utf8"), beforeUnknown, "unknown origin must be non-mutating");
   } finally {
     rmSync(rootA, { recursive: true, force: true });
