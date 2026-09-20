@@ -47,17 +47,15 @@ import { keywordClassify } from "./classify.js";
 import { assertTrustedExecutionContext, LifecycleError, lifecyclePayloadHash } from "./run-lifecycle.js";
 import { discoverLegacySources, migrateLegacySource, recoverLegacyMigrations } from "./run-migration.js";
 import {
+  candidateForState,
   finalizeCanonicalRun,
   persistCanonicalRun,
-  previousReceipt,
   readRunControl,
   readRunState,
-  recordPrepareReceipt,
   reworkCanonicalRunAtomically,
   resumeCanonicalRun,
   runTarget,
   runStatePath,
-  selectSession,
 } from "./run-store.js";
 import type {
   CapturedDispatchContext,
@@ -275,14 +273,6 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
   if (execution.branch !== activeBranch || execution.worktree !== opts.cwd) {
     throw new LifecycleError("run_context_mismatch", "trusted execution context does not match the host worktree", { branch: activeBranch });
   }
-  const recovered = recoverLegacyMigrations(opts.cwd);
-  if (recovered.pending.length > 0) throw new LifecycleError("recovery_required", `legacy migration recovery is pending for ${recovered.pending.join(", ")}`, { next_action: "retry migration recovery before preparing a workflow" });
-  const legacyDiscovery = discoverLegacySources(opts.cwd);
-  if (legacyDiscovery.issues.length > 0) throw new LifecycleError("migration_required", `legacy source discovery failed: ${legacyDiscovery.issues.map((issue) => issue.error).join("; ")}`, { next_action: "repair the legacy source or run explicit migration" });
-  for (const source of legacyDiscovery.sources) {
-    const migration = migrateLegacySource(opts.cwd, source, execution);
-    if (!migration.ok) throw new LifecycleError(migration.code === "run_busy" ? "run_busy" : migration.code === "recovery_required" ? "recovery_required" : "migration_required", migration.error, { next_action: "resolve the migration result before continuing" });
-  }
   const requestId = opts.request_id ?? randomUUID();
   const previousRunId = operation === "new" ? null : opts.run_id ?? null;
   if (operation !== "new" && !previousRunId) throw new LifecycleError("run_selection_required", `${operation} requires an explicit run_id before mutation`, { next_action: "resolve a run selector before calling workflow_prepare" });
@@ -324,6 +314,14 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
     };
   }
 
+  const recovered = recoverLegacyMigrations(opts.cwd);
+  if (recovered.pending.length > 0) throw new LifecycleError("recovery_required", `legacy migration recovery is pending for ${recovered.pending.join(", ")}`, { next_action: "retry migration recovery before preparing a workflow" });
+  const legacyDiscovery = discoverLegacySources(opts.cwd);
+  if (legacyDiscovery.issues.length > 0) throw new LifecycleError("migration_required", `legacy source discovery failed: ${legacyDiscovery.issues.map((issue) => issue.error).join("; ")}`, { next_action: "repair the legacy source or run explicit migration" });
+  for (const source of legacyDiscovery.sources) {
+    const migration = migrateLegacySource(opts.cwd, source, execution);
+    if (!migration.ok) throw new LifecycleError(migration.code === "run_busy" ? "run_busy" : migration.code === "recovery_required" ? "recovery_required" : "migration_required", migration.error, { next_action: "resolve the migration result before continuing" });
+  }
   let state: TeamState;
   let classification: Classification;
   let profile: Profile;
@@ -371,14 +369,19 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
       files: opts.files,
       issue: opts.issue ?? null,
     };
+    const selectedCandidate = candidateForState(state);
     transition = {
       request_id: requestId,
       payload_hash: lifecyclePayloadHash(request),
       operation,
       previous_run_id: null,
-      selected_run_id: runId,
+      previous_title: null,
+      previous_status: null,
+      selected_run_id: selectedCandidate.run_id,
+      selected_title: selectedCandidate.title,
+      selected_status: selectedCandidate.status,
       committed_at: new Date().toISOString(),
-      continuation: { stage: state.stage_cursor, status: "active" },
+      continuation: { stage: selectedCandidate.stage, status: selectedCandidate.status },
     };
     const committed = persistCanonicalRun(opts.cwd, state, { context: execution, request, receipt: transition });
     state = committed.state;
@@ -392,23 +395,43 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
     profile = profiles.find((candidate) => candidate.name === classification.workflow)!;
     if (!profile) throw new LifecycleError("run_state_invalid", `profile '${classification.workflow}' for run '${runId}' is unavailable`, { run_id: runId });
     flags = state.scope ?? resolveScope([], config);
+    const previousCandidate = candidateForState(state);
     if (operation === "resume") {
       if (state.lifecycle_status === "complete" || state.pause.kind === "done") throw new LifecycleError("run_terminal", `run '${runId}' is complete; use rework or new`, { run_id: runId });
-      state = resumeCanonicalRun(opts.cwd, runId, execution);
+      const resumeRequest = { mode: "resume", request_id: requestId, execution, run_id: runId, branch: activeBranch } as LifecycleRequest;
+      const resumeReceipt: PrepareRequestReceipt = {
+        request_id: requestId,
+        payload_hash: lifecyclePayloadHash(resumeRequest),
+        operation: "resume",
+        previous_run_id: previousCandidate.run_id,
+        previous_title: previousCandidate.title,
+        previous_status: previousCandidate.status,
+        selected_run_id: previousCandidate.run_id,
+        selected_title: previousCandidate.title,
+        selected_status: previousCandidate.status,
+        committed_at: new Date().toISOString(),
+        continuation: { stage: previousCandidate.stage, status: previousCandidate.status },
+      };
+      state = resumeCanonicalRun(opts.cwd, runId, execution, { request: resumeRequest, receipt: resumeReceipt });
+      transition = resumeReceipt;
     } else {
       const affectedStage = opts.affected_stage ?? state.stage_cursor;
       if (!profile.stages.some((candidate) => candidate.id === affectedStage)) throw new LifecycleError("run_state_invalid", "rework stage '" + affectedStage + "' is not declared by workflow '" + profile.name + "'", { run_id: runId });
       if (!opts.feedback) throw new LifecycleError("lifecycle_request_conflict", "rework requires feedback", { run_id: runId });
       const activeDispatch = state.dispatch_capability?.dispatches?.find((dispatch) => ["authorized", "running", "pending"].includes(dispatch.status) && !dispatch.completion);
-      if (activeDispatch) throw new LifecycleError("run_busy", `run '${runId}' has unfinished dispatch '${activeDispatch.id}'; reconcile it before rework`, { run_id: runId, next_action: "reconcile the pending worker result before rework" });
+      if (activeDispatch) throw new LifecycleError("run_busy", "rework requires all dispatch workers to be reconciled", { run_id: runId });
       const feedback = opts.feedback;
       const reworkRequest = { mode: operation, request_id: requestId, execution, run_id: runId, branch: activeBranch, feedback, ...(requestedAffectedStage ? { affected_stage: requestedAffectedStage } : {}) } as LifecycleRequest;
       const reworkReceipt: PrepareRequestReceipt = {
         request_id: requestId,
         payload_hash: lifecyclePayloadHash(reworkRequest),
         operation: "rework",
-        previous_run_id: runId,
-        selected_run_id: runId,
+        previous_run_id: previousCandidate.run_id,
+        previous_title: previousCandidate.title,
+        previous_status: previousCandidate.status,
+        selected_run_id: previousCandidate.run_id,
+        selected_title: previousCandidate.title,
+        selected_status: previousCandidate.status,
         committed_at: new Date().toISOString(),
         continuation: { stage: affectedStage, status: "active" },
       };
@@ -424,28 +447,7 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
       });
       transition = reworkReceipt;
     }
-    if (operation !== "rework") selectSession(opts.cwd, execution, runId, activeBranch);
-    transition = {
-      request_id: requestId,
-      payload_hash: lifecyclePayloadHash({ mode: operation, request_id: requestId, execution, run_id: runId, branch: activeBranch, feedback: opts.feedback ?? "", ...(requestedAffectedStage ? { affected_stage: requestedAffectedStage } : {}) }),
-      operation,
-      previous_run_id: runId,
-      selected_run_id: runId,
-      committed_at: new Date().toISOString(),
-      continuation: { stage: state.stage_cursor, status: state.lifecycle_status ?? "active" },
-    };
   }
-  const request = {
-    mode: operation,
-    request_id: requestId,
-    execution,
-    ...(operation === "new"
-      ? { task: opts.task, branch: activeBranch, classification, files: opts.files, issue: opts.issue ?? null }
-      : operation === "resume"
-        ? { run_id: state.run_id!, branch: activeBranch }
-        : { run_id: state.run_id!, branch: activeBranch, feedback: opts.feedback ?? "", ...(requestedAffectedStage ? { affected_stage: requestedAffectedStage } : {}) }),
-  } as LifecycleRequest;
-  const recorded = operation === "rework" ? transition : recordPrepareReceipt(opts.cwd, request, transition);
   const resolveSlots = (stage: NonNullable<Profile["stages"][number]>): DispatchSlot[] =>
     resolveStageDispatchSlots(stage, { cwd: opts.cwd, flags, resolveDevAgent: () => flags.dev_agent });
   const expectedRoster = (stage: NonNullable<Profile["stages"][number]>): Array<{ role: string; agent: string }> =>
@@ -456,7 +458,7 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
     artifactsDir: runTarget(opts.cwd, state.run_id!).artifactsDir ?? "",
     expectedRoster,
     operation,
-    transition: recorded,
+    transition,
   };
 }
 

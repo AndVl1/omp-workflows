@@ -8,13 +8,13 @@ import {
   updateStateAtomically,
   withWorkspaceTransaction,
   withWorkspaceRead,
-  type ResolvedState,
+  type CanonicalRunTarget,
   type StatePublication,
 } from "./state.js";
 import { beginLifecycleTransaction, commitLifecycleTransaction, type LifecycleFileContent } from "./lifecycle-journal.js";
 import { LifecycleError, lifecyclePayloadHash, selectRunCandidate } from "./run-lifecycle.js";
 import type { RunSelectionInput, RunSelectionResult } from "./run-lifecycle.js";
-import { validateDispatchCapabilityValue } from "./control-plane-contract.js";
+import { isRecord, validateDispatchCapabilityValue, validatePrepareRequestReceiptValue } from "./control-plane-contract.js";
 import type {
   LifecycleRequest,
   LifecycleStatus,
@@ -57,6 +57,61 @@ function ensureClaimId(runId: string, ownerKind: "workflow" | "cto"): void {
   else if (!runId || !/^[A-Za-z0-9._-]+$/.test(runId)) throw new LifecycleError("run_state_invalid", "invalid CTO claim id", { run_id: runId });
 }
 
+function receiptBindingIssues(
+  cwd: string,
+  control: RunControl,
+  requestId: string,
+  receipt: unknown,
+  verifyCanonicalState = true,
+): string[] {
+  const issues: string[] = [];
+  const shape = validatePrepareRequestReceiptValue(receipt, `$.prepare_receipts.${requestId}`);
+  if (!shape.ok) issues.push(...shape.issues.map((issue) => `${issue.path} ${issue.message}`));
+  if (!isRecord(receipt)) return issues;
+  if (receipt.request_id !== requestId) issues.push(`$.prepare_receipts.${requestId}.request_id must equal its map key`);
+  const descriptors: Array<{ label: "previous" | "selected"; runId: unknown; title: unknown; status: unknown }> = [
+    { label: "previous", runId: receipt.previous_run_id, title: receipt.previous_title, status: receipt.previous_status },
+    { label: "selected", runId: receipt.selected_run_id, title: receipt.selected_title, status: receipt.selected_status },
+  ];
+  for (const descriptor of descriptors) {
+    if (descriptor.label === "previous" && descriptor.runId === null) continue;
+    if (typeof descriptor.runId !== "string" || !validRunId(descriptor.runId)) continue;
+    const indexed = control.runs[descriptor.runId];
+    const historicalSameRun = descriptor.label === "previous" && receipt.selected_run_id === descriptor.runId;
+    const compare = (candidate: RunCandidate, source: string): void => {
+      if (candidate.run_id !== descriptor.runId) issues.push(`${source}.run_id does not match ${descriptor.label}_run_id`);
+      if (!verifyCanonicalState && !historicalSameRun && candidate.title !== descriptor.title) {
+        issues.push(`${source}.title does not match ${descriptor.label}_title`);
+      }
+    };
+    if (indexed) compare(indexed, `$.runs.${descriptor.runId}`);
+    let canonical: RunCandidate | null = null;
+    if (verifyCanonicalState) {
+      if (!existsSync(runStatePath(cwd, descriptor.runId))) {
+        issues.push(`${descriptor.label} run '${descriptor.runId}' canonical state is missing`);
+      } else {
+        try {
+          const resolved = resolveCanonicalRun(cwd, { kind: "team", runId: descriptor.runId });
+          if (!resolved?.state) issues.push(`${descriptor.label} run '${descriptor.runId}' state is unavailable`);
+          else canonical = candidateForState(resolved.state);
+        } catch (error) {
+          issues.push(`${descriptor.label} run '${descriptor.runId}' state is invalid: ${(error as Error).message}`);
+        }
+      }
+    }
+    if (!indexed && !canonical) issues.push(`${descriptor.label} run '${descriptor.runId}' is absent from the canonical run index and state`);
+    if (canonical) compare(canonical, `canonical state '${descriptor.runId}'`);
+  }
+  return issues;
+}
+
+function assertReceiptBinding(cwd: string, control: RunControl, requestId: string, receipt: unknown, verifyCanonicalState = true): asserts receipt is PrepareRequestReceipt {
+  const issues = receiptBindingIssues(cwd, control, requestId, receipt, verifyCanonicalState);
+  if (issues.length > 0) {
+    throw new LifecycleError("recovery_required", `run-control prepare receipt '${requestId}' is invalid: ${issues.join("; ")}`, { next_action: "repair or recover the lifecycle control plane before mutating" });
+  }
+}
+
 function readControlRaw(cwd: string): RunControl {
   const path = controlPath(cwd);
   if (!existsSync(path)) return defaultControl();
@@ -69,10 +124,15 @@ function readControlRaw(cwd: string): RunControl {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new LifecycleError("recovery_required", "run-control.json is not an object", { next_action: "recover lifecycle transaction before mutating" });
   const value = parsed as Partial<RunControl>;
   const revision = value.revision;
-  if (value.schema !== 2 || !Number.isInteger(revision) || (revision as number) < 0 || !value.runs || !value.selections || !value.prepare_receipts || !value.selection_snapshots) {
+  if (value.schema !== 2 || !Number.isInteger(revision) || (revision as number) < 0
+    || !isRecord(value.runs) || !isRecord(value.selections) || !isRecord(value.prepare_receipts) || !isRecord(value.selection_snapshots)) {
     throw new LifecycleError("recovery_required", "run-control.json has an unknown schema or incomplete fields", { next_action: "recover lifecycle transaction before mutating" });
   }
-  return { ...defaultControl(), ...value, schema: 2 };
+  const control = { ...defaultControl(), ...value, schema: 2 } as RunControl;
+  for (const [requestId, receipt] of Object.entries(value.prepare_receipts)) {
+    assertReceiptBinding(cwd, control, requestId, receipt);
+  }
+  return control;
 }
 
 function claimCoordinatorIsBusy(claim: WorktreeExecutionClaim, context: TrustedExecutionContext): boolean {
@@ -125,13 +185,25 @@ export function updateRunControl<T>(cwd: string, mutate: RunControlMutation<T>):
   });
 }
 
-export function runTarget(cwd: string, runId: string): ResolvedState {
+export function runTarget(cwd: string, runId: string): CanonicalRunTarget {
   ensureRunId(runId);
   const root = resolve(cwd, WORK_STATE, RUNS_DIR, runId);
-  return { state: null, statePath: join(root, "state.json"), stateDir: root, artifactsDir: join(root, "artifacts"), isLegacy: false, isStale: false, canonicalRun: true };
+  return {
+    state: null,
+    statePath: join(root, "state.json"),
+    stateDir: root,
+    artifactsDir: join(root, "artifacts"),
+    isLegacy: false,
+    isStale: false,
+    canonicalRun: true,
+    schema: 2,
+    runId,
+    runKey: runId,
+    branch: resolveActiveBranch(cwd),
+  };
 }
 export function runStatePath(cwd: string, runId: string): string {
-  return runTarget(cwd, runId).statePath!;
+  return runTarget(cwd, runId).statePath;
 }
 
 export function readRunState(cwd: string, runId: string, currentBranch?: string): TeamState | null {
@@ -159,6 +231,22 @@ export function candidateForState(state: TeamState): RunCandidate {
     stage: state.stage_cursor,
     updated_at: state.updated_at,
     rework_generation: state.rework_generation ?? 0,
+  };
+}
+function transitionReceiptForSnapshots(
+  receipt: PrepareRequestReceipt,
+  previous: RunCandidate | null,
+  selected: RunCandidate,
+): PrepareRequestReceipt {
+  return {
+    ...receipt,
+    previous_run_id: previous?.run_id ?? null,
+    previous_title: previous?.title ?? null,
+    previous_status: previous?.status ?? null,
+    selected_run_id: selected.run_id,
+    selected_title: selected.title,
+    selected_status: selected.status,
+    continuation: { stage: selected.stage, status: selected.status },
   };
 }
 
@@ -458,23 +546,67 @@ export interface CanonicalRunCommitOptions {
   receipt?: PrepareRequestReceipt;
 }
 
-export function persistCanonicalRun(cwd: string, state: TeamState, options: CanonicalRunCommitOptions = {}): { target: ResolvedState; state: TeamState } {
+function authoritativeSessionCandidate(cwd: string, control: RunControl, context: TrustedExecutionContext, currentRunId: string): RunCandidate | null {
+  const selection = control.selections[context.session_id];
+  if (!selection || selection.run_id === currentRunId) return null;
+  if (!validRunId(selection.run_id)) {
+    throw new LifecycleError("recovery_required", `session '${context.session_id}' selects an invalid canonical run '${selection.run_id}'`, { next_action: "repair or recover the lifecycle control plane before mutating" });
+  }
+  const indexed = control.runs[selection.run_id];
+  if (!existsSync(runStatePath(cwd, selection.run_id))) {
+    throw new LifecycleError("recovery_required", `session '${context.session_id}' selects missing canonical run '${selection.run_id}'`, { run_id: selection.run_id, next_action: "repair or recover the lifecycle control plane before mutating" });
+  }
+  try {
+    const resolved = resolveCanonicalRun(cwd, { kind: "team", runId: selection.run_id });
+    if (!resolved?.state) throw new Error("canonical state is unavailable");
+    const candidate = candidateForState(resolved.state);
+    if (indexed && (indexed.title !== candidate.title || indexed.branch !== candidate.branch)) {
+      throw new Error("canonical run index does not match its state");
+    }
+    return candidate;
+  } catch (error) {
+    throw new LifecycleError("recovery_required", `session '${context.session_id}' selection is invalid: ${(error as Error).message}`, { run_id: selection.run_id, next_action: "repair or recover the selected canonical run before mutating" });
+  }
+}
+
+export function persistCanonicalRun(cwd: string, state: TeamState, options: CanonicalRunCommitOptions = {}): { target: CanonicalRunTarget; state: TeamState } {
+  if (Boolean(options.request) !== Boolean(options.receipt)) {
+    throw new LifecycleError("lifecycle_request_conflict", "lifecycle request and receipt must be supplied together");
+  }
+  if (options.request && (options.request.mode !== "new" || options.receipt!.operation !== "new" || options.receipt!.request_id !== options.request.request_id)) {
+    throw new LifecycleError("lifecycle_request_conflict", "persistCanonicalRun accepts only a matching new lifecycle request and receipt");
+  }
   if (state.schema !== 2 || !state.run_id || state.run_key !== state.run_id) throw new LifecycleError("run_state_invalid", "schema-2 canonical run requires matching run_id and run_key");
-  ensureRunId(state.run_id);
   return withWorkspaceTransaction(cwd, () => {
     const runId = state.run_id;
     if (!runId) throw new LifecycleError("run_state_invalid", "schema-2 canonical run requires run_id");
     const target = runTarget(cwd, runId);
     const statePath = target.statePath!;
-    if (existsSync(statePath)) throw new LifecycleError("lifecycle_request_conflict", `run '${state.run_id}' already exists`, { run_id: state.run_id });
     const beforeControl = controlContent(cwd);
     const control = readControlRaw(cwd);
+    const requestHash = options.request ? lifecyclePayloadHash(options.request) : null;
+    const existing = options.request ? control.prepare_receipts[options.request.request_id] : undefined;
+    if (existing) {
+      if (existing.payload_hash !== requestHash) {
+        throw new LifecycleError("lifecycle_request_conflict", "request_id replayed with a different payload", { run_id: existing.selected_run_id });
+      }
+      const existingTarget = runTarget(cwd, existing.selected_run_id);
+      if (!existsSync(existingTarget.statePath!)) {
+        throw new LifecycleError("recovery_required", "exact replay receipt points to a missing canonical run", { run_id: existing.selected_run_id });
+      }
+      const existingState = JSON.parse(readFileSync(existingTarget.statePath!, "utf8")) as TeamState;
+      if (options.receipt) Object.assign(options.receipt, existing);
+      return { target: { ...existingTarget, state: existingState }, state: existingState };
+    }
+    if (existsSync(statePath)) throw new LifecycleError("lifecycle_request_conflict", `run '${state.run_id}' already exists`, { run_id: state.run_id });
     let claim = control.execution_claim;
+    let previousCandidate: RunCandidate | null = null;
     if (options.context) {
       if (claim && claim.run_id !== runId) {
         const sameSession = claim.coordinator_session_id === options.context.session_id && !claim.released_at;
         const previous = sameSession ? resolveCanonicalRun(cwd, { kind: "team", runId: claim.run_id }) : null;
         const previousState = previous?.state;
+        if (previousState) previousCandidate = candidateForState(previousState);
         const previousPending = Boolean(previousState?.pending)
           || (previousState?.dispatch_capability?.pending?.some((entry) => entry.status === "authorized" || entry.status === "running" || entry.status === "pending") ?? false)
           || (previousState?.dispatch_capability?.dispatches?.some((entry) => entry.status === "authorized" || entry.status === "running" || entry.status === "pending") ?? false);
@@ -496,24 +628,33 @@ export function persistCanonicalRun(cwd: string, state: TeamState, options: Cano
           released_at: null,
         };
       }
+      if (!previousCandidate) previousCandidate = authoritativeSessionCandidate(cwd, control, options.context, runId);
     }
     const committedState: TeamState = { ...state, state_revision: 1 };
     const stateContent = `${JSON.stringify(committedState, null, 2)}\n`;
+    const selectedCandidate = candidateForState(committedState);
+    const committedReceipt = options.request && options.receipt
+      ? {
+          ...transitionReceiptForSnapshots(options.receipt, options.request.mode === "new" ? previousCandidate : null, selectedCandidate),
+          payload_hash: lifecyclePayloadHash(options.request),
+        }
+      : null;
     const nextControl: RunControl = {
       ...control,
       revision: control.revision + 1,
       execution_claim: claim,
-      runs: { ...control.runs, [runId]: candidateForState(committedState) },
+      runs: { ...control.runs, [runId]: selectedCandidate },
       ...(options.context
         ? { selections: {
             ...Object.fromEntries(Object.entries(control.selections).map(([sessionId, selection]) => [sessionId, selection.run_id === runId ? { ...selection, active: false } : selection])),
             [options.context.session_id]: { run_id: runId, branch: state.branch, selected_at: new Date().toISOString(), active: true },
           } }
         : {}),
-      ...(options.request && options.receipt
-        ? { prepare_receipts: { ...control.prepare_receipts, [options.request.request_id]: { ...options.receipt, payload_hash: lifecyclePayloadHash(options.request) } } }
+      ...(committedReceipt
+        ? { prepare_receipts: { ...control.prepare_receipts, [options.request!.request_id]: committedReceipt } }
         : {}),
     };
+    if (committedReceipt) assertReceiptBinding(cwd, nextControl, options.request!.request_id, committedReceipt, false);
     const controlContentAfter = `${JSON.stringify(nextControl, null, 2)}\n`;
     const transaction = beginLifecycleTransaction({
       cwd,
@@ -522,6 +663,7 @@ export function persistCanonicalRun(cwd: string, state: TeamState, options: Cano
       after: { [statePath]: stateContent, [controlPath(cwd)]: controlContentAfter },
     });
     commitLifecycleTransaction(cwd, transaction.transaction_id);
+    if (committedReceipt && options.receipt) Object.assign(options.receipt, committedReceipt);
     return {
       target: { ...target, state: committedState },
       state: committedState,
@@ -553,7 +695,12 @@ export function reworkCanonicalRunAtomically(
   options: { context?: TrustedExecutionContext; ownershipToken?: string; invalidateOwnedFiles?: (current: TeamState, next: TeamState) => string[] } = {},
 ): TeamState {
   ensureRunId(runId);
+  if (request.mode !== "rework" || receipt.operation !== "rework" || request.run_id !== runId || receipt.request_id !== request.request_id) {
+    throw new LifecycleError("lifecycle_request_conflict", "reworkCanonicalRunAtomically requires a matching rework request and receipt", { run_id: runId });
+  }
   return withWorkspaceTransaction(cwd, () => {
+    const controlPathValue = controlPath(cwd);
+    const controlBefore = controlContent(cwd);
     const target = runTarget(cwd, runId);
     const statePath = target.statePath!;
     const stateRaw = readFileSync(statePath, "utf8");
@@ -561,6 +708,15 @@ export function reworkCanonicalRunAtomically(
     if (current.schema !== 2 || current.run_id !== runId || current.run_key !== runId) throw new LifecycleError("run_state_invalid", "canonical rework identity is invalid", { run_id: runId });
     if (request.branch !== current.branch) throw new LifecycleError("run_context_mismatch", "rework run '" + runId + "' belongs to branch '" + current.branch + "'", { run_id: runId, branch: current.branch });
     const control = readControlRaw(cwd);
+    const requestHash = lifecyclePayloadHash(request);
+    const existing = control.prepare_receipts[request.request_id];
+    if (existing) {
+      if (existing.payload_hash !== requestHash) {
+        throw new LifecycleError("lifecycle_request_conflict", "request_id replayed with a different payload", { run_id: existing.selected_run_id });
+      }
+      Object.assign(receipt, existing);
+      return current;
+    }
     const claim = control.execution_claim;
     let publishedClaim = claim;
     let ownershipToken = options.ownershipToken;
@@ -635,19 +791,32 @@ export function reworkCanonicalRunAtomically(
       after[join(revisionRoot, relativePath)] = content;
       if (relativePath.startsWith("artifacts/")) artifactSha256[relativePath.slice("artifacts/".length)] = createHash("sha256").update(lifecycleContentBytes(content)).digest("hex");
     }
-    after[join(revisionRoot, "manifest.json")] = `${JSON.stringify({ schema: 2, revision_id: revisionId, run_id: runId, label: "rework", source_state: join(revisionRoot, "state.json"), created_at: new Date().toISOString(), state_sha256: createHash("sha256").update(lifecycleContentBytes(stateContent)).digest("hex"), artifact_sha256: artifactSha256 }, null, 2)}\n`;
-    const controlPathValue = controlPath(cwd);
-    const controlBefore = controlContent(cwd);
+    const manifestPath = join(revisionRoot, "manifest.json");
+    const manifest = {
+      schema: 2,
+      revision_id: revisionId,
+      run_id: runId,
+      label: "rework",
+      source_state: join(revisionRoot, "state.json"),
+      created_at: new Date().toISOString(),
+      state_sha256: createHash("sha256").update(lifecycleContentBytes(stateContent)).digest("hex"),
+      artifact_sha256: artifactSha256,
+    };
+    after[manifestPath] = `${JSON.stringify(manifest, null, 2)}\n`;
     const nextSelections = options.context
       ? {
           ...Object.fromEntries(Object.entries(control.selections).map(([sessionId, selection]) => [sessionId, sessionId === options.context!.session_id ? { ...selection, active: false } : selection])),
           [options.context.session_id]: { run_id: runId, branch: current.branch, selected_at: new Date().toISOString(), active: true },
         }
       : Object.fromEntries(Object.entries(control.selections).map(([sessionId, selection]) => [sessionId, selection.run_id === runId ? { ...selection, active: true } : selection]));
-    const nextControl: RunControl = { ...control, revision: control.revision + 1, runs: { ...control.runs, [runId]: candidateForState(nextState) }, selections: nextSelections, ...(options.context ? { execution_claim: publishedClaim } : {}) };
-    const receiptPath = join(resolve(cwd, WORK_STATE), "run-control.json");
-    const nextReceipt = { ...receipt, payload_hash: lifecyclePayloadHash(request) };
+    const nextCandidate = candidateForState(nextState);
+    const nextReceipt = {
+      ...transitionReceiptForSnapshots(receipt, candidateForState(current), nextCandidate),
+      payload_hash: requestHash,
+    };
+    const nextControl: RunControl = { ...control, revision: control.revision + 1, runs: { ...control.runs, [runId]: nextCandidate }, selections: nextSelections, ...(options.context ? { execution_claim: publishedClaim } : {}) };
     const nextControlWithReceipt = { ...nextControl, prepare_receipts: { ...nextControl.prepare_receipts, [request.request_id]: nextReceipt } };
+    assertReceiptBinding(cwd, nextControlWithReceipt, request.request_id, nextReceipt, false);
     after[controlPathValue] = `${JSON.stringify(nextControlWithReceipt, null, 2)}\n`;
     const before: Record<string, LifecycleFileContent> = { [statePath]: stateRaw, [controlPathValue]: controlBefore };
     for (const path of ownedFiles) {
@@ -656,33 +825,11 @@ export function reworkCanonicalRunAtomically(
     }
     const tx = beginLifecycleTransaction({ cwd, operation: "rework", before, after });
     commitLifecycleTransaction(cwd, tx.transaction_id);
+    Object.assign(receipt, nextReceipt);
     return nextState;
   });
 }
 
-export function recordPrepareReceipt(cwd: string, request: LifecycleRequest, receipt: PrepareRequestReceipt): PrepareRequestReceipt {
-  return withWorkspaceTransaction(cwd, () => {
-    const before = controlContent(cwd);
-    const control = readControlRaw(cwd);
-    const hash = lifecyclePayloadHash(request);
-    const existing = control.prepare_receipts[request.request_id];
-    if (existing) {
-      if (existing.payload_hash !== hash) throw new LifecycleError("lifecycle_request_conflict", "request_id replayed with a different payload", { run_id: existing.selected_run_id });
-      return existing;
-    }
-    const nextReceipt = { ...receipt, payload_hash: hash };
-    writeControlTransaction(cwd, before, {
-      ...control,
-      revision: control.revision + 1,
-      prepare_receipts: { ...control.prepare_receipts, [request.request_id]: nextReceipt },
-    }, request.mode);
-    return nextReceipt;
-  });
-}
-
-export function previousReceipt(cwd: string, request: LifecycleRequest): PrepareRequestReceipt | null {
-  return withWorkspaceRead(cwd, () => readControlRaw(cwd).prepare_receipts[request.request_id] ?? null, () => null);
-}
 
 export function deactivateSessionSelection(cwd: string, sessionId: string): void {
   if (!sessionId) return;
@@ -880,36 +1027,140 @@ export function lifecycleTransactionPath(cwd: string, transactionId = randomUUID
 }
 
 export const ordinaryRunIdentity = (state: TeamState): OrdinaryRunIdentity => ({ schema: 2, run_id: state.run_id ?? "", run_key: state.run_key ?? "", branch: state.branch });
-export function resumeCanonicalRun(cwd: string, runId: string, context: TrustedExecutionContext): TeamState {
-  const state = readRunState(cwd, runId);
-  if (!state) throw new LifecycleError("run_not_found", `run '${runId}' is missing`, { run_id: runId });
-  if (state.lifecycle_status === "complete" || state.pause.kind === "done") throw new LifecycleError("run_terminal", `run '${runId}' is complete; use rework or new`, { run_id: runId });
-  const control = readRunControl(cwd);
-  const currentClaim = control.execution_claim;
-  if (currentClaim?.run_id === runId) {
-    handoverExecutionClaim(cwd, { run_id: runId, context, token: currentClaim.token });
-  } else if (!currentClaim) {
-    acquireExecutionClaim(cwd, { run_id: runId, context });
-  } else {
-    throw new LifecycleError("run_busy", `worktree execution is owned by run '${currentClaim.run_id}'`, { run_id: currentClaim.run_id });
+export function resumeCanonicalRun(
+  cwd: string,
+  runId: string,
+  context: TrustedExecutionContext,
+  options: { request: LifecycleRequest; receipt: PrepareRequestReceipt },
+): TeamState {
+  if (options.request.mode !== "resume" || options.receipt.operation !== "resume" || options.request.run_id !== runId || options.receipt.request_id !== options.request.request_id) {
+    throw new LifecycleError("lifecycle_request_conflict", "resumeCanonicalRun requires a matching resume request and receipt", { run_id: runId });
   }
-  const capabilityPending = state.dispatch_capability?.pending?.some((entry) =>
-    entry.status === "authorized" || entry.status === "running" || entry.status === "pending",
-  ) ?? false;
-  if (!state.pending && !capabilityPending) {
-    return updateCanonicalRun(cwd, runId, (current) => ({ ...current, lifecycle_status: current.pause.kind === "none" ? "active" : "paused" }));
-  }
-  return updateCanonicalRun(cwd, runId, (current) => {
-    const next: TeamState = {
-      ...current,
-      lifecycle_status: "paused",
-      pause: { kind: "background_wait", reason: "transport_reconnect: persisted dispatch awaits a verifiable provider receipt" },
-    };
-    if (current.pending) {
-      next.pending = { ...current.pending, status: "pending", pending_reason: "transport_reconnect", updated_at: new Date().toISOString() };
-    } else {
-      delete next.pending;
+  return withWorkspaceTransaction(cwd, () => {
+    const target = runTarget(cwd, runId);
+    const statePath = target.statePath!;
+    if (!existsSync(statePath)) throw new LifecycleError("run_not_found", `run '${runId}' is missing`, { run_id: runId });
+    const stateRaw = readFileSync(statePath, "utf8");
+    const controlPathValue = controlPath(cwd);
+    const controlBefore = controlContent(cwd);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stateRaw);
+    } catch (error) {
+      throw new LifecycleError("recovery_required", `run '${runId}' state is unreadable: ${(error as Error).message}`, { run_id: runId });
     }
-    return next;
+    const issues: string[] = [];
+    const current = normalizePersistedState(parsed, issues);
+    if (!current || current.schema !== 2 || current.run_id !== runId || current.run_key !== runId) {
+      throw new LifecycleError("run_state_invalid", `run '${runId}' state is invalid: ${issues.join("; ") || "canonical identity is invalid"}`, { run_id: runId });
+    }
+    if (context.branch !== current.branch) throw new LifecycleError("run_context_mismatch", `run '${runId}' belongs to branch '${current.branch}'`, { run_id: runId, branch: current.branch });
+    const control = readControlRaw(cwd);
+    const requestHash = options.request ? lifecyclePayloadHash(options.request) : null;
+    const existing = options.request ? control.prepare_receipts[options.request.request_id] : undefined;
+    if (existing) {
+      if (existing.payload_hash !== requestHash) {
+        throw new LifecycleError("lifecycle_request_conflict", "request_id replayed with a different payload", { run_id: existing.selected_run_id });
+      }
+      if (options.receipt) Object.assign(options.receipt, existing);
+      const replayTarget = runTarget(cwd, existing.selected_run_id);
+      if (!existsSync(replayTarget.statePath!)) throw new LifecycleError("recovery_required", "exact replay receipt points to a missing canonical run", { run_id: existing.selected_run_id });
+      let replayParsed: unknown;
+      try {
+        replayParsed = JSON.parse(readFileSync(replayTarget.statePath!, "utf8"));
+      } catch (error) {
+        throw new LifecycleError("recovery_required", `exact replay state is unreadable: ${(error as Error).message}`, { run_id: existing.selected_run_id });
+      }
+      const replayIssues: string[] = [];
+      const replayState = normalizePersistedState(replayParsed, replayIssues);
+      if (!replayState || replayState.schema !== 2 || replayState.run_id !== existing.selected_run_id || replayState.run_key !== existing.selected_run_id) {
+        throw new LifecycleError("recovery_required", `exact replay state is invalid: ${replayIssues.join("; ")}`, { run_id: existing.selected_run_id });
+      }
+      return replayState;
+    }
+    if (current.lifecycle_status === "complete" || current.pause.kind === "done") throw new LifecycleError("run_terminal", `run '${runId}' is complete; use rework or new`, { run_id: runId });
+
+    const currentClaim = control.execution_claim;
+    let publishedClaim: WorktreeExecutionClaim;
+    if (currentClaim?.run_id === runId) {
+      if (!currentClaim.released_at && claimBusy(currentClaim, context)) {
+        throw new LifecycleError("run_busy", `coordinator for run '${runId}' is still live`, { run_id: runId, next_action: "wait for a release receipt or reconcile the owner" });
+      }
+      publishedClaim = {
+        ...currentClaim,
+        token: randomUUID(),
+        coordinator_session_id: context.session_id,
+        ...(context.process_id ? { coordinator_process_id: context.process_id } : {}),
+        ownership_epoch: randomUUID(),
+        released_at: null,
+      };
+    } else if (!currentClaim) {
+      publishedClaim = {
+        token: randomUUID(),
+        owner_kind: "workflow",
+        run_id: runId,
+        coordinator_session_id: context.session_id,
+        ...(context.process_id ? { coordinator_process_id: context.process_id } : {}),
+        ownership_epoch: randomUUID(),
+        worker_ids: [],
+        released_at: null,
+      };
+    } else {
+      throw new LifecycleError("run_busy", `worktree execution is owned by run '${currentClaim.run_id}'`, { run_id: currentClaim.run_id });
+    }
+
+    const capabilityPending = current.dispatch_capability?.pending?.some((entry) =>
+      entry.status === "authorized" || entry.status === "running" || entry.status === "pending",
+    ) ?? false;
+    let nextState: TeamState;
+    if (!current.pending && !capabilityPending) {
+      nextState = { ...current, lifecycle_status: current.pause.kind === "none" ? "active" : "paused" };
+    } else {
+      nextState = {
+        ...current,
+        lifecycle_status: "paused",
+        pause: { kind: "background_wait", reason: "transport_reconnect: persisted dispatch awaits a verifiable provider receipt" },
+      };
+      if (current.pending) {
+        nextState.pending = { ...current.pending, status: "pending", pending_reason: "transport_reconnect", updated_at: new Date().toISOString() };
+      } else {
+        delete nextState.pending;
+      }
+    }
+    nextState = {
+      ...nextState,
+      state_revision: (typeof current.state_revision === "number" ? current.state_revision : 0) + 1,
+      updated_at: new Date().toISOString(),
+    };
+    const previousCandidate = candidateForState(current);
+    const selectedCandidate = candidateForState(nextState);
+    const nextReceipt = options.request && options.receipt
+      ? {
+          ...transitionReceiptForSnapshots(options.receipt, previousCandidate, selectedCandidate),
+          payload_hash: requestHash!,
+        }
+      : null;
+    const nextSelections = {
+      ...Object.fromEntries(Object.entries(control.selections).map(([sessionId, selection]) => [sessionId, sessionId === context.session_id ? { ...selection, active: false } : selection])),
+      [context.session_id]: { run_id: runId, branch: current.branch, selected_at: new Date().toISOString(), active: true },
+    };
+    const nextControl: RunControl = {
+      ...control,
+      revision: control.revision + 1,
+      execution_claim: publishedClaim,
+      runs: { ...control.runs, [runId]: selectedCandidate },
+      selections: nextSelections,
+      ...(nextReceipt ? { prepare_receipts: { ...control.prepare_receipts, [options.request!.request_id]: nextReceipt } } : {}),
+    };
+    if (nextReceipt) assertReceiptBinding(cwd, nextControl, options.request!.request_id, nextReceipt, false);
+    const transaction = beginLifecycleTransaction({
+      cwd,
+      operation: "resume",
+      before: { [statePath]: stateRaw, [controlPathValue]: controlBefore },
+      after: { [statePath]: `${JSON.stringify(nextState, null, 2)}\n`, [controlPathValue]: `${JSON.stringify(nextControl, null, 2)}\n` },
+    });
+    commitLifecycleTransaction(cwd, transaction.transaction_id);
+    if (nextReceipt && options.receipt) Object.assign(options.receipt, nextReceipt);
+    return nextState;
   });
 }

@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { beginCapability, authorizeDispatch as rawAuthorizeDispatch, completeDispatch as rawCompleteDispatch, advanceCursor as rawAdvanceCursor, recordCheckpointDecision as rawRecordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
 import { appendCheckpointDecision, checkpointAnswerBinding, checkpointPolicyHash, recordTrustedCheckpointAnswer, validateCheckpointDecision } from "../src/engine/checkpoints.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+
 import { runTarget } from "../src/engine/run-store.js";
 import { run } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
@@ -40,7 +40,7 @@ function completeDispatch(root: string, input: Parameters<typeof rawCompleteDisp
     const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
     const artifacts = { ...(state.artifacts ?? {}) };
     for (const id of input.artifact_ids) artifacts[id] = `artifacts/${id}.json`;
-    writeStateBootstrap(root, { ...state, artifacts }, { target: runTarget(root, RUN_ID) });
+    writeFileSync(statePath, JSON.stringify({ ...state, artifacts }) + "\n");
   }
   return rawCompleteDispatch(root, { ...input, run_id: RUN_ID }, { runId: RUN_ID });
 }
@@ -72,7 +72,7 @@ function setupStage(
     const runDir = join(root, ".work-state", "runs", RUN_ID);
     const artifactsDir = join(runDir, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
-    writeStateBootstrap(root, {
+    writeFileSync(statePath, JSON.stringify({
       schema: 2, run_id: RUN_ID, run_key: RUN_ID, lifecycle_status: "active", rework_generation: 0,
       branch, title: "loop test", classification: classification(profile.name, false), task: "loop test",
       workflow_override: false, issue: null, required_inputs: {}, required_input_receipts: {},
@@ -83,7 +83,7 @@ function setupStage(
       profile_hash: persistedHash,
       ...(profile.checkpoint_policy ? { checkpoint_policy: profile.checkpoint_policy } : {}),
       updated_at: new Date().toISOString(),
-    }, { target: runTarget(root, RUN_ID) });
+    }) + "\n");
     if (profile.name === "lightweight" && stageId === "implementation") {
       writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "loop test", branch }));
     }
@@ -159,6 +159,10 @@ function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), "utf8")) as TeamState;
 }
 
+function writeCanonicalState(root: string, state: TeamState): void {
+  const persisted = { ...state, state_revision: state.state_revision ?? 1 };
+  writeFileSync(runTarget(root, RUN_ID).statePath!, `${JSON.stringify(persisted, null, 2)}\n`);
+}
 function typedCheckpoint(root: string, stageId: string, checkpointId: string, decision = "proceed", answerSuffix = "") {
   const state = readState(root);
   const policy = state.checkpoint_policy;
@@ -175,7 +179,7 @@ function typedCheckpoint(root: string, stageId: string, checkpointId: string, de
     checkpoint_id: checkpointId,
     decision,
   });
-  writeStateBootstrap(root, trusted.state, { target: runTarget(root, RUN_ID) });
+  writeCanonicalState(root, trusted.state);
   return {
     run_id: state.work_identity?.run_id ?? state.run_key ?? state.branch,
     stage_id: stageId,
@@ -197,7 +201,7 @@ function persistTypedCheckpoint(root: string, stageId: string, checkpointId: str
   const typed = typedCheckpoint(root, stageId, checkpointId, decision);
   const appended = appendCheckpointDecision(readState(root), typed);
   assert.equal(appended.ok, true, appended.ok ? "checkpoint recorded" : `checkpoint append failed: ${appended.code}: ${appended.error}`);
-  writeStateBootstrap(root, appended.state, { target: runTarget(root, RUN_ID) });
+  writeCanonicalState(root, appended.state);
 }
 const LOOP_DIAGNOSIS = { root_cause: "loop fixture 1", explanation: "initial upstream diagnosis for the first committed loop iteration" };
 const LOOP_IMPLEMENTATION = { files_touched: ["loop-fixture-1"], ready: true, validation_run: true, validation_evidence: "initial upstream implementation fixture" };
@@ -384,10 +388,9 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
     assert.equal(authorized.ok, true);
     if (!authorized.ok || !authorized.record) return;
     assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "done" }).ok, true);
-
     const profileState = readState(root);
     assert.equal(profileState.checkpoint_policy?.source, "profile");
-    writeStateBootstrap(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } }, { target: runTarget(root, RUN_ID) });
+    writeCanonicalState(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } });
     persistTypedCheckpoint(root, "implementation", "approve_implementation");
     const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "typed human consent" });
     assert.equal(advanced.ok, true, "routing autonomous=true must not conflict with a profile-source human policy");
@@ -438,14 +441,14 @@ test("checkpoint: typed recording is idempotent; conflicting decisions fail and 
     const typed = typedCheckpoint(root, "implementation", "approve_implementation");
     const firstAppend = appendCheckpointDecision(readState(root), typed);
     assert.equal(firstAppend.ok, true, firstAppend.ok ? "first append" : `${firstAppend.code}: ${firstAppend.error}`);
-    writeStateBootstrap(root, firstAppend.state, { target: runTarget(root, RUN_ID) });
+    writeCanonicalState(root, firstAppend.state);
     const secondAppend = appendCheckpointDecision(readState(root), typed);
     assert.equal(secondAppend.ok, true);
-    writeStateBootstrap(root, secondAppend.state, { target: runTarget(root, RUN_ID) });
+    writeCanonicalState(root, secondAppend.state);
     const replay = appendCheckpointDecision(readState(root), typed);
     assert.equal(replay.ok, true);
     assert.equal(replay.idempotent, true, "identical typed decision is idempotent");
-    writeStateBootstrap(root, replay.state, { target: runTarget(root, RUN_ID) });
+    writeCanonicalState(root, replay.state);
     const decisions = readState(root);
     assert.equal(decisions.typed_checkpoint_decisions?.length, 1, "identical typed decision is idempotent");
     assert.equal(decisions.checkpoint_decisions?.length, 1, "typed mirror remains singular");

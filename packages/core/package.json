@@ -10,8 +10,7 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.js"
+      "import": "./dist/index.js"
     },
     "./visualize": {
       "types": "./dist/visualize/index.d.ts",

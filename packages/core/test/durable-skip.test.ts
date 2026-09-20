@@ -38,7 +38,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { createCapability, authorizeDispatch as rawAuthorizeDispatch, completeDispatch as rawCompleteDispatch, advanceCursor as rawAdvanceCursor, type CapabilityHandoff } from "../src/engine/durable.js";
-import { writeStateBootstrap, checkMonotonic } from "../src/engine/state.js";
+import { checkMonotonic } from "../src/engine/state.js";
 import { buildDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
 import { run, prepareWorkflowState } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";

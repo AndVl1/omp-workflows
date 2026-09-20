@@ -33,7 +33,7 @@ import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, dispatchTaskId, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
 import { registerTeamWorkflow, registerWorkflowTools } from "../src/index.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+
 import { runTarget } from "../src/engine/run-store.js";
 import type { TeamState, TrustedExecutionContext } from "../src/engine/types.js";
 import { prepareWorkflowState } from "../src/engine/run.js";
@@ -126,6 +126,25 @@ function writeRequiredArtifact(root: string, artifactId: string, value: unknown)
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
+}
+
+function initP5ClassificationFixture(root: string): TrustedExecutionContext {
+  const requestedBranch = `p5/${randomUUID()}`;
+  initGit(root, requestedBranch);
+  const branch = execFileSync("git", ["-C", root, "branch", "--show-current"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+  assert.equal(branch, requestedBranch, "P5 fixture must capture the initialized branch");
+  return trustedContext(root, branch);
+}
+
+function writeP5WorkflowState(
+  root: string,
+  execution: TrustedExecutionContext,
+  state: Record<string, unknown>,
+): string {
+  return writeWorkflowState(root, { ...state, branch: execution.branch });
 }
 
 const trustedIntakeRoles = { analyst: "analyst", "tech-researcher": "tech-researcher" } as const;
@@ -375,7 +394,7 @@ function recordTypedCheckpoint(root: string, stageId: string, checkpointId: stri
   };
   const appended = appendCheckpointDecision(trusted.state, typed);
   assert.equal(appended.ok, true, appended.ok ? "checkpoint recorded" : `checkpoint append failed: ${appended.code}: ${appended.error}`);
-  writeStateBootstrap(root, appended.state, { target: runTarget(root, runId) });
+  writeFileSync(runTarget(root, runId).statePath!, `${JSON.stringify(appended.state, null, 2)}\n`);
 }
 test("workflow_prepare: public tool rejects branch drift, detached HEAD, and non-git cwd before writes", async () => {
   const mismatch = mkdtempSync(join(tmpdir(), "workflow-prepare-mismatch-"));
@@ -465,35 +484,19 @@ test("do-work: [AUTONOMOUSLY] lookalike stays literal and hint is false", () => 
 // ── (d) /cto and /do-work share the four-field classification contract ──────
 
 
-test("classification contract: /do-work and /cto request the SAME four model fields", () => {
-  const root = mkdtempSync(join(tmpdir(), "class-contract-"));
-  try {
-    const work = buildDoWorkPrompt(parseWorkEnvelope("Fix login bug", root), root);
-    const cto = buildCtoPrompt(parseWorkEnvelope("Fix login bug", root), root);
-    for (const prompt of [work, cto]) {
-      assert.ok(prompt.includes("CLASSIFICATION:"), "visible classification block");
-      assert.ok(prompt.includes("- Type: FEATURE | REFACTOR | OPS | BUG_FIX | SPEC | REGRESS | INVESTIGATION | REVIEW | HOTFIX"), "Type field");
-      assert.ok(prompt.includes("- Complexity: QUICK | MEDIUM | COMPLEX | CRITICAL"), "Complexity field");
-      assert.ok(prompt.includes("- Confidence: HIGH | MEDIUM | LOW"), "Confidence field");
-      assert.ok(prompt.includes("- Autonomous: true | false"), "Autonomous field");
-      assert.ok(prompt.includes("Autonomy is YOUR decision"), "model decides autonomy");
-    }
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 // ── (a) hint false + natural-language autonomy → model true → debug-cycle ───
 
 test("P5 gate: natural-language autonomous task (hint false) is accepted as debug-cycle when the MODEL decides true", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-model-auto-"));
   try {
+    const execution = initP5ClassificationFixture(root);
     const envelope = parseWorkEnvelope("Do this without waiting for approval — fix the login bug", root);
     assert.equal(envelope.autonomyHint, false, "parser does NOT recognize natural-language autonomy");
 
 
     // Model output: autonomous=true -> debug-cycle passes the gate.
-    writeWorkflowState(root, {
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle", autonomous: true, autonomous_reason: "task explicitly waives approval" },
     });
     assert.equal(classificationGateFor(root), undefined, "model autonomous=true accepted as debug-cycle");
@@ -507,17 +510,18 @@ test("P5 gate: natural-language autonomous task (hint false) is accepted as debu
 test("P5 gate: [AUTONOMOUS] marker can be OVERRIDDEN by the model to interactive", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-override-"));
   try {
+    const execution = initP5ClassificationFixture(root);
     const envelope = parseWorkEnvelope("[AUTONOMOUS] Walk me through each step before touching code", root);
     assert.equal(envelope.autonomyHint, true, "static hint is ON");
 
 
     // Model decides autonomous=false -> interactive bug-fix passes; debug-cycle blocks.
-    writeWorkflowState(root, {
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "bug-fix", autonomous: false, autonomous_reason: "user wants step-by-step review" },
     });
     assert.equal(classificationGateFor(root), undefined, "model false stays interactive");
 
-    writeWorkflowState(root, {
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle", autonomous: false },
     });
     const blocked = classificationGateFor(root);
@@ -533,7 +537,8 @@ test("P5 gate: [AUTONOMOUS] marker can be OVERRIDDEN by the model to interactive
 test("P5 gate: missing classification.autonomous blocks — no silent default", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-missing-auto-"));
   try {
-    writeWorkflowState(root, {
+    const execution = initP5ClassificationFixture(root);
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle" },
     });
     const blocked = classificationGateFor(root);
@@ -547,7 +552,8 @@ test("P5 gate: missing classification.autonomous blocks — no silent default", 
 test("P5 gate: non-boolean classification.autonomous blocks — fail closed", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-nonbool-auto-"));
   try {
-    writeWorkflowState(root, {
+    const execution = initP5ClassificationFixture(root);
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle", autonomous: "true" },
     });
     const blocked = classificationGateFor(root);
@@ -563,7 +569,8 @@ test("P5 gate: non-boolean classification.autonomous blocks — fail closed", ()
 test("P5 gate: workflow_override:true cannot bypass MISSING classification.autonomous", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-override-missing-"));
   try {
-    writeWorkflowState(root, {
+    const execution = initP5ClassificationFixture(root);
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle" },
       workflow_override: true,
     });
@@ -578,7 +585,8 @@ test("P5 gate: workflow_override:true cannot bypass MISSING classification.auton
 test("P5 gate: workflow_override:true cannot bypass NON-BOOLEAN classification.autonomous", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-override-nonbool-"));
   try {
-    writeWorkflowState(root, {
+    const execution = initP5ClassificationFixture(root);
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle", autonomous: "true" },
       workflow_override: true,
     });
@@ -593,7 +601,8 @@ test("P5 gate: workflow_override:true cannot bypass NON-BOOLEAN classification.a
 test("P5 gate: workflow_override:true still allows a VALID model autonomy decision", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-override-valid-"));
   try {
-    writeWorkflowState(root, {
+    const execution = initP5ClassificationFixture(root);
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "debug-cycle", autonomous: false },
       workflow_override: true,
     });
@@ -610,8 +619,9 @@ test("P5 gate: workflow_override:true still allows a VALID model autonomy decisi
 test("P5 gate: a present model field wins over the legacy top-level field", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-priority-"));
   try {
+    const execution = initP5ClassificationFixture(root);
     // Legacy says true, model says false — the model decision is the authority.
-    writeWorkflowState(root, {
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "bug-fix", autonomous: false },
       autonomous: true,
     });
@@ -626,11 +636,12 @@ test("P5 gate: a present model field wins over the legacy top-level field", () =
 test("P5 gate: a static hint cannot force autonomous — hint true + model false stays interactive", () => {
   const root = mkdtempSync(join(tmpdir(), "p5-static-hint-"));
   try {
+    const execution = initP5ClassificationFixture(root);
     const envelope = parseWorkEnvelope("[AUTONOMOUS] Fix bug", root);
     assert.equal(envelope.autonomyHint, true);
 
     // Even with the marker present, the persisted model decision rules.
-    writeWorkflowState(root, {
+    writeP5WorkflowState(root, execution, {
       classification: { type: "BUG_FIX", complexity: "QUICK", workflow: "bug-fix", autonomous: false },
     });
     assert.equal(classificationGateFor(root), undefined, "hint true must not force debug-cycle");

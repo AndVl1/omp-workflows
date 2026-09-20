@@ -36,13 +36,29 @@ import {
   validateTypedCheckpointDecisionValue,
   validateWorkIdentityValue,
 } from "../src/engine/control-plane-contract.js";
-import { resolveState, updateStateAtomically, writeStateBootstrap, type StateMutation } from "../src/engine/state.js";
+import { updateStateAtomically as updateStateAtomicallyRaw, type StateMutation, type StateSnapshot } from "../src/engine/state.js";
+import { runTarget } from "../src/engine/run-store.js";
 import type { DispatchCapabilityState, PendingState, TeamState, WorkIdentity } from "../src/engine/types.js";
 
-const TIMESTAMP = "2026-08-31T00:00:00Z";
+const TIMESTAMP = "2026-08-30T00:00:00Z";
+const RUN_ID = "44444444-4444-4444-8444-444444444444";
 
 function initGit(root: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+}
+function writeCanonicalState(root: string, state: TeamState): void {
+  const target = runTarget(root, RUN_ID);
+  mkdirSync(target.stateDir!, { recursive: true });
+  mkdirSync(target.artifactsDir!, { recursive: true });
+  writeFileSync(target.statePath!, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function updateStateAtomically<T>(
+  root: string,
+  mutate: (snapshot: StateSnapshot) => StateMutation<T>,
+  options: Omit<Parameters<typeof updateStateAtomicallyRaw>[2], "target"> = {},
+) {
+  return updateStateAtomicallyRaw(root, mutate, { ...options, target: runTarget(root, RUN_ID) });
 }
 
 function identityFor(capability: DispatchCapabilityState, overrides: Partial<WorkIdentity> = {}): WorkIdentity {
@@ -458,13 +474,14 @@ function writeLedgerFixture(root: string): void {
   const profile = loadProfile("lightweight");
   assert.ok(profile);
   const issued = createCapability({
-    run_key: "main", branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
+    run_key: RUN_ID, branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
     stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
   });
-  writeStateBootstrap(root, {
-    schema: 1,
+  writeCanonicalState(root, {
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
     branch: "main",
-    run_key: "main",
     classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
     task: "transaction",
     workflow_override: false,
@@ -477,16 +494,17 @@ function writeLedgerFixture(root: string): void {
     profile_hash: profileHash(profile),
     scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    dispatch_capability: issued.state,
+    dispatch_capability: { ...issued.state, issued_for: { ...issued.state.issued_for!, run_key: RUN_ID } },
+    state_revision: 1,
     updated_at: new Date().toISOString(),
-  }, { featureSlug: "tx" });
+  });
 }
 
 test("transaction: sequential commits advance the revision monotonically and never lose concurrent fields", () => {
   const root = mkdtempSync(join(tmpdir(), "tx-monotonic-"));
   try {
     writeLedgerFixture(root);
-    const statePath = resolveState(root).statePath!;
+    const statePath = runTarget(root, RUN_ID).statePath!;
 
     const first = updateStateAtomically<string>(root, (snapshot) => {
       assert.ok(snapshot.state, "fixture state must resolve");
@@ -523,7 +541,7 @@ test("transaction: a lockless write racing inside a transaction is a CAS conflic
   const root = mkdtempSync(join(tmpdir(), "tx-cas-"));
   try {
     writeLedgerFixture(root);
-    const statePath = resolveState(root).statePath!;
+    const statePath = runTarget(root, RUN_ID).statePath!;
     const before = readFileSync(statePath, "utf8");
 
     const result = updateStateAtomically(root, (snapshot) => {
@@ -548,7 +566,7 @@ test("transaction: discard mutates nothing; fail returns its domain code without
   const root = mkdtempSync(join(tmpdir(), "tx-discard-"));
   try {
     writeLedgerFixture(root);
-    const statePath = resolveState(root).statePath!;
+    const statePath = runTarget(root, RUN_ID).statePath!;
     const before = readFileSync(statePath, "utf8");
 
     const discarded = updateStateAtomically(root, (snapshot) => ({ op: "discard", value: 7 }));
@@ -589,7 +607,7 @@ test("transaction: a live lock owner is never stolen; a dead owner is reclaimed;
     writeFileSync(lockPath, JSON.stringify({ pid: deadPid, token: "dead", acquired_at: new Date().toISOString() }));
     const reclaimed = updateStateAtomically(root, (snapshot) => ({ op: "commit", state: { ...snapshot.state!, task: "after-reclaim" } }), { lockTimeoutMs: 2_000 });
     assert.equal(reclaimed.ok, true, reclaimed.ok ? "dead owner reclaimed" : reclaimed.error);
-    assert.equal((JSON.parse(readFileSync(resolveState(root).statePath!, "utf8")) as TeamState).task, "after-reclaim");
+    assert.equal((JSON.parse(readFileSync(runTarget(root, RUN_ID).statePath!, "utf8")) as TeamState).task, "after-reclaim");
 
     // Malformed owner: not verifiably dead, so never stolen.
     writeFileSync(lockPath, "not json");

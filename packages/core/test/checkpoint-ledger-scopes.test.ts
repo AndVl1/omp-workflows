@@ -49,7 +49,7 @@ import {
 } from "../src/engine/checkpoints.js";
 import { validateActiveCapabilityStateBinding } from "../src/engine/control-plane-contract.js";
 import { registerWorkflowProfiles, loadProfile, profileHash } from "../src/engine/profile.js";
-import { normalizePersistedState, writeStateBootstrap as writeStateBootstrapRaw } from "../src/engine/state.js";
+import { normalizePersistedState } from "../src/engine/state.js";
 import { runTarget } from "../src/engine/run-store.js";
 import type { CheckpointPolicy, Profile, TeamState } from "../src/engine/types.js";
 
@@ -136,11 +136,13 @@ function debugCycleProfile(policy: CheckpointPolicy): Profile {
   };
 }
 
-function writeStateBootstrap(root: string, state: TeamState, _options?: Parameters<typeof writeStateBootstrapRaw>[2]): { statePath: string; artifactsDir: string } {
+function writeCanonicalState(root: string, state: TeamState): { statePath: string; artifactsDir: string } {
   const target = runTarget(root, RUN_ID);
   mkdirSync(target.stateDir!, { recursive: true });
   mkdirSync(target.artifactsDir!, { recursive: true });
-  return writeStateBootstrapRaw(root, state, { target });
+  const persisted = { ...state, state_revision: state.state_revision ?? 1 };
+  writeFileSync(target.statePath!, `${JSON.stringify(persisted, null, 2)}\n`);
+  return { statePath: target.statePath!, artifactsDir: target.artifactsDir! };
 }
 
 function readState(root: string): TeamState {
@@ -153,7 +155,7 @@ function writeArtifacts(root: string, artifacts: Record<string, unknown>): void 
   for (const [id, value] of Object.entries(artifacts)) writeFileSync(join(artifactsDir, `${id}.json`), JSON.stringify(value));
   const state = readState(root);
   const declarations = Object.fromEntries(Object.keys(artifacts).map((id) => [id, `artifacts/${id}.json`]));
-  writeStateBootstrap(root, { ...state, artifacts: { ...(state.artifacts ?? {}), ...declarations } });
+  writeCanonicalState(root, { ...state, artifacts: { ...(state.artifacts ?? {}), ...declarations } });
 }
 
 /** Arm a stage with a fresh capability and run its single dispatch to completion. */
@@ -167,13 +169,14 @@ function runStage(root: string, profile: Profile, stageId: string, role: string,
     kind: "single",
     expected_roster: [{ role, agent: role }],
   });
+  const checkpointPolicy = profile.stages.find((stage) => stage.id === stageId)?.checkpoint_policy ?? profile.checkpoint_policy;
   let previous: TeamState = { stages: [] } as unknown as TeamState;
   try {
     previous = readState(root);
   } catch {
     // first stage setup: no state yet
   }
-  writeStateBootstrap(root, {
+  writeCanonicalState(root, {
     schema: 2,
     run_id: RUN_ID,
     run_key: RUN_ID,
@@ -196,6 +199,7 @@ function runStage(root: string, profile: Profile, stageId: string, role: string,
     ...(previous.checkpoint_decisions ? { checkpoint_decisions: previous.checkpoint_decisions } : {}),
     ...(previous.trusted_checkpoint_answers ? { trusted_checkpoint_answers: previous.trusted_checkpoint_answers } : {}),
     ...(previous.checkpoint_policy ? { checkpoint_policy: previous.checkpoint_policy } : {}),
+    ...(checkpointPolicy ? { checkpoint_policy: checkpointPolicy } : {}),
     updated_at: new Date().toISOString(),
   });
   writeArtifacts(root, artifacts);
@@ -295,7 +299,7 @@ function recordDecisionFor(
   // The trusted ask path persists the minted answer BEFORE the decision is
   // recorded (two durable calls): mirror that here, or the record
   // transaction's fresh re-read sees a proof with no ledger answer.
-  writeStateBootstrap(root, trusted.state);
+  writeCanonicalState(root, trusted.state);
   const recorded = recordCheckpointDecision(root, {
     ...auth,
     checkpoint: checkpointId,
@@ -319,7 +323,7 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
       run_key: RUN_ID, branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalState(root, {
       schema: 2,
       run_id: RUN_ID,
       run_key: RUN_ID,
@@ -333,6 +337,7 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
       artifacts: {},
       pause: { kind: "none", reason: "" },
       policy: { strict_orchestrator: true },
+      checkpoint_policy: profile.checkpoint_policy,
       profile_hash: profileHash(profile),
       scope: scopeFlags(),
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
@@ -368,7 +373,7 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
           : answer,
       ),
     };
-    writeStateBootstrap(root, supersededState);
+    writeCanonicalState(root, supersededState);
     const policy = readState(root).checkpoint_policy!;
     const stage = { id: "implementation", checkpoint: "approve_implementation" };
     const scopeFields = {
@@ -408,7 +413,7 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
     };
     const appended = appendCheckpointDecision(readState(root), valid);
     assert.equal(appended.ok, true, appended.ok ? "recorded" : `${appended.code}: ${appended.error}`);
-    writeStateBootstrap(root, appended.state);
+    writeCanonicalState(root, appended.state);
     const afterRecord = readState(root);
     const finalized = afterRecord.trusted_checkpoint_answers!.find((answer) => answer.answer_id === "ledger/proof-2");
     assert.equal(finalized?.consumed_reason, "finalized");
@@ -446,7 +451,7 @@ test("ledger: a consumed proof without a provable final decision is treated as s
       run_key: RUN_ID, branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalState(root, {
       schema: 2,
       run_id: RUN_ID,
       run_key: RUN_ID,
@@ -460,6 +465,7 @@ test("ledger: a consumed proof without a provable final decision is treated as s
       artifacts: {},
       pause: { kind: "none", reason: "" },
       policy: { strict_orchestrator: true },
+      checkpoint_policy: profile.checkpoint_policy,
       profile_hash: profileHash(profile),
       scope: scopeFlags(),
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
@@ -482,7 +488,7 @@ test("ledger: a consumed proof without a provable final decision is treated as s
         answer.answer_id === "ledger/orphan" ? { ...answer, consumed_at: new Date().toISOString() } : answer,
       ),
     };
-    writeStateBootstrap(root, legacyConsumed);
+    writeCanonicalState(root, legacyConsumed);
     const policy = readState(root).checkpoint_policy!;
     const result = validateCheckpointDecision(readState(root), {
       run_id: RUN_ID,
@@ -667,7 +673,7 @@ test("ledger: commitCheckpointAnswer keeps ONE live answer per question across c
       run_key: RUN_ID, branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalState(root, {
       schema: 2,
       run_id: RUN_ID,
       run_key: RUN_ID,
@@ -681,6 +687,7 @@ test("ledger: commitCheckpointAnswer keeps ONE live answer per question across c
       artifacts: {},
       pause: { kind: "none", reason: "" },
       policy: { strict_orchestrator: true },
+      checkpoint_policy: profile.checkpoint_policy,
       profile_hash: profileHash(profile),
       scope: scopeFlags(),
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
@@ -712,7 +719,7 @@ test("ledger: commitCheckpointAnswer keeps ONE live answer per question across c
       checkpoint_id: "approve_implementation",
       decision: "proceed",
     });
-    writeStateBootstrap(root, escalation.state);
+    writeCanonicalState(root, escalation.state);
 
     // The terminal UI commits a DIFFERENT decision: the escalation proof is
     // superseded and exactly one fresh live answer exists afterwards.
@@ -770,13 +777,13 @@ test("ledger: stale top-level work identity is forbidden when the active capabil
   try {
     initGit(root, "main");
     const policy = approvalPolicy(["approve_fix", "reject_fix"], "required_human");
-    const profile = debugCycleProfile(policy);
+    const profile: Profile = { ...debugCycleProfile(policy), checkpoint_policy: policy };
     registerWorkflowProfiles([profile]);
     const issued = createCapability({
       run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "dev", agent: "dev" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalState(root, {
       schema: 2,
       run_id: RUN_ID,
       run_key: RUN_ID,
@@ -790,6 +797,7 @@ test("ledger: stale top-level work identity is forbidden when the active capabil
       artifacts: {},
       pause: { kind: "none", reason: "" },
       policy: { strict_orchestrator: true },
+      checkpoint_policy: profile.checkpoint_policy,
       profile_hash: profileHash(profile),
       scope: scopeFlags(),
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
@@ -847,7 +855,7 @@ test("ledger: a mirrored foreign run_id is rejected by the strict active identit
       run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalState(root, {
       schema: 2,
       run_id: RUN_ID,
       run_key: RUN_ID,
@@ -861,6 +869,7 @@ test("ledger: a mirrored foreign run_id is rejected by the strict active identit
       artifacts: {},
       pause: { kind: "none", reason: "" },
       policy: { strict_orchestrator: true },
+      checkpoint_policy: profile.checkpoint_policy,
       profile_hash: profileHash(profile),
       scope: scopeFlags(),
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
@@ -932,7 +941,7 @@ test("ledger: invalid exact live answer is atomically superseded, never reused",
       run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalState(root, {
       schema: 2,
       run_id: RUN_ID,
       run_key: RUN_ID,
@@ -946,6 +955,7 @@ test("ledger: invalid exact live answer is atomically superseded, never reused",
       artifacts: {},
       pause: { kind: "none", reason: "" },
       policy: { strict_orchestrator: true },
+      checkpoint_policy: profile.checkpoint_policy,
       profile_hash: profileHash(profile),
       scope: scopeFlags(),
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
@@ -998,7 +1008,7 @@ test("ledger: malformed current-scope sibling blocks already_finalized replay", 
       run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalState(root, {
       schema: 2,
       run_id: RUN_ID,
       run_key: RUN_ID,
@@ -1012,6 +1022,7 @@ test("ledger: malformed current-scope sibling blocks already_finalized replay", 
       artifacts: {},
       pause: { kind: "none", reason: "" },
       policy: { strict_orchestrator: true },
+      checkpoint_policy: profile.checkpoint_policy,
       profile_hash: profileHash(profile),
       scope: scopeFlags(),
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
@@ -1116,7 +1127,7 @@ test("ledger: conflicting current-scope finals are checked before any exact repl
       { ...decisionBase, decision: "proceed", rationale: "first" },
       { ...decisionBase, decision: "reject", rationale: "second" },
     ];
-    writeStateBootstrap(root, base);
+    writeCanonicalState(root, base);
     const replay = commitCheckpointAnswer(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,

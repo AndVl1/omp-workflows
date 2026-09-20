@@ -292,18 +292,44 @@ export function validatePrepareRequestReceiptValue(value: unknown, path = "$"): 
     add(issues, path, "prepare receipt must be an object");
     return { ok: false, issues };
   }
-  unknownKeys(value, ["request_id", "payload_hash", "operation", "previous_run_id", "selected_run_id", "committed_at", "continuation"], path, issues);
+  unknownKeys(value, ["request_id", "payload_hash", "operation", "previous_run_id", "previous_title", "previous_status", "selected_run_id", "selected_title", "selected_status", "committed_at", "continuation"], path, issues);
   requireString(value, "request_id", path, issues);
-  requireString(value, "payload_hash", path, issues);
+  if (typeof value.payload_hash !== "string" || !/^[a-f0-9]{64}$/.test(value.payload_hash)) {
+    add(issues, `${path}.payload_hash`, "must be a lowercase SHA-256 hex digest");
+  }
   requireEnum(value, "operation", [...LIFECYCLE_MODES], path, issues);
   if (value.previous_run_id !== null) requireUuid(value, "previous_run_id", path, issues);
+  if (value.previous_title !== null) requireString(value, "previous_title", path, issues);
+  if (value.previous_status !== null) requireEnum(value, "previous_status", ["active", "paused", "complete", "failed", "blocked"], path, issues);
+  const previousFields = [value.previous_run_id, value.previous_title, value.previous_status];
+  const previousAllNull = previousFields.every((field) => field === null);
+  const previousAllPresent = previousFields.every((field) => field !== null && field !== undefined);
+  if (!previousAllNull && !previousAllPresent) {
+    add(issues, path, "previous_run_id, previous_title, and previous_status must be all null or all present");
+  }
   requireUuid(value, "selected_run_id", path, issues);
-  requireString(value, "committed_at", path, issues);
+  requireString(value, "selected_title", path, issues);
+  requireEnum(value, "selected_status", ["active", "paused", "complete", "failed", "blocked"], path, issues);
+  if (value.operation === "new") {
+    if (value.previous_run_id !== null && value.previous_run_id === value.selected_run_id) {
+      add(issues, `${path}.previous_run_id`, "new transition previous and selected run IDs must differ");
+    }
+  } else if (value.operation === "resume" || value.operation === "rework") {
+    if (typeof value.previous_run_id !== "string" || value.previous_run_id !== value.selected_run_id) {
+      add(issues, `${path}.previous_run_id`, `${value.operation} transition previous and selected run IDs must match`);
+    }
+  }
+  if (typeof value.committed_at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.committed_at) || !Number.isFinite(Date.parse(value.committed_at))) {
+    add(issues, `${path}.committed_at`, "must be a valid canonical ISO timestamp");
+  }
   if (!isRecord(value.continuation)) add(issues, `${path}.continuation`, "must be an object");
   else {
     unknownKeys(value.continuation, ["stage", "status"], `${path}.continuation`, issues);
     requireString(value.continuation, "stage", `${path}.continuation`, issues);
     requireEnum(value.continuation, "status", ["active", "paused", "complete", "failed", "blocked"], `${path}.continuation`, issues);
+    if (value.continuation.status !== value.selected_status) {
+      add(issues, `${path}.continuation.status`, "must equal selected_status");
+    }
   }
   return issues.length > 0 ? { ok: false, issues } : { ok: true };
 }

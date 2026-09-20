@@ -31,7 +31,7 @@ import {
   DEFAULT_FAN_IN_POLICY,
   type FanInPolicy,
 } from "../src/engine/fan-in.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+
 import { resolveConfig } from "../src/engine/config.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { run } from "../src/engine/run.js";

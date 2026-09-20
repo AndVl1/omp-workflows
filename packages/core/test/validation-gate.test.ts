@@ -20,7 +20,6 @@ import { join } from "node:path";
 import {
   checkArtifact,
   validationGate,
-  resolveArtifactsDir,
 } from "../src/gates/validation.js";
 import { runStage, type TaskCaller, type StageContext } from "../src/engine/stage.js";
 import type { StageDef, TeamState } from "../src/engine/types.js";
@@ -177,17 +176,7 @@ test("validationGate: file-based — malformed JSON is reported", () => {
   }
 });
 
-test("resolveArtifactsDir: returns legacy artifacts dir when no .active-feature", () => {
-  const { cwd, cleanup } = withTempDir();
-  try {
-    mkdirSync(join(cwd, ".work-state", "artifacts"), { recursive: true });
-    const result = resolveArtifactsDir(cwd);
-    assert.ok(result, "expected a path");
-    assert.ok(result!.endsWith("artifacts"));
-  } finally {
-    cleanup();
-  }
-});
+
 
 test("runStage: runSingle with implementation stage and unvalidated artifact returns failed", async () => {
   const { cwd, cleanup } = withTempDir();

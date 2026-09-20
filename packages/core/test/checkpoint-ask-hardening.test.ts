@@ -40,7 +40,7 @@ import { z as zod } from "zod";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { createCapability, recordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
 import { checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
-import { resolveCanonicalRun, writeStateBootstrap } from "../src/engine/state.js";
+import { resolveCanonicalRun } from "../src/engine/state.js";
 import { persistCanonicalRun, runTarget } from "../src/engine/run-store.js";
 import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 import { registerWorkflowTools } from "../src/index.js";
@@ -250,6 +250,10 @@ function overwriteStateFile(root: string, mutate: (raw: Record<string, unknown>)
   writeFileSync(target.statePath!, JSON.stringify(raw, null, 2) + "\n");
 }
 
+function writeCanonicalState(root: string, state: TeamState): void {
+  const persisted = { ...state, state_revision: state.state_revision ?? 1 };
+  writeFileSync(runTarget(root, RUN_ID).statePath!, `${JSON.stringify(persisted, null, 2)}\n`);
+}
 /**
  * Seed MULTIPLE genuinely live answers for one question by deriving each
  * from the SAME pre-answer state. The raw fixture bypasses the normal
@@ -267,7 +271,7 @@ function seedLiveAnswers(root: string, entries: Array<{ answerId: string; decisi
       decision,
     }));
   const answers = minted.flatMap((result) => result.state.trusted_checkpoint_answers ?? []);
-  writeStateBootstrap(root, { ...resolved.state!, trusted_checkpoint_answers: answers }, { target: resolved });
+  writeCanonicalState(root, { ...resolved.state!, trusted_checkpoint_answers: answers });
 }
 
 function seedLiveAnswer(root: string, answerId: string, decision: string): void {
@@ -280,7 +284,7 @@ function seedLiveAnswer(root: string, answerId: string, decision: string): void 
     checkpoint_id: "approve_implementation",
     decision,
   });
-  writeStateBootstrap(root, trusted.state, { target: resolved });
+  writeCanonicalState(root, trusted.state);
 }
 
 /** Record `decision` with a durable escalation proof, as another trusted surface would. */
@@ -294,7 +298,7 @@ function recordEscalationDecision(root: string, issued: IssuedCapability, decisi
     checkpoint_id: "approve_implementation",
     decision,
   });
-  writeStateBootstrap(root, trusted.state, { target: resolved });
+  writeCanonicalState(root, trusted.state);
   const recorded = recordCheckpointDecision(root, {
     run_id: RUN_ID,
     token: issued.advance_token,
@@ -399,7 +403,7 @@ withFixture("ask: a cursor/capability transition while the dialog is open reject
       cursor_epoch: "rotated-epoch",
       dispatch_capability: { ...cap, issued_for: { ...cap.issued_for!, cursor_epoch: "rotated-epoch" } },
     };
-    writeStateBootstrap(root, rotated, { target: resolved });
+    writeCanonicalState(root, rotated);
     return submit(questions[0]!, ["proceed"]);
   }, []));
   const details = response.details as { ok?: boolean; code?: string; error?: string };
@@ -675,7 +679,7 @@ withFixture("ask: a live escalation proof is superseded across channels and can 
     checkpoint_id: "approve_implementation",
     decision: "proceed",
   });
-  writeStateBootstrap(root, escalation.state, { target: resolved });
+  writeCanonicalState(root, escalation.state);
   const staleProof = escalation.proof;
 
   const response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["reject"]), []));

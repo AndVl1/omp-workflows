@@ -361,7 +361,11 @@ export interface PrepareRequestReceipt {
   payload_hash: string;
   operation: LifecycleOperation;
   previous_run_id: string | null;
+  previous_title: string | null;
+  previous_status: LifecycleStatus | null;
   selected_run_id: string;
+  selected_title: string;
+  selected_status: LifecycleStatus;
   committed_at: string;
   continuation: {
     stage: string;

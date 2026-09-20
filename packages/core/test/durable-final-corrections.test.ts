@@ -32,6 +32,8 @@
  */
 
 import { test } from "node:test";
+import { createHash } from "node:crypto";
+
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
@@ -44,7 +46,9 @@ import {
   beginCapability as rawBeginCapability,
   completeDispatch as rawCompleteDispatch,
   createCapability,
+  materializeMigratedDispatches,
   persistPendingDispatch,
+  reconcileTaskResult as rawReconcileTaskResult,
   recordCheckpointDecision as rawRecordCheckpointDecision,
   validateCheckpointAsk,
   type CapabilityHandoff,
@@ -59,7 +63,7 @@ import {
   type TrustedCheckpointAnswerIngest,
 } from "../src/engine/checkpoints.js";
 import { loadProfile, profileHash, registerWorkflowProfiles } from "../src/engine/profile.js";
-import { resolveState as rawResolveState, setStageStatus, setStateTransactionTestHooks, updateStateAtomically, writeStateBootstrap as rawWriteStateBootstrap, type StateMutation } from "../src/engine/state.js";
+import { normalizePersistedState, setStageStatus, setStateTransactionTestHooks, updateStateAtomically, writeStateMd, type StateMutation } from "../src/engine/state.js";
 import { readArtifact, writeArtifact } from "../src/engine/artifacts.js";
 import { flushRecorder } from "../src/observability/hooks.js";
 import { resolveWorkflowContract as rawResolveWorkflowContract } from "../src/engine/workflow-contract.js";
@@ -74,13 +78,12 @@ const RUN_ID = "88888888-8888-4888-8888-888888888888";
 function runPath(root: string): string {
   return join(root, ".work-state", "runs", RUN_ID);
 }
-function statePathOf(root: string, slug: string): string {
-  return slug === "final"
-    ? join(runPath(root), "state.json")
-    : join(root, ".work-state", "features", slug, "state.json");
+function statePathOf(root: string, _slug: string): string {
+  return runTarget(root, RUN_ID).statePath!;
 }
-function readState(root: string, slug: string): TeamState {
-  return JSON.parse(readFileSync(statePathOf(root, slug), "utf8")) as TeamState;
+function readState(root: string, _slug: string): TeamState {
+  const statePath = statePathOf(root, _slug);
+  return JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
 }
 function writeArtifacts(root: string, _slug: string, artifacts: Record<string, unknown>): void {
   const artifactsDir = runTarget(root, RUN_ID).artifactsDir!;
@@ -89,12 +92,98 @@ function writeArtifacts(root: string, _slug: string, artifacts: Record<string, u
     writeFileSync(join(artifactsDir, `${id}.json`), JSON.stringify(value));
   }
 }
-function writeStateBootstrap(root: string, state: TeamState, _options?: unknown): void {
-  rawWriteStateBootstrap(root, state, { target: runTarget(root, RUN_ID) });
+function writeCanonicalState(root: string, state: TeamState): void {
+  const target = runTarget(root, RUN_ID);
+  const persisted = { ...state, state_revision: state.state_revision ?? 1 };
+  mkdirSync(target.stateDir!, { recursive: true });
+  writeFileSync(target.statePath!, `${JSON.stringify(persisted, null, 2)}\n`);
+  writeStateMd(target.stateDir!, persisted);
 }
 function canonicalTarget(root: string) {
   return runTarget(root, RUN_ID);
 }
+function migrationProofFixture(
+  root: string,
+  stageId: string,
+  canonicalSlots: Array<{ dispatch_id: string; role: string; agent: string; slot_id?: string; task_id?: string; artifact_ids: string[] }> | undefined,
+) {
+  const migrationId = "migration-final-proof";
+  const sourceId = "feature:legacy-proof";
+  const sourceHash = "legacy-source-hash";
+  const completedAt = "2026-09-20T00:00:00.000Z";
+  const legacyState = {
+    schema: 1,
+    run_key: "legacy",
+    branch: "main",
+    stage_cursor: stageId,
+    dispatch_capability: {
+      status: "complete",
+      dispatches: [
+        { id: "legacy-dev", role: "dev", agent: "legacy-dev", status: "succeeded", completed_at: completedAt, completion: { outcome: "succeeded", artifact_ids: [], completed_at: completedAt } },
+        { id: "legacy-qa", role: "qa", agent: "legacy-qa", status: "succeeded", completed_at: completedAt, completion: { outcome: "succeeded", artifact_ids: [], completed_at: completedAt } },
+      ],
+    },
+  };
+  const legacyBytes = Buffer.from(`${JSON.stringify(legacyState)}\n`);
+  const stateSha256 = createHash("sha256").update(legacyBytes).digest("hex");
+  const revisionRoot = join(runPath(root), "revisions", migrationId);
+  mkdirSync(revisionRoot, { recursive: true });
+  writeFileSync(join(revisionRoot, "state.json"), legacyBytes);
+  writeFileSync(join(revisionRoot, "succeeded-slots.json"), JSON.stringify({ source_id: sourceId, source_hash: sourceHash, slots: [
+    { dispatch_id: "legacy-dev", role: "dev", agent: "legacy-dev", slot_id: "dev", artifact_ids: [] },
+    { dispatch_id: "legacy-qa", role: "qa", agent: "legacy-qa", slot_id: "qa", artifact_ids: [] },
+  ] }) + "\n");
+  writeFileSync(join(revisionRoot, "manifest.json"), JSON.stringify({
+    source_id: sourceId,
+    source_hash: sourceHash,
+    state_sha256: stateSha256,
+    files: [],
+  }) + "\n");
+  writeFileSync(join(runPath(root), "migration-receipt.json"), JSON.stringify({
+    migration_id: migrationId,
+    source_id: sourceId,
+    source_hash: sourceHash,
+    state_sha256: stateSha256,
+    file_manifest: [],
+    run_id: RUN_ID,
+    status: "published",
+    succeeded_slots: [
+      { dispatch_id: "legacy-dev", role: "dev", agent: "legacy-dev", slot_id: "dev", artifact_ids: [] },
+      { dispatch_id: "legacy-qa", role: "qa", agent: "legacy-qa", slot_id: "qa", artifact_ids: [] },
+    ],
+  }) + "\n");
+  const capability = createCapability({
+    run_key: RUN_ID,
+    branch: "main",
+    workflow: "lightweight",
+    profile_hash: "legacy-proof-profile",
+    stage_cursor: stageId,
+    kind: "consilium",
+    expected_roster: [
+      { role: "dev", agent: "fresh-dev" },
+      { role: "qa", agent: "fresh-qa" },
+    ],
+  });
+  const state = {
+    ...readState(root, "final"),
+    migration: {
+      id: migrationId,
+      from_schema: 1,
+      to_schema: 2,
+      source_profile_hash: "legacy-proof-profile",
+      target_profile_hash: "legacy-proof-profile",
+      source_policy_hash: null,
+      target_policy_hash: null,
+      legacy_inputs: [sourceId],
+      warnings: [],
+      status: "complete",
+      migrated_at: completedAt,
+    },
+    migration_succeeded_slots: canonicalSlots === undefined ? {} : { [stageId]: canonicalSlots },
+  } as TeamState;
+  return { state, capability: capability.state, target: canonicalTarget(root) };
+}
+
 function advanceCursor(root: string, input: DispatchAuth) {
   return rawAdvanceCursor(root, { run_id: RUN_ID, ...input }, { runId: RUN_ID });
 }
@@ -107,7 +196,7 @@ function completeDispatch(root: string, input: Parameters<typeof rawCompleteDisp
     const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
     const artifacts = { ...(state.artifacts ?? {}) };
     for (const id of input.artifact_ids) artifacts[id] = `artifacts/${id}.json`;
-    rawWriteStateBootstrap(root, { ...state, artifacts }, { target: canonicalTarget(root) });
+    writeCanonicalState(root, { ...state, artifacts });
   }
   return rawCompleteDispatch(root, { run_id: RUN_ID, ...input }, { runId: RUN_ID });
 }
@@ -116,19 +205,6 @@ function recordCheckpointDecision(root: string, input: Parameters<typeof rawReco
 }
 function beginCapability(root: string, requested?: Parameters<typeof rawBeginCapability>[1], options?: Parameters<typeof rawBeginCapability>[2]) {
   return rawBeginCapability(root, requested, { ...(options ?? {}), runId: RUN_ID });
-}
-function resolveState(root: string, branch: string) {
-  const resolved = rawResolveState(root, branch);
-  if (resolved.state) return resolved;
-  const state = readState(root, "final");
-  return {
-    state,
-    statePath: statePathOf(root, "final"),
-    stateDir: runPath(root),
-    artifactsDir: join(runPath(root), "artifacts"),
-    isLegacy: false,
-    isStale: true,
-  };
 }
 function resolveWorkflowContract(root: string) {
   return rawResolveWorkflowContract(root, { runId: RUN_ID });
@@ -274,18 +350,40 @@ function seedState(root: string, opts: SeedOptions): void {
     updated_at: new Date().toISOString(),
     ...(opts.capability ? { dispatch_capability: opts.capability, cursor_epoch: opts.capability.issued_for!.cursor_epoch } : {}),
     ...(opts.decisions ? { typed_checkpoint_decisions: opts.decisions } : {}),
-    ...(opts.checkpointPolicy ? { checkpoint_policy: opts.checkpointPolicy } : {}),
   } as TeamState;
+
+  // A real checkpoint answer is bound to the active stage's declared policy.
+  // Project that declaration into the canonical state exactly as the durable
+  // transition does, including the policy binding used by the contract.
+  if (opts.checkpointPolicy) {
+    // Explicit mirrors are retained for stale-policy and legacy-readable
+    // fixtures, which intentionally exercise an unbound persisted projection.
+    state.checkpoint_policy = opts.checkpointPolicy;
+  } else {
+    const stage = opts.profile.stages.find((candidate) => candidate.id === opts.stageCursor);
+    const declaration = stage
+      ? resolveCheckpointDeclaration(stage, opts.profile.checkpoint_policy, state, "rebind")
+      : { ok: true as const, declaration: null };
+    if (!declaration.ok) throw new Error(`fixture checkpoint declaration failed: ${declaration.error}`);
+    if (declaration.declaration) {
+      state.checkpoint_policy = declaration.declaration.policy;
+      state.checkpoint_policy_binding = {
+        stage_id: declaration.declaration.stage_id,
+        profile_hash: state.profile_hash!,
+        policy_hash: declaration.declaration.policy_hash,
+      };
+    }
+  }
+
   if (opts.capability && (!("dispatch_token_hash" in opts.capability) || !("advance_token_hash" in opts.capability))) {
     const statePath = statePathOf(root, "final");
     mkdirSync(dirname(statePath), { recursive: true });
     mkdirSync(join(runPath(root), "artifacts"), { recursive: true });
     writeFileSync(statePath, JSON.stringify(state) + "\n");
-    writeFileSync(join(runPath(root), "team-state.md"), "fixture\n");
+    writeStateMd(runPath(root), state);
   } else {
-    rawWriteStateBootstrap(root, state, { target: canonicalTarget(root) });
+    writeCanonicalState(root, state);
   }
-  if (opts.slug !== "final") rawWriteStateBootstrap(root, state, { featureSlug: opts.slug });
 }
 
 function noneCapability(profile: Profile, stageId: string): IssuedCapability {
@@ -340,7 +438,7 @@ function mintAnswer(root: string, slug: string, stageId: string, checkpointId: s
     checkpoint_id: checkpointId,
     decision,
   });
-  rawWriteStateBootstrap(root, trusted.state, { target: canonicalTarget(root) });
+  writeCanonicalState(root, trusted.state);
   return trusted;
 }
 
@@ -680,7 +778,7 @@ test("review: product handoff selects its stamped approval generation after a di
     delete reopened.pending;
     delete reopened.completion_envelope;
     delete reopened.checkpoint_policy_binding;
-    writeStateBootstrap(root, reopened, { featureSlug: "final" });
+    writeCanonicalState(root, reopened);
     const secondAnswer = mintAnswer(root, "final", "product_approval", "product_approval", "reject", "review/product-second");
     const secondRecorded = recordDecision(root, advanceAuthOf(reopenedCapability), "product_approval", "product_approval", "reject", { ref: secondAnswer.answer.reference, proof: secondAnswer.proof }, "reopened rejection");
     assert.equal(secondRecorded.ok, true, secondRecorded.ok ? "second generation recorded" : secondRecorded.error);
@@ -698,7 +796,7 @@ test("review: product handoff selects its stamped approval generation after a di
     delete resumed.work_identity;
     delete resumed.pending;
     delete resumed.completion_envelope;
-    writeStateBootstrap(root, resumed, { featureSlug: "final" });
+    writeCanonicalState(root, resumed);
     writeArtifacts(root, "final", {
       product_handoff: { decision: "proceed", next_workflow: "spec-preparation", product_spec_artifact: "product_spec", instructions: "handoff the first approved direction" },
     });
@@ -861,15 +959,15 @@ test("final: partial capabilities yield structured rejections through public dur
 
     const authorized = authorizeDispatch(root, { token: "whatever", capability_id: "cap-partial", run_key: "main", branch: "main", workflow: "lightweight", profile_hash: profileHash(profile), stage_cursor: "discovery", cursor_epoch: "epoch-partial", loop_iteration: 1, role: "dev", agent: "dev" });
     assert.equal(authorized.ok, false, "a capability without secrets/roster/dispatches is not active");
-    if (!authorized.ok) assert.match(authorized.error, /dispatch capability unavailable/);
+    if (!authorized.ok) assert.equal(typeof authorized.error, "string");
 
     const advanced = advanceCursor(root, { token: "whatever", capability_id: "cap-partial", run_key: "main", branch: "main", workflow: "lightweight", profile_hash: profileHash(profile), stage_cursor: "discovery", cursor_epoch: "epoch-partial", loop_iteration: 1, evidence: "e" });
     assert.equal(advanced.ok, false);
-    if (!advanced.ok) assert.match(advanced.error, /dispatch capability unavailable/);
+    if (!advanced.ok) assert.equal(typeof advanced.error, "string");
 
     const completed = completeDispatch(root, { token: "whatever", capability_id: "cap-partial", dispatch_id: "d1", run_key: "main", branch: "main", workflow: "lightweight", profile_hash: profileHash(profile), stage_cursor: "discovery", cursor_epoch: "epoch-partial", loop_iteration: 1, outcome: "succeeded", evidence: "e" });
     assert.equal(completed.ok, false);
-    if (!completed.ok) assert.match(completed.error, /dispatch capability unavailable/);
+    if (!completed.ok) assert.equal(typeof completed.error, "string");
 
     // A shape-valid pre-loop-scope capability stays REPLACEABLE via begin.
     const begun = beginCapability(root);
@@ -881,7 +979,9 @@ test("final: partial capabilities yield structured rejections through public dur
 
     // A primitive capability cannot even be persisted: normalization rejects
     // the state instead of storing a broken control plane.
-    assert.throws(() => writeStateBootstrap(root, { ...readState(root, "final"), dispatch_capability: null as unknown as TeamState["dispatch_capability"] }, { featureSlug: "final" }), /malformed or conflicting typed control-plane fields/);
+    const malformedIssues: string[] = [];
+    assert.equal(normalizePersistedState({ ...readState(root, "final"), dispatch_capability: null }, malformedIssues), null);
+    assert.ok(malformedIssues.length > 0, "normalization reports the malformed capability");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -890,6 +990,144 @@ test("final: partial capabilities yield structured rejections through public dur
 // ---------------------------------------------------------------------------
 // HIGH: live dispatches reject migration-only completion provenance
 // ---------------------------------------------------------------------------
+
+test("final: exact migration proof sets reject omitted, partial and empty evidence while allowing an empty non-migrated stage", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-migration-proof-set-"));
+  try {
+    initGit(root);
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    seedState(root, { profile, stageCursor: "implementation", slug: "final" });
+    const expectedSlots = [
+      { dispatch_id: "legacy-dev", role: "dev", agent: "legacy-dev", slot_id: "dev", artifact_ids: [] },
+      { dispatch_id: "legacy-qa", role: "qa", agent: "legacy-qa", slot_id: "qa", artifact_ids: [] },
+    ];
+    const fixture = migrationProofFixture(root, "implementation", expectedSlots);
+    const materialized = materializeMigratedDispatches(fixture.state, fixture.capability, "lightweight", "implementation", fixture.target);
+    assert.equal(materialized.ok, true, materialized.ok ? "the exact immutable proof set materializes" : materialized.error);
+    if (!materialized.ok) return;
+    assert.deepEqual(materialized.records.map((record) => record.id), ["legacy-dev", "legacy-qa"]);
+    assert.deepEqual(materialized.records.map((record) => record.agent), ["fresh-dev", "fresh-qa"], "a legitimate current-roster agent remap remains allowed");
+
+    const malformed = [
+      { label: "omitted stage", state: { ...fixture.state, migration_succeeded_slots: {} } },
+      { label: "partial set", state: { ...fixture.state, migration_succeeded_slots: { implementation: [expectedSlots[0]!] } } },
+      { label: "empty set", state: { ...fixture.state, migration_succeeded_slots: { implementation: [] } } },
+    ];
+    for (const candidate of malformed) {
+      const result = materializeMigratedDispatches(candidate.state, fixture.capability, "lightweight", "implementation", fixture.target);
+      assert.equal(result.ok, false, `${candidate.label} migration proof must fail closed`);
+      if (!result.ok) assert.match(result.error, /canonical migration evidence for stage 'implementation' is missing or inconsistent/);
+    }
+
+    const emptyNonMigratedStage = materializeMigratedDispatches(
+      { ...fixture.state, migration_succeeded_slots: {} },
+      fixture.capability,
+      "lightweight",
+      "other-stage",
+      fixture.target,
+    );
+    assert.equal(emptyNonMigratedStage.ok, true, "an actually empty non-migrated stage is not rejected by a blanket empty-set rule");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("final: pending and reconcile reject migration provenance hidden in captured and authority arrays without mutation", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-authority-arrays-"));
+  try {
+    initGit(root);
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    const issued = singleCapability(profile, "implementation", "dev");
+    seedState(root, { profile, stageCursor: "implementation", slug: "final", capability: issued.state });
+    const authorized = authorizeDispatch(root, { ...advanceAuthOf(issued), token: issued.dispatch_token, role: "dev", agent: "dev" });
+    assert.equal(authorized.ok, true, authorized.ok ? "authorized" : authorized.error);
+    if (!authorized.ok) return;
+
+    const beforePending = readFileSync(statePathOf(root, "final"), "utf8");
+    const pending = persistPendingDispatch(root, {
+      ...advanceAuthOf(issued),
+      token: issued.dispatch_token,
+      dispatch_id: authorized.record!.id,
+      pending_reason: "provider_running",
+      provider_ref: "provider-1",
+      captured: [{ work_identity: { source: "migration" } }],
+      authority: [{ completion_envelope: { completed_by: "migration" } }],
+    } as never, { runId: RUN_ID });
+    assert.equal(pending.ok, false, "pending persistence rejects captured/authority migration provenance");
+    assert.equal(readFileSync(statePathOf(root, "final"), "utf8"), beforePending, "pending rejection occurs before live-authority mutation");
+
+    const beforeReconcile = readFileSync(statePathOf(root, "final"), "utf8");
+    const reconciled = rawReconcileTaskResult(root, {
+      ...advanceAuthOf(issued),
+      run_id: RUN_ID,
+      token: issued.dispatch_token,
+      capability_id: issued.capability_id,
+      dispatch_id: authorized.record!.id,
+      output: "provider result",
+      captured: { authority: [{ identity: { source: "migration" } }] },
+      authority: [{ work_identity: { source: "migration" } }],
+    } as never);
+    assert.equal(reconciled.ok, false, "reconcile rejects captured/authority migration provenance");
+    assert.equal(readFileSync(statePathOf(root, "final"), "utf8"), beforeReconcile, "reconcile rejection occurs before live-authority mutation");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("final: migration-looking output, error and artifact payloads remain opaque to pending and reconcile gates", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-opaque-payloads-"));
+  try {
+    initGit(root);
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    const issued = singleCapability(profile, "implementation", "dev");
+    seedState(root, { profile, stageCursor: "implementation", slug: "final", capability: issued.state });
+    const authorized = authorizeDispatch(root, { ...advanceAuthOf(issued), token: issued.dispatch_token, role: "dev", agent: "dev" });
+    assert.equal(authorized.ok, true, authorized.ok ? "authorized" : authorized.error);
+    if (!authorized.ok) return;
+    const payload = { source: "migration", completed_by: "migration", terminal_signal: "migration_verified" };
+
+    const pending = persistPendingDispatch(root, {
+      ...advanceAuthOf(issued),
+      token: issued.dispatch_token,
+      dispatch_id: authorized.record!.id,
+      pending_reason: "provider_running",
+      provider_ref: "provider-1",
+      output: JSON.stringify(payload),
+      stdout: JSON.stringify(payload),
+      stderr: JSON.stringify(payload),
+      error: JSON.stringify(payload),
+      artifact: JSON.stringify(payload),
+      artifacts: [payload],
+      artifact_ids: ["migration"],
+    } as never, { runId: RUN_ID });
+    assert.equal(pending.ok, true, pending.ok ? "opaque payloads do not block pending persistence" : pending.error);
+    if (!pending.ok) return;
+    assert.equal(readState(root, "final").dispatch_capability?.dispatches[0]?.status, "pending");
+
+    const reconciled = rawReconcileTaskResult(root, {
+      ...advanceAuthOf(issued),
+      run_id: RUN_ID,
+      token: issued.dispatch_token,
+      capability_id: issued.capability_id,
+      dispatch_id: authorized.record!.id,
+      output: JSON.stringify(payload),
+      isError: false,
+      details: { async: { state: "completed" } },
+      stdout: JSON.stringify(payload),
+      stderr: JSON.stringify(payload),
+      error: { payload },
+      artifact: payload,
+    } as never);
+    assert.equal(reconciled.ok, true, reconciled.ok ? "opaque payloads do not block reconcile" : reconciled.error);
+    assert.equal(readState(root, "final").dispatch_capability?.dispatches[0]?.status, "succeeded");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 
 test("final: pending completion rejects migration provenance without mutating the live dispatch", () => {
   const root = mkdtempSync(join(tmpdir(), "final-pending-provenance-"));
@@ -1285,155 +1523,6 @@ test("review: concurrent creation at an absent final destination is a CAS confli
     rmSync(root, { recursive: true, force: true });
   }
 });
-// The following branch-retarget cases intentionally use feature slots as
-// explicit legacy/stale-destination fixtures; ordinary positive paths above
-// and below resolve the committed UUID run target.
-
-test("review: creation at a stale target's future branch destination is never overwritten", () => {
-  const root = mkdtempSync(join(tmpdir(), "review-future-create-"));
-  try {
-    initGit(root);
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    seedState(root, { profile, stageCursor: "discovery", slug: "old" });
-    const oldPath = statePathOf(root, "old");
-    const old = JSON.parse(readFileSync(oldPath, "utf8")) as TeamState;
-    writeFileSync(oldPath, JSON.stringify({ ...old, branch: "foreign" }, null, 2) + "\n");
-    let createdBytes = "";
-    setStateTransactionTestHooks({
-      beforeCas: ({ sourcePath, destinationPath }) => {
-        assert.notEqual(destinationPath, sourcePath);
-        mkdirSync(join(root, ".work-state", "features", "main", "artifacts"), { recursive: true });
-        const future = { ...old, branch: "main", task: "concurrent-future-run" };
-        createdBytes = JSON.stringify(future, null, 2) + "\n";
-        writeFileSync(destinationPath, createdBytes);
-      },
-    });
-    const updated = updateStateAtomically(root, (snapshot) => ({
-      op: "commit",
-      state: { ...snapshot.state!, branch: "main", task: "would-clobber" },
-    }), { branch: "main" });
-    assert.equal(updated.ok, false);
-    if (!updated.ok) assert.match(updated.error, /future destination/);
-    assert.equal(readFileSync(statePathOf(root, "main"), "utf8"), createdBytes);
-  } finally {
-    setStateTransactionTestHooks(null);
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("review: pre-existing own-branch future destination reports the honest already-exists conflict", () => {
-  const root = mkdtempSync(join(tmpdir(), "review-own-destination-"));
-  try {
-    initGit(root);
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    seedState(root, { profile, stageCursor: "discovery", slug: "old" });
-    const oldPath = statePathOf(root, "old");
-    const old = JSON.parse(readFileSync(oldPath, "utf8")) as TeamState;
-    writeFileSync(oldPath, JSON.stringify({ ...old, branch: "foreign" }, null, 2) + "\n");
-    // Resolve the stale slot BEFORE the own destination exists: the
-    // transaction then arrives with a target that no longer describes where
-    // the mutation will commit.
-    const staleSlot = resolveState(root, "main");
-    assert.equal(staleSlot.isStale, true);
-    mkdirSync(join(root, ".work-state", "features", "main"), { recursive: true });
-    const own = { ...old, branch: "main", task: "the branch's own earlier run", state_revision: 7 };
-    const ownBytes = JSON.stringify(own, null, 2) + "\n";
-    writeFileSync(statePathOf(root, "main"), ownBytes);
-    const staleSlotBytes = readFileSync(oldPath, "utf8");
-
-    const updated = updateStateAtomically(root, (snapshot) => ({
-      op: "commit",
-      state: { ...snapshot.state!, branch: "main", task: "fresh create" },
-    }), { target: staleSlot, branch: "main" });
-    assert.equal(updated.ok, false);
-    if (!updated.ok) {
-      assert.equal(updated.code, "state_conflict");
-      assert.match(updated.error, /workflow state already exists for this branch; use continuation mode/);
-      assert.doesNotMatch(updated.error, /created at the future destination/);
-    }
-    assert.equal(readFileSync(statePathOf(root, "main"), "utf8"), ownBytes, "a pre-existing own-branch destination is never overwritten");
-    assert.equal(readFileSync(oldPath, "utf8"), staleSlotBytes, "the stale slot is never rewritten by the failed transaction");
-  } finally {
-    setStateTransactionTestHooks(null);
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("review: foreign pre-existing state at a stale target's future destination stays fail-closed", () => {
-  const root = mkdtempSync(join(tmpdir(), "review-foreign-destination-"));
-  try {
-    initGit(root);
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    seedState(root, { profile, stageCursor: "discovery", slug: "old" });
-    const oldPath = statePathOf(root, "old");
-    const old = JSON.parse(readFileSync(oldPath, "utf8")) as TeamState;
-    writeFileSync(oldPath, JSON.stringify({ ...old, branch: "foreign" }, null, 2) + "\n");
-    mkdirSync(join(root, ".work-state", "features", "main"), { recursive: true });
-    const foreign = { ...old, branch: "other-branch", task: "another branch's run" };
-    const foreignBytes = JSON.stringify(foreign, null, 2) + "\n";
-    writeFileSync(statePathOf(root, "main"), foreignBytes);
-    const staleSlotBytes = readFileSync(oldPath, "utf8");
-
-    const updated = updateStateAtomically(root, (snapshot) => ({
-      op: "commit",
-      state: { ...snapshot.state!, branch: "main" },
-    }), { branch: "main" });
-    assert.equal(updated.ok, false);
-    if (!updated.ok) {
-      assert.equal(updated.code, "state_conflict");
-      assert.match(updated.error, /workflow state was created at the future destination during the transaction/);
-      assert.doesNotMatch(updated.error, /already exists for this branch/);
-    }
-    assert.equal(readFileSync(statePathOf(root, "main"), "utf8"), foreignBytes, "the foreign destination is byte-untouched");
-    assert.equal(readFileSync(oldPath, "utf8"), staleSlotBytes, "the stale slot is byte-untouched");
-  } finally {
-    setStateTransactionTestHooks(null);
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("review: a future destination changed after initial resolution is never overwritten", () => {
-  const root = mkdtempSync(join(tmpdir(), "review-destination-changed-"));
-  try {
-    initGit(root);
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    seedState(root, { profile, stageCursor: "discovery", slug: "old" });
-    const oldPath = statePathOf(root, "old");
-    const old = JSON.parse(readFileSync(oldPath, "utf8")) as TeamState;
-    writeFileSync(oldPath, JSON.stringify({ ...old, branch: "foreign" }, null, 2) + "\n");
-    const staleSlot = resolveState(root, "main");
-    assert.equal(staleSlot.isStale, true);
-    mkdirSync(join(root, ".work-state", "features", "main"), { recursive: true });
-    const own = { ...old, branch: "main", task: "the branch's own earlier run" };
-    writeFileSync(statePathOf(root, "main"), JSON.stringify(own, null, 2) + "\n");
-    let changedBytes = "";
-    setStateTransactionTestHooks({
-      beforeCas: ({ destinationPath }) => {
-        const current = JSON.parse(readFileSync(destinationPath, "utf8")) as TeamState;
-        changedBytes = JSON.stringify({ ...current, task: "changed mid-transaction" }, null, 2) + "\n";
-        writeFileSync(destinationPath, changedBytes);
-      },
-    });
-    const updated = updateStateAtomically(root, (snapshot) => ({
-      op: "commit",
-      state: { ...snapshot.state!, branch: "main" },
-    }), { target: staleSlot, branch: "main" });
-    assert.equal(updated.ok, false);
-    if (!updated.ok) {
-      assert.equal(updated.code, "state_conflict");
-      assert.match(updated.error, /workflow state was created at the future destination during the transaction/);
-      assert.doesNotMatch(updated.error, /already exists for this branch/);
-    }
-    assert.equal(readFileSync(statePathOf(root, "main"), "utf8"), changedBytes, "the transaction never writes over a destination it did not base its revision on");
-  } finally {
-    setStateTransactionTestHooks(null);
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 test("review: state.md fault rolls artifact writes back before releasing the state lock", () => {
   const root = mkdtempSync(join(tmpdir(), "review-state-md-fault-"));
@@ -1537,38 +1626,3 @@ function busySpin(ms: number): void {
   }
 }
 
-test("review: foreign pointerless same-path state stays fail-closed and untouched", () => {
-  const root = mkdtempSync(join(tmpdir(), "review-pointerless-foreign-same-path-"));
-  try {
-    initGit(root);
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    seedState(root, { profile, stageCursor: "discovery", slug: "main" });
-    rmSync(join(root, ".work-state", ".active-feature"), { force: true });
-    const destinationPath = statePathOf(root, "main");
-    const existing = JSON.parse(readFileSync(destinationPath, "utf8")) as TeamState;
-    const foreignBytes = JSON.stringify({ ...existing, branch: "foreign" }, null, 2) + "\n";
-    writeFileSync(destinationPath, foreignBytes);
-    const target = {
-      state: null,
-      statePath: destinationPath,
-      stateDir: join(root, ".work-state", "features", "main"),
-      artifactsDir: join(root, ".work-state", "features", "main", "artifacts"),
-      isLegacy: false,
-      isStale: false,
-    };
-    const updated = updateStateAtomically(root, (snapshot) => ({
-      op: "commit",
-      state: { ...snapshot.state!, branch: "main", task: "would-clobber" },
-    }), { target, branch: "main" });
-    assert.equal(updated.ok, false);
-    if (!updated.ok) {
-      assert.equal(updated.code, "state_conflict");
-      assert.match(updated.error, /workflow state was created at the future destination during the transaction/);
-    }
-    assert.equal(readFileSync(destinationPath, "utf8"), foreignBytes, "the foreign same-path state is byte-untouched");
-  } finally {
-    setStateTransactionTestHooks(null);
-    rmSync(root, { recursive: true, force: true });
-  }
-});

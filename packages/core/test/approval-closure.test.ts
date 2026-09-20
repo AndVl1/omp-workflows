@@ -55,7 +55,7 @@ import {
   recordTrustedCheckpointAnswer,
 } from "../src/engine/checkpoints.js";
 import { loadProfile, profileHash, registerWorkflowProfiles, type Profile } from "../src/engine/profile.js";
-import { updateStateAtomically as updateStateAtomicallyRaw, writeStateBootstrap as writeStateBootstrapRaw } from "../src/engine/state.js";
+import { updateStateAtomically as updateStateAtomicallyRaw } from "../src/engine/state.js";
 import { finalizeWorkflowRun, run } from "../src/engine/run.js";
 import { readRunControl, runStatePath, runTarget } from "../src/engine/run-store.js";
 import { validateActiveCapabilityStateBinding, validateActiveDispatchCapabilityValue } from "../src/engine/control-plane-contract.js";
@@ -101,14 +101,16 @@ function artifactsDirFor(root: string): string {
   return runTarget(root, RUN_ID).artifactsDir!;
 }
 
-function writeStateBootstrap(root: string, state: TeamState, _options?: Parameters<typeof writeStateBootstrapRaw>[2]): { statePath: string; artifactsDir: string } {
+function writeCanonicalState(root: string, state: TeamState): { statePath: string; artifactsDir: string } {
   const target = runTarget(root, RUN_ID);
   mkdirSync(target.stateDir!, { recursive: true });
   mkdirSync(target.artifactsDir!, { recursive: true });
-  return writeStateBootstrapRaw(root, state, { target });
+  const persisted = { ...state, state_revision: state.state_revision ?? 1 };
+  writeFileSync(target.statePath!, `${JSON.stringify(persisted, null, 2)}\n`);
+  return { statePath: target.statePath!, artifactsDir: target.artifactsDir! };
 }
 
-function updateStateAtomically(root: string, mutate: Parameters<typeof updateStateAtomicallyRaw>[1], options?: Parameters<typeof updateStateAtomicallyRaw>[2]) {
+function updateStateAtomically(root: string, mutate: Parameters<typeof updateStateAtomicallyRaw>[1], options?: Omit<Parameters<typeof updateStateAtomicallyRaw>[2], "target">) {
   return updateStateAtomicallyRaw(root, mutate, { ...(options ?? {}), target: runTarget(root, RUN_ID) });
 }
 
@@ -214,6 +216,8 @@ function seedState(root: string, opts: SeedOptions): IssuedCapability {
         run_key: RUN_ID, branch: "main", workflow: opts.profile.name, profile_hash: profileHash(opts.profile),
         stage_cursor: opts.stageCursor, kind: "none", expected_roster: [],
       });
+  const checkpointPolicy = opts.profile.stages.find((stage) => stage.id === opts.stageCursor)?.checkpoint_policy
+    ?? opts.profile.checkpoint_policy;
   const state = {
     schema: 2 as const,
     run_id: RUN_ID,
@@ -236,13 +240,14 @@ function seedState(root: string, opts: SeedOptions): IssuedCapability {
     policy: { strict_orchestrator: true },
     profile_hash: profileHash(opts.profile),
     scope: NO_SCOPE,
+    ...(checkpointPolicy ? { checkpoint_policy: checkpointPolicy } : {}),
     updated_at: new Date().toISOString(),
     ...(opts.workIdentity ? { work_identity: opts.workIdentity } : {}),
     ...(opts.legacyDecisions ? { checkpoint_decisions: opts.legacyDecisions } : {}),
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
   } as TeamState;
-  writeStateBootstrap(root, state);
+  writeCanonicalState(root, state);
   return issued;
 }
 
@@ -846,13 +851,14 @@ test("closure: a deferred roster stage keeps no capability after the cursor move
       artifacts: {},
       pause: { kind: "none" as const, reason: "" },
       policy: { strict_orchestrator: true },
+      checkpoint_policy: profile.checkpoint_policy,
       profile_hash: persistedHash,
       scope: NO_SCOPE,
       updated_at: new Date().toISOString(),
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
     } as TeamState;
-    writeStateBootstrap(root, state);
+    writeCanonicalState(root, state);
 
     const artifactsDir = artifactsDirFor(root);
     mkdirSync(artifactsDir, { recursive: true });
@@ -860,7 +866,7 @@ test("closure: a deferred roster stage keeps no capability after the cursor move
     writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: [{ path: "a.ts", why: "x" }], summary: "explored" }));
     writeFileSync(join(artifactsDir, "clarifications.json"), JSON.stringify({ questions: [], answers: ["proceed"] }));
     const withArtifacts = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    writeStateBootstrap(root, {
+    writeCanonicalState(root, {
       ...withArtifacts,
       artifacts: {
         ...(withArtifacts.artifacts ?? {}),
@@ -880,7 +886,7 @@ test("closure: a deferred roster stage keeps no capability after the cursor move
       checkpoint_id: "user_answers",
       decision: "proceed",
     });
-    writeStateBootstrap(root, trusted.state);
+    writeCanonicalState(root, trusted.state);
     const policy = profile.checkpoint_policy!;
     const recorded = updateStateAtomically(root, (snapshot) => {
       assert.ok(snapshot.state);
@@ -1059,7 +1065,7 @@ test("closure: authorizing mutations reject a capability whose policy hash or lo
       loop_iteration: 2,
       checkpoint_policy_hash: declaredHash,
     });
-    writeStateBootstrap(root, { ...JSON.parse(readFileSync(statePath, "utf8")) as TeamState, dispatch_capability: wrongIteration.state, cursor_epoch: wrongIteration.state.issued_for!.cursor_epoch });
+    writeCanonicalState(root, { ...JSON.parse(readFileSync(statePath, "utf8")) as TeamState, dispatch_capability: wrongIteration.state, cursor_epoch: wrongIteration.state.issued_for!.cursor_epoch });
     const wrongIterationAdvance = advanceCursor(root, {
       token: wrongIteration.advance_token,
       capability_id: wrongIteration.capability_id,
@@ -1082,7 +1088,7 @@ test("closure: authorizing mutations reject a capability whose policy hash or lo
       stage_cursor: "build", kind: "none", expected_roster: [],
       checkpoint_policy_hash: declaredHash,
     });
-    writeStateBootstrap(root, { ...JSON.parse(readFileSync(statePath, "utf8")) as TeamState, dispatch_capability: bound.state, cursor_epoch: bound.state.issued_for!.cursor_epoch });
+    writeCanonicalState(root, { ...JSON.parse(readFileSync(statePath, "utf8")) as TeamState, dispatch_capability: bound.state, cursor_epoch: bound.state.issued_for!.cursor_epoch });
     const boundAdvance = advanceCursor(root, {
       token: bound.advance_token,
       capability_id: bound.capability_id,
@@ -1226,7 +1232,7 @@ test("closure: fan-in synthesis writes of a rejected advance are rolled back", (
     const artifactsDir = artifactsDirFor(root);
     mkdirSync(artifactsDir, { recursive: true });
     const seededState = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    writeStateBootstrap(root, {
+    writeCanonicalState(root, {
       ...seededState,
       artifacts: { ...(seededState.artifacts ?? {}), synthesis: "artifacts/synthesis.json" },
     });

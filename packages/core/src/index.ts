@@ -1917,8 +1917,6 @@ export {
   handoverExecutionClaim,
   persistCanonicalRun,
   updateCanonicalRun,
-  recordPrepareReceipt,
-  previousReceipt,
   selectSession,
   sessionSelection,
   snapshotCanonicalRun,

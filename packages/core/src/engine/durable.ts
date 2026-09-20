@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
-import { normalizePersistedState, resolveState, resolveCanonicalRun, isSafeStateSegment, resolveActiveBranch, updateStateAtomically, type ResolvedState, type StateMutation, type StateUpdateResult, type StateSnapshot } from "./state.js";
+import { normalizePersistedState, resolveCanonicalRun, isSafeStateSegment, resolveActiveBranch, updateStateAtomically, type ResolvedState, type StateMutation, type StateUpdateResult, type StateSnapshot } from "./state.js";
 import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole, type ResolvedConfig } from "./config.js";
 import { validateAgentMappingState, type AgentMappingDiagnostic, type AgentMappingState } from "./agent-mapping.js";
 import { resolveScope, type ScopeFlags } from "./scope.js";
@@ -298,10 +298,10 @@ function runTransition(cwd: string, mutate: (state: TeamState, target: ResolvedS
       return { op: "discard", value: { ok: false, error: "workflow state is stale for the active branch", state: snapshot.state } };
     }
     return toMutation(mutate(snapshot.state, snapshot.target));
-  }, opts.terminalPublication || opts.runId ? {
-    ...(opts.runId ? { target: runTarget(cwd, opts.runId) } : {}),
+  }, {
+    target: runTarget(cwd, opts.runId),
     ...(opts.terminalPublication ? { publication: (snapshot: StateSnapshot, nextState: TeamState) => terminalControlPublication(cwd, snapshot.state, nextState) } : {}),
-  } : undefined);
+  });
   if (!outcome.ok) return { ok: false, error: outcome.error };
   if (!outcome.value) return { ok: false, error: "state transaction completed without a result" };
   // The returned state is the COMMITTED, normalized and revision-stamped

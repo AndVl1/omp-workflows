@@ -31,9 +31,8 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { resolve } from "node:path";
 
-const WORK_STATE_DIR = ".work-state";
 
 /** Stage ids whose produced artifact must include a validation block. */
 const VALIDATION_REQUIRED_STAGES = new Set(["implementation", "review_fixes"]);
@@ -136,23 +135,3 @@ function isValidationTrue(artifact: Record<string, unknown>): boolean {
   return v === true || v === "true";
 }
 
-/**
- * Resolve the artifacts dir for the active feature. Exposed so callers
- * (mainly the engine) can find the dir without re-implementing the
- * state resolution. Returns null if no state exists.
- */
-export function resolveArtifactsDir(cwd: string): string | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return null;
-  const active = join(wsDir, ".active-feature");
-  if (existsSync(active)) {
-    const slug = readFileSync(active, "utf8").trim();
-    if (slug) {
-      const featureDir = join(wsDir, "features", slug);
-      if (existsSync(featureDir)) return join(featureDir, "artifacts");
-    }
-  }
-  const legacy = join(wsDir, "artifacts");
-  if (existsSync(legacy)) return legacy;
-  return null;
-}

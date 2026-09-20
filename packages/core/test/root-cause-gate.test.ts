@@ -23,7 +23,7 @@ import { join } from "node:path";
 import { loadProfile, profileHash, registerWorkflowProfiles } from "../src/engine/profile.js";
 import { advanceCursor, createCapability, type IssuedCapability } from "../src/engine/durable.js";
 import { isRootCauseDocumented } from "../src/engine/dod.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+
 import { runTarget } from "../src/engine/run-store.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
@@ -79,7 +79,8 @@ function setupStage(root: string): { issued: IssuedCapability; artifactsDir: str
   });
   const target = runTarget(root, RUN_ID);
   mkdirSync(target.stateDir!, { recursive: true });
-  const { artifactsDir } = writeStateBootstrap(root, {
+  const artifactsDir = target.artifactsDir!;
+  writeFileSync(target.statePath!, JSON.stringify({
     schema: 2,
     run_id: RUN_ID,
     run_key: RUN_ID,
@@ -100,7 +101,7 @@ function setupStage(root: string): { issued: IssuedCapability; artifactsDir: str
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
-  }, { target });
+  }, null, 2) + "\n");
   mkdirSync(artifactsDir, { recursive: true });
   return { issued, artifactsDir };
 }

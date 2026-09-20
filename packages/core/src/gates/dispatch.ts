@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { resolveState, resolveActiveBranch, resolveCanonicalRun } from "../engine/state.js";
+import { resolveActiveBranch, resolveCanonicalRun, type ResolvedState } from "../engine/state.js";
 import { loadProfile, profileHash } from "../engine/profile.js";
 import { readRequiredStageInputs } from "../engine/stage.js";
 
@@ -75,7 +75,7 @@ function markerForEvent(item: Record<string, unknown>): string | undefined {
   return marker?.run;
 }
 
-function resolveDispatchTarget(cwd: string, event: { input?: unknown }, controller?: WorkflowSessionController): ReturnType<typeof resolveState> | ReturnType<typeof resolveCanonicalRun> | null | undefined {
+function resolveDispatchTarget(cwd: string, event: { input?: unknown }, controller?: WorkflowSessionController): ResolvedState | null | undefined {
   const branch = resolveActiveBranch(cwd);
   const marker = dispatchMarkerForEvent(event);
   if (!marker) {

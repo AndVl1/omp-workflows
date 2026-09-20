@@ -28,7 +28,7 @@ import { resolveConfig } from "../src/engine/config.js";
 import { resolveWorkflowContract as rawResolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildAgentMapping, writeAgentMapping, type AgentMappingState } from "../src/engine/agent-mapping.js";
 import { buildDispatchMarker, parseDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
-import { resolveState as rawResolveState } from "../src/engine/state.js";
+
 import { prepareWorkflowState } from "../src/engine/run.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TeamState } from "../src/engine/types.js";
@@ -60,7 +60,7 @@ function advanceCursor(root: string, input: Parameters<typeof rawAdvanceCursor>[
 function recordCheckpointDecision(root: string, input: Parameters<typeof rawRecordCheckpointDecision>[1]) {
   return rawRecordCheckpointDecision(root, { run_id: RUN_ID, run_key: RUN_ID, ...input });
 }
-function writeStateBootstrap(root: string, state: TeamState, _options?: unknown): void {
+function writeCanonicalFixture(root: string, state: TeamState): void {
   const capability = state.dispatch_capability
     ? { ...state.dispatch_capability, issued_for: state.dispatch_capability.issued_for ? { ...state.dispatch_capability.issued_for, run_key: RUN_ID } : state.dispatch_capability.issued_for }
     : undefined;
@@ -70,6 +70,7 @@ function writeStateBootstrap(root: string, state: TeamState, _options?: unknown)
     run_id: RUN_ID,
     run_key: RUN_ID,
     lifecycle_status: state.lifecycle_status ?? "active",
+    state_revision: state.state_revision ?? 1,
     required_inputs: state.required_inputs ?? {},
     required_input_receipts: state.required_input_receipts ?? {},
     ...(state.checkpoint_policy ? { checkpoint_policy: state.checkpoint_policy } : (state.classification?.workflow ? { checkpoint_policy: loadProfile(state.classification.workflow)?.checkpoint_policy } : {})),
@@ -87,7 +88,7 @@ function writeStateBootstrap(root: string, state: TeamState, _options?: unknown)
   }
   writeFileSync(join(runDir, "state.json"), JSON.stringify({ ...canonical, artifacts }) + "\n");
 }
-function resolveState(root: string) {
+function readCanonicalState(root: string) {
   const statePath = join(root, ".work-state", "runs", RUN_ID, "state.json");
   if (!existsSync(statePath)) return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false };
   return { state: JSON.parse(readFileSync(statePath, "utf8")) as TeamState, statePath, stateDir: join(root, ".work-state", "runs", RUN_ID), artifactsDir: join(root, ".work-state", "runs", RUN_ID, "artifacts"), isLegacy: false, isStale: false };
@@ -101,7 +102,7 @@ function initGit(root: string, branch: string): void {
 }
 
 function trustedCheckpoint(root: string, stageId: string, checkpointId: string, decision: string, channel: "terminal" | "escalation" = "terminal") {
-  const resolved = resolveState(root);
+  const resolved = readCanonicalState(root);
   assert.ok(resolved.state, "checkpoint fixture state must resolve");
   const trusted = recordTrustedCheckpointAnswer(resolved.state, {
     answer_id: `durable/${stageId}/${checkpointId}`,
@@ -111,7 +112,7 @@ function trustedCheckpoint(root: string, stageId: string, checkpointId: string, 
     checkpoint_id: checkpointId,
     decision,
   });
-  writeStateBootstrap(root, trusted.state, { target: resolved });
+  writeCanonicalFixture(root, trusted.state);
 
   return trusted;
 }
@@ -248,7 +249,7 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
     const persistedProfileHash = profileHash(profile);
     const exploration = profile.stages.find((stage) => stage.id === "exploration");
     assert.ok(exploration);
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/repeat",
       run_key: RUN_ID,
@@ -264,7 +265,7 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
       profile_hash: persistedProfileHash,
       scope: NO_SCOPE,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "repeat" });
+    });
 
     publishMapping(root);
     const begun = beginCapability(root, THREE_SLOT_SELECTION);
@@ -314,7 +315,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       run_key: RUN_ID, branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
       stage_cursor: "discovery", kind: "none", expected_roster: [],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/repeat",
       run_key: RUN_ID,
@@ -332,7 +333,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "repeat" });
+    });
     publishMapping(root);
     const trusted = trustedCheckpoint(root, "discovery", "confirm_understanding", "proceed", "escalation");
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
@@ -444,7 +445,7 @@ test("br-eu6: both analyst slots authorize and complete independently; orchestra
   }
 });
 
-test("br-eu6: single-to-single advance arms a ready capability with the next stage in_progress and immediately executable", () => {
+test("br-eu6: single-to-single advance arms the next stage; required inputs are read before dispatch", () => {
   const root = mkdtempSync(join(tmpdir(), "br-eu6-single-"));
   try {
     initGit(root, "feat/single");
@@ -455,7 +456,7 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
       run_key: RUN_ID, branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/single",
       run_key: RUN_ID,
@@ -473,7 +474,7 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "single" });
+    });
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     // Schema-valid implementation artifact (files_touched is required by the
@@ -529,9 +530,17 @@ test("br-eu6: single-to-single advance arms a ready capability with the next sta
 
     const codeReview = profile.stages.find((stage) => stage.id === "code_review");
     assert.ok(codeReview);
-    const marker = buildDispatchMarker("feat/single", codeReview, ["code-reviewer"], "code-reviewer", advanced.state.cursor_epoch);
+    const marker = buildDispatchMarker(RUN_ID, codeReview, ["code-reviewer"], "code-reviewer", advanced.state.cursor_epoch);
+    const blockedBeforeRead = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: marker } }, { cwd: root });
+    assert.equal(blockedBeforeRead?.reason, "dispatch gate: recovery_required: required inputs must be read and hash-receipted before dispatch");
+
+    // Public workflow_begin reads code_review's declared implementation input,
+    // hashes the exact artifact bytes, and persists the capability-bound receipt.
+    const begun = beginCapability(root);
+    assert.equal(begun.ok, true, begun.ok ? "workflow_begin read and hash-receipted code-review inputs" : begun.error);
+    if (!begun.ok) return;
     const gate = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: marker } }, { cwd: root });
-    assert.equal(gate, undefined, "armed next stage is immediately executable");
+    assert.equal(gate, undefined, "required-input read receipt makes the armed next stage executable");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -577,13 +586,15 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
     };
-    writeStateBootstrap(root, initialState, { featureSlug: "reopen" });
+    writeCanonicalFixture(root, initialState);
     publishMapping(root);
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "reopen stale bindings", branch }));
     const upstreamPath = join(artifactsDir, "discovery-upstream.json");
     writeFileSync(upstreamPath, "upstream");
+    const upstreamSecondPath = join(artifactsDir, "discovery-upstream-second.json");
+    writeFileSync(upstreamSecondPath, "upstream-second");
     const outsideDir = join(root, "outside");
     mkdirSync(outsideDir, { recursive: true });
     const outsidePath = join(outsideDir, "must-survive.json");
@@ -629,7 +640,12 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     const staleState = JSON.parse(readFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), "utf8")) as TeamState;
     staleState.slot_artifacts = {
       ...staleState.slot_artifacts,
-      discovery: { slots: { prior: { discovery: { path: upstreamPath, hash: "upstream" } } } },
+      discovery: {
+        slots: {
+          "analyst#1": { discovery: { path: upstreamPath, hash: "upstream-1" } },
+          "analyst#2": { discovery: { path: upstreamSecondPath, hash: "upstream-2" } },
+        },
+      },
       architecture: { slots: { "architect#2": { architecture: { path: join(artifactsDir, "architecture-architect-2.json"), hash: "downstream" } } } },
     };
     const oldExplorationSlots = staleState.slot_artifacts.exploration?.slots["analyst#1"];
@@ -637,7 +653,7 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     oldExplorationSlots.outside = { path: outsidePath, hash: "outside" };
     const downstreamPath = join(artifactsDir, "architecture-architect-2.json");
     writeFileSync(downstreamPath, "downstream");
-    writeStateBootstrap(root, staleState, { featureSlug: "reopen" });
+    writeCanonicalFixture(root, staleState);
 
     const execution = {
       session_id: "reopen-session",
@@ -673,8 +689,10 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     assert.deepEqual(begun.state.dispatch_capability?.dispatches, [], "reopened capability never reuses old dispatch records");
     assert.equal(begun.state.slot_artifacts?.exploration, undefined, "reopened slot bindings are cleared");
     assert.equal(begun.state.slot_artifacts?.architecture, undefined, "downstream slot bindings are cleared");
-    assert.ok(begun.state.slot_artifacts?.discovery, "upstream slot bindings remain available");
-    assert.equal(existsSync(upstreamPath), true, "upstream slot artifact file remains");
+    assert.ok(begun.state.slot_artifacts?.discovery?.slots["analyst#1"], "first upstream repeated-role occurrence remains bound");
+    assert.equal(begun.state.slot_artifacts?.discovery?.slots["analyst#2"]?.discovery.path, upstreamSecondPath, "second upstream repeated-role occurrence remains distinct");
+    assert.equal(existsSync(upstreamPath), true, "first upstream slot artifact file remains");
+    assert.equal(existsSync(upstreamSecondPath), true, "second upstream slot artifact file remains");
     assert.equal(existsSync(outsidePath), true, "out-of-tree stale path is never removed");
     for (const item of oldArtifacts) assert.equal(existsSync(join(artifactsDir, item.id + ".json")), false, "stale slot file is removed: " + item.id);
     assert.equal(existsSync(downstreamPath), false, "downstream stale slot file is removed");
@@ -707,6 +725,12 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     const firstAuth = authorizeDispatch(root, { ...freshAuth, role: first.role, agent: first.agent });
     assert.equal(firstAuth.ok, true);
     if (!firstAuth.ok || !firstAuth.record) return;
+    const beforeMissingOldFile = readCanonicalState(root).state;
+    assert.ok(beforeMissingOldFile, "state remains available before missing artifact rejection");
+    const upstreamBytesBefore = {
+      first: readFileSync(upstreamPath),
+      second: readFileSync(upstreamSecondPath),
+    };
     const missingOldFile = completeDispatch(root, {
       ...freshAuth,
       role: first.role,
@@ -718,7 +742,19 @@ test("br-eu6: reopening a stage clears stale downstream slot bindings and starts
     });
     assert.equal(missingOldFile.ok, false, "a removed old file cannot authorize fresh completion");
     if (missingOldFile.ok) return;
-    assert.match(missingOldFile.error, /declared artifact missing/);
+    const afterMissingOldFile = readCanonicalState(root).state;
+    assert.ok(afterMissingOldFile, "state remains available after missing artifact rejection");
+    assert.equal(afterMissingOldFile.stage_cursor, beforeMissingOldFile.stage_cursor, "missing artifact cannot advance the cursor");
+    assert.equal(afterMissingOldFile.cursor_epoch, beforeMissingOldFile.cursor_epoch, "missing artifact cannot rotate the cursor epoch");
+    assert.deepEqual(afterMissingOldFile.stages, beforeMissingOldFile.stages, "missing artifact cannot advance stage statuses");
+    assert.deepEqual(afterMissingOldFile.dispatch_capability, beforeMissingOldFile.dispatch_capability, "missing artifact leaves the dispatch capability unchanged");
+    assert.deepEqual(afterMissingOldFile.slot_artifacts?.exploration, beforeMissingOldFile.slot_artifacts?.exploration, "affected exploration bindings stay unchanged");
+    assert.deepEqual(afterMissingOldFile.slot_artifacts?.architecture, beforeMissingOldFile.slot_artifacts?.architecture, "downstream bindings stay unchanged");
+    assert.deepEqual(afterMissingOldFile.slot_artifacts?.discovery?.slots, beforeMissingOldFile.slot_artifacts?.discovery?.slots, "upstream repeated-role bindings stay unchanged");
+    assert.equal(afterMissingOldFile.slot_artifacts?.discovery?.slots["analyst#1"]?.discovery?.path, upstreamPath, "analyst#1 upstream binding remains distinct");
+    assert.equal(afterMissingOldFile.slot_artifacts?.discovery?.slots["analyst#2"]?.discovery?.path, upstreamSecondPath, "analyst#2 upstream binding remains distinct");
+    assert.deepEqual(readFileSync(upstreamPath), upstreamBytesBefore.first, "analyst#1 upstream bytes remain unchanged");
+    assert.deepEqual(readFileSync(upstreamSecondPath), upstreamBytesBefore.second, "analyst#2 upstream bytes remain unchanged");
 
     for (const item of oldArtifacts) {
       writeFileSync(join(artifactsDir, item.id + ".json"), JSON.stringify({ files_to_read: [{ path: "fresh.ts" }], summary: "fresh " + item.role }));
@@ -790,7 +826,7 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
       run_key: RUN_ID, branch: "feat/arch", workflow: "full-feature", profile_hash: persistedProfileHash,
       stage_cursor: "clarify", kind: "none", expected_roster: [],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/arch",
       run_key: RUN_ID,
@@ -808,7 +844,7 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "arch" });
+    });
     publishMapping(root);
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
@@ -884,7 +920,7 @@ test("wave-004: advance into architecture stays semantically unselected; workflo
 });
 
 /** Fixture state parked on the architecture stage with upstream stages done. */
-function writeArchitectureFixture(root: string, branch: string, slug: string): void {
+function writeArchitectureFixture(root: string, branch: string): void {
   initGit(root, branch);
   const profile = loadProfile("full-feature");
   assert.ok(profile);
@@ -893,7 +929,7 @@ function writeArchitectureFixture(root: string, branch: string, slug: string): v
   mkdirSync(join(runDir, "artifacts"), { recursive: true });
   writeFileSync(join(runDir, "artifacts", "exploration.json"), JSON.stringify({ summary: "exploration" }) + "\n");
   writeFileSync(join(runDir, "artifacts", "clarifications.json"), JSON.stringify({ answers: [] }) + "\n");
-  writeStateBootstrap(root, {
+  writeCanonicalFixture(root, {
     schema: 1,
     branch,
     run_key: branch,
@@ -910,15 +946,15 @@ function writeArchitectureFixture(root: string, branch: string, slug: string): v
     profile_hash: persistedProfileHash,
     scope: NO_SCOPE,
     updated_at: new Date().toISOString(),
-  }, { featureSlug: slug });
+  });
 }
 
 test("wave-004: trusted mapping handoff wins over a tampered persisted mapping; malformed handoff fails closed; fallback stays compatible", () => {
   const control = mkdtempSync(join(tmpdir(), "wave004-hostile-control-"));
   const trusted = mkdtempSync(join(tmpdir(), "wave004-hostile-trusted-"));
   try {
-    writeArchitectureFixture(control, "feat/hostile-control", "hostile-control");
-    writeArchitectureFixture(trusted, "feat/hostile-trusted", "hostile-trusted");
+    writeArchitectureFixture(control, "feat/hostile-control");
+    writeArchitectureFixture(trusted, "feat/hostile-trusted");
     const hostileRoles = { ...poolRoles, architect: "omp-attacker" };
     const hostilePool = [...Object.values(poolRoles), "omp-attacker"];
     publishHostileMapping(control, hostileRoles, hostilePool);
@@ -966,7 +1002,7 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
       run_key: RUN_ID, branch: "feat/trusted-advance", workflow: "lightweight", profile_hash: persistedProfileHash,
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/trusted-advance",
       run_key: RUN_ID,
@@ -984,7 +1020,7 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "trusted-advance" });
+    });
     publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "omp-attacker" }, ["developer-kotlin", "omp-attacker"]);
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
@@ -1070,7 +1106,7 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
     const profile = loadProfile("loop-roster-regression");
     assert.ok(profile);
     const persistedProfileHash = profileHash(profile);
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/loop-roster",
       run_key: RUN_ID,
@@ -1087,7 +1123,7 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
       scope: NO_SCOPE,
       cursor_epoch: "fixture-epoch-0",
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "loop-roster" });
+    });
     publishMapping(root);
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
@@ -1178,7 +1214,7 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
     initGit(otherRoot, "feat/tool-hook");
     const profile = loadProfile("lightweight");
     assert.ok(profile);
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/tool-hook",
       run_key: RUN_ID,
@@ -1195,10 +1231,10 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
       scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
       cursor_epoch: "fixture-epoch-0",
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "tool-hook" });
+    });
     const otherBootstrap = JSON.parse(readFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), "utf8")) as TeamState;
     const { dispatch_capability: _rootCapability, ...otherState } = otherBootstrap;
-    writeStateBootstrap(otherRoot, otherState, { featureSlug: "tool-hook-other" });
+    writeCanonicalFixture(otherRoot, otherState);
 
     const calls: string[] = [];
     const responses: Array<AgentMappingState | undefined | null> = [undefined, undefined, null];
@@ -1283,7 +1319,7 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
     assert.equal(advancedThrow.details.ok, false);
     assert.match(advancedThrow.details.error ?? "", /stale discovery markers/);
     hookFailure = null;
-    const state = resolveState(root);
+    const state = readCanonicalState(root);
     assert.equal(state.state?.stage_cursor, "implementation", "failed hook calls never advanced the cursor");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1294,7 +1330,7 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
 test("wave-004: a malicious outer-valid trusted handoff fails closed before any roster resolution", () => {
   const root = mkdtempSync(join(tmpdir(), "wave004-outer-valid-"));
   try {
-    writeArchitectureFixture(root, "feat/outer-valid", "outer-valid");
+    writeArchitectureFixture(root, "feat/outer-valid");
     const base = {
       schema: 1 as const,
       generated_at: new Date().toISOString(),
@@ -1340,7 +1376,7 @@ test("wave-004: a malicious outer-valid trusted handoff fails closed before any 
     assert.equal(conflictedBegin.ok, false);
     if (!conflictedBegin.ok) assert.match(conflictedBegin.error, /resolved role 'architect' carries an 'unavailable' diagnostic/);
     // Every rejection left the persisted workflow state untouched.
-    const untouched = resolveState(root);
+    const untouched = readCanonicalState(root);
     assert.equal(untouched.state?.stage_cursor, "architecture");
     assert.equal(untouched.state?.dispatch_capability, undefined, "the fixture started deferred and rejection must not mint a capability");
   } finally {
@@ -1359,7 +1395,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
       run_key: RUN_ID, branch: "feat/missing-next-role", workflow: "lightweight", profile_hash: persistedProfileHash,
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/missing-next-role",
       run_key: RUN_ID,
@@ -1377,7 +1413,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "missing-next-role" });
+    });
     publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "omp-attacker" }, ["developer-kotlin", "omp-attacker"]);
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
@@ -1425,7 +1461,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
       assert.match(missing.error, /next stage 'code_review' dispatch roster unresolved/);
       assert.match(missing.error, /'code-reviewer' is missing or unavailable in the trusted agent mapping handoff/);
     }
-    const untouched = resolveState(root);
+    const untouched = readCanonicalState(root);
     assert.equal(untouched.state?.stage_cursor, "implementation", "a failed advance never moves the cursor");
     assert.equal(untouched.state?.cursor_epoch, issued.state.issued_for!.cursor_epoch, "a failed advance never rotates the epoch");
   } finally {
@@ -1459,7 +1495,7 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
       run_key: RUN_ID, branch: "feat/loop-missing-role", workflow: "loop-non-roster-regression", profile_hash: persistedProfileHash,
       stage_cursor: "build", kind: "single", expected_roster: [{ role: "builder", agent: "builder" }],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/loop-missing-role",
       run_key: RUN_ID,
@@ -1477,7 +1513,7 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "loop-missing-role" });
+    });
     publishMapping(root);
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
@@ -1544,7 +1580,7 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
       assert.match(missingLoop.error, /loop target stage 'build' dispatch roster unresolved/);
       assert.match(missingLoop.error, /'builder' is missing or unavailable in the trusted agent mapping handoff/);
     }
-    const untouched = resolveState(root);
+    const untouched = readCanonicalState(root);
     assert.equal(untouched.state?.stage_cursor, "check", "a failed re-entry never moves the cursor");
     assert.equal(untouched.state?.cursor_epoch, armed.handoff.cursor_epoch, "a failed re-entry never rotates the epoch");
     assert.equal(untouched.state?.loop_state, undefined, "a failed re-entry never records loop history");
@@ -1587,7 +1623,7 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
       run_key: RUN_ID, branch: "feat/deferred-mask", workflow: "full-feature", profile_hash: persistedProfileHash,
       stage_cursor: "clarify", kind: "none", expected_roster: [],
     });
-    writeStateBootstrap(root, {
+    writeCanonicalFixture(root, {
       schema: 1,
       branch: "feat/deferred-mask",
       run_key: RUN_ID,
@@ -1607,7 +1643,7 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
       roster_selection: frozenExploration.selection,
       roster_selections: { exploration: frozenExploration.selection },
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "deferred-mask" });
+    });
     publishMapping(root);
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });

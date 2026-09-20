@@ -14,6 +14,7 @@ import {
   readFileSync,
   existsSync,
   mkdirSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,7 +23,7 @@ import { observabilityHooks, flushRecorder } from "../../src/observability/hooks
 import { registerObservabilityHooks } from "../../src/observability/index.js";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { readCanonicalObservabilityPointer } from "../../src/observability/recorder.js";
-import { writeStateBootstrap } from "../../src/engine/state.js";
+
 import { runTarget } from "../../src/engine/run-store.js";
 import type { TeamState } from "../../src/engine/types.js";
 
@@ -62,7 +63,9 @@ function makeInitialState(branch: string): TeamState {
 function prepareCanonicalState(cwd: string, state: TeamState = makeInitialState("main")): string {
   const target = runTarget(cwd, RUN_ID);
   mkdirSync(target.stateDir!, { recursive: true });
-  return writeStateBootstrap(cwd, state, { target }).statePath;
+  mkdirSync(target.artifactsDir!, { recursive: true });
+  writeFileSync(target.statePath!, `${JSON.stringify(state, null, 2)}\n`);
+  return target.statePath!;
 }
 
 test("integration: selected canonical run owns a full lifecycle telemetry rollup", async () => {

@@ -31,7 +31,7 @@ import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engin
 import { createCapability, advanceCursor, recordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
 import { checkpointPolicyHash, recordTrustedCheckpointAnswer, unresolvedCheckpointError } from "../src/engine/checkpoints.js";
 import { migrationCheckpointPolicy } from "../src/engine/workflow-contract.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+
 import { runTarget } from "../src/engine/run-store.js";
 
 import type { Profile, TeamState } from "../src/engine/types.js";
@@ -73,10 +73,13 @@ function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "runs", APPROVAL_RUN_ID, "state.json"), "utf8")) as TeamState;
 }
 
-function writeCanonicalState(root: string, state: TeamState): void {
+function writeCanonicalState(root: string, state: TeamState): { statePath: string; artifactsDir: string } {
   const target = runTarget(root, APPROVAL_RUN_ID);
   mkdirSync(target.stateDir!, { recursive: true });
-  writeStateBootstrap(root, state, { target });
+  mkdirSync(target.artifactsDir!, { recursive: true });
+  const persisted = { ...state, state_revision: state.state_revision ?? 1 };
+  writeFileSync(target.statePath!, `${JSON.stringify(persisted, null, 2)}\n`);
+  return { statePath: target.statePath!, artifactsDir: target.artifactsDir! };
 }
 
 function advanceAuth(issued: IssuedCapability) {
@@ -110,9 +113,7 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
     expected_roster: [],
     checkpoint_policy_hash: policyHash,
   });
-  const target = runTarget(root, APPROVAL_RUN_ID);
-  mkdirSync(target.stateDir!, { recursive: true });
-  const { artifactsDir } = writeStateBootstrap(root, {
+  const { artifactsDir } = writeCanonicalState(root, {
     schema: 2,
     run_id: APPROVAL_RUN_ID,
     run_key: APPROVAL_RUN_ID,
@@ -126,7 +127,7 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
     stage_cursor: "product_approval",
     stages: profile.stages.map((s) => ({ id: s.id, status: s.id === "product_approval" ? "in_progress" as const : "pending" as const })),
     artifacts: {},
-    pause: { kind: "none", reason: "" },
+    pause: { kind: "none" as const, reason: "" },
     policy: { strict_orchestrator: true },
     profile_hash: persistedHash,
     checkpoint_policy: policy,
@@ -135,7 +136,7 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
-  }, { target });
+  });
   return { issued, artifactsDir };
 }
 

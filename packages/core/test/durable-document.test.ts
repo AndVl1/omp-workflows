@@ -21,7 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { createCapability, advanceCursor, type IssuedCapability } from "../src/engine/durable.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+
 import { runTarget } from "../src/engine/run-store.js";
 import { validateProductPrdDocument } from "../src/engine/product-prd.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
@@ -103,7 +103,7 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
   });
   const runDir = join(root, ".work-state", "runs", RUN_ID);
   mkdirSync(runDir, { recursive: true });
-  writeStateBootstrap(root, {
+  writeFileSync(runTarget(root, RUN_ID).statePath!, JSON.stringify({
     schema: 2,
     run_id: RUN_ID,
     run_key: RUN_ID,
@@ -122,7 +122,7 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
-  }, { target: runTarget(root, RUN_ID) });
+  }, null, 2) + "\n");
   const featureDir = runDir;
   const artifactsDir = join(featureDir, "artifacts");
   mkdirSync(artifactsDir, { recursive: true });
