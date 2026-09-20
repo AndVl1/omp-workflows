@@ -17,7 +17,7 @@ omp plugin install @andvl1/omp-workflows-core
 ```
 
 (The package carries an `omp: {}` manifest — skills are discovered without
-an extension entry; see [`docs/adding-agents.md`](../docs/adding-agents.md).)
+an extension entry; see [`docs/adding-agents.md`](../../docs/adding-agents.md).)
 
 ## Public API
 
@@ -34,6 +34,52 @@ export default function (pi: ExtensionAPI) {
   });
 }
 ```
+## Жизненный цикл обычного workflow
+
+Обычные запуски имеют явный режим `new`, `resume` или `rework`. Наличие старых файлов состояния само по себе не превращает новую задачу в продолжение. Для `/team` действует тот же контракт: это alias `/do-work`.
+
+```text
+/do-work --new Добавить экспорт отчётов
+/do-work продолжи экспорт отчётов
+/do-work --resume
+/do-work --resume --run <run-id>
+/do-work --rework --run <run-id> Исправить результат экспорта
+/do-work --list
+/do-work --list --all-branches
+```
+
+UUID не обязателен для обычного пользовательского сценария: имя задачи, однозначный фрагмент или пункт показанного списка разрешаются в точный `run_id` до мутации. `--run <run-id>` остаётся техническим selector для автоматизации и диагностики. `--` завершает разбор options, поэтому флаги внутри текста задачи не интерпретируются. Неоднозначный выбор возвращает список с названием, веткой, статусом и этапом; ошибочный явный selector не получает fallback.
+
+### Канонический запуск и восстановление
+
+Для ordinary workflow используется schema 2: `run_id`, `run_key` и `WorkIdentity.run_id` обязаны совпадать. Канонический state находится в `.work-state/runs/<run-id>/state.json`, а неизменяемые результаты доработки или миграции — в `.work-state/runs/<run-id>/revisions/<revision-id>/`. Ветка — контекст маршрутизации и проверки совместимости, а не ключ identity или каталог: новая задача на другой ветке создаёт независимый run; `resume`/`rework` на чужой ветке отклоняются как `run_context_mismatch`.
+
+`resume` в новой host-сессии не восстанавливает старый чат. После `workflow_prepare` агент обязан прочитать `workflow_instructions`, canonical state и обязательные входные artifacts текущего этапа: задачу, classification, cursor, ограничения, решения и provenance завершённых этапов. Отсутствующий или недействительный обязательный input блокирует зависимое действие с `recovery_required`; summary или случайный файл его не заменяют. Сохранённый pending dispatch не запускается повторно: при недоступном host-транспорте сохраняются `background_wait` и `transport_reconnect`.
+
+`rework` сохраняет предыдущий результат в revision snapshot и открывает только затронутую стадию с downstream-зависимостями. Старые artifacts и proofs остаются историей и не завершают новую версию. Терминальный run сохраняется доступным для чтения; отдельного archive lifecycle или обязательной archive-команды нет.
+
+### Конфликты, миграция и транзакционное восстановление
+
+В одном физическом worktree допускается один конфликтующий execution claim. Живой или неизвестно завершённый coordinator/worker даёт `run_busy`; ошибка и receipt `workflow_prepare` сохраняют state неизменным и указывают поддерживаемое следующее действие. `workflow_status` можно использовать для проверки текущего run/stage/capability state. Смерть coordinator не доказывает остановку workers: разрешается resume того же run или reconcile, но не независимый `new` и не force-unlock.
+
+Lifecycle journal и lock/CAS восстанавливаются до следующей мутации. При прерывании **до** canonical commit откатывается только staging, исходные данные остаются нетронутыми; **после** commit выполняется только forward repair с сохранением canonical mapping. Backup — evidence для recovery, а не способ вернуть старую authority.
+
+Legacy root/feature state и прежняя форма `continuation` — только import boundary. Старый API должен быть заменён на явный `resume`/`rework`; неизвестная schema, повреждённая ссылка, активный или неизвестный legacy dispatch дают `migration_required`, `recovery_required` или `run_busy` без создания обходного пустого run. `.work-state/.active-feature` не является runtime authority после cutover. Не удаляйте marker, не перемещайте state вручную и не редактируйте canonical JSON: следуйте diagnostic `next_action` и повторите штатную операцию после устранения причины.
+
+### Status, report и viewer
+
+Status, report и visualization используют тот же canonical selector. В fullstack доступны:
+
+```text
+/session-report do-work id=<run-id> [revision=<revision-id>]
+/workflow-view do-work id=<run-id> [revision=<revision-id>]
+/workflow-view --all
+```
+
+У выбранного ordinary run можно открыть конкретную revision; `--all` не совмещается с `revision=`. Legacy state не читается как fallback: report/viewer возвращают явное `migration_required` или `canonical-unavailable` с инструкцией сначала выбрать/import canonical run. Текущий viewer доступен для canonical run/revision и не выбирает latest, slug или `.active-feature`; существенная переработка UI/graph model остаётся отдельным будущим scope.
+
+Подробный stage и artifact contract описан в [`workflows/README.md`](workflows/README.md).
+
 
 ## Custom bundle — with your own model-role taxonomy
 ## Bundle-owned workflow profiles
@@ -56,7 +102,7 @@ Registered profiles are included in `loadAllProfiles()` and can be selected expl
 
 > Полный гайд по созданию своего набора агентов (frontmatter, model-роли,
 > registerTeamWorkflow, slash-команды, минимальный скелет бандла):
-> **[`docs/adding-agents.md`](../docs/adding-agents.md)**.
+> **[`docs/adding-agents.md`](../../docs/adding-agents.md)**.
 
 `defaultFullstackModelRoles` ships as the default 14-entry taxonomy, but any bundle
 can override it with its own `ModelRoleEntry[]` while reusing the helpers

@@ -4,6 +4,22 @@
 
 План поэтапного рефакторинга движка, подготовленный 2026-09-19. Это planning-документ, не описание уже реализованной архитектуры и не разрешение на реализацию всех блоков. Первый change: [run-lifecycle](../../openspec/changes/run-lifecycle/proposal.md). Следующие changes создаются отдельно после проверки предыдущих результатов.
 
+Фактический статус `run-lifecycle`: основной runtime cutover реализован и подтверждён targeted/process доказательствами; final 7.4 integration/CI также принят (run `35541403305` на repair head `3d853bc1582aebe4a3950cd85673a848767432c7`, install/build/typecheck/test PASS). Live-приёмка пользовательских journeys ещё не закрыта; delivered не означает acceptance 7.3.
+
+В рамках реализованного cutover подтверждены:
+
+- canonical UUID identity для run; revision IDs сохраняют timestamp-UUID composite format и не объявляются отдельными UUID, при этом identity run/revision независима от ветки, host-сессии и текста задачи;
+- явный command intent и различение `new`/`resume`/`rework`, включая выбор по названию или стабильному показанному списку без обязательного ввода UUID;
+- транзакционные migration/recovery/rework с сохранением evidence, откатом staged transaction до commit и forward repair после commit; backup сохраняется как evidence, а не используется как механизм rollback; fail-closed `migration_required`, идемпотентное восстановление и отсутствие удаления marker или ручного редактирования canonical state;
+- единый canonical authority для state, ownership claims, capability/epoch scopes и late-result routing; busy/recovery UX сохраняет конфликт и поддерживаемый путь сверки;
+- cutover потребителей report/session/observability к выбранным canonical run/revision; viewer использует тот же selector либо явно сообщает migration-required/недоступность, без legacy authority fallback;
+- process-level fault/race proof и готовность terminal E2E harness/PTY prerequisite. Это подтверждает готовность harness, но не результат живого OMP journey;
+- final 7.4 workspace integration/CI: run `35541403305` на repair head `3d853bc1582aebe4a3950cd85673a848767432c7` завершился успешно для install, build, typecheck и test; эта проверка не заменяет live 7.3.
+
+Открытой runtime-приёмкой остаётся live 7.3 (зарегистрированные `/do-work` journeys, fresh-session resume и missing-input recovery) до отдельного отчёта QA/Main; закрытие run-lifecycle требует этого live proof и синхронизации примеров команд с фактическими transcript/evidence и canonical-state checks для A → B → C → A. 8.1/8.2 остаются pending до фиксации документации и этой audit-проверки.
+
+Будущими и не реализованными остаются политика автономии и scheduler, programmatic continuation main agent и redesign viewer/graph model. Archive lifecycle в этом change не вводится и является non-goal, а не обещанным будущим блоком. UUID остаётся внутренней идентичностью; ручной state repair не является поддерживаемым способом эксплуатации.
+
 ## Outcomes
 
 1. Последовательные задачи и запуски `/do-work` в одном worktree, на одной или разных ветках, не требуют удаления маркеров или перемещения `.work-state` вручную.
@@ -13,16 +29,18 @@
 
 ## Evidence
 
-Проверенные при подготовке исходники:
+### Baseline before `run-lifecycle`
 
-- `packages/core/src/commands/do-work.ts`: наличие состояния текущей ветки автоматически объявляется продолжением прежней задачи.
-- `packages/core/src/engine/run.ts`: новый запуск отвергается при существующем состоянии ветки; свежий `run_key` равен имени ветки. Продолжение совмещено с `reopenFromFeedback`.
-- `packages/core/src/engine/state.ts`: выбор состояния зависит от `.active-feature`, legacy root и branch-derived feature path; есть специальные пути восстановления устаревших указателей.
-- `packages/core/workflows/standard.json` и `packages/core/src/engine/types.ts`: текстовые инструкции автономии говорят продолжать, но типизированные правила чекпоинтов требуют человека; legacy-текст не является разрешением.
-- `packages/core/src/commands/register.ts`, `commands/do-work.ts`, `engine/run.ts`, `engine/stage.ts`: prompt-driven путь и прямой интерпретатор имеют разные внешние циклы исполнения, но используют общие durable-переходы.
-- `packages/core/src/index.ts`: общий публичный вход содержит host-интеграцию, регистрацию инструментов и широкий экспорт API.
+Исходные наблюдения, собранные при подготовке roadmap до реализации change:
 
-Аудит `~/Desktop/omp-review.pdf` от 2026-09-06 — исторический источник гипотез: стабилизация ядра, compiler/validator, frozen bundle и граница side effects. Его цифры, результаты тестов и конкретные security findings не считаются автоматически актуальными. В этом planning-проходе runtime не запускался; статические наблюдения не являются доказательством всех пользовательских сбоев.
+- `packages/core/src/commands/do-work.ts`: наличие состояния текущей ветки автоматически объявлялось продолжением прежней задачи.
+- `packages/core/src/engine/run.ts`: новый запуск отвергался при существующем состоянии ветки; свежий `run_key` равнялся имени ветки. Продолжение совмещалось с `reopenFromFeedback`.
+- `packages/core/src/engine/state.ts`: выбор состояния зависел от `.active-feature`, legacy root и branch-derived feature path; существовали специальные пути восстановления устаревших указателей.
+- `packages/core/workflows/standard.json` и `packages/core/src/engine/types.ts`: текстовые инструкции автономии говорили продолжать, но типизированные правила чекпоинтов требовали человека; legacy-текст не являлся разрешением.
+- `packages/core/src/commands/register.ts`, `commands/do-work.ts`, `engine/run.ts`, `engine/stage.ts`: prompt-driven путь и прямой интерпретатор имели разные внешние циклы исполнения, но использовали общие durable-переходы.
+- `packages/core/src/index.ts`: общий публичный вход содержал host-интеграцию, регистрацию инструментов и широкий экспорт API.
+
+Аудит `~/Desktop/omp-review.pdf` от 2026-09-06 — исторический источник гипотез: стабилизация ядра, compiler/validator, frozen bundle и граница side effects. Его цифры, результаты тестов и конкретные security findings не считаются автоматически актуальными. Эти наблюдения описывают baseline до change; текущие delivered/pending границы указаны в `Status` и блоке A.
 
 ## Principles
 
@@ -60,15 +78,15 @@ Request + constraints + defaults
 
 ### A. Run lifecycle
 
-**Change:** `run-lifecycle` — единственный подробно спланированный блок сейчас.
+**Статус:** основная реализация доставлена и 7.4 integration/CI принята; остаётся acceptance-граница live 7.3.
 
-**Результат:** идентичность запуска независима от ветки; start, resume и rework различаются; новая задача не наследует старую только из-за файлов состояния. Выбор запуска, история, переключение веток, поздние результаты workers и миграция имеют единый контракт.
+**Фактический результат:** независимая canonical UUID identity run; revision IDs сохраняют timestamp-UUID composite format; явные `new`, `resume` и `rework`; человекочитаемый выбор из списка или по названию без обязательного UUID; transactional migration/recovery/rework с сохранением evidence, откатом staged transaction до commit и forward repair после commit; backup остаётся evidence, а не механизмом rollback; canonical authority, ownership claims и capability scopes; перевод report/session/observability consumers на выбранный run/revision; готовые process/E2E harness seams.
 
 **Включено:** ingress `/do-work` и `/team`, state resolution, session/run binding, существующие workflow tools/hooks и читатели состояния, защита от одновременно конфликтующего исполнения, миграция legacy state.
 
-**Не включено:** изменение checkpoint permission, автономный scheduler, новая модель retries/budgets, миграция внутреннего CTO portfolio state на новый формат.
+**Не включено:** изменение checkpoint permission, автономный scheduler, новая модель retries/budgets, миграция внутреннего CTO portfolio state на новый формат, programmatic continuation main agent и redesign viewer/graph model. Viewer не получает отдельный legacy fallback: он либо читает тот же canonical selector, либо возвращает явную недоступность/migration guidance.
 
-**Выход:** сквозной сценарий «задача A завершена → новая B на той же ветке → новая C на другой ветке → возвращение к A для доработки» и продолжение незавершённого запуска в новой сессии проходят без ручной чистки; история и safety-проверки сохранены.
+**Следующая проверка:** сценарий «задача A завершена → новая B на той же ветке → новая C на другой ветке → возвращение к A для доработки», fresh-session resume и missing-input recovery должны быть приняты QA/Main через live OMP harness. До этого не объявлять 7.3 PASS; 7.4 уже принят отдельным integration/CI run.
 
 ### B. Autonomy and outcome contract
 
@@ -99,6 +117,17 @@ Request + constraints + defaults
 **Кандидаты, не обязательства:** compiler/validator до запуска; полный frozen execution bundle; optional domain packs; дальнейшее выделение report/visualize. Каждый кандидат получает отдельное обоснование и change. Trusted executor для произвольных side effects, distributed backend и telemetry overhaul не входят автоматически.
 
 **Выход:** проверенный ацикличный граф зависимостей, объявленные публичные контракты, перенесённые потребители и удалённые старые пути. Модульные границы вводятся и в A–C, если нужны их контракту; D не откладывает модульность на конец.
+
+## Cleanup audit
+
+Аудит tracked migration/scaffold/smoke-кандидатов завершён в рамках 8.2. Disposable temporary material для удаления не найдено:
+
+- `packages/core/src/engine/run-migration.ts` — production explicit importer и recovery path; сохраняется;
+- `packages/core/test/smoke.test.ts` — постоянный regression/smoke test package boundary и canonical lifecycle guard; сохраняется;
+- `vibe-report/` (включая исторический migration report и lifecycle UX evidence) и `.work-state/cto/run-lifecycle-01a0bacd/artifacts/` — evidence, а не disposable scaffold; сохраняются;
+- generated `packages/core/dist/engine/run-migration.*` не является tracked source и не удаляется в этом docs-only изменении.
+
+Карта ответственности намеренно не менялась: package ownership не перемещался.
 
 ## Ownership and Integration
 

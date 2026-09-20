@@ -58,6 +58,40 @@ The `commands/` adapters remain a compatibility path for runtimes that only
 discover custom-TS files from disk; same-name project files are not an override
 API.
 
+## Жизненный цикл `/do-work`
+
+Fullstack регистрирует `/do-work` и alias `/team`; они используют общий lifecycle contract core. Явные режимы имеют приоритет над интерпретацией текста, а обычная задача не становится resume только потому, что в worktree уже есть state.
+
+```text
+/do-work --new Добавить экспорт отчётов
+/do-work продолжи экспорт отчётов
+/do-work --resume
+/do-work --resume --run <run-id>
+/do-work --rework --run <run-id> Исправить результат экспорта
+/do-work --list
+/do-work --list --all-branches
+```
+
+Для new/resume/rework UUID не обязателен: можно назвать задачу или выбрать пункт показанного списка. `--run <run-id>` — точный технический selector; `/do-work --list` выводит title, branch, status, stage и стабильные `snapshot_id`/`index`, чтобы пункт можно было разрешить без угадывания. Если совпадений несколько, команда просит выбор; ошибочный явный selector не переключается на другой run. `--` завершает разбор options и позволяет передать флаги как обычный текст задачи.
+
+Успешный `workflow_prepare` возвращает видимый receipt с operation, previous/selected run, названиями, статусами и continuation point. При `run_busy` переход не выполнен и частичный новый run не показывается как созданный. Один физический worktree допускает один конфликтующий execution claim: живой или неизвестно завершённый coordinator/worker нужно сначала проверить через `workflow_status`; новый независимый run не вытесняет pending work, а resume присоединяется только к тому же run.
+
+Resume из новой host-сессии использует canonical state и required artifacts, а не историю чата: `workflow_instructions` восстанавливает задачу, classification, cursor, решения, ограничения и входы текущего этапа до следующего dispatch. `recovery_required` останавливает работу при отсутствующем или повреждённом обязательном input; сохранённый pending dispatch не дублируется и при недоступном транспорте остаётся `background_wait`/`transport_reconnect`. Rework сохраняет прежние результаты в immutable revision и переоткрывает затронутую часть, поэтому старые downstream proofs не завершают новую версию.
+
+В schema 2 ordinary `run_id`, `run_key` и `WorkIdentity.run_id` совпадают. Branch — контекст маршрутизации/проверки, не ключ запуска: новый запрос на другой ветке независим, а resume/rework на чужой ветке дают `run_context_mismatch`. Legacy state и старый `continuation` после cutover являются import-only; неизвестная schema, небезопасная ссылка или активное старое исполнение возвращают `migration_required`, `recovery_required` или `run_busy`, без legacy fallback. Lifecycle transaction восстанавливается автоматически: до canonical commit откатывается staging, после commit допустим только forward repair. Не удаляйте `.active-feature`/другие marker-файлы и не редактируйте canonical state вручную.
+
+### Canonical report и viewer
+
+Доступны оба read-only представления canonical run/revision:
+
+```text
+/session-report do-work id=<run-id> [revision=<revision-id>]
+/workflow-view do-work id=<run-id> [revision=<revision-id>]
+/workflow-view --all
+```
+
+`/session-report` пишет self-contained HTML, а `/workflow-view` — offline bundle в `.work-state/visualize`. Они читают только выбранный canonical run/revision; latest, slug и legacy state не являются fallback. Для legacy/unavailable источника команда возвращает явную `migration_required` или `canonical-unavailable` и предлагает сначала выполнить штатный import/select. Текущий viewer поддерживается для canonical reader; переработка UI/graph model остаётся отдельным будущим scope.
+
 The `agents/` and `skills/` directories are picked up by OMP's discovery automatically.
 
 ## URL-first lecture research
@@ -141,9 +175,10 @@ Provider comparisons use the dependency-light API at `@andvl1/omp-workflows-full
 | `/init-team` | Write `.omp/team.config.json` with detected/default stack mappings. |
 | `/interview <topic>` | Delegate structured clarification to the analyst. |
 | `/omp-model-roles` | Validate model-role configuration or delegate recommendations. |
-| `/session-report [do-work|cto] [id=<id>] [--full]` | Generate a self-contained offline HTML snapshot of one workflow session. |
+| `/session-report [do-work|cto] [id=<id>] [revision=<id>] [--full]` | Generate a self-contained offline HTML snapshot of one workflow session. |
+| `/workflow-view [do-work|cto] [id=<id>] [revision=<id>] [--all] [--full]` | Render a canonical workflow visualization bundle. |
 
-The three workflow entry points are registered directly; `/init-team`, `/interview`, `/omp-model-roles`, and `/session-report` remain custom-TS modules copied into project-local `.omp/commands/`. Most commands return prompts and do not dispatch subagents directly. `/session-report` is deterministic: it reads persisted state/artifacts, renders HTML, and writes only under `.work-state`.
+The three workflow entry points are registered directly; `/init-team`, `/interview`, `/omp-model-roles`, `/session-report`, and `/workflow-view` remain custom-TS modules copied into project-local `.omp/commands/`. Most commands return prompts and do not dispatch subagents directly. `/session-report` and `/workflow-view` are deterministic read-only renderers: they require canonical selectors, read persisted state/artifacts, and write only under `.work-state`.
 
 ## Model roles
 

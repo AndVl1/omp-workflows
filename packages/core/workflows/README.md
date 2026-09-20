@@ -16,22 +16,47 @@ mechanically. Same classification → same stage sequence.
 > command does NOT drive subagent dispatch itself — that surface is owned by the main agent
 > in OMP 17.x. The interpreter loop in `engine/{stage,run}.ts` is invoked by the main agent
 > via `createTaskCaller(TaskTool)` for every `single` / `consilium` stage.
+
+## Контракт жизненного цикла
+
+Профиль описывает порядок стадий, но не выбирает запуск по наличию state или имени ветки. Host ingress явно различает `new`, `resume` и `rework`; `/do-work` и `/team` используют один и тот же `workflow_prepare` и общий selected context.
+
+```text
+/do-work --new Добавить экспорт отчётов
+/do-work продолжи экспорт отчётов
+/do-work --resume
+/do-work --rework Исправить экспорт отчётов
+/do-work --list
+```
+
+UUID не нужен для обычного new/resume/rework: имя или пункт read-only списка сначала разрешается в точный `run_id`, затем `workflow_prepare` повторно проверяет target под lock. `--run <run-id>` остаётся явным техническим selector; неоднозначность возвращается пользователю и не разрешается по времени изменения. Результат перехода показывает operation, предыдущий и выбранный run, названия, статусы и continuation point; `run_busy` означает, что переход не опубликован.
+
+`resume` в новой сессии читает canonical schema-2 state и обязательные artifacts через `workflow_instructions` до зависимого dispatch: task, classification, cursor, pause, решения, ограничения и provenance не берутся из старого чата. `recovery_required` блокирует действие при отсутствующем/невалидном required input; pending или succeeded dispatch не повторяется. `rework` создаёт immutable revision snapshot, инвалидирует затронутые downstream outputs и сохраняет допустимые upstream results.
+
+Ordinary identity — `run_id = run_key = WorkIdentity.run_id`; branch остаётся контекстом маршрутизации и проверки, но не identity. На другой ветке создаётся новый независимый run, а resume/rework старого run отклоняются как `run_context_mismatch`. В одном физическом worktree действует один execution claim: живой или неизвестный coordinator/worker возвращает `run_busy`, а смерть coordinator не считается завершением workers.
+
+После consumer cutover legacy state и прежний `continuation` являются только import boundary. Неизвестная schema, повреждённая migration-транзакция или активный legacy dispatch возвращают `migration_required`, `recovery_required` или `run_busy`; старый marker не становится authority и не выбирается как fallback. Lifecycle journal восстанавливается до следующей мутации: до canonical commit возможен rollback staging, после commit — только forward repair с сохранением mapping. Не удаляйте marker и не редактируйте canonical state вручную.
+
+Status/report/view используют один canonical run/revision reader. `/workflow-view` и `/session-report` доступны для выбранного canonical run/revision; legacy/latest/slug selection возвращает явную migration guidance или `canonical-unavailable`, а не legacy fallback. Если для нового формата недостаточно локального reader-подключения, viewer отключается только для этого входа с переходом к text status/report; полная переработка UI или graph model остаётся будущим scope.
+
+Пользовательская справка и точные флаги находятся в [`core README`](../README.md) и [`fullstack command guide`](../../fullstack/README.md).
+
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `_schema.json` | JSON Schema for a profile (stage taxonomy, fields). |
-| `artifacts-schema.json` | Typed handoff contracts written to `.work-state/artifacts/<id>.json` (P2). |
+| `artifacts-schema.json` | Typed handoff contracts written under the selected run's `artifactsDir` (normally `.work-state/runs/<run-id>/artifacts/`) (P2). |
 | `<name>.json` | One profile per workflow. |
 | `stages/<id>.md` | Per-stage prompt templates / criteria, **loaded on demand** by the interpreter (P9). The file name equals the stage `id`. Keeps `commands/team.md` lean — it holds only governance; the "how" of each stage is read only when that stage runs. |
 | `cto.json` | CTO sub-orchestration profile (explicit `/cto` only — `match.type` is `[]`, never auto-selected). Stages: discovery → decomposition → teams (`type: team`, filled from `.omp/teams.json`) → integration review → summary. |
 | `teams.example.json` | Example TeamDef registry (`id, name, scope, profile, lead, roster`). Consumers copy it to `<project>/.omp/teams.json` to register their development teams for `/cto`. |
 
-> **Work-state paths.** The hooks read state from per-feature subdirs
-> (`.work-state/features/<slug>/state.json` — see `commands/team.md` § Work-state directory
-> layout) when `.work-state/.active-feature` is set, falling back to the legacy
-> `.work-state/team-state.json` for projects on the older single-state layout. Same schema,
-> same gates — just two physical locations.
+> **Canonical work-state paths.** Runtime lifecycle readers resolve the selected ordinary
+> run from `.work-state/runs/<run-id>/state.json` and its `artifacts/`/`revisions/`
+> children. `.work-state/.active-feature`, legacy feature directories, and
+> `.work-state/team-state.json` are import-only inputs; they are not runtime selectors
+> or a fallback authority after cutover.
 
 ## Stage taxonomy (`stage.type`)
 
@@ -152,10 +177,11 @@ ends at an explicit human approval gate.
    on either explicit `approved` or `rejected`. No implementation, task creation, or code work
    starts before approval; approval never launches implementation. Produces `lecture_decision`.
 
-**Artifacts.** Every stage writes typed artifacts to `.work-state/artifacts/<id>.json` per
-`artifacts-schema.json`: URL intake, provider-neutral acquisition, evidence-grounded mapping,
-synthesis with conflicts, repo-fit/security findings, and the explicit decision. The profile
-never produces source code.
+**Artifacts.** Every stage writes typed artifacts under the selected run's `artifactsDir`
+(`.work-state/runs/<run-id>/artifacts/` for canonical runs) per `artifacts-schema.json`:
+URL intake, provider-neutral acquisition, evidence-grounded mapping, synthesis with
+conflicts, repo-fit/security findings, and the explicit decision. The profile never produces
+source code.
 
 **Acquisition boundary.** Core cannot auto-acquire by itself. A consumer must register
 `lecture_acquire` (or route direct `core.run()` orchestration through `LectureAcquisitionPort`).
@@ -179,22 +205,22 @@ validates persisted state, profile hash and dispatch capability before any stage
 
 ## Interpreter contract (how `/team` walks a profile)
 
-1. **Classify** the request → emit a structured `CLASSIFICATION` block → write
-   `.work-state/team-state.json` **before launching any agent** (P5 gate).
+1. **Classify** the request → emit a structured `CLASSIFICATION` block → call
+   `workflow_prepare` so the selected canonical run is persisted before launching any agent.
 2. **Resolve** the profile from the table above; load `workflows/<name>.json`.
 3. For each stage in order:
    - **skip** if `skip_if` evaluates true.
-   - **read** every artifact id in `consumes` from `.work-state/artifacts/<id>.json` and
-     thread relevant content into subagent prompts (no pasted prose — P2).
+   - **read** every artifact id in `consumes` from the `artifactsDir` returned by
+     `workflow_instructions` and thread relevant content into subagent prompts (no pasted prose — P2).
    - **run** per `type`: orchestrator (inline), single (one Task), consilium (parallel Tasks),
      document (engine render at advance), bash (shell), none (skip). For `consilium`, apply `conditional[]` against scope flags to
      adjust the roster.
    - **resolve roles → agents**: agent name from `.omp/team.config.json` `roles` (P6), falling back to built-in defaults and legacy `.claude/team.config.json`. Model capability is set by agent frontmatter and OMP policy — low-tier agents use `@smol` + `thinkingLevel: medium`, middle-tier use `@task` + `thinkingLevel: auto`, high-tier use `@slow` + `thinkingLevel: high`. Concrete models are configured via OMP `modelRoles` or `task.agentModelOverrides`, not in workflow config.
-   - **checkpoint**: interactive → stop and wait; autonomous → apply `autonomous` decision + log.
+   - **checkpoint**: follow the declared typed checkpoint policy; interactive answers enter through `workflow_checkpoint_ask`. Routing/autonomy metadata never authorizes a checkpoint.
    - **gate**: do not mark the stage `done` until the gate condition holds.
-   - **write** the `produces` artifact to `.work-state/artifacts/<id>.json`.
+   - **write** the `produces` artifact to the selected run's `artifactsDir`.
    - **loop**: if the stage has a `loop`, repeat `back_to` until `until` or `max_iterations`.
-   - **advance** `stage_cursor` in `team-state.json` and mirror progress into `team-state.md`.
+   - **advance** the selected run's `stage_cursor` and mirror progress only through the configured run reader.
 
 The prose phase descriptions in `commands/team.md` remain as a **STAGE REFERENCE (fallback)** —
 the detailed prompt templates and review criteria live there. Profiles drive *which* stages
@@ -210,9 +236,10 @@ DONE** section in `commands/team.md` for the policy and per-type minimums.
 Enforcement is two-layered and **never wedges the session**:
 - **Primary**: the `dod_complete` gate (interpreter) and `root_cause_documented` gate (BUG_FIX,
   before implementation).
-- **Backstop**: `hooks/dod-gate.sh` (Stop) reads `.work-state/artifacts/dod.json` (typed, not
-  prose). It blocks (exit 2) **only at a done-claim** — `pause.kind == "done"` or
-  `stage_cursor == "summary"` — with unmet or evidence-less items.
+- **Backstop**: `hooks/dod-gate.sh` (Stop) reads the typed `dod` artifact from the selected run's
+  `artifactsDir`, not from a branch-derived or legacy path. It blocks (exit 2) **only at a
+  done-claim** — `pause.kind == "done"` or `stage_cursor == "summary"` — with unmet or
+  evidence-less items.
 
 Stop is always allowed (no DoD enforcement) when: `pause.kind` ∈
 `background_wait | user_checkpoint | needs_human | failed`; the workflow is
