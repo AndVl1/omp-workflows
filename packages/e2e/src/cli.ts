@@ -13,7 +13,7 @@
  */
 
 import { execSync, spawn, spawnSync } from 'node:child_process';
-import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { parseArgs, type ParseArgsConfig } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -140,6 +140,69 @@ export function parseBootstrapArgs(argv: string[]): BootstrapArgs {
   };
 }
 
+export interface ScratchPackageTargets {
+  readonly core: string;
+  readonly fullstack: string;
+}
+
+/** Materialize and validate scratch-local symlinks without touching npm globals. */
+export function ensureScratchPackageLinks(scratchDir: string, targets: ScratchPackageTargets): void {
+  const packageTargets = [
+    ['omp-workflows-core', targets.core],
+    ['omp-workflows-fullstack', targets.fullstack],
+  ] as const;
+  const canonicalTargets = packageTargets.map(([name, packagePath]) => {
+    const requestedTarget = resolve(packagePath);
+    let canonicalTarget: string;
+    try {
+      canonicalTarget = realpathSync(requestedTarget);
+    } catch (error) {
+      throw new Error(`ux-e2e: cannot resolve ${name} package target ${requestedTarget}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    let targetStat: ReturnType<typeof lstatSync>;
+    try {
+      targetStat = lstatSync(canonicalTarget);
+    } catch (error) {
+      throw new Error(`ux-e2e: cannot stat ${name} package target ${canonicalTarget}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!targetStat.isDirectory() || !existsSync(join(canonicalTarget, 'package.json'))) {
+      throw new Error(`ux-e2e: ${name} package target is not a package directory: ${canonicalTarget}`);
+    }
+    return [name, canonicalTarget] as const;
+  });
+
+  const linkRoot = join(resolve(scratchDir), 'node_modules', '@andvl1');
+  mkdirSync(linkRoot, { recursive: true });
+  for (const [name, canonicalTarget] of canonicalTargets) {
+    const linkPath = join(linkRoot, name);
+    let existing: ReturnType<typeof lstatSync> | null = null;
+    try {
+      existing = lstatSync(linkPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (existing !== null) {
+      if (!existing.isSymbolicLink()) {
+        throw new Error(`ux-e2e: refusing to replace scratch package entry ${linkPath}`);
+      }
+      let linkedTarget: string;
+      try {
+        linkedTarget = realpathSync(linkPath);
+      } catch (error) {
+        throw new Error(`ux-e2e: refusing to use unresolved scratch package link ${linkPath}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (linkedTarget !== canonicalTarget) {
+        throw new Error(`ux-e2e: scratch package link points outside the requested worktree: ${linkPath}`);
+      }
+      continue;
+    }
+    symlinkSync(canonicalTarget, linkPath, 'dir');
+    if (realpathSync(linkPath) !== canonicalTarget) {
+      throw new Error(`ux-e2e: scratch package link did not resolve to the requested worktree: ${linkPath}`);
+    }
+  }
+}
+
 /** Materialize the scratch project. Returns the scratch dir path. */
 export function runBootstrap(args: BootstrapArgs): string {
   const monorepo = args.monorepo ?? defaultMonorepoRoot();
@@ -165,6 +228,7 @@ export function runBootstrap(args: BootstrapArgs): string {
   if (!existsSync(join(corePkg, 'package.json')) || !existsSync(join(fullstackPkg, 'package.json'))) {
     throw new Error(`ux-e2e bootstrap: monorepo layout not found under ${monorepo} (expected packages/core and packages/fullstack)`);
   }
+  ensureScratchPackageLinks(scratchDir, { core: corePkg, fullstack: fullstackPkg });
   // omp overlay: no ask timeouts, progress UI, autolearn off, no setup wizard.
   const ompDir = join(scratchDir, '.omp');
   mkdirSync(ompDir, { recursive: true });
@@ -185,7 +249,7 @@ export function runBootstrap(args: BootstrapArgs): string {
   // Materialize custom-TS commands into <scratch>/.omp/commands/.
   const copyScript = join(fullstackPkg, 'scripts', 'copy-commands.mjs');
   if (existsSync(copyScript)) {
-    execSync(`${process.execPath} ${shellQuote(copyScript)} ${shellQuote(scratchDir)}`, { stdio: 'inherit' });
+    execSync(`${process.execPath} ${shellQuote(copyScript)} ${shellQuote(scratchDir)}`, { stdio: 'inherit', env: { ...process.env, OMP_PROJECT_DIR: scratchDir } });
   }
 
   materializeWorkspaceActivation(monorepo, scratchDir);
