@@ -31,6 +31,7 @@ import { generateReport, type ReportInput, type Verdict } from './report.js';
 import { loadScenario, type ScenarioDefinition } from './scenario.js';
 
 import { deferred } from './util.js';
+import { materializeWorkspaceActivation } from './workspace-activation.js';
 const USAGE = `ux-e2e — interactive UX E2E test framework for omp + omp-workflows
 
 Usage: ux-e2e <subcommand> [options]
@@ -164,10 +165,6 @@ export function runBootstrap(args: BootstrapArgs): string {
   if (!existsSync(join(corePkg, 'package.json')) || !existsSync(join(fullstackPkg, 'package.json'))) {
     throw new Error(`ux-e2e bootstrap: monorepo layout not found under ${monorepo} (expected packages/core and packages/fullstack)`);
   }
-  // npm link, NOT file: — file: deps fail to resolve the unpublished
-  // peer @oh-my-pi/pi-coding-agent with ETARGET.
-  execSync(`npm link ${shellQuote(corePkg)} ${shellQuote(fullstackPkg)}`, { cwd: scratchDir, stdio: 'inherit' });
-
   // omp overlay: no ask timeouts, progress UI, autolearn off, no setup wizard.
   const ompDir = join(scratchDir, '.omp');
   mkdirSync(ompDir, { recursive: true });
@@ -190,6 +187,8 @@ export function runBootstrap(args: BootstrapArgs): string {
   if (existsSync(copyScript)) {
     execSync(`${process.execPath} ${shellQuote(copyScript)} ${shellQuote(scratchDir)}`, { stdio: 'inherit' });
   }
+
+  materializeWorkspaceActivation(monorepo, scratchDir);
 
   console.log(`ux-e2e bootstrap: scratch project ready at ${scratchDir}`);
   return scratchDir;

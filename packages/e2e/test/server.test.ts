@@ -14,6 +14,7 @@ import { test } from 'node:test';
 import { WebSocket } from 'ws';
 
 import { deferred } from '../src/util.js';
+import { readWorkspaceActivation } from '../src/workspace-activation.js';
 
 import { waitFor, WaitTimeoutError } from '../src/driver.js';
 import {
@@ -84,6 +85,7 @@ test('server: mintToken/safeEqual primitives', () => {
 test('server: buildOmpArgs matches the launch contract', () => {
   const args = buildOmpArgs({
     ompProfile: 'ux-e2e-test',
+    extensionPath: '/worktree/packages/fullstack/dist/index.js',
     maxTimeSec: 1800,
     approvalMode: 'yolo',
     configPath: '/tmp/scratch/.omp/ux-e2e-overlay.json',
@@ -92,6 +94,7 @@ test('server: buildOmpArgs matches the launch contract', () => {
   });
   assert.deepEqual(args, [
     '--profile', 'ux-e2e-test',
+    '--extension', '/worktree/packages/fullstack/dist/index.js',
     '--config', '/tmp/scratch/.omp/ux-e2e-overlay.json',
     '--session-dir', '/tmp/scratch/.omp/agent',
     '--hide-thinking',
@@ -100,6 +103,25 @@ test('server: buildOmpArgs matches the launch contract', () => {
   ]);
   assert.ok(!args.includes('-p') && !args.includes('--print'), 'never passes -p/--print');
   assert.ok(!args.includes('--no-pty'), 'never passes --no-pty');
+});
+
+test("server: launch records explicit worktree extension and dispatch provenance", async t => {
+  const scratch = makeScratch();
+  const session = await startTestSession({ cwd: scratch, noPty: true, token: "sekret" });
+  t.after(() => session.close());
+
+  const sessionJson = JSON.parse(readFileSync(join(scratch, ".work-state", "ux-e2e", "session.json"), "utf8")) as {
+    launch: { argv: string[]; extension_path: string | null; dispatch_origin_dir: string; env: { OMP_WORKFLOWS_DISPATCH_ORIGIN_DIR: string } };
+  };
+  const activation = readWorkspaceActivation(scratch);
+  assert.ok(activation);
+  assert.equal(sessionJson.launch.extension_path, activation.fullstackExtension);
+  const extensionIndex = sessionJson.launch.argv.indexOf("--extension");
+  assert.ok(extensionIndex >= 0);
+  assert.equal(sessionJson.launch.argv[extensionIndex + 1], activation.fullstackExtension);
+  const dispatchOriginDir = join(scratch, ".work-state", "ux-e2e", "dispatch-origin");
+  assert.equal(sessionJson.launch.dispatch_origin_dir, dispatchOriginDir);
+  assert.equal(sessionJson.launch.env.OMP_WORKFLOWS_DISPATCH_ORIGIN_DIR, dispatchOriginDir);
 });
 
 test('server: buildOmpArgs omits --profile when ompProfile is unset (default = inherit host profile)', () => {
