@@ -94,6 +94,28 @@ function writeSessionFile(path: string, body: string): void {
   }
 }
 
+/**
+ * Preserve a non-empty transcript before a scratch session is restarted.
+ * Restarting the PTY must not erase the raw evidence needed to explain a
+ * fresh-session resume. The active transcript remains a clean append-only
+ * stream for the new session; the archive is sibling evidence, not runtime
+ * state and is never read as workflow authority.
+ */
+function archivePriorTranscript(transcriptPath: string, stateDir: string): string | null {
+  if (!existsSync(transcriptPath)) return null;
+  const previous = readFileSync(transcriptPath, 'utf8');
+  if (previous.length === 0) return null;
+  const stamp = new Date().toISOString().replace(/[^0-9]/gu, '');
+  let archivePath = join(stateDir, `transcript-${stamp}.jsonl`);
+  let suffix = 1;
+  while (existsSync(archivePath)) {
+    archivePath = join(stateDir, `transcript-${stamp}-${String(suffix)}.jsonl`);
+    suffix += 1;
+  }
+  writeSessionFile(archivePath, previous);
+  return archivePath;
+}
+
 function appendSessionFile(path: string, body: string): void {
   appendFileSync(path, body, { mode: SESSION_FILE_MODE });
   try {
@@ -1060,7 +1082,9 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   mkdirSync(stateDir, { recursive: true, mode: SESSION_DIR_MODE });
   const transcriptPath = join(stateDir, 'transcript.jsonl');
   const sessionJsonPath = join(stateDir, 'session.json');
-  // Truncate the transcript — a fresh session starts with a clean evidence file.
+  const previousTranscript = archivePriorTranscript(transcriptPath, stateDir);
+  // Start each PTY with a clean current stream; the previous stream is retained
+  // next to it when a scratch session is resumed.
   writeSessionFile(transcriptPath, '');
 
   const ompVersion = await resolveOmpVersion(ompBinary);
@@ -1143,6 +1167,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     tty: { cols, rows, term: 'xterm-256color' },
     task_prompt: opts.taskPrompt !== null && opts.taskPrompt !== undefined ? sanitizeForJson(opts.taskPrompt) : null,
     scenario: opts.scenario ?? null,
+    previous_transcript: previousTranscript,
     surface,
     host_config: {
       path: hostConfig.path,

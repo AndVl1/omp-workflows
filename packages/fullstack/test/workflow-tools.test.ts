@@ -8,8 +8,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import {
   dispatchGate,
-  createCapability,
-  type IssuedCapability,
+  beginCapability,
   authorizeDispatch,
   completeDispatch,
   buildAgentMapping,
@@ -24,6 +23,8 @@ import {
   recordWorkTerminal,
   writeConfig,
   writeAgentMapping,
+  prepareWorkflowState,
+  runTarget,
 } from "@andvl1/omp-workflows-core";
 import {
   FULLSTACK_BUNDLE_ID,
@@ -129,17 +130,42 @@ function publishMapping(root: string): void {
 
 test("fullstack: workflow_begin exposes role-bound dispatch markers", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-workflow-marker-handoff-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    writeConsiliumBeginFixture(root);
     publishMapping(root);
-    const tools = new Map<string, RegisteredTool>();
-    registerWorkflowTools({
-      zod: { z },
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
+    const prepared = prepareWorkflowState({
+      cwd: root,
+      branch: "main",
+      task: "consilium marker regression",
+      autonomous: true,
+      classification: { type: "SPEC", complexity: "COMPLEX", confidence: "HIGH", autonomous: true, workflow: "spec-preparation" },
+      mode: "new",
+      execution: {
+        session_id: "session-direct",
+        caller: "host",
+        process_id: process.pid,
+        worktree: root,
+        branch: "main",
+        authority: "coordinator",
       },
-    } as never);
+    });
+    mkdirSync(prepared.artifactsDir, { recursive: true });
+    writeFileSync(join(prepared.artifactsDir, "product_spec.json"), JSON.stringify({
+      recommendation: "proceed",
+      value_proposition: "make the specification handoff traceable",
+      opportunity: "the workflow needs durable product context",
+      target_users: ["workflow maintainers"],
+      solution_direction: "persist the approved product direction as canonical JSON",
+      success_metrics: ["handoff preserves product context"],
+      guardrail_metrics: ["no product context is silently dropped"],
+      scope: ["canonical product context"],
+      anti_scope: ["application implementation"],
+      risks: ["fixture context may become stale"],
+      validation_plan: ["verify canonical artifact consumption"],
+      evidence_trace: [],
+      open_decisions: [],
+    }) + "\n");
 
     const begin = tools.get("workflow_begin")!;
     const response = await begin.execute(
@@ -147,10 +173,11 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
       {},
       undefined,
       undefined,
-      { cwd: root, hasUI: true } as never,
+      { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never,
     );
     const details = response.details as {
       ok?: boolean;
+      error?: string;
       handoff?: {
         run_key: string;
         stage_cursor: string;
@@ -158,7 +185,7 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
         dispatch_markers?: Array<{ role: string; agent: string; marker: string }>;
       };
     };
-    assert.equal(details.ok, true);
+    assert.equal(details.ok, true, details.error);
     const markers = details.handoff?.dispatch_markers ?? [];
     assert.deepEqual(
       markers.map(({ role, agent }) => ({ role, agent })),
@@ -169,12 +196,12 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
       ],
     );
     for (const marker of markers) {
-      assert.match(marker.marker, /<!-- omp-dispatch run=main stage=intake_repo_map kind=consilium/);
+      assert.match(marker.marker, new RegExp(`<!-- omp-dispatch run=${details.handoff?.run_key} stage=intake_repo_map kind=consilium`));
       assert.match(marker.marker, new RegExp(`cursor=${details.handoff?.cursor_epoch}`));
       assert.match(marker.marker, new RegExp(`role=${marker.role}`));
     }
     const instructions = tools.get("workflow_instructions")!;
-    const instructionResponse = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const instructionResponse = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
     const instructionDetails = instructionResponse.details as { stage?: { slot_artifacts?: Record<string, string[]> } };
     assert.deepEqual(instructionDetails.stage?.slot_artifacts, {
       analyst: ["spec_intake_repo_map-analyst"],
@@ -192,24 +219,35 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
     }, { cwd: root });
     assert.equal(gate, undefined);
   } finally {
+    await fireSessionStop({ cwd: root, mode: "tui", hasUI: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_instructions exposes declared artifact schemas", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-workflow-artifact-schemas-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    writeBeginFixture(root, "main");
-    const tools = new Map<string, RegisteredTool>();
-    registerWorkflowTools({
-      zod: { z },
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
+    prepareWorkflowState({
+      cwd: root,
+      branch: "main",
+      task: "artifact schema fixture",
+      autonomous: false,
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      mode: "new",
+      execution: {
+        session_id: "session-direct",
+        caller: "host",
+        process_id: process.pid,
+        worktree: root,
+        branch: "main",
+        authority: "coordinator",
       },
-    } as never);
+    });
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
     const instructions = tools.get("workflow_instructions")!;
-    const response = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const response = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
     const details = response.details as {
       stage?: {
         artifact_schemas?: Record<string, {
@@ -228,68 +266,44 @@ test("fullstack: workflow_instructions exposes declared artifact schemas", async
     assert.equal(schemas.dod?.properties?.items?.items?.type, "object");
     assert.deepEqual(schemas.dod?.properties?.items?.items?.required, ["criterion", "verify_method", "status"]);
   } finally {
+    await fireSessionStop({ cwd: root, mode: "tui", hasUI: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
 test("fullstack: workflow_status exposes completion artifact bindings", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-workflow-status-artifacts-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    mkdirSync(join(root, ".work-state"), { recursive: true });
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
-    const issued = createCapability({
-      run_key: "main",
-      branch: "main",
-      workflow: "lightweight",
-      profile_hash: persistedProfileHash,
-      stage_cursor: "implementation",
-      kind: "single",
-      expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
-    });
-    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
-      schema: 1,
-      branch: "main",
-      run_key: "main",
-      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
-      task: "status artifact binding",
-      stage_cursor: "implementation",
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" : stage.id === "discovery" ? "done" : "pending" })),
-      artifacts: {},
-      scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: "developer-kotlin" },
-      policy: { strict_orchestrator: true },
-      pause: { kind: "none", reason: "" },
-      profile_hash: persistedProfileHash,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      dispatch_capability: issued.state,
-    }) + "\n");
-    const tools = new Map<string, RegisteredTool>();
-    registerWorkflowTools({
-      zod: { z },
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
-      },
-    } as never);
+    const issued = writeCheckpointAskFixture(root);
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    const binding = issued.state.issued_for!;
+    const rosterEntry = issued.state.expected_roster?.[0];
     const auth = {
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
-      run_key: "main",
-      branch: "main",
-      workflow: "lightweight",
-      profile_hash: persistedProfileHash,
-      stage_cursor: "implementation",
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      loop_iteration: issued.state.issued_for!.loop_iteration,
-      role: "developer-kotlin",
-      agent: "developer-kotlin",
+      run_id: binding.run_key,
+      run_key: binding.run_key,
+      branch: binding.branch,
+      workflow: binding.workflow,
+      profile_hash: binding.profile_hash,
+      stage_cursor: binding.stage_cursor,
+      cursor_epoch: binding.cursor_epoch,
+      loop_iteration: binding.loop_iteration,
+      role: rosterEntry?.role ?? "developer-kotlin",
+      agent: rosterEntry?.agent ?? "developer-kotlin",
       tool_call_id: "tool-status-artifact",
     };
     const authorized = authorizeDispatch(root, auth);
     assert.equal(authorized.ok, true);
     assert.ok(authorized.ok && authorized.record);
-    mkdirSync(join(root, ".work-state", "artifacts"), { recursive: true });
-    writeFileSync(join(root, ".work-state", "artifacts", "implementation.json"), JSON.stringify({
+    const artifactsDir = runTarget(root, issued.state.issued_for!.run_key).artifactsDir!;
+    mkdirSync(artifactsDir, { recursive: true });
+    const statusStatePath = runTarget(root, issued.state.issued_for!.run_key).statePath!;
+    const statusState = JSON.parse(readFileSync(statusStatePath, "utf8")) as { artifacts?: Record<string, string> };
+    statusState.artifacts = { ...(statusState.artifacts ?? {}), implementation: "implementation.json" };
+    writeFileSync(statusStatePath, `${JSON.stringify(statusState)}\n`);
+    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({
       ready: true,
       validation_run: true,
       validation_evidence: "status binding fixture",
@@ -301,10 +315,10 @@ test("fullstack: workflow_status exposes completion artifact bindings", async ()
       outcome: "succeeded",
       evidence: "implementation completed",
       artifact_ids: ["implementation"],
-    });
-    assert.equal(completed.ok, true);
+    }, { runId: issued.state.issued_for!.run_key });
+    assert.equal(completed.ok, true, completed.ok ? undefined : completed.error);
     const status = tools.get("workflow_status")!;
-    const response = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const response = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
     const details = response.details as { capability?: { dispatches?: Array<Record<string, unknown>> } };
     assert.deepEqual(details.capability?.dispatches?.[0], {
       id: authorized.record.id,
@@ -318,6 +332,7 @@ test("fullstack: workflow_status exposes completion artifact bindings", async ()
       outcome: "succeeded",
     });
   } finally {
+    await fireSessionStop({ cwd: root, mode: "tui", hasUI: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -412,6 +427,7 @@ test("fullstack: workflow_prepare schema accepts PRODUCT_DISCOVERY classificatio
 test("fullstack: workflow_prepare persists PHASE-0 state in the canonical session cwd", async () => {
   const canonical = mkdtempSync(join(tmpdir(), "omp-workflow-prepare-canonical-"));
   const stale = mkdtempSync(join(tmpdir(), "omp-workflow-prepare-stale-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     // INT-001: the engine no longer falls back to core domain defaults, so the
@@ -427,13 +443,7 @@ test("fullstack: workflow_prepare persists PHASE-0 state in the canonical sessio
       },
       { cwd: canonical },
     );
-    const tools = new Map<string, RegisteredTool>();
-    registerWorkflowTools({
-      zod: { z },
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
-      },
-    } as never);
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: canonical, ui: {} });
 
     const prepare = tools.get("workflow_prepare")!;
     const response = await prepare.execute(
@@ -453,17 +463,16 @@ test("fullstack: workflow_prepare persists PHASE-0 state in the canonical sessio
       },
       undefined,
       undefined,
-      { cwd: stale, sessionManager: { getCwd: () => canonical }, hasUI: true } as never,
+      { cwd: stale, sessionManager: { getCwd: () => canonical, getSessionId: () => "session-direct" }, mode: "tui", session_id: "session-direct", hasUI: true } as never,
     );
 
-    const details = response.details as { ok?: boolean; state_path?: string; state?: { branch?: string } };
+    const details = response.details as { ok?: boolean; state_path?: string; state?: { run_id?: string; branch?: string } };
     assert.equal(details.ok, true);
     assert.equal(details.state?.branch, "main");
-    assert.equal(details.state_path, join(canonical, ".work-state", "features", "main", "state.json"));
+    assert.equal(details.state_path, runTarget(canonical, details.state?.run_id ?? "").statePath);
     const state = JSON.parse(readFileSync(details.state_path!, "utf8")) as {
       branch: string;
       task: string;
-
       classification?: { type: string; autonomous: boolean; workflow?: string };
       scope?: { scope: string[] };
     };
@@ -474,7 +483,7 @@ test("fullstack: workflow_prepare persists PHASE-0 state in the canonical sessio
       {},
       undefined,
       undefined,
-      { cwd: canonical, hasUI: true } as never,
+      { cwd: canonical, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => canonical, getSessionId: () => "session-direct" }, hasUI: true } as never,
     );
     assert.equal((beginResponse.details as { ok?: boolean }).ok, true);
     assert.equal(state.branch, "main");
@@ -490,26 +499,27 @@ test("fullstack: workflow_prepare persists PHASE-0 state in the canonical sessio
     assert.deepEqual(state.scope?.scope, ["backend-kotlin"]);
 
     const reopenResponse = await tools.get("workflow_prepare")!.execute(
-      "test",
+      "test-resume",
       {
-        task: "continue current workflow",
+        mode: "resume",
+        run_id: details.state?.run_id,
         branch: "main",
-        continuation: { feedback: "recheck the fix", stageId: "discovery" },
       },
       undefined,
       undefined,
-      { cwd: canonical, hasUI: true } as never,
+      { cwd: canonical, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => canonical, getSessionId: () => "session-direct" }, hasUI: true } as never,
     );
-    assert.equal((reopenResponse.details as { ok?: boolean }).ok, true);
+    assert.equal((reopenResponse.details as { ok?: boolean; error?: string }).ok, true, (reopenResponse.details as { error?: string }).error);
     const resumedBegin = await begin.execute(
       "test",
       {},
       undefined,
       undefined,
-      { cwd: canonical, hasUI: true } as never,
+      { cwd: canonical, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => canonical, getSessionId: () => "session-direct" }, hasUI: true } as never,
     );
     assert.equal((resumedBegin.details as { ok?: boolean }).ok, true);
   } finally {
+    await fireSessionStop({ cwd: canonical, mode: "tui", hasUI: true });
     rmSync(canonical, { recursive: true, force: true });
     rmSync(stale, { recursive: true, force: true });
   }
@@ -518,34 +528,41 @@ test("fullstack: workflow_prepare persists PHASE-0 state in the canonical sessio
 test("fullstack: workflow_begin follows the canonical session cwd, not a stale context cwd", async () => {
   const canonical = mkdtempSync(join(tmpdir(), "omp-workflow-canonical-"));
   const stale = mkdtempSync(join(tmpdir(), "omp-workflow-stale-"));
+  let fireSessionStop: ((ctx: Record<string, unknown>) => Promise<void>) | undefined;
   try {
     execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    writeBeginFixture(canonical, "main");
-    // This is the exact failure shape from the report: state says `main`,
-    // but the stale context directory has no active git branch.
-    writeBeginFixture(stale, "main");
-
-    const tools = new Map<string, RegisteredTool>();
-    registerWorkflowTools({
-      zod: { z },
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
+    prepareWorkflowState({
+      cwd: canonical,
+      branch: "main",
+      task: "canonical begin regression",
+      autonomous: false,
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      mode: "new",
+      execution: {
+        session_id: "session-direct",
+        caller: "host",
+        process_id: process.pid,
+        worktree: canonical,
+        branch: "main",
+        authority: "coordinator",
       },
-    } as never);
-
-    const begin = tools.get("workflow_begin")!;
+    });
+    const toolsAndLifecycle = registerToolsWithSessionSink();
+    fireSessionStop = toolsAndLifecycle.fireSessionStop;
+    await toolsAndLifecycle.fireSessionStart({ mode: "tui", hasUI: true, cwd: canonical, ui: {} });
+    const begin = toolsAndLifecycle.tools.get("workflow_begin")!;
     const response = await begin.execute(
       "test",
       {},
       undefined,
       undefined,
-      { cwd: stale, sessionManager: { getCwd: () => canonical }, hasUI: true } as never,
+      { cwd: stale, sessionManager: { getCwd: () => canonical, getSessionId: () => "session-direct" }, mode: "tui", session_id: "session-direct", hasUI: true } as never,
     );
-
     const details = response.details;
     if (!details || typeof details !== "object" || !("ok" in details)) throw new Error("workflow_begin response has no ok field");
     assert.equal(details.ok, true);
   } finally {
+    await fireSessionStop?.({ cwd: canonical, mode: "tui", hasUI: true });
     rmSync(canonical, { recursive: true, force: true });
     rmSync(stale, { recursive: true, force: true });
   }
@@ -666,48 +683,87 @@ test("fullstack: F7 core lifecycle exports remain public", () => {
 });
 
 function writeCheckpointAskFixture(root: string): IssuedCapability {
-  const profile = loadProfile("lightweight");
-  assert.ok(profile);
-  const persistedProfileHash = profileHash(profile);
-  const issued = createCapability({
-    run_key: "main",
+  // prepareWorkflowState resolves scope from the caller's registered preset;
+  // without this canonical config, src/main/App.kt cannot select a dev agent.
+  writeConfig(
+    join(root, ".omp", "team.config.json"),
+    {
+      roles: fullstackPreset.roles,
+      scope_map: fullstackPreset.scopeMap,
+      flags: fullstackPreset.flags,
+      scope_runtime_classes: fullstackPreset.scopeRuntimeClasses,
+      scope_ui_classes: fullstackPreset.scopeUiClasses,
+    },
+    { cwd: root },
+  );
+  const execution = {
+    session_id: "session-direct",
+    caller: "host" as const,
+    process_id: process.pid,
+    worktree: root,
     branch: "main",
-    workflow: "lightweight",
-    profile_hash: persistedProfileHash,
-    stage_cursor: "implementation",
-    kind: "single",
-    expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
-  });
-  mkdirSync(join(root, ".work-state"), { recursive: true });
-  writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
-    schema: 1,
+    authority: "coordinator" as const,
+  };
+  const prepared = prepareWorkflowState({
+    cwd: root,
     branch: "main",
-    run_key: "main",
-    classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
     task: "checkpoint ask ingest",
-    stage_cursor: "implementation",
-    stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" : "pending" })),
-    artifacts: {},
-    scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: "developer-kotlin" },
-    policy: { strict_orchestrator: true },
-    pause: { kind: "none", reason: "" },
-    profile_hash: persistedProfileHash,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    dispatch_capability: issued.state,
+    autonomous: false,
+    classification: {
+      type: "FEATURE",
+      complexity: "QUICK",
+      confidence: "HIGH",
+      autonomous: false,
+      workflow: "lightweight",
+    },
+    mode: "new",
+    execution,
+    files: ["src/main/App.kt"],
+  });
+  const runId = prepared.state.run_id!;
+  const state = JSON.parse(readFileSync(prepared.statePath!, "utf8")) as {
+    stages?: Array<{ id: string; status: string }>;
+    artifacts?: Record<string, string>;
+    [key: string]: unknown;
+  };
+  // Arm the implementation stage through the same durable begin transition
+  // used by the host. Its declared discovery input is a canonical prerequisite
+  // rather than an unbound hand-written capability.
+  state.artifacts = { ...(state.artifacts ?? {}), discovery: "discovery.json" };
+  state.stage_cursor = "implementation";
+  state.stages = (state.stages ?? []).map((stage) => ({
+    ...stage,
+    status: stage.id === "discovery" ? "done" : stage.id === "implementation" ? "in_progress" : "pending",
+  }));
+  writeFileSync(prepared.statePath!, `${JSON.stringify(state)}\n`);
+  mkdirSync(prepared.artifactsDir, { recursive: true });
+  writeFileSync(join(prepared.artifactsDir, "discovery.json"), JSON.stringify({
+    task: "checkpoint ask ingest",
+    branch: "main",
   }) + "\n");
-  return issued;
+  const begun = beginCapability(root, undefined, { runId });
+  if (!begun.ok || !begun.handoff || !begun.state.dispatch_capability) {
+    throw new Error(begun.ok ? "begin did not return a capability handoff" : begun.error);
+  }
+  return {
+    capability_id: begun.handoff.capability_id,
+    dispatch_token: begun.handoff.dispatch_token,
+    advance_token: begun.handoff.advance_token,
+    state: begun.state.dispatch_capability,
+  };
 }
 
 function checkpointAskAuth(issued: IssuedCapability) {
+  const binding = issued.state.issued_for!;
   return {
     token: issued.advance_token,
     capability_id: issued.capability_id,
-    run_key: "main",
-    branch: "main",
-    workflow: "lightweight",
-    stage_cursor: "implementation",
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    loop_iteration: issued.state.issued_for!.loop_iteration,
+    run_key: binding.run_key,
+    branch: binding.branch,
+    workflow: binding.workflow,
+    stage_cursor: binding.stage_cursor,
+    cursor_epoch: binding.cursor_epoch,
+    loop_iteration: binding.loop_iteration,
     checkpoint: "approve_implementation",
     checkpoint_id: "approve_implementation",
     checkpoint_kind: "implementation_approval",
@@ -723,6 +779,9 @@ function askDialogContext(root: string, answer: FakeAskDialogResult, calls: Fake
   return {
     cwd: root,
     hasUI: true,
+    mode: "tui",
+    session_id: "session-direct",
+    sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
     ui: {
       async askDialog(questions: FakeAskDialogQuestion[]): Promise<FakeAskDialogResult> {
         calls.push(questions);
@@ -752,16 +811,11 @@ function askToolSelection(selection: string[] | undefined, extra: Partial<{ time
 
 test("fullstack: workflow_checkpoint_ask ingests the terminal answer and its proof unblocks workflow_checkpoint", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-ask-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     const issued = writeCheckpointAskFixture(root);
-    const tools = new Map<string, RegisteredTool>();
-    registerWorkflowTools({
-      zod: { z },
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
-      },
-    } as never);
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
     const ask = tools.get("workflow_checkpoint_ask")!;
     const calls: FakeAskDialogQuestion[][] = [];
     const response = await ask.execute("test", {
@@ -786,7 +840,7 @@ test("fullstack: workflow_checkpoint_ask ingests the terminal answer and its pro
     assert.equal(calls[0]?.[0]?.multi, false);
     assert.match(calls[0]?.[0]?.question ?? "", /checkpoint 'approve_implementation'/);
     // The ingest persisted the durable answer; no decision exists yet.
-    const ingested = JSON.parse(readFileSync(join(root, ".work-state", "team-state.json"), "utf8")) as Record<string, unknown>;
+    const ingested = JSON.parse(readFileSync(runTarget(root, issued.state.issued_for!.run_key).statePath!, "utf8")) as Record<string, unknown>;
     const answers = ingested.trusted_checkpoint_answers as Array<Record<string, unknown>>;
     assert.equal(answers?.length, 1);
     assert.equal(answers[0]?.answer_id, details.actor_provenance?.proof?.answer_id);
@@ -798,13 +852,13 @@ test("fullstack: workflow_checkpoint_ask ingests the terminal answer and its pro
     const recorded = await checkpoint.execute("test", {
       token: issued.advance_token,
       capability_id: issued.capability_id,
-      run_key: "main",
-      branch: "main",
-      workflow: "lightweight",
-      profile_hash: profileHash(loadProfile("lightweight")),
-      stage_cursor: "implementation",
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      branch: issued.state.issued_for!.branch,
+      workflow: issued.state.issued_for!.workflow,
+      profile_hash: issued.state.issued_for!.profile_hash,
+      stage_cursor: issued.state.issued_for!.stage_cursor,
+      run_key: issued.state.issued_for!.run_key,
       loop_iteration: issued.state.issued_for!.loop_iteration,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
       checkpoint: "approve_implementation",
       checkpoint_id: "approve_implementation",
       checkpoint_kind: "implementation_approval",
@@ -812,10 +866,10 @@ test("fullstack: workflow_checkpoint_ask ingests the terminal answer and its pro
       actor_provenance: details.actor_provenance,
       decision: "proceed",
       rationale: "approved at the terminal",
-    }, undefined, undefined, { cwd: root, hasUI: true } as never);
+    }, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
     const recordedDetails = recorded.details as { ok?: boolean; error?: string };
     assert.equal(recordedDetails.ok, true, recordedDetails.error);
-    const decided = JSON.parse(readFileSync(join(root, ".work-state", "team-state.json"), "utf8")) as Record<string, unknown>;
+    const decided = JSON.parse(readFileSync(runTarget(root, issued.state.issued_for!.run_key).statePath!, "utf8")) as Record<string, unknown>;
     const typed = decided.typed_checkpoint_decisions as Array<Record<string, unknown>>;
     assert.equal(typed?.length, 1);
     assert.equal(typed[0]?.authorization, "human");
@@ -823,22 +877,18 @@ test("fullstack: workflow_checkpoint_ask ingests the terminal answer and its pro
     const consumed = (decided.trusted_checkpoint_answers as Array<Record<string, unknown>>)[0];
     assert.ok(consumed?.consumed_at, "the human answer is consumed after the decision");
   } finally {
+    await fireSessionStop({ cwd: root, mode: "tui", hasUI: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_checkpoint rejects a decision that diverges from the recorded human answer", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-diverge-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     const issued = writeCheckpointAskFixture(root);
-    const tools = new Map<string, RegisteredTool>();
-    registerWorkflowTools({
-      zod: { z },
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
-      },
-    } as never);
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
     const ask = tools.get("workflow_checkpoint_ask")!;
     const askResponse = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, askDialogContext(root, askToolSelection(["proceed"]), []) as never);
     const askDetails = askResponse.details as { ok?: boolean; error?: string; actor_provenance?: unknown };
@@ -848,11 +898,11 @@ test("fullstack: workflow_checkpoint rejects a decision that diverges from the r
     const envelope = {
       token: issued.advance_token,
       capability_id: issued.capability_id,
-      run_key: "main",
-      branch: "main",
-      workflow: "lightweight",
-      profile_hash: profileHash(loadProfile("lightweight")),
-      stage_cursor: "implementation",
+      run_key: issued.state.issued_for!.run_key,
+      branch: issued.state.issued_for!.branch,
+      workflow: issued.state.issued_for!.workflow,
+      profile_hash: issued.state.issued_for!.profile_hash,
+      stage_cursor: issued.state.issued_for!.stage_cursor,
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       loop_iteration: issued.state.issued_for!.loop_iteration,
       checkpoint: "approve_implementation",
@@ -861,30 +911,26 @@ test("fullstack: workflow_checkpoint rejects a decision that diverges from the r
       authorization: "human",
       actor_provenance: askDetails.actor_provenance,
     };
-    const diverged = await checkpoint.execute("test", { ...envelope, decision: "reject", rationale: "model override" }, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const diverged = await checkpoint.execute("test", { ...envelope, decision: "reject", rationale: "model override" }, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
     const divergedDetails = diverged.details as { ok?: boolean; error?: string };
     assert.equal(divergedDetails.ok, false);
     assert.match(divergedDetails.error ?? "", /stale or mismatched/);
-    const decided = await checkpoint.execute("test", { ...envelope, decision: "proceed", rationale: "as answered" }, undefined, undefined, { cwd: root, hasUI: true } as never);
+    const decided = await checkpoint.execute("test", { ...envelope, decision: "proceed", rationale: "as answered" }, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
     const decidedDetails = decided.details as { ok?: boolean; error?: string };
     assert.equal(decidedDetails.ok, true, decidedDetails.error);
   } finally {
+    await fireSessionStop({ cwd: root, mode: "tui", hasUI: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_checkpoint_ask records nothing on decline, timeout, custom text, or unknown selection", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-decline-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     const issued = writeCheckpointAskFixture(root);
-    const tools = new Map<string, RegisteredTool>();
-    registerWorkflowTools({
-      zod: { z },
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
-      },
-    } as never);
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
     const ask = tools.get("workflow_checkpoint_ask")!;
     const declines: Array<[string, FakeAskDialogResult]> = [
       ["declined", undefined],
@@ -898,31 +944,27 @@ test("fullstack: workflow_checkpoint_ask records nothing on decline, timeout, cu
       const details = response.details as { ok?: boolean; code?: string; error?: string };
       assert.equal(details.ok, false, `${label} must not authorize`);
       assert.equal(details.code, "WORKFLOW_CHECKPOINT_DECLINED", `${label}: ${details.error}`);
-      const state = JSON.parse(readFileSync(join(root, ".work-state", "team-state.json"), "utf8")) as Record<string, unknown>;
+      const state = JSON.parse(readFileSync(runTarget(root, issued.state.issued_for!.run_key).statePath!, "utf8")) as Record<string, unknown>;
       assert.equal(state.trusted_checkpoint_answers, undefined, `${label} must not ingest an answer`);
     }
   } finally {
+    await fireSessionStop({ cwd: root, mode: "tui", hasUI: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_checkpoint_ask fails closed without UI, for unauthenticated callers, and stays idempotent when resolved", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-closed-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     const issued = writeCheckpointAskFixture(root);
-    const tools = new Map<string, RegisteredTool>();
-    registerWorkflowTools({
-      zod: { z },
-      registerTool(tool: RegisteredTool) {
-        tools.set(tool.name, tool);
-      },
-    } as never);
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
     const ask = tools.get("workflow_checkpoint_ask")!;
     const calls: FakeAskDialogQuestion[][] = [];
 
     // Headless session: hasUI is true but no UI surface is bound.
-    const unavailable = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, { cwd: root, hasUI: true } as never);
+    const unavailable = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
     const unavailableDetails = unavailable.details as { ok?: boolean; code?: string };
     assert.equal(unavailableDetails.ok, false);
     assert.equal(unavailableDetails.code, "WORKFLOW_CHECKPOINT_ASK_UNAVAILABLE");
@@ -949,7 +991,7 @@ test("fullstack: workflow_checkpoint_ask fails closed without UI, for unauthenti
       actor_provenance: (first.details as { actor_provenance?: unknown }).actor_provenance,
       decision: "proceed",
       rationale: "approved at the terminal",
-    }, undefined, undefined, { cwd: root, hasUI: true } as never);
+    }, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
     assert.equal((recorded.details as { ok?: boolean; error?: string }).ok, true, (recorded.details as { error?: string }).error);
     const callsAfterAnswer = calls.length;
     const replay = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, askDialogContext(root, undefined, calls) as never);
@@ -959,6 +1001,7 @@ test("fullstack: workflow_checkpoint_ask fails closed without UI, for unauthenti
     assert.equal(replayDetails.decision, "proceed");
     assert.equal(calls.length, callsAfterAnswer, "resolved checkpoints never re-prompt the human");
   } finally {
+    await fireSessionStop({ cwd: root, mode: "tui", hasUI: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -973,53 +1016,112 @@ test("fullstack: workflow_checkpoint_ask fails closed without UI, for unauthenti
  */
 function registerToolsWithSessionSink(): {
   tools: Map<string, RegisteredTool>;
-  fireSessionStart: (ctx: Record<string, unknown>) => void;
+  fireSessionStart: (ctx: Record<string, unknown>) => Promise<void>;
+  fireSessionStop: (ctx: Record<string, unknown>) => Promise<void>;
 } {
   const tools = new Map<string, RegisteredTool>();
-  let sessionStart: ((event: unknown, ctx: unknown) => void) | undefined;
+  const sessionStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
+  const sessionStops: Array<(event: unknown, ctx: unknown) => unknown> = [];
   registerWorkflowTools({
     zod: { z },
     registerTool(tool: RegisteredTool) {
       tools.set(tool.name, tool);
     },
-    on(_event: string, handler: (event: unknown, ctx: unknown) => void) {
-      sessionStart = handler;
+    on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+      if (event === "session_start") sessionStarts.push(handler);
+      if (event === "session_stop") sessionStops.push(handler);
     },
   } as never);
-  return { tools, fireSessionStart: (ctx) => sessionStart?.({}, ctx) };
+  return {
+    tools,
+    fireSessionStart: async (ctx) => {
+      const hostContext = {
+        ...ctx,
+        session_id: ctx.session_id ?? "session-direct",
+        sessionManager: {
+          getSessionId: () => ctx.session_id ?? "session-direct",
+          getCwd: () => ctx.cwd,
+        },
+      };
+      await Promise.all(sessionStarts.map(handler => handler({}, hostContext)));
+    },
+    fireSessionStop: async (ctx) => {
+      await Promise.all(sessionStops.map(handler => handler({}, ctx)));
+    },
+  };
 }
 
 test("fullstack: workflow tools trust the authoritative host profile across TUI, RPC, rpc-ui, json, print, and worker contexts", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-workflow-context-eligibility-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    writeBeginFixture(root, "main");
-    const { tools, fireSessionStart } = registerToolsWithSessionSink();
     const status = tools.get("workflow_status")!;
 
-    // Terminal TUI: the profile names the interactive surface and the
-    // per-call tool context carries the same UI (hasUI=true).
-    fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
-    const tui = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
-    assert.equal((tui.details as { ok?: boolean }).ok, true);
+    // Prepare through the trusted controller so the positive status read is
+    // backed by the session's canonical run selection, not a raw state seed.
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    const prepare = tools.get("workflow_prepare")!;
+    const prepared = await prepare.execute("host-profile-prepare", {
+      mode: "new",
+      task: "host profile eligibility",
+      branch: "main",
+      classification: {
+        type: "FEATURE",
+        complexity: "QUICK",
+        confidence: "HIGH",
+        autonomous: false,
+        workflow: "lightweight",
+      },
+    }, undefined, undefined, {
+      cwd: root,
+      hasUI: true,
+      mode: "tui",
+      session_id: "session-direct",
+      sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
+    } as never);
+    const preparedDetails = prepared.details as { ok?: boolean; error?: string; state?: { run_id?: string } };
+    assert.equal(preparedDetails.ok, true, preparedDetails.error);
+    const hostRunId = preparedDetails.state?.run_id;
+    if (!hostRunId) throw new Error("trusted host preparation did not return the selected canonical run id");
+    const tui = await status.execute("test-tui", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    assert.equal((tui.details as { ok?: boolean; error?: string }).ok, true, (tui.details as { error?: string }).error);
 
     // Plain rpc: the host passes no setToolUIContext (main.ts), so the
     // per-call tool context is UI-less (hasUI=false, no ui) while the
     // session profile carries the connected client's UI. The profile is
     // authoritative — this exact shape was misclassified as a worker
-    // (WORKFLOW_CONTEXT_REJECTED) before.
-    fireSessionStart({ mode: "rpc", hasUI: true, cwd: root, ui: { select: async () => undefined } });
-    const rpc = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
+    await fireSessionStart({ mode: "rpc", hasUI: true, cwd: root, ui: { select: async () => undefined } });
+    const rpcResume = await prepare.execute("host-profile-rpc-resume", {
+      mode: "resume",
+      run_id: hostRunId,
+      branch: "main",
+    }, undefined, undefined, {
+      cwd: root,
+      hasUI: false,
+      mode: "rpc",
+      session_id: "session-direct",
+    } as never);
+    const rpcResumeDetails = rpcResume.details as { ok?: boolean; error?: string };
+    assert.equal(rpcResumeDetails.ok, true, rpcResumeDetails.error);
+    const rpc = await status.execute("test-rpc", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
     assert.equal((rpc.details as { code?: string }).code, undefined);
-    assert.equal((rpc.details as { ok?: boolean }).ok, true);
+    assert.equal((rpc.details as { ok?: boolean; error?: string }).ok, true, (rpc.details as { error?: string }).error);
 
     // rpc-ui: the same profile, but the host also wires the tool context.
-    const rpcUi = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true, ui: { select: async () => undefined } } as never);
-    assert.equal((rpcUi.details as { ok?: boolean }).ok, true);
+    const rpcUi = await status.execute("test-rpc-ui", {}, undefined, undefined, {
+      cwd: root,
+      hasUI: true,
+      mode: "rpc",
+      session_id: "session-direct",
+      sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
+      ui: { select: async () => undefined },
+    } as never);
+    assert.equal((rpcUi.details as { ok?: boolean; error?: string }).ok, true, (rpcUi.details as { error?: string }).error);
 
     // json and print (headless single-shot) sessions never own the tools.
     for (const mode of ["json", "print"]) {
-      fireSessionStart({ mode, hasUI: false, cwd: root, ui: {} });
+      await fireSessionStart({ mode, hasUI: false, cwd: root, ui: {} });
       const headless = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
       assert.equal((headless.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED", mode);
     }
@@ -1030,21 +1132,22 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     const worker = await status.execute("worker", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
     assert.equal((worker.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
   } finally {
+    await fireSessionStop({ cwd: root, hasUI: true, mode: "tui" });
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_checkpoint_ask ingests the connected RPC client's select answer from the session profile", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-ask-rpc-"));
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     const issued = writeCheckpointAskFixture(root);
-    const { tools, fireSessionStart } = registerToolsWithSessionSink();
     const ask = tools.get("workflow_checkpoint_ask")!;
     const calls: Array<{ title: string; options: string[] }> = [];
     // Plain-rpc session: the profile carries the live select bridge; the
     // per-call tool context stays UI-less exactly as the host wires it.
-    fireSessionStart({
+    await fireSessionStart({
       mode: "rpc",
       hasUI: true,
       cwd: root,
@@ -1065,21 +1168,23 @@ test("fullstack: workflow_checkpoint_ask ingests the connected RPC client's sele
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0]!.options, ["proceed", "reject"]);
   } finally {
+    await fireSessionStop({ cwd: root, hasUI: true, mode: "rpc" });
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_checkpoint_ask fails closed in json/print headless sessions while the no-profile fallback keeps the legacy heuristic", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-ask-headless-"));
+  let fallbackStop: ((ctx: Record<string, unknown>) => Promise<void>) | undefined;
+  const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     const issued = writeCheckpointAskFixture(root);
-    const { tools, fireSessionStart } = registerToolsWithSessionSink();
     const ask = tools.get("workflow_checkpoint_ask")!;
     const status = tools.get("workflow_status")!;
 
     for (const mode of ["json", "print"]) {
-      fireSessionStart({ mode, hasUI: false, cwd: root, ui: {} });
+      await fireSessionStart({ mode, hasUI: false, cwd: root, ui: {} });
       const rejected = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, { cwd: root, hasUI: false } as never);
       assert.equal((rejected.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED", mode);
     }
@@ -1088,11 +1193,14 @@ test("fullstack: workflow_checkpoint_ask fails closed in json/print headless ses
     // per-call heuristic decides — interactive contexts pass, worker
     // contexts are rejected.
     const fallback = registerToolsWithSessionSink();
-    const mainCtx = await fallback.tools.get("workflow_status")!.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true } as never);
+    fallbackStop = fallback.fireSessionStop;
+    const mainCtx = await fallback.tools.get("workflow_status")!.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
     assert.equal((mainCtx.details as { ok?: boolean }).ok, true);
     const workerCtx = await fallback.tools.get("workflow_status")!.execute("worker", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
     assert.equal((workerCtx.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
   } finally {
+    await fireSessionStop({ cwd: root, hasUI: true, mode: "tui" });
+    await fallbackStop?.({ cwd: root, hasUI: true, mode: "tui" });
     rmSync(root, { recursive: true, force: true });
   }
 });

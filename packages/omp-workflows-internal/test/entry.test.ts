@@ -102,7 +102,6 @@ test("zero workflow-engine registration when workspace markers are absent", () =
 	assert.deepEqual(host.tools, [], "no tool registrations");
 	assert.equal(host.hooks.has("before_agent_start"), false, "engine gates not wired");
 	assert.equal(host.hooks.has("tool_call"), false, "engine gates not wired");
-	assert.equal(host.hooks.has("session_stop"), false, "engine gates not wired");
 	assert.equal(isRegisteredWorkflow("omp-feature") && false, false);
 	for (const capability of ALL_CAPABILITIES) assertUnclaimed(root, capability);
 });

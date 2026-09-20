@@ -8,12 +8,20 @@
  * parses and matches the type name — but the schema is preserved for ref.
  */
 
-import { constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { lifecycleTransactionStatus } from "./lifecycle-journal.js";
 import { recordArtifactWritten } from "../observability/hooks.js";
 
 const ARTIFACT_ID_RE = /^[A-Za-z0-9._-]+$/;
+const RUN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function canonicalRunIdFromArtifactsDir(path: string): string | undefined {
+  const normalized = path.replace(/\\/g, "/");
+  const match = normalized.match(new RegExp(`/\\.work-state/runs/(${RUN_ID_RE.source})/artifacts(?:/|$)`, "i"));
+  return match?.[1];
+}
 
 function assertArtifactId(id: string): void {
   if (!ARTIFACT_ID_RE.test(id) || id === "." || id === "..") {
@@ -94,12 +102,51 @@ interface FileGeneration {
 
 interface ArtifactJournalEntry {
   previous: FileGeneration | null;
+  /** Exact bytes intended for the next publication, persisted before rename. */
+  planned?: Pick<FileGeneration, "raw" | "sha256">;
   written: FileGeneration | null;
 }
 
 export interface ArtifactJournal {
   writes: Map<string, ArtifactJournalEntry>;
   observability: Array<() => void>;
+  cwd?: string;
+  durablePath?: string;
+  commitStatePath?: string;
+  commitStateHash?: string;
+  lifecycleTransactionId?: string;
+}
+
+function persistArtifactJournal(journal: ArtifactJournal): void {
+  if (!journal.durablePath) return;
+  const payload = { status: "prepared", commitStatePath: journal.commitStatePath, commitStateHash: journal.commitStateHash, lifecycleTransactionId: journal.lifecycleTransactionId, writes: Object.fromEntries(Array.from(journal.writes.entries()).map(([path, entry]) => [path, entry])) };
+  const tmp = `${journal.durablePath}.${randomUUID()}.tmp`;
+  mkdirSync(dirname(journal.durablePath), { recursive: true });
+  writeFileSync(tmp, JSON.stringify(payload), "utf8");
+  renameSync(tmp, journal.durablePath);
+}
+
+export function recoverArtifactJournals(cwd: string): void {
+  const root = join(resolve(cwd, ".work-state"), "artifact-transactions");
+  if (!existsSync(root)) return;
+  for (const name of readdirSync(root)) {
+    const path = join(root, name);
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as { writes?: Record<string, ArtifactJournalEntry>; commitStatePath?: string; commitStateHash?: string; lifecycleTransactionId?: string };
+      const writes = new Map(Object.entries(parsed.writes ?? {}));
+      // A crash may occur after rename but before the written inode is saved.
+      for (const [target, entry] of writes) {
+        if (entry.written || !entry.planned) continue;
+        const current = readGenerationNoFollow(target);
+        if (current && current.sha256 === entry.planned.sha256 && current.raw === entry.planned.raw) entry.written = current;
+      }
+      const journal: ArtifactJournal = { writes, observability: [], cwd, durablePath: path, commitStatePath: parsed.commitStatePath, commitStateHash: parsed.commitStateHash, lifecycleTransactionId: parsed.lifecycleTransactionId };
+      if (artifactJournalHasCommitBoundary(journal)) commitArtifactJournal(journal);
+      else rollbackArtifactJournal(journal);
+    } catch (error) {
+      throw new Error("artifact journal recovery failed for '" + name + "': " + (error as Error).message);
+    }
+  }
 }
 
 let artifactJournal: ArtifactJournal | null = null;
@@ -137,6 +184,10 @@ function sameGeneration(left: FileGeneration | null, right: FileGeneration | nul
     && left.sha256 === right.sha256;
 }
 
+function matchesPlannedGeneration(current: FileGeneration | null, planned: ArtifactJournalEntry["planned"]): boolean {
+  return current !== null && planned !== undefined && current.sha256 === planned.sha256 && current.raw === planned.raw;
+}
+
 function atomicRestore(path: string, raw: string): void {
   const tempPath = join(dirname(path), `.artifact-rollback.${randomUUID()}.tmp`);
   try {
@@ -153,9 +204,11 @@ function atomicRestore(path: string, raw: string): void {
 }
 
 /** Begin journaling artifact writes and transaction-bound observability. */
-export function beginArtifactJournal(): void {
+export function beginArtifactJournal(cwd?: string): void {
   if (artifactJournal) throw new Error("artifact journal is already active");
-  artifactJournal = { writes: new Map(), observability: [] };
+  const durablePath = cwd ? join(resolve(cwd, ".work-state", "artifact-transactions"), `${randomUUID()}.json`) : undefined;
+  artifactJournal = { writes: new Map(), observability: [], ...(cwd ? { cwd, durablePath } : {}) };
+  persistArtifactJournal(artifactJournal);
 }
 
 /** Stop journaling and return the captured transaction log. */
@@ -166,6 +219,34 @@ export function endArtifactJournal(): ArtifactJournal {
 }
 
 /** Publish one event now, or buffer it until the authoritative state commit. */
+export function markArtifactJournalCommit(statePath: string, stateContent: string): void {
+  if (!artifactJournal) return;
+  artifactJournal.commitStatePath = statePath;
+  artifactJournal.commitStateHash = createHash("sha256").update(stateContent, "utf8").digest("hex");
+  persistArtifactJournal(artifactJournal);
+}
+
+/** Link this artifact journal to the lifecycle transaction whose marker
+ * makes its after-image authoritative. */
+export function markArtifactJournalLifecycle(transactionId: string): void {
+  if (!artifactJournal) return;
+  artifactJournal.lifecycleTransactionId = transactionId;
+  persistArtifactJournal(artifactJournal);
+}
+
+export function artifactJournalHasCommitBoundary(journal: ArtifactJournal): boolean {
+  if (journal.lifecycleTransactionId && journal.cwd) {
+    const status = lifecycleTransactionStatus(journal.cwd, journal.lifecycleTransactionId);
+    if (status?.status === "committing" || status?.status === "committed") return true;
+  }
+  return Boolean(
+    journal.commitStatePath
+    && journal.commitStateHash
+    && existsSync(journal.commitStatePath)
+    && createHash("sha256").update(readFileSync(journal.commitStatePath)).digest("hex") === journal.commitStateHash,
+  );
+}
+
 export function publishAfterStateCommit(publish: () => void): void {
   if (artifactJournal) {
     artifactJournal.observability.push(publish);
@@ -176,6 +257,7 @@ export function publishAfterStateCommit(publish: () => void): void {
 
 /** Finalize a committed journal. Event hooks are best-effort by contract. */
 export function commitArtifactJournal(journal: ArtifactJournal): void {
+  if (journal.durablePath) { try { unlinkSync(journal.durablePath); } catch { /* best effort cleanup */ } }
   for (const publish of journal.observability) {
     try {
       publish();
@@ -194,31 +276,32 @@ export function rollbackArtifactJournal(journal: ArtifactJournal): void {
   for (const [path, entry] of Array.from(journal.writes.entries()).reverse()) {
     try {
       const current = readGenerationNoFollow(path);
-      if (!sameGeneration(current, entry.written)) continue;
-      if (entry.previous === null) {
-        unlinkSync(path);
-      } else {
-        atomicRestore(path, entry.previous.raw);
-      }
+      const ours = sameGeneration(current, entry.written) || (entry.written === null && matchesPlannedGeneration(current, entry.planned));
+      if (!ours) continue;
+      if (entry.previous === null) unlinkSync(path);
+      else atomicRestore(path, entry.previous.raw);
     } catch {
       // A changed/unsafe generation is deliberately not overwritten.
     }
   }
+  if (journal.durablePath) { try { unlinkSync(journal.durablePath); } catch { /* best effort cleanup */ } }
 }
 
 export function writeArtifact<T = unknown>(artifactsDir: string, id: string, data: T): string {
   assertArtifactId(id);
   mkdirSync(artifactsDir, { recursive: true });
   const path = safeArtifactPath(artifactsDir, id, true);
-  if (!path) throw new Error(`unsafe artifact path: ${id}`);
+  if (!path) throw new Error("unsafe artifact path: " + id);
+  const body = JSON.stringify(data, null, 2) + "\n";
   if (artifactJournal) {
     const existing = artifactJournal.writes.get(path);
-    if (!existing) {
-      const previous = readGenerationNoFollow(path);
-      artifactJournal.writes.set(path, { previous, written: null });
-    }
+    const entry = existing ?? { previous: readGenerationNoFollow(path), written: null };
+    entry.planned = { raw: body, sha256: createHash("sha256").update(body, "utf8").digest("hex") };
+    entry.written = null;
+    artifactJournal.writes.set(path, entry);
+    // Durable publication intent exists before rename, closing the crash gap.
+    persistArtifactJournal(artifactJournal);
   }
-  const body = JSON.stringify(data, null, 2) + "\n";
   const tempPath = join(artifactsDir, `.artifact.${randomUUID()}.tmp`);
   try {
     writeFileSync(tempPath, body, "utf8");
@@ -237,6 +320,7 @@ export function writeArtifact<T = unknown>(artifactsDir: string, id: string, dat
     const written = readGenerationNoFollow(path);
     if (!written) throw new Error(`artifact write vanished before journaling: ${path}`);
     entry.written = written;
+    persistArtifactJournal(artifactJournal);
   }
   // Best-effort artifact_written telemetry (additive; never blocks the write).
   // The project root is derived from the `.work-state` segment of the
@@ -249,6 +333,7 @@ export function writeArtifact<T = unknown>(artifactsDir: string, id: string, dat
           artifactId: id,
           artifactPath: relative(root, path),
           artifactBytes: Buffer.byteLength(body, "utf8"),
+          runId: canonicalRunIdFromArtifactsDir(artifactsDir),
         });
       } catch {
         // best-effort telemetry

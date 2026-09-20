@@ -164,11 +164,11 @@ export interface InternalDiscoveredAgent {
  */
 export type InternalAgentDiscovery = (cwd: string) => Promise<{ agents: ReadonlyArray<InternalDiscoveredAgent> }>;
 
-/** In-flight refreshes keyed by resolved session root (dedup per cwd). */
+/** In-flight refreshes keyed by resolved workspace root (dedup per cwd). */
 const mappingRefreshes = new Map<string, Promise<AgentMappingState>>();
 
 /**
- * Last discovery-verified mapping per resolved session root. The only
+ * Last discovery-verified mapping per resolved workspace root. The only
  * runtime source `beforeBegin` trusts: the persisted mapping file is a
  * write-through for non-handoff consumers and is never read back here.
  */
@@ -182,8 +182,8 @@ const freshMappings = new Map<string, AgentMappingState>();
  * closed. The typed error matches the kickoff gate so every seam rejects
  * identically.
  */
-function assertMarkersCurrent(sessionCwd: string): void {
-	if (!detectWorkspaceMarkers(sessionCwd).ok) {
+function assertMarkersCurrent(workspaceCwd: string): void {
+	if (!detectWorkspaceMarkers(workspaceCwd).ok) {
 		throw new Error(`activation_markers_missing: ${OMP_INTERNAL_ACTIVATION_MARKER}`);
 	}
 }
@@ -274,22 +274,24 @@ export function refreshInternalAgentMappings(
 	discover: InternalAgentDiscovery = defaultAgentDiscovery,
 ): Promise<AgentMappingState> {
 	const resolvedCwd = resolve(cwd);
-	const sessionCwd = existsSync(resolvedCwd) ? realpathSync(resolvedCwd) : resolvedCwd;
-	const running = mappingRefreshes.get(sessionCwd);
+	// Mapping authority is workspace-wide. Capture the canonical root before
+	// discovery suspends; no run/session selection is consulted or stored here.
+	const workspaceCwd = existsSync(resolvedCwd) ? realpathSync(resolvedCwd) : resolvedCwd;
+	const running = mappingRefreshes.get(workspaceCwd);
 	if (running) return running;
-	if (!detectWorkspaceMarkers(sessionCwd).ok) {
+	if (!detectWorkspaceMarkers(workspaceCwd).ok) {
 		// Markers removed mid-session: the workspace is no longer ours to
 		// serve — drop any cached runtime mapping with it.
-		freshMappings.delete(sessionCwd);
+		freshMappings.delete(workspaceCwd);
 		return Promise.reject(new Error(`activation_markers_missing: ${OMP_INTERNAL_ACTIVATION_MARKER}`));
 	}
-	const refresh = discover(sessionCwd)
+	const refresh = discover(workspaceCwd)
 		.then(({ agents }) => {
 			// Discovery just resolved after an async suspension: the workspace
 			// may have lost its markers while it was in flight.
-			assertMarkersCurrent(sessionCwd);
+			assertMarkersCurrent(workspaceCwd);
 			const inventory = bundleOwnedInventory(agents);
-			const config = resolveConfig(sessionCwd);
+			const config = resolveConfig(workspaceCwd);
 			const requiredAgents = [
 				...new Set(
 					requiredInternalProfileRoles(loadOmpWorkflowProfiles()).map(
@@ -319,9 +321,9 @@ export function refreshInternalAgentMappings(
 			});
 			// Publish-time re-check: nothing is written, cached or returned
 			// once activation is gone, however briefly discovery raced it.
-			assertMarkersCurrent(sessionCwd);
-			writeAgentMapping(sessionCwd, mapping);
-			freshMappings.set(sessionCwd, mapping);
+			assertMarkersCurrent(workspaceCwd);
+			writeAgentMapping(workspaceCwd, mapping);
+			freshMappings.set(workspaceCwd, mapping);
 			return mapping;
 		})
 		.catch((error: unknown) => {
@@ -330,13 +332,13 @@ export function refreshInternalAgentMappings(
 			// accepted one would authorize begin from a stale roster. The next
 			// begin re-attempts discovery or fails closed — it never falls back
 			// to the persisted mapping file.
-			freshMappings.delete(sessionCwd);
+			freshMappings.delete(workspaceCwd);
 			throw error;
 		})
 		.finally(() => {
-			mappingRefreshes.delete(sessionCwd);
+			mappingRefreshes.delete(workspaceCwd);
 		});
-	mappingRefreshes.set(sessionCwd, refresh);
+	mappingRefreshes.set(workspaceCwd, refresh);
 	return refresh;
 }
 
@@ -356,21 +358,23 @@ export function refreshInternalAgentMappings(
  * tampered) mapping file, which is never read back here. A joiner that
  * passed its own entry check still inherits the fail-closed rejection when
  * markers vanish while the joined refresh is in flight: the refresh
- * re-verifies markers at discovery completion and before publish.
+ * settles cleanly.
  */
 export function waitForInternalAgentMappings(
 	cwd: string,
 	discover: InternalAgentDiscovery = defaultAgentDiscovery,
 ): Promise<AgentMappingState> {
 	const resolvedCwd = resolve(cwd);
-	const sessionCwd = existsSync(resolvedCwd) ? realpathSync(resolvedCwd) : resolvedCwd;
-	if (!detectWorkspaceMarkers(sessionCwd).ok) {
-		freshMappings.delete(sessionCwd);
+	// Capture workspace scope synchronously; this callback never tracks a
+	// selected run and therefore cannot retarget a suspended discovery.
+	const workspaceCwd = existsSync(resolvedCwd) ? realpathSync(resolvedCwd) : resolvedCwd;
+	if (!detectWorkspaceMarkers(workspaceCwd).ok) {
+		freshMappings.delete(workspaceCwd);
 		return Promise.reject(new Error(`activation_markers_missing: ${OMP_INTERNAL_ACTIVATION_MARKER}`));
 	}
-	const running = mappingRefreshes.get(sessionCwd);
+	const running = mappingRefreshes.get(workspaceCwd);
 	if (running) return running;
-	const fresh = freshMappings.get(sessionCwd);
+	const fresh = freshMappings.get(workspaceCwd);
 	if (fresh) return Promise.resolve(fresh);
-	return refreshInternalAgentMappings(sessionCwd, discover);
+	return refreshInternalAgentMappings(workspaceCwd, discover);
 }

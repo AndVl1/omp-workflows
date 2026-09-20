@@ -26,6 +26,8 @@ import { classificationToolGate } from "../src/gates/classification.js";
 import { createTaskCaller, runStage, type TaskToolLike } from "../src/engine/stage.js";
 
 const genericRoles = { worker: "worker" };
+const CANONICAL_RUN_ID = "66666666-6666-4666-8666-666666666666";
+
 
 test("core: workflow commands register before project command discovery", async () => {
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
@@ -178,14 +180,27 @@ test("core: registerTeamWorkflow registers gates but NOT commands", () => {
 		"extension must not register slash commands",
 	);
 });
-test("core: task gate blocks launches without zero-step state", () => {
+
+test("core: selected canonical run blocks task launches without zero-step classification", () => {
   const root = join(tmpdir(), `omp-gate-${Date.now()}`);
-  mkdirSync(join(root, ".work-state"), { recursive: true });
-  writeFileSync(join(root, ".work-state", ".active-feature"), "pending\n");
+  const runDir = join(root, ".work-state", "runs", CANONICAL_RUN_ID);
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, "state.json"), JSON.stringify({
+    schema: 2,
+    run_id: CANONICAL_RUN_ID,
+    run_key: CANONICAL_RUN_ID,
+    lifecycle_status: "active",
+    branch: "feature/smoke",
+    task: "missing classification",
+    stage_cursor: "discovery",
+    stages: [{ id: "discovery", status: "pending" }],
+    artifacts: {},
+    pause: { kind: "none", reason: "" },
+  }));
   try {
-    const result = classificationToolGate({ toolName: "task" }, { cwd: root });
+    const result = classificationToolGate({ toolName: "task" }, { cwd: root, run_id: CANONICAL_RUN_ID });
     assert.equal(result?.block, true);
-    assert.match(result?.reason ?? "", /PHASE 0/);
+    assert.match(result?.reason ?? "", /missing classification|PHASE 0/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

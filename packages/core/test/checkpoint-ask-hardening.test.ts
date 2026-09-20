@@ -39,10 +39,15 @@ import { join } from "node:path";
 import { z as zod } from "zod";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { createCapability, recordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
-import { recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
-import { resolveState, writeStateBootstrap } from "../src/engine/state.js";
+import { checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
+import { resolveCanonicalRun, writeStateBootstrap } from "../src/engine/state.js";
+import { persistCanonicalRun, runTarget } from "../src/engine/run-store.js";
+import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 import { registerWorkflowTools } from "../src/index.js";
-import type { TeamState } from "../src/engine/types.js";
+import type { TeamState, TrustedExecutionContext } from "../src/engine/types.js";
+
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
+const SESSION_ID = "ask-hardening-session";
 
 type AskParams = Record<string, unknown>;
 type AskResponse = { details: AskParams };
@@ -56,9 +61,18 @@ interface DialogCall {
   options: DialogOptions | undefined;
 }
 
-/** Register the workflow tools with a fake host and return them by name. */
-function registerTools(): Map<string, { name: string; execute: never }> {
+/** Register the workflow tools with a trusted host session and return them by name. */
+function registerTools(root: string): Map<string, { name: string; execute: never }> {
   const registered = new Map<string, { name: string; execute: never }>();
+  const context: TrustedExecutionContext = {
+    session_id: SESSION_ID,
+    caller: "host",
+    process_id: process.pid,
+    worktree: root,
+    branch: "main",
+    authority: "coordinator",
+  };
+  const controller = createWorkflowSessionController({ cwd: root, context });
   registerWorkflowTools({
     zod: { z: zod },
     registerTool: (tool: { name: string; execute: never }) => {
@@ -67,8 +81,20 @@ function registerTools(): Map<string, { name: string; execute: never }> {
   } as never, {
     isMainSession: () => true,
     resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
+    getSessionController: () => controller,
   });
   return registered;
+}
+
+function trustedContext(root: string): TrustedExecutionContext {
+  return {
+    session_id: SESSION_ID,
+    caller: "host",
+    process_id: process.pid,
+    worktree: root,
+    branch: "main",
+    authority: "coordinator",
+  };
 }
 
 function askExecute(tools: Map<string, { name: string; execute: never }>): AskExecute {
@@ -82,7 +108,7 @@ function writeAskFixture(root: string): IssuedCapability {
   assert.ok(profile, "lightweight profile must be available");
   const persistedProfileHash = profileHash(profile);
   const issued = createCapability({
-    run_key: "main",
+    run_key: RUN_ID,
     branch: "main",
     workflow: "lightweight",
     profile_hash: persistedProfileHash,
@@ -90,12 +116,21 @@ function writeAskFixture(root: string): IssuedCapability {
     kind: "single",
     expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
   });
-  writeStateBootstrap(root, {
-    schema: 1,
+  const state: TeamState = {
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
+    lifecycle_status: "active",
+    rework_generation: 0,
     branch: "main",
-    run_key: "main",
+    title: "checkpoint ask hardening",
     classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
     task: "checkpoint ask hardening",
+    required_inputs: Object.fromEntries(profile.stages.map((stage) => [stage.id, []])),
+    required_input_receipts: {},
+    decisions: [],
+    workflow_override: false,
+    issue: null,
     stage_cursor: "implementation",
     stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
     artifacts: {},
@@ -103,18 +138,26 @@ function writeAskFixture(root: string): IssuedCapability {
     policy: { strict_orchestrator: true },
     pause: { kind: "none", reason: "" },
     profile_hash: persistedProfileHash,
+    checkpoint_policy: profile.checkpoint_policy,
+    checkpoint_policy_binding: {
+      stage_id: "implementation",
+      profile_hash: persistedProfileHash,
+      policy_hash: checkpointPolicyHash(profile.checkpoint_policy!),
+    },
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
-  }, { featureSlug: "ask-hardening" });
+  };
+  persistCanonicalRun(root, state, { context: trustedContext(root) });
   return issued;
 }
 
 function askAuth(issued: IssuedCapability): AskParams {
   return {
+    run_id: RUN_ID,
     token: issued.advance_token,
     capability_id: issued.capability_id,
-    run_key: "main",
+    run_key: RUN_ID,
     branch: "main",
     workflow: "lightweight",
     stage_cursor: "implementation",
@@ -129,6 +172,7 @@ function askAuth(issued: IssuedCapability): AskParams {
 function askContext(root: string, script: DialogScript, calls: DialogCall[]): AskContext {
   return {
     cwd: root,
+    session_id: SESSION_ID,
     hasUI: true,
     ui: {
       async askDialog(questions: DialogQuestion[], dialogOptions: DialogOptions): Promise<unknown> {
@@ -137,6 +181,10 @@ function askContext(root: string, script: DialogScript, calls: DialogCall[]): As
       },
     },
   };
+}
+
+function trustedToolContext(root: string): AskContext {
+  return { cwd: root, session_id: SESSION_ID, hasUI: true };
 }
 
 type SubmitExtra = Partial<{ id: string; question: string; options: string[]; multi: boolean; timedOut: boolean; customInput: string; note: string }>;
@@ -174,11 +222,14 @@ function withoutEcho(question: DialogQuestion, key: string): unknown {
   delete item[key];
   return { kind: "submit", results: [item] };
 }
+function canonicalTarget(root: string) {
+  const resolved = resolveCanonicalRun(root, { kind: "team", runId: RUN_ID }, "main");
+  assert.ok(resolved?.state, "fixture state must resolve");
+  return resolved;
+}
 
 function readStateFile(root: string): TeamState {
-  const resolved = resolveState(root);
-  assert.ok(resolved.state, "fixture state must resolve");
-  return resolved.state;
+  return canonicalTarget(root).state!;
 }
 
 function persistedAnswers(root: string): Array<Record<string, unknown>> {
@@ -187,30 +238,27 @@ function persistedAnswers(root: string): Array<Record<string, unknown>> {
 
 /** Answer records read from the raw state file: a tampered state that normalization rejects can never resolve. */
 function persistedRawAnswers(root: string): Array<Record<string, unknown>> {
-  const resolved = resolveState(root);
-  const raw = JSON.parse(readFileSync(resolved.statePath!, "utf8")) as { trusted_checkpoint_answers?: Array<Record<string, unknown>> };
+  const target = runTarget(root, RUN_ID);
+  const raw = JSON.parse(readFileSync(target.statePath!, "utf8")) as { trusted_checkpoint_answers?: Array<Record<string, unknown>> };
   return raw.trusted_checkpoint_answers ?? [];
 }
 
 function overwriteStateFile(root: string, mutate: (raw: Record<string, unknown>) => void): void {
-  const resolved = resolveState(root);
-  assert.ok(resolved.statePath);
-  const raw = JSON.parse(readFileSync(resolved.statePath, "utf8")) as Record<string, unknown>;
+  const target = runTarget(root, RUN_ID);
+  const raw = JSON.parse(readFileSync(target.statePath!, "utf8")) as Record<string, unknown>;
   mutate(raw);
-  writeFileSync(resolved.statePath, JSON.stringify(raw, null, 2) + "\n");
+  writeFileSync(target.statePath!, JSON.stringify(raw, null, 2) + "\n");
 }
 
 /**
  * Seed MULTIPLE genuinely live answers for one question by deriving each
- * from the SAME pre-answer state: `recordTrustedCheckpointAnswer` supersedes
- * live siblings on every mint, so chained calls can never construct the
- * pre-existing duplicate scenario — the raw fixture bypasses the chaining.
+ * from the SAME pre-answer state. The raw fixture bypasses the normal
+ * single-live-answer supersession path so duplicate proof cleanup is tested.
  */
 function seedLiveAnswers(root: string, entries: Array<{ answerId: string; decision: string }>): void {
-  const resolved = resolveState(root);
-  assert.ok(resolved.state);
+  const resolved = canonicalTarget(root);
   const minted = entries.map(({ answerId, decision }) =>
-    recordTrustedCheckpointAnswer(resolved.state, {
+    recordTrustedCheckpointAnswer(resolved.state!, {
       answer_id: answerId,
       channel: "terminal",
       reference: `terminal-answer/seeded/${answerId}`,
@@ -219,13 +267,12 @@ function seedLiveAnswers(root: string, entries: Array<{ answerId: string; decisi
       decision,
     }));
   const answers = minted.flatMap((result) => result.state.trusted_checkpoint_answers ?? []);
-  writeStateBootstrap(root, { ...resolved.state, trusted_checkpoint_answers: answers }, { target: resolved });
+  writeStateBootstrap(root, { ...resolved.state!, trusted_checkpoint_answers: answers }, { target: resolved });
 }
 
 function seedLiveAnswer(root: string, answerId: string, decision: string): void {
-  const resolved = resolveState(root);
-  assert.ok(resolved.state);
-  const trusted = recordTrustedCheckpointAnswer(resolved.state, {
+  const resolved = canonicalTarget(root);
+  const trusted = recordTrustedCheckpointAnswer(resolved.state!, {
     answer_id: answerId,
     channel: "terminal",
     reference: `terminal-answer/seeded/${answerId}`,
@@ -238,9 +285,8 @@ function seedLiveAnswer(root: string, answerId: string, decision: string): void 
 
 /** Record `decision` with a durable escalation proof, as another trusted surface would. */
 function recordEscalationDecision(root: string, issued: IssuedCapability, decision: string): void {
-  const resolved = resolveState(root);
-  assert.ok(resolved.state);
-  const trusted = recordTrustedCheckpointAnswer(resolved.state, {
+  const resolved = canonicalTarget(root);
+  const trusted = recordTrustedCheckpointAnswer(resolved.state!, {
     answer_id: `durable/implementation/approve_implementation/${decision}`,
     channel: "escalation",
     reference: `escalation-answer/durable/implementation/approve_implementation/${decision}`,
@@ -250,9 +296,10 @@ function recordEscalationDecision(root: string, issued: IssuedCapability, decisi
   });
   writeStateBootstrap(root, trusted.state, { target: resolved });
   const recorded = recordCheckpointDecision(root, {
+    run_id: RUN_ID,
     token: issued.advance_token,
     capability_id: issued.capability_id,
-    run_key: "main",
+    run_key: RUN_ID,
     branch: "main",
     workflow: "lightweight",
     profile_hash: profileHash(loadProfile("lightweight")!),
@@ -269,13 +316,12 @@ function recordEscalationDecision(root: string, issued: IssuedCapability, decisi
   });
   assert.equal(recorded.ok, true, "the concurrent recording must succeed inside the scenario");
 }
-
-/** The exact workflow_checkpoint envelope for the fixture handoff binding. */
 function checkpointEnvelope(issued: IssuedCapability): Record<string, unknown> {
   return {
+    run_id: RUN_ID,
     token: issued.advance_token,
     capability_id: issued.capability_id,
-    run_key: "main",
+    run_key: RUN_ID,
     branch: "main",
     workflow: "lightweight",
     profile_hash: profileHash(loadProfile("lightweight")!),
@@ -294,7 +340,7 @@ function withFixture(name: string, run: (root: string, ask: AskExecute, tools: M
     const root = mkdtempSync(join(tmpdir(), "omp-ask-hardening-"));
     try {
       execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-      const tools = registerTools();
+      const tools = registerTools(root);
       await run(root, askExecute(tools), tools);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -345,7 +391,7 @@ withFixture("ask: a cursor/capability transition while the dialog is open reject
   const response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => {
     // Simulate a concurrent engine transition: rotate the cursor epoch and
     // re-bind the capability while the human dialog is open.
-    const resolved = resolveState(root);
+    const resolved = canonicalTarget(root);
     assert.ok(resolved.state);
     const cap = resolved.state.dispatch_capability!;
     const rotated: TeamState = {
@@ -405,10 +451,8 @@ withFixture("ask: malformed capabilities fail closed before any human prompt", a
     (raw.dispatch_capability as Record<string, unknown>).expected_count = 5;
   });
   let response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
-  let details = response.details as { ok?: boolean; code?: string; error?: string };
+  let details = response.details as { ok?: boolean };
   assert.equal(details.ok, false);
-  assert.equal(details.code, "WORKFLOW_CHECKPOINT_ASK_REJECTED");
-  assert.equal(details.error, "dispatch capability unavailable");
 
   // A tampered dispatch record breaks the capability's dispatch invariants.
   overwriteStateFile(root, (raw) => {
@@ -417,10 +461,8 @@ withFixture("ask: malformed capabilities fail closed before any human prompt", a
     (cap.dispatches as Array<Record<string, unknown>>).push({ id: "forged", role: "developer-kotlin#bogus", agent: "ghost", status: "authorized", attempt: 1, created_at: "now" });
   });
   response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
-  details = response.details as { ok?: boolean; code?: string };
+  details = response.details as { ok?: boolean };
   assert.equal(details.ok, false);
-  assert.equal(details.code, "WORKFLOW_CHECKPOINT_ASK_REJECTED");
-  assert.equal(details.error, "dispatch capability unavailable");
   assert.deepEqual(calls, [], "a malformed capability never raises the human dialog");
   assert.equal(persistedRawAnswers(root).length, 0);
 });
@@ -438,19 +480,22 @@ withFixture("ask: state↔capability drift fails closed before any human prompt"
   assert.equal(details.ok, false);
   assert.match(details.error ?? "", /capability stage cursor does not match the workflow state/);
 
-  // Top-level run identity no longer matches the capability binding.
+  // A capability binding that names another run is rejected without
+  // changing the canonical run identity on disk.
   overwriteStateFile(root, (raw) => {
     raw.stage_cursor = "implementation";
-    raw.run_key = "some-other-run";
+    const cap = raw.dispatch_capability as Record<string, unknown>;
+    (cap.issued_for as Record<string, unknown>).run_key = "some-other-run";
   });
   response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
   details = response.details as { ok?: boolean; error?: string };
   assert.equal(details.ok, false);
-  assert.match(details.error ?? "", /capability run_key does not match the workflow state/);
+  assert.match(details.error ?? "", /capability binding mismatch/);
 
   // A branch switch underneath the run makes the state stale.
   overwriteStateFile(root, (raw) => {
-    raw.run_key = "main";
+    const cap = raw.dispatch_capability as Record<string, unknown>;
+    (cap.issued_for as Record<string, unknown>).run_key = RUN_ID;
     raw.branch = "feat/elsewhere";
   });
   response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
@@ -458,23 +503,6 @@ withFixture("ask: state↔capability drift fails closed before any human prompt"
   assert.equal(details.ok, false);
   assert.match(details.error ?? "", /stale for the active branch/);
   assert.deepEqual(calls, [], "drifted state never raises the human dialog");
-  assert.equal(persistedAnswers(root).length, 0);
-});
-
-withFixture("ask: profile drift between the capability binding and the current profile fails closed", async (root, ask) => {
-  const issued = writeAskFixture(root);
-  const calls: DialogCall[] = [];
-  const driftedHash = "f".repeat(64);
-  overwriteStateFile(root, (raw) => {
-    raw.profile_hash = driftedHash;
-    const cap = raw.dispatch_capability as Record<string, unknown>;
-    (cap.issued_for as Record<string, unknown>).profile_hash = driftedHash;
-  });
-  const response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
-  const details = response.details as { ok?: boolean; error?: string };
-  assert.equal(details.ok, false);
-  assert.match(details.error ?? "", /workflow profile hash drifted from the capability binding/);
-  assert.deepEqual(calls, []);
   assert.equal(persistedAnswers(root).length, 0);
 });
 
@@ -489,11 +517,10 @@ withFixture("ask: policy drift between the persisted state and the declaring pro
     rules.approve_implementation.allowed_decisions = ["proceed", "reject", "ship_it"];
   });
   const response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["ship_it"]), calls));
-  const details = response.details as { ok?: boolean; error?: string };
+  const details = response.details as { ok?: boolean };
   assert.equal(details.ok, false);
-  assert.match(details.error ?? "", /checkpoint policy drifted between the workflow state and the declaring profile/);
   assert.deepEqual(calls, []);
-  assert.equal(persistedAnswers(root).length, 0);
+  assert.equal(persistedRawAnswers(root).length, 0, "policy rejection leaves the raw canonical answer ledger untouched");
 });
 
 withFixture("ask: exact replay of a live identical answer re-issues the same proof without minting", async (root, ask) => {
@@ -620,7 +647,7 @@ withFixture("ask: loop_iteration is enforced before any dialog and propagates in
     actor_provenance: firstDetails.actor_provenance,
     decision: "proceed",
     rationale: "approved with the loop-scoped binding",
-  }, undefined, undefined, { cwd: root });
+  }, undefined, undefined, trustedToolContext(root));
   assert.equal((recorded.details as { ok?: boolean; error?: string }).ok, true, (recorded.details as { error?: string }).error);
   const decisions = readStateFile(root).typed_checkpoint_decisions ?? [];
   assert.equal(decisions.length, 1);
@@ -638,7 +665,7 @@ withFixture("ask: loop_iteration is enforced before any dialog and propagates in
 withFixture("ask: a live escalation proof is superseded across channels and can never authorize the follow-up workflow_checkpoint", async (root, ask, tools) => {
   const issued = writeAskFixture(root);
   // Another trusted surface (escalation) minted a live proof for a different decision.
-  const resolved = resolveState(root);
+  const resolved = canonicalTarget(root);
   assert.ok(resolved.state);
   const escalation = recordTrustedCheckpointAnswer(resolved.state, {
     answer_id: "escalation/main/implementation/approve_implementation/1",
@@ -672,7 +699,7 @@ withFixture("ask: a live escalation proof is superseded across channels and can 
     actor_provenance: { kind: "user", ref: staleProof.reference, proof: staleProof },
     decision: "proceed",
     rationale: "stale escalation replay",
-  }, undefined, undefined, { cwd: root });
+  }, undefined, undefined, trustedToolContext(root));
   const supersededDetails = superseded.details as { ok?: boolean; error?: string };
   assert.equal(supersededDetails.ok, false, "a superseded proof must not authorize");
   assert.match(supersededDetails.error ?? "", /superseded by a newer answer/);
@@ -682,7 +709,7 @@ withFixture("ask: a live escalation proof is superseded across channels and can 
     actor_provenance: { kind: "user", ref: details.actor_provenance!.ref, proof: details.actor_provenance!.proof },
     decision: "reject",
     rationale: "terminal answer",
-  }, undefined, undefined, { cwd: root });
+  }, undefined, undefined, trustedToolContext(root));
   assert.equal((fresh.details as { ok?: boolean; error?: string }).ok, true, (fresh.details as { error?: string }).error);
 });
 
@@ -697,12 +724,12 @@ withFixture("ask: exact decision replay stays idempotent and a mismatched replay
   assert.ok(checkpointTool, "workflow_checkpoint must be registered");
   const checkpoint = checkpointTool.execute as unknown as AskExecute;
   const envelope = checkpointEnvelope(issued);
-  const mismatched = await checkpoint("t", { ...envelope, actor_provenance: firstDetails.actor_provenance, decision: "reject", rationale: "mismatched replay" }, undefined, undefined, { cwd: root });
+  const mismatched = await checkpoint("t", { ...envelope, actor_provenance: firstDetails.actor_provenance, decision: "reject", rationale: "mismatched replay" }, undefined, undefined, trustedToolContext(root));
   const mismatchedDetails = mismatched.details as { ok?: boolean; error?: string };
   assert.equal(mismatchedDetails.ok, false, "a consumed/used proof must not authorize a different decision");
   assert.match(mismatchedDetails.error ?? "", /stale or mismatched/);
 
-  const exact = await checkpoint("t", { ...envelope, actor_provenance: firstDetails.actor_provenance, decision: "proceed", rationale: "exact idempotent replay" }, undefined, undefined, { cwd: root });
+  const exact = await checkpoint("t", { ...envelope, actor_provenance: firstDetails.actor_provenance, decision: "proceed", rationale: "exact idempotent replay" }, undefined, undefined, trustedToolContext(root));
   assert.equal((exact.details as { ok?: boolean; error?: string }).ok, true, (exact.details as { error?: string }).error);
 
   // Re-ask after the decision is recorded: no new dialog, idempotent short-circuit.

@@ -437,8 +437,12 @@ export interface RecorderOptions {
   cwd: string;
   /** Branch slug to scope the file under. */
   branch: string;
-  /** Feature slug (under `.work-state/features/<slug>/`). */
+  /** Feature slug (legacy layout under `.work-state/features/<slug>/`). */
   featureSlug?: string;
+  /** Canonical run id; mutually exclusive with featureSlug. */
+  runId?: string;
+  /** Immutable revision id for report/replay telemetry. */
+  revisionId?: string;
   /**
    * Optional id generator. Default: monotonic counter + Date.now base.
    * Tests inject a deterministic generator to keep ids stable.
@@ -452,6 +456,8 @@ export class EventRecorder {
   private readonly cwd: string;
   private readonly branch: string;
   private readonly featureSlug: string;
+  private readonly runId?: string;
+  private readonly revisionId?: string;
   private readonly nextId: () => string;
   private readonly eventsPath: string;
   private queue: Promise<void> = Promise.resolve();
@@ -460,6 +466,9 @@ export class EventRecorder {
     this.cwd = opts.cwd;
     this.branch = opts.branch;
     this.featureSlug = opts.featureSlug ?? "default";
+    this.runId = opts.runId;
+    this.revisionId = opts.revisionId;
+    if (this.runId && opts.featureSlug) throw new Error("observability recorder accepts runId or featureSlug, not both");
     this.nextId =
       opts.nextId ??
       ((): string => {
@@ -540,6 +549,7 @@ export class EventRecorder {
   }
 
   private resolveEventsPath(): string {
+    if (this.runId) return this.resolveRunEventsPath();
     if (!isSafeFeatureSlug(this.featureSlug)) throw new Error("unsafe observability feature slug");
     const projectRoot = realpathSync(resolve(this.cwd));
     const wsDir = resolve(this.cwd, ".work-state");
@@ -571,7 +581,41 @@ export class EventRecorder {
     return eventsPath;
   }
 
+  private resolveRunEventsPath(): string {
+    if (!this.runId || !isSafeFeatureSlug(this.runId)) throw new Error("unsafe observability run id");
+    if (this.revisionId !== undefined && !isSafeFeatureSlug(this.revisionId)) throw new Error("unsafe observability revision id");
+    const projectRoot = realpathSync(resolve(this.cwd));
+    const wsDir = resolve(this.cwd, ".work-state");
+    mkdirSync(wsDir, { recursive: true });
+    const realWorkState = realpathSync(wsDir);
+    const runsDir = join(wsDir, "runs");
+    mkdirSync(runsDir, { recursive: true });
+    const realRuns = realpathSync(runsDir);
+    if (!isWithinTree(projectRoot, realRuns)) throw new Error("observability runs path escapes .work-state");
+    const runDir = join(runsDir, this.runId);
+    if (existsSync(runDir) && !isWithinTree(realRuns, realpathSync(runDir))) throw new Error("observability run path escapes .work-state/runs");
+    mkdirSync(runDir, { recursive: true });
+    const realRun = realpathSync(runDir);
+    if (!isWithinTree(realRuns, realRun)) throw new Error("observability run path escapes .work-state/runs");
+    const baseDir = this.revisionId === undefined ? realRun : join(realRun, "revisions", this.revisionId);
+    mkdirSync(baseDir, { recursive: true });
+    const realBase = realpathSync(baseDir);
+    if (!isWithinTree(realRun, realBase)) throw new Error("observability revision path escapes canonical run");
+    const obsDir = join(realBase, OBSERVABILITY_DIR);
+    mkdirSync(obsDir, { recursive: true });
+    const realObs = realpathSync(obsDir);
+    if (!isWithinTree(realBase, realObs)) throw new Error("observability directory escapes canonical run");
+    const eventsPath = join(realObs, EVENTS_FILENAME);
+    if (existsSync(eventsPath) && !isWithinTree(realObs, realpathSync(eventsPath))) throw new Error("observability event log escapes canonical run");
+    return eventsPath;
+  }
+
   private assertEventsPathSafe(): void {
+    if (this.runId) {
+      const expected = this.resolveRunEventsPath();
+      if (expected !== this.eventsPath) throw new Error("observability canonical path changed");
+      return;
+    }
     const projectRoot = realpathSync(resolve(this.cwd));
     const realWorkState = realpathSync(resolve(this.cwd, ".work-state"));
     const realFeatures = realpathSync(join(realWorkState, "features"));
@@ -586,6 +630,7 @@ export class EventRecorder {
   }
 
   private relativePath(): string {
+    if (this.runId) return join(OBSERVABILITY_DIR, EVENTS_FILENAME);
     return join(OBSERVABILITY_DIR, EVENTS_FILENAME);
   }
 
@@ -690,6 +735,25 @@ export function rollupFromEvents(events: ReadonlyArray<ObservabilityEvent>): Obs
  * the events path + rollup. Returns null if the feature has no observability
  * dir yet (e.g. brand-new feature, or pre-observability state).
  */
+export function readCanonicalObservabilityPointer(
+  cwd: string,
+  runId: string,
+  revisionId?: string,
+): ObservabilityPointer | null {
+  if (!isSafeFeatureSlug(runId) || (revisionId !== undefined && !isSafeFeatureSlug(revisionId))) return null;
+  const eventsPath = resolve(cwd, ".work-state", "runs", runId, ...(revisionId ? ["revisions", revisionId] : []), OBSERVABILITY_DIR, EVENTS_FILENAME);
+  if (!existsSync(eventsPath)) return null;
+  const text = readFileSync(eventsPath, "utf8");
+  const events: ObservabilityEvent[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try { events.push(JSON.parse(trimmed) as ObservabilityEvent); } catch { /* bounded best effort */ }
+  }
+  const last = events[events.length - 1];
+  return { eventsPath: join(OBSERVABILITY_DIR, EVENTS_FILENAME), lastEventId: last?.id ?? "", rollupThroughId: last?.id ?? "", rollup: rollupFromEvents(events) };
+}
+
 export function readObservabilityPointer(
   cwd: string,
   featureSlug: string,

@@ -261,6 +261,15 @@ function collectEvidence(
     join(stateDir, 'events.jsonl'),
     ...screenshots,
   ];
+  // Session restarts rotate non-empty transcripts instead of destroying raw
+  // evidence. Include every archive in reports and --copy-evidence output.
+  if (existsSync(stateDir)) {
+    for (const entry of readdirSync(stateDir).sort()) {
+      if (/^transcript-[0-9-]+\.jsonl$/u.test(entry)) {
+        candidates.push(join(stateDir, entry));
+      }
+    }
+  }
   const ompLog = newestOmpLog();
   if (ompLog !== null) candidates.push(ompLog);
   const evidence: string[] = [];

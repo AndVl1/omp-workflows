@@ -1,22 +1,9 @@
 /**
- * Focused tests for the `/workflow-view` fullstack custom-TS command
- * (visualize OPT-A, architecture-8).
+ * Focused tests for the `/workflow-view` fullstack custom-TS command.
  *
- * The command is a thin orchestration shell over the core visualize API:
- * `listSessions` (discovery) → `buildSessionSnapshots` (one-read normalized
- * model with redaction/caps) → `buildManifest` → Markdown/HTML serializers →
- * `preflightLinks` (zero-dead-link gate) → `publishVisualize` (whole-tree
- * atomic swap). These tests drive the real command factory with fake
- * CustomCommandAPI/HookCommandContext and real core functions against temp
- * project roots:
- *   - argument parsing (bare / kind / id= / --all / --full / errors)
- *   - latest/selected/all selection semantics incl. legacy and CTO layouts
- *   - deterministic output paths, overwrite-on-rerun, source-mutation
- *     digest/content changes
- *   - --full embeds redacted bodies where the compact policy hides them
- *   - visible partiality of selected/latest vs completeness of --all
- *   - error paths (unknown/duplicate/unsafe args, unknown id, empty
- *     workspace, write failure) never write a bundle
+ * The command is a thin orchestration shell over the core visualize API.
+ * These tests retain pure legacy/CTO selection coverage, verify migration
+ * gating for ordinary legacy state, and cover the supported CTO/error paths.
  */
 
 import { test } from "node:test";
@@ -25,10 +12,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
-  readdirSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -39,13 +23,11 @@ import workflowViewFactory, {
   selectWorkflowSessions,
 } from "../commands/workflow-view/index.js";
 import {
-  VISUALIZE_OUTPUT_FILES,
   VISUALIZE_OUTPUT_ROOT,
   listSessions,
   sessionPagePath,
 } from "@andvl1/omp-workflows-core";
-import type { VisualizationManifest, VisualizationSnapshot } from "@andvl1/omp-workflows-core";
-
+import type { VisualizationSnapshot } from "@andvl1/omp-workflows-core";
 function makeProject(): { root: string; notifyCalls: string[] } {
   const root = mkdtempSync(join(tmpdir(), "workflow-view-cmd-"));
   return { root, notifyCalls: [] };
@@ -79,10 +61,6 @@ function fakeCtx(root: string, notifyCalls: string[]): Record<string, unknown> {
 function writeJson(path: string, value: unknown): void {
   mkdirSync(join(path, ".."), { recursive: true });
   writeFileSync(path, JSON.stringify(value, null, 2), "utf8");
-}
-
-function readJson<T>(path: string): T {
-  return JSON.parse(readFileSync(path, "utf8")) as T;
 }
 
 const STANDARD_STATE = {
@@ -312,60 +290,30 @@ test("command: /workflow-view factory boots", () => {
   assert.ok(cmd.description.includes("/workflow-view [do-work|cto|legacy]"));
 });
 
-test("command: bare invocation renders the latest session as a visibly partial bundle", async () => {
+test("command: bare ordinary view requires an explicit canonical run after cutover", async () => {
   const { root, notifyCalls } = makeProject();
   writeFeatureFixture(root, "alpha", { updated_at: "2026-08-08T10:00:00.000Z" });
-  writeFeatureFixture(root, "beta", { task: "Beta feature", updated_at: "2026-08-09T10:00:00.000Z" });
   const cmd = workflowViewFactory(fakeApi(root) as never);
   const result = await cmd.execute([], fakeCtx(root, notifyCalls) as never);
 
-  const viz = join(root, VISUALIZE_OUTPUT_ROOT);
-  assert.ok(existsSync(join(viz, "index.md")), "hub markdown written");
-  assert.ok(existsSync(join(viz, "index.html")), "hub html written");
-  assert.ok(existsSync(join(viz, "manifest.json")), "manifest written");
-  const betaMd = sessionPagePath("feature", "beta", "md");
-  const betaHtml = sessionPagePath("feature", "beta", "html");
-  assert.ok(existsSync(join(viz, betaMd)), "latest session page written");
-  assert.ok(existsSync(join(viz, betaHtml)), "latest session html written");
-  assert.ok(!existsSync(join(viz, "sessions", "feature", "alpha.md")), "older session not generated in selected scope");
-
-  const hub = readFileSync(join(viz, "index.html"), "utf8");
-  assert.ok(hub.includes("Partial bundle"), "selected hub is visibly partial");
-  assert.ok(hub.includes("selected / latest (partial)"), "hub badge marks the partial scope");
-  assert.ok(hub.includes("beta feature worktree"), "hub lists the selected session");
-  assert.ok(!hub.includes("alpha feature worktree"), "hub never links to the unselected session");
-
-  const manifest = readJson<VisualizationManifest>(join(viz, "manifest.json"));
-  assert.equal(manifest.scope, "selected");
-  assert.equal(manifest.counts.generatedSessions, 1);
-  assert.equal(manifest.counts.discoveredSessions, 2, "hub metadata reports the total discovered count, not the selected count");
-  assert.deepEqual(manifest.sessions.map((s) => s.id), ["beta"]);
-
-  assert.ok(result.includes(".work-state/visualize"), "status names the output root");
-  assert.ok(result.includes("selected/latest (partial)"), "status marks partiality");
-  assert.ok(result.includes("1 session generated (2 discovered)"), "status reports 1 generated of 2 discovered");
-  assert.ok(hub.includes("1 of 2 discovered"), "partial hub names the total discovered count");
-  assert.ok(result.includes("index.html"), "status names the hub page");
-  assert.ok(!result.includes(root), "status never exposes the absolute cwd");
-  assert.equal(notifyCalls.length, 1, "user notified once");
-  assert.ok(notifyCalls[0]!.includes("workflow-view:"), "notify prefix");
+  assert.match(result, /migration_required/);
+  assert.ok(!existsSync(join(root, VISUALIZE_OUTPUT_ROOT)), "legacy ordinary state is not rendered");
+  assert.equal(notifyCalls.length, 0, "migration failure does not notify as success");
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: selected kind/id writes the exact session; --all with id= is rejected", async () => {
+test("command: CTO view remains supported while ordinary feature view is migration-gated", async () => {
   const { root } = makeProject();
   writeFeatureFixture(root, "alpha");
-  writeFeatureFixture(root, "beta", { task: "Beta feature" });
   writeCtoFixture(root, "run-1");
   const cmd = workflowViewFactory(fakeApi(root) as never);
 
-  const byId = await cmd.execute(["do-work", "id=alpha"], fakeCtx(root, []) as never);
-  const viz = join(root, VISUALIZE_OUTPUT_ROOT);
-  assert.ok(existsSync(join(viz, sessionPagePath("feature", "alpha", "html"))));
-  assert.ok(!existsSync(join(viz, sessionPagePath("feature", "beta", "html"))), "other sessions not generated");
-  assert.ok(byId.startsWith("Workflow view written:"));
+  const ordinary = await cmd.execute(["do-work", "id=alpha"], fakeCtx(root, []) as never);
+  assert.match(ordinary, /migration_required/);
+  assert.ok(!existsSync(join(root, VISUALIZE_OUTPUT_ROOT)), "ordinary legacy state is not rendered");
 
   const byKind = await cmd.execute(["cto"], fakeCtx(root, []) as never);
+  const viz = join(root, VISUALIZE_OUTPUT_ROOT);
   assert.ok(existsSync(join(viz, sessionPagePath("cto", "run-1", "html"))));
   assert.ok(!byKind.includes("cto/run-1"), "status stays safe (no raw ids in path claims)");
 
@@ -375,140 +323,74 @@ test("command: selected kind/id writes the exact session; --all with id= is reje
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: --all renders every discoverable session as a complete bundle", async () => {
+test("command: --all ordinary view requires canonical runs after cutover", async () => {
   const { root } = makeProject();
-  writeFeatureFixture(root, "alpha", { updated_at: "2026-08-08T10:00:00.000Z" });
-  writeFeatureFixture(root, "beta", { task: "Beta feature", updated_at: "2026-08-09T10:00:00.000Z" });
-  writeCtoFixture(root, "run-1", "2026-08-10T11:00:00.000Z");
+  writeFeatureFixture(root, "alpha");
+  writeCtoFixture(root, "run-1");
   const cmd = workflowViewFactory(fakeApi(root) as never);
 
   const result = await cmd.execute(["--all"], fakeCtx(root, []) as never);
-  const viz = join(root, VISUALIZE_OUTPUT_ROOT);
-  for (const [kind, pathKey] of [["feature", "alpha"], ["feature", "beta"], ["cto", "run-1"]] as const) {
-    assert.ok(existsSync(join(viz, sessionPagePath(kind, pathKey, "md"))), `${kind}/${pathKey} md generated`);
-    assert.ok(existsSync(join(viz, sessionPagePath(kind, pathKey, "html"))), `${kind}/${pathKey} html generated`);
-  }
-
-  const hub = readFileSync(join(viz, "index.html"), "utf8");
-  assert.ok(hub.includes("all sessions (complete)"), "--all hub is the completeness mode");
-  assert.ok(hub.includes("alpha feature worktree") && hub.includes("beta feature worktree"), "hub lists every session");
-
-  const manifest = readJson<VisualizationManifest>(join(viz, "manifest.json"));
-  assert.equal(manifest.scope, "all");
-  assert.equal(manifest.counts.discoveredSessions, 3);
-  assert.equal(manifest.counts.generatedSessions, 3);
-  assert.equal(manifest.counts.generatedPages, 8);
-  assert.deepEqual(manifest.sessions.map((s) => s.id), ["run-1", "beta", "alpha"], "deterministic total order");
-  assert.ok(result.includes("all sessions (complete)"));
-  assert.ok(result.includes("3 sessions generated (3 discovered)"));
-  assert.ok(!result.includes(root), "no absolute paths in status");
+  assert.match(result, /migration_required/);
+  assert.ok(!existsSync(join(root, VISUALIZE_OUTPUT_ROOT)));
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: legacy and cto layouts write kind-namespaced pages", async () => {
+test("command: legacy viewer input requires migration while CTO remains namespaced", async () => {
   const { root } = makeProject();
   writeLegacyFixture(root);
   writeCtoFixture(root, "run-1");
   const cmd = workflowViewFactory(fakeApi(root) as never);
 
   const legacyResult = await cmd.execute(["legacy"], fakeCtx(root, []) as never);
-  const viz = join(root, VISUALIZE_OUTPUT_ROOT);
-  assert.ok(existsSync(join(viz, sessionPagePath("legacy", "legacy-root", "md"))), "legacy-root page written");
-  assert.ok(legacyResult.includes("selected/latest (partial)"));
+  assert.match(legacyResult, /migration_required/);
+  assert.ok(!existsSync(join(root, VISUALIZE_OUTPUT_ROOT)), "legacy root is not rendered");
 
   const ctoResult = await cmd.execute(["cto", "id=run-1", "--all"], fakeCtx(root, []) as never);
   assert.ok(ctoResult.startsWith("ERROR: --all is mutually exclusive with id="), "id= still rejects --all");
   const ctoOk = await cmd.execute(["cto", "id=run-1"], fakeCtx(root, []) as never);
-  assert.ok(existsSync(join(viz, sessionPagePath("cto", "run-1", "html"))), "cto page written");
+  assert.ok(existsSync(join(root, VISUALIZE_OUTPUT_ROOT, sessionPagePath("cto", "run-1", "html"))), "cto page written");
   assert.ok(!ctoOk.includes("run-1"), "status does not leak raw ids into path claims");
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: re-running overwrites the same bundle paths (static snapshot semantics)", async () => {
+test("command: ordinary reruns remain migration-gated", async () => {
   const { root } = makeProject();
   writeFeatureFixture(root, "alpha");
   const cmd = workflowViewFactory(fakeApi(root) as never);
-  const viz = join(root, VISUALIZE_OUTPUT_ROOT);
-  const page = join(viz, sessionPagePath("feature", "alpha", "md"));
 
-  await cmd.execute(["id=alpha"], fakeCtx(root, []) as never);
-  const first = readFileSync(page, "utf8");
-  const firstStat = statSync(page);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  await cmd.execute(["id=alpha"], fakeCtx(root, []) as never);
-  const second = readFileSync(page, "utf8");
-  const secondStat = statSync(page);
-
-  assert.ok(secondStat.mtimeMs >= firstStat.mtimeMs, "same page rewritten on re-run");
-  // Byte-identical except volatile generated_at timestamps (staleness stays
-  // fresh for both runs): normalize both the front-matter and overview
-  // renderings before comparing.
-  const stripVolatile = (text: string): string =>
-    text
-      .replace(/^generated_at: .*$/m, "generated_at: VOLATILE")
-      .replace(/- \*\*Generated at:\*\* .*/g, "- **Generated at:** VOLATILE");
-  assert.equal(stripVolatile(second), stripVolatile(first), "deterministic content across reruns");
-  assert.equal(readdirSync(join(root, VISUALIZE_OUTPUT_ROOT)).sort().join(","), "index.html,index.md,manifest.json,sessions");
+  const first = await cmd.execute(["id=alpha"], fakeCtx(root, []) as never);
+  const second = await cmd.execute(["id=alpha"], fakeCtx(root, []) as never);
+  assert.match(first, /migration_required/);
+  assert.match(second, /migration_required/);
+  assert.ok(!existsSync(join(root, VISUALIZE_OUTPUT_ROOT)));
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: source mutation changes the digest and rendered content", async () => {
+test("command: source mutation remains migration-gated until canonical import", async () => {
   const { root } = makeProject();
   writeFeatureFixture(root, "alpha", { task: "Build the /workflow-view command" });
   const cmd = workflowViewFactory(fakeApi(root) as never);
-  const viz = join(root, VISUALIZE_OUTPUT_ROOT);
 
-  await cmd.execute(["do-work", "id=alpha"], fakeCtx(root, []) as never);
-  const first = readJson<VisualizationManifest>(join(viz, "manifest.json"));
-  const firstDigest = first.sessions[0]!.sourceDigestBounded;
-  const firstHtml = readFileSync(join(viz, sessionPagePath("feature", "alpha", "html")), "utf8");
-  assert.ok(firstHtml.includes("Build the /workflow-view command"));
-
-  // Mutate the canonical state text (task changed; updated_at unchanged).
+  const first = await cmd.execute(["do-work", "id=alpha"], fakeCtx(root, []) as never);
   writeFeatureFixture(root, "alpha", { task: "Build the /workflow-view command v2" });
-  await cmd.execute(["do-work", "id=alpha"], fakeCtx(root, []) as never);
-
-  const second = readJson<VisualizationManifest>(join(viz, "manifest.json"));
-  const secondDigest = second.sessions[0]!.sourceDigestBounded;
-  const secondHtml = readFileSync(join(viz, sessionPagePath("feature", "alpha", "html")), "utf8");
-  assert.notEqual(secondDigest, firstDigest, "source digest changes with canonical content");
-  assert.ok(secondHtml.includes("v2"), "rendered content reflects the mutation");
-  assert.equal(second.sessions[0]!.id, first.sessions[0]!.id, "same stable identity after mutation");
+  const second = await cmd.execute(["do-work", "id=alpha"], fakeCtx(root, []) as never);
+  assert.match(first, /migration_required/);
+  assert.match(second, /migration_required/);
+  assert.ok(!existsSync(join(root, VISUALIZE_OUTPUT_ROOT)));
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: --full embeds redacted bodies that the compact policy hides", async () => {
+test("command: ordinary full/stale view requests remain migration-gated", async () => {
   const { root } = makeProject();
   writeBugFixFixture(root, "bugfix");
-  const cmd = workflowViewFactory(fakeApi(root) as never);
-  const viz = join(root, VISUALIZE_OUTPUT_ROOT);
-  const page = join(viz, sessionPagePath("feature", "bugfix", "html"));
-
-  // bug-fix is compact: bodies disabled by default → body-only string absent.
-  await cmd.execute(["do-work", "id=bugfix"], fakeCtx(root, []) as never);
-  const defaultHtml = readFileSync(page, "utf8");
-  assert.ok(!defaultHtml.includes("guard empty string"), "body hidden under the compact policy");
-  assert.ok(defaultHtml.includes("Validate the input"), "summary still visible");
-
-  await cmd.execute(["do-work", "id=bugfix", "--full"], fakeCtx(root, []) as never);
-  const fullHtml = readFileSync(page, "utf8");
-  assert.ok(fullHtml.includes("guard empty string"), "--full embeds the redacted body");
-  assert.ok(fullHtml.includes("add regression test"), "body content rendered");
-  rmSync(root, { recursive: true, force: true });
-});
-
-test("command: stale sessions surface the regenerate hint in status", async () => {
-  const { root } = makeProject();
   writeFeatureFixture(root, "alpha", { updated_at: "2099-01-01T00:00:00.000Z" });
   const cmd = workflowViewFactory(fakeApi(root) as never);
 
-  const result = await cmd.execute(["id=alpha"], fakeCtx(root, []) as never);
-  assert.ok(result.includes("stale (1)"), "status reports the stale count");
-  assert.ok(result.includes("run the on-demand visualize command to regenerate stale output"), "regenerate hint present");
-
-  const manifest = readJson<VisualizationManifest>(join(root, VISUALIZE_OUTPUT_ROOT, "manifest.json"));
-  assert.equal(manifest.counts.staleSessions, 1);
-  assert.equal(manifest.sessions[0]!.staleness, "stale");
+  const full = await cmd.execute(["do-work", "id=bugfix", "--full"], fakeCtx(root, []) as never);
+  const stale = await cmd.execute(["id=alpha"], fakeCtx(root, []) as never);
+  assert.match(full, /migration_required/);
+  assert.match(stale, /migration_required/);
+  assert.ok(!existsSync(join(root, VISUALIZE_OUTPUT_ROOT)));
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -568,45 +450,39 @@ test("command: unknown/duplicate arguments return usage and write nothing", asyn
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: unknown session id returns an error listing discoverable ids and writes nothing", async () => {
+test("command: unknown ordinary session id requires canonical import", async () => {
   const { root } = makeProject();
   writeFeatureFixture(root, "alpha");
   writeCtoFixture(root, "run-1");
   const cmd = workflowViewFactory(fakeApi(root) as never);
 
   const result = await cmd.execute(["id=ghost"], fakeCtx(root, []) as never);
-  assert.ok(result.startsWith("ERROR: session not found: ghost"));
-  assert.ok(result.includes("discoverable sessions: cto/run-1, feature/alpha"), "error lists discoverable ids");
+  assert.match(result, /migration_required/);
   assert.ok(!existsSync(join(root, VISUALIZE_OUTPUT_ROOT)), "nothing written");
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: empty workspace returns an error and creates nothing", async () => {
+test("command: empty ordinary workspace requires migration and creates nothing", async () => {
   const { root } = makeProject();
   const cmd = workflowViewFactory(fakeApi(root) as never);
 
   const bare = await cmd.execute([], fakeCtx(root, []) as never);
-  assert.ok(bare.startsWith("ERROR: no workflow sessions found under .work-state"));
-  assert.ok(bare.includes("Usage: /workflow-view"));
+  assert.match(bare, /migration_required/);
   assert.ok(!existsSync(join(root, ".work-state")), "no .work-state created on failure");
 
   const all = await cmd.execute(["--all"], fakeCtx(root, []) as never);
-  assert.ok(all.startsWith("ERROR:"));
+  assert.match(all, /migration_required/);
   assert.ok(!existsSync(join(root, ".work-state")), "--all also creates nothing");
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: write failure returns an error without touching the destination", async () => {
+test("command: ordinary write requests remain migration-gated", async () => {
   const { root } = makeProject();
   writeFeatureFixture(root, "alpha");
-  // Block the output root with a regular file → publish preflight conflict.
-  writeFileSync(join(root, VISUALIZE_OUTPUT_ROOT), "occupied", "utf8");
   const cmd = workflowViewFactory(fakeApi(root) as never);
 
   const result = await cmd.execute(["id=alpha"], fakeCtx(root, []) as never);
-  assert.ok(result.startsWith("ERROR: could not write workflow view:"), `error prefix: ${result}`);
-  assert.equal(readFileSync(join(root, VISUALIZE_OUTPUT_ROOT), "utf8"), "occupied", "destination untouched");
-  const wsEntries = readdirSync(join(root, ".work-state"));
-  assert.ok(!wsEntries.some((name) => name.startsWith(".visualize-staging-") || name.startsWith(".visualize-backup-")), "no staging/backup leftovers");
+  assert.match(result, /migration_required/);
+  assert.ok(!existsSync(join(root, VISUALIZE_OUTPUT_ROOT)));
   rmSync(root, { recursive: true, force: true });
 });

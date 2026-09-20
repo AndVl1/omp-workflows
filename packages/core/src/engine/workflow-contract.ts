@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join, isAbsolute } from "node:path";
 import { loadProfile, profileHash as sharedProfileHash, resolveWorkflowProfilePath } from "./profile.js";
 import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
-import { resolveActiveBranch, resolveState } from "./state.js";
-import { resolveStageDispatchSlots } from "./stage.js";
+import { resolveActiveBranch, resolveCanonicalRun, withWorkspaceRead } from "./state.js";
+import { readRequiredStageInputs, resolveStageDispatchSlots } from "./stage.js";
 import { sanitizeSlot } from "./fan-in.js";
 import { artifactSchemaFor, type JsonSchemaDef } from "./artifact-contract.js";
 import {
@@ -519,6 +520,7 @@ export interface WorkflowContractOptions {
   requireState?: boolean;
   workflow?: WorkflowName;
   branch?: string;
+  runId?: string;
   stageId?: string;
   maxInstructions?: number;
 }
@@ -532,12 +534,17 @@ export interface WorkflowStageContract {
   roles: Array<{ role: string; agent: string }>;
   parallel: boolean;
   consumes: string[];
-  produces: string[];
-  /** Exact JSON schemas for every declared output; null means unconstrained. */
-  artifact_schemas: Record<string, JsonSchemaDef | null>;
-  /** Artifact ids each dispatch slot must write before completion. */
+  /** Canonical evidence inputs that MUST be read before dependent dispatch. */
+  required_inputs: Array<{ artifact_id: string; path: string; sha256?: string }>;
+  /** Exact bytes read from required inputs; summaries cannot substitute for these. */
+  required_input_contents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
+  input_read_receipt: { stage_id: string; capability_id: string; cursor_epoch: string; rework_generation: number; read_at: string; inputs: Array<{ artifact_id: string; path: string; sha256: string }> } | null;
+  /** Artifact ids produced for each selected role/slot. */
   slot_artifacts: Record<string, string[]>;
-  /** Legacy checkpoint label retained for display/migration only. */
+  /** Persisted decisions restored from the selected run, never from chat text. */
+  decisions: Array<{ id: string; summary: string; artifact_id?: string; at: string; evidence?: string }>;
+  produces: string[];
+  artifact_schemas: Record<string, JsonSchemaDef | null>;
   checkpoint: string | null;
   /** Legacy prose; never treated as authorization. */
   autonomous: string | null;
@@ -610,6 +617,14 @@ export interface WorkflowContract {
     profileHash: string;
     stageCursor: string;
     stageStatuses: Array<{ id: string; status: string }>;
+    task: string;
+    classification: TeamState["classification"];
+    constraints: { branch: string; scope: TeamState["scope"] | null; policy: TeamState["policy"] | null };
+    pause: TeamState["pause"];
+    decisions: Array<{ id: string; summary: string; artifact_id?: string; at: string; evidence?: string }>;
+    required_inputs: Array<{ artifact_id: string; path: string; sha256?: string }>;
+    required_input_contents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
+    input_read_receipt: { stage_id: string; capability_id: string; cursor_epoch: string; rework_generation: number; read_at: string; inputs: Array<{ artifact_id: string; path: string; sha256: string }> } | null;
     completion_intent: CompletionIntent;
     checkpoint_policy: CheckpointPolicy | null;
     checkpoint_decision: CheckpointDecision | TypedCheckpointDecision | null;
@@ -648,7 +663,9 @@ export class WorkflowContractError extends Error {
     | "STAGE_MISSING"
     | "PROFILE_MISMATCH"
     | "POLICY_INVALID"
-    | "MIGRATION_CONFLICT";
+    | "MIGRATION_CONFLICT"
+    | "MIGRATION_REQUIRED"
+    | "RECOVERY_REQUIRED";
   constructor(code: WorkflowContractError["code"], message: string) {
     super(message);
     this.name = "WorkflowContractError";
@@ -727,14 +744,27 @@ function validationMessage(label: string, result: TypedContractValidationResult)
 
 /** Resolve the persisted run, profile and current stage into one bounded, typed contract. */
 export function resolveWorkflowContract(cwd: string, options: WorkflowContractOptions = {}): WorkflowContract {
-  const expectedBranch = options.branch ?? resolveActiveBranch(cwd);
-  const resolved = resolveState(cwd, expectedBranch);
-  if (resolved.invalid) throw new WorkflowContractError("STATE_INVALID", "workflow state is malformed or unsafe");
-  const state = resolved.state as TeamState | null;
-  if (options.requireState !== false && (!state || !resolved.statePath)) {
-    throw new WorkflowContractError("STATE_MISSING", "workflow contract requires an active persisted state");
+  try { return withWorkspaceRead(cwd, () => resolveWorkflowContractLocked(cwd, options), () => {
+    if (options.requireState === false && options.workflow) return resolveWorkflowContractLocked(cwd, options);
+    throw new WorkflowContractError(options.requireState === false ? "PROFILE_MISSING" : "STATE_MISSING", options.requireState === false ? "stateless workflow contract requires options.workflow" : "workflow state is missing");
+  }); }
+  catch (error) {
+    if (error instanceof WorkflowContractError) throw error;
+    throw new WorkflowContractError("RECOVERY_REQUIRED", `lifecycle journal recovery is required: ${(error as Error).message}`);
   }
-  if (state && resolved.isStale) {
+}
+
+function resolveWorkflowContractLocked(cwd: string, options: WorkflowContractOptions = {}): WorkflowContract {
+  const expectedBranch = options.branch ?? resolveActiveBranch(cwd);
+  const resolved = options.runId
+    ? resolveCanonicalRun(cwd, { kind: "team", runId: options.runId }, expectedBranch)
+    : null;
+  if (resolved?.invalid) throw new WorkflowContractError("STATE_INVALID", "workflow state is malformed or unsafe");
+  const state = resolved?.state as TeamState | null;
+  if (options.requireState !== false && (!state || !resolved?.statePath)) {
+    throw new WorkflowContractError("STATE_MISSING", "workflow state requires an explicit active run selector");
+  }
+  if (state && resolved?.isStale) {
     throw new WorkflowContractError("STATE_STALE", `workflow state branch '${state.branch}' is stale (current '${expectedBranch ?? "unknown"}')`);
   }
   if (state) {
@@ -769,6 +799,13 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
   if (!stage) throw new WorkflowContractError("STAGE_MISSING", `stage cursor '${stageId ?? ""}' is not present in '${workflow}'`);
   const stageValidation = validateTypedControlPlane(stage);
   if (!stageValidation.ok) throw new WorkflowContractError("POLICY_INVALID", validationMessage(`workflow stage '${stage.id}'`, stageValidation));
+  const requiredInputsResult = state && resolved?.artifactsDir
+    ? readRequiredStageInputs(stage, state, resolved.artifactsDir)
+    : { ok: true as const, inputs: [] };
+  if (!requiredInputsResult.ok) throw new WorkflowContractError("RECOVERY_REQUIRED", requiredInputsResult.error);
+  const requiredInputContents = requiredInputsResult.inputs;
+  const requiredInputManifest = requiredInputContents.map(({ artifact_id, path, sha256 }) => ({ artifact_id, path, sha256 }));
+
 
   const config = resolveConfig(cwd);
   const flags = state?.scope ?? resolveScope([], config);
@@ -919,9 +956,18 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     && validateActiveDispatchCapabilityValue(capability).ok
     && validateActiveCapabilityStateBinding(state).ok;
   const capabilityStatus = capabilityActive ? capability?.status : undefined;
+  const inputReadReceipt = state?.required_input_receipts?.[stage.id] ?? null;
+  const inputReceiptValid = requiredInputManifest.length === 0 || Boolean(inputReadReceipt
+    && inputReadReceipt.stage_id === stage.id
+    && inputReadReceipt.capability_id === capability?.capability_id
+    && inputReadReceipt.cursor_epoch === state?.cursor_epoch
+    && inputReadReceipt.rework_generation === (state?.rework_generation ?? 0)
+    && inputReadReceipt.inputs.length === requiredInputManifest.length
+    && inputReadReceipt.inputs.every((entry) => requiredInputManifest.some((required) => required.artifact_id === entry.artifact_id && required.path === entry.path && required.sha256 === entry.sha256)));
   const dispatchAllowed = state !== null &&
     kind !== null &&
     selectionReady &&
+    inputReceiptValid &&
     capabilityActive &&
     (capabilityStatus === "ready" || capabilityStatus === "dispatched");
   const selectedRoleAgents = roster_selection?.selected.map((entry) => ({ role: entry.slot_id, agent: entry.agent })) ?? [];
@@ -940,6 +986,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     stage.autonomous ? "stage.autonomous is display/migration input only" : null,
     !roster_policy && (stage.roles || stage.role) ? "legacy roles/role manifest remains exact and is not adaptive selection" : null,
     !roster_selection && roster_policy ? "adaptive stage awaits a frozen roster_selection before dispatch" : null,
+    !inputReceiptValid ? "required input read receipt is missing or stale; dependent dispatch is blocked" : null,
     staleSelection ? `stale roster_selection (stage '${staleSelection.stage_id}', epoch '${staleSelection.capability_epoch}') is masked for the current stage cursor` : null,
     declarationConflict ? `persisted checkpoint_policy conflicts with the declared policy for stage '${stage.id}'; the declared policy is shown and every authorizing use fails closed until workflow_begin re-projects the mirror` : null,
   ].filter((warning): warning is string => warning !== null);
@@ -964,6 +1011,20 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     roles: roleAgents,
     parallel: stage.parallel ?? stage.type === "consilium",
     consumes: stage.consumes ?? [],
+    required_inputs: requiredInputManifest,
+    required_input_contents: requiredInputContents,
+    input_read_receipt: inputReadReceipt,
+    decisions: (state?.decisions ?? []).map((decision) => ({
+      ...decision,
+      ...(decision.artifact_id && resolved?.artifactsDir ? (() => {
+        try {
+          const evidencePath = join(resolved.artifactsDir, `${decision.artifact_id}.json`);
+          return existsSync(evidencePath) ? { evidence: readFileSync(evidencePath, "utf8") } : {};
+        } catch {
+          return {};
+        }
+      })() : {}),
+    })),
     produces: typeof stage.produces === "string" ? [stage.produces] : stage.produces ?? [],
     artifact_schemas: artifactSchemasFor(stage),
     checkpoint_decision,
@@ -995,7 +1056,9 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     instructions: instructions(stage, options.maxInstructions ?? 4000),
     provenance: { source: "workflow", profilePath: path, profileHash: pHash, stageHash: hash(stage), control_plane },
   };
-  const stateRaw = resolved.statePath ? readFileSync(resolved.statePath, "utf8") : null;
+  const resolvedStatePath = resolved?.statePath ?? null;
+  const resolvedArtifactsDir = resolved?.artifactsDir ?? null;
+  const stateRaw = resolvedStatePath ? readFileSync(resolvedStatePath, "utf8") : null;
   const stateHash = stateRaw
     ? hash(JSON.parse(stateRaw))
     : hash({ source: "stateless", workflow, stage: stage.id, profileHash: pHash });
@@ -1013,9 +1076,17 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
     completion_envelope,
     status,
     state: {
-      path: resolved.statePath,
-      artifactsDir: resolved.artifactsDir,
+      path: resolvedStatePath,
+      artifactsDir: resolvedArtifactsDir,
       branch: state?.branch ?? expectedBranch ?? "",
+      task: state?.task ?? "",
+      classification: state?.classification ?? { type: "FEATURE", complexity: "QUICK", confidence: "LOW", autonomous: false, workflow },
+      constraints: { branch: state?.branch ?? expectedBranch ?? "", scope: state?.scope ?? null, policy: state?.policy ?? null },
+      pause: state?.pause ?? { kind: "none", reason: "" },
+      decisions: (state?.decisions ?? []).map((decision) => ({ ...decision })),
+      required_inputs: requiredInputManifest,
+      required_input_contents: requiredInputContents,
+      input_read_receipt: inputReadReceipt,
       workflow,
       profileHash: pHash,
       stageCursor: state?.stage_cursor ?? stage.id,
@@ -1040,7 +1111,7 @@ export function resolveWorkflowContract(cwd: string, options: WorkflowContractOp
       },
     },
     stage: stageContract,
-    provenance: { statePath: resolved.statePath, profilePath: path, profileHash: pHash, stateHash, control_plane },
+    provenance: { statePath: resolvedStatePath, profilePath: path, profileHash: pHash, stateHash, control_plane },
   };
 }
 

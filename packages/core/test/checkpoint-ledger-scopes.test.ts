@@ -26,7 +26,18 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision, commitCheckpointAnswer, type CapabilityHandoff, type IssuedCapability } from "../src/engine/durable.js";
+import {
+  createCapability,
+  authorizeDispatch as authorizeDispatchRaw,
+  completeDispatch as completeDispatchRaw,
+  advanceCursor as advanceCursorRaw,
+  beginCapability as beginCapabilityRaw,
+  persistPendingDispatch as persistPendingDispatchRaw,
+  recordCheckpointDecision as recordCheckpointDecisionRaw,
+  commitCheckpointAnswer as commitCheckpointAnswerRaw,
+  type CapabilityHandoff,
+  type IssuedCapability,
+} from "../src/engine/durable.js";
 import {
   appendCheckpointDecision,
   checkpointDecisionKey,
@@ -38,11 +49,49 @@ import {
 } from "../src/engine/checkpoints.js";
 import { validateActiveCapabilityStateBinding } from "../src/engine/control-plane-contract.js";
 import { registerWorkflowProfiles, loadProfile, profileHash } from "../src/engine/profile.js";
-import { normalizePersistedState, writeStateBootstrap } from "../src/engine/state.js";
+import { normalizePersistedState, writeStateBootstrap as writeStateBootstrapRaw } from "../src/engine/state.js";
+import { runTarget } from "../src/engine/run-store.js";
 import type { CheckpointPolicy, Profile, TeamState } from "../src/engine/types.js";
+
+const RUN_ID = "22222222-2222-4222-8222-222222222222";
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
+}
+
+type DispatchAuth = Parameters<typeof authorizeDispatchRaw>[1];
+
+function authorizeDispatch(root: string, input: DispatchAuth) {
+  return authorizeDispatchRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input });
+}
+
+function persistPendingDispatch(root: string, input: Parameters<typeof persistPendingDispatchRaw>[1]) {
+  return persistPendingDispatchRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input });
+}
+
+function completeDispatch(root: string, input: Parameters<typeof completeDispatchRaw>[1], options?: Parameters<typeof completeDispatchRaw>[2]) {
+  return completeDispatchRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input }, { runId: RUN_ID, ...(options ?? {}) });
+}
+
+function advanceCursor(root: string, input: DispatchAuth, options?: Parameters<typeof advanceCursorRaw>[2]) {
+  return advanceCursorRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input }, { runId: RUN_ID, ...(options ?? {}) });
+}
+
+function beginCapability(root: string, requested?: Parameters<typeof beginCapabilityRaw>[1], options?: Parameters<typeof beginCapabilityRaw>[2]) {
+  return beginCapabilityRaw(root, requested, { runId: RUN_ID, ...(options ?? {}) });
+}
+
+function recordCheckpointDecision(root: string, input: Parameters<typeof recordCheckpointDecisionRaw>[1]) {
+  return recordCheckpointDecisionRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input });
+}
+
+function commitCheckpointAnswer(root: string, input: Parameters<typeof commitCheckpointAnswerRaw>[1]) {
+  return commitCheckpointAnswerRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input });
+}
+
+
+function scopeFlags() {
+  return { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "dev" };
 }
 
 function approvalPolicy(decisions: string[], defaultRule: CheckpointPolicy["default"]): CheckpointPolicy {
@@ -87,24 +136,30 @@ function debugCycleProfile(policy: CheckpointPolicy): Profile {
   };
 }
 
-function scopeFlags() {
-  return { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "dev" };
+function writeStateBootstrap(root: string, state: TeamState, _options?: Parameters<typeof writeStateBootstrapRaw>[2]): { statePath: string; artifactsDir: string } {
+  const target = runTarget(root, RUN_ID);
+  mkdirSync(target.stateDir!, { recursive: true });
+  mkdirSync(target.artifactsDir!, { recursive: true });
+  return writeStateBootstrapRaw(root, state, { target });
 }
 
 function readState(root: string): TeamState {
-  return JSON.parse(readFileSync(join(root, ".work-state", "features", "ledger", "state.json"), "utf8")) as TeamState;
+  return JSON.parse(readFileSync(runTarget(root, RUN_ID).statePath!, "utf8")) as TeamState;
 }
 
 function writeArtifacts(root: string, artifacts: Record<string, unknown>): void {
-  const artifactsDir = join(root, ".work-state", "features", "ledger", "artifacts");
+  const artifactsDir = runTarget(root, RUN_ID).artifactsDir!;
   mkdirSync(artifactsDir, { recursive: true });
   for (const [id, value] of Object.entries(artifacts)) writeFileSync(join(artifactsDir, `${id}.json`), JSON.stringify(value));
+  const state = readState(root);
+  const declarations = Object.fromEntries(Object.keys(artifacts).map((id) => [id, `artifacts/${id}.json`]));
+  writeStateBootstrap(root, { ...state, artifacts: { ...(state.artifacts ?? {}), ...declarations } });
 }
 
 /** Arm a stage with a fresh capability and run its single dispatch to completion. */
 function runStage(root: string, profile: Profile, stageId: string, role: string, artifactIds: string[], artifacts: Record<string, unknown>, stageStatuses?: TeamState["stages"]): IssuedCapability {
   const issued = createCapability({
-    run_key: "main",
+    run_key: RUN_ID,
     branch: "main",
     workflow: profile.name,
     profile_hash: profileHash(profile),
@@ -119,9 +174,10 @@ function runStage(root: string, profile: Profile, stageId: string, role: string,
     // first stage setup: no state yet
   }
   writeStateBootstrap(root, {
-    schema: 1,
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
     branch: "main",
-    run_key: "main",
     classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: profile.name },
     task: "checkpoint ledger scopes",
     workflow_override: false,
@@ -141,7 +197,7 @@ function runStage(root: string, profile: Profile, stageId: string, role: string,
     ...(previous.trusted_checkpoint_answers ? { trusted_checkpoint_answers: previous.trusted_checkpoint_answers } : {}),
     ...(previous.checkpoint_policy ? { checkpoint_policy: previous.checkpoint_policy } : {}),
     updated_at: new Date().toISOString(),
-  }, { featureSlug: "ledger" });
+  });
   writeArtifacts(root, artifacts);
   const authorized = authorizeDispatch(root, dispatchAuthOf(issued, role));
   assert.equal(authorized.ok, true, authorized.ok ? "authorized" : authorized.error);
@@ -156,7 +212,7 @@ function dispatchAuthOf(issued: IssuedCapability, role: string) {
   return {
     token: issued.dispatch_token,
     capability_id: issued.capability_id,
-    run_key: "main",
+    run_key: RUN_ID,
     branch: "main",
     workflow: issued.state.issued_for!.workflow,
     profile_hash: issued.state.issued_for!.profile_hash,
@@ -172,7 +228,7 @@ function advanceAuthOf(issued: IssuedCapability) {
   return {
     token: issued.advance_token,
     capability_id: issued.capability_id,
-    run_key: "main",
+    run_key: RUN_ID,
     branch: "main",
     workflow: issued.state.issued_for!.workflow,
     profile_hash: issued.state.issued_for!.profile_hash,
@@ -239,7 +295,7 @@ function recordDecisionFor(
   // The trusted ask path persists the minted answer BEFORE the decision is
   // recorded (two durable calls): mirror that here, or the record
   // transaction's fresh re-read sees a proof with no ledger answer.
-  writeStateBootstrap(root, trusted.state, { featureSlug: "ledger" });
+  writeStateBootstrap(root, trusted.state);
   const recorded = recordCheckpointDecision(root, {
     ...auth,
     checkpoint: checkpointId,
@@ -260,13 +316,14 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
     const profile = loadProfile("lightweight");
     assert.ok(profile);
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
     writeStateBootstrap(root, {
-      schema: 1,
+      schema: 2,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
       branch: "main",
-      run_key: "main",
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
       task: "superseded proof",
       workflow_override: false,
@@ -281,7 +338,7 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "ledger" });
+    });
     const state = readState(root);
 
     const first = recordTrustedCheckpointAnswer(state, {
@@ -311,7 +368,7 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
           : answer,
       ),
     };
-    writeStateBootstrap(root, supersededState, { featureSlug: "ledger" });
+    writeStateBootstrap(root, supersededState);
     const policy = readState(root).checkpoint_policy!;
     const stage = { id: "implementation", checkpoint: "approve_implementation" };
     const scopeFields = {
@@ -322,7 +379,7 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
     };
 
     const withSupersededProof = validateCheckpointDecision(readState(root), {
-      run_id: "main",
+      run_id: RUN_ID,
       stage_id: "implementation",
       checkpoint_id: "approve_implementation",
       checkpoint_kind: policy.rules.approve_implementation!.kind,
@@ -338,7 +395,7 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
 
     // The superseding answer authorizes; the append finalizes it.
     const valid = {
-      run_id: "main",
+      run_id: RUN_ID,
       stage_id: "implementation",
       checkpoint_id: "approve_implementation",
       checkpoint_kind: policy.rules.approve_implementation!.kind,
@@ -351,7 +408,7 @@ test("ledger: a superseded proof never authorizes; the exact finalized decision 
     };
     const appended = appendCheckpointDecision(readState(root), valid);
     assert.equal(appended.ok, true, appended.ok ? "recorded" : `${appended.code}: ${appended.error}`);
-    writeStateBootstrap(root, appended.state, { featureSlug: "ledger" });
+    writeStateBootstrap(root, appended.state);
     const afterRecord = readState(root);
     const finalized = afterRecord.trusted_checkpoint_answers!.find((answer) => answer.answer_id === "ledger/proof-2");
     assert.equal(finalized?.consumed_reason, "finalized");
@@ -386,13 +443,14 @@ test("ledger: a consumed proof without a provable final decision is treated as s
     const profile = loadProfile("lightweight");
     assert.ok(profile);
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
     writeStateBootstrap(root, {
-      schema: 1,
+      schema: 2,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
       branch: "main",
-      run_key: "main",
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
       task: "orphan proof",
       workflow_override: false,
@@ -407,7 +465,7 @@ test("ledger: a consumed proof without a provable final decision is treated as s
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "ledger" });
+    });
     const state = readState(root);
     const trusted = recordTrustedCheckpointAnswer(state, {
       answer_id: "ledger/orphan",
@@ -424,10 +482,10 @@ test("ledger: a consumed proof without a provable final decision is treated as s
         answer.answer_id === "ledger/orphan" ? { ...answer, consumed_at: new Date().toISOString() } : answer,
       ),
     };
-    writeStateBootstrap(root, legacyConsumed, { featureSlug: "ledger" });
+    writeStateBootstrap(root, legacyConsumed);
     const policy = readState(root).checkpoint_policy!;
     const result = validateCheckpointDecision(readState(root), {
-      run_id: "main",
+      run_id: RUN_ID,
       stage_id: "implementation",
       checkpoint_id: "approve_implementation",
       checkpoint_kind: policy.rules.approve_implementation!.kind,
@@ -563,7 +621,7 @@ test("ledger: the current stage's declaration wins; a prior stage's decision and
     // policy_auto recorded under the STALE stage-1 policy hash can never
     // authorize the ship checkpoint.
     const staleAuto = validateCheckpointDecision(readState(root), {
-      run_id: "main",
+      run_id: RUN_ID,
       stage_id: "ship",
       checkpoint_id: "approve_fix",
       checkpoint_kind: "implementation_approval",
@@ -606,13 +664,14 @@ test("ledger: commitCheckpointAnswer keeps ONE live answer per question across c
     const profile = loadProfile("lightweight");
     assert.ok(profile);
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: "lightweight", profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
     writeStateBootstrap(root, {
-      schema: 1,
+      schema: 2,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
       branch: "main",
-      run_key: "main",
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
       task: "cross-channel uniqueness",
       workflow_override: false,
@@ -627,12 +686,12 @@ test("ledger: commitCheckpointAnswer keeps ONE live answer per question across c
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "ledger" });
+    });
 
     const request = {
       token: issued.advance_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: "lightweight",
       stage_cursor: "implementation",
@@ -653,7 +712,7 @@ test("ledger: commitCheckpointAnswer keeps ONE live answer per question across c
       checkpoint_id: "approve_implementation",
       decision: "proceed",
     });
-    writeStateBootstrap(root, escalation.state, { featureSlug: "ledger" });
+    writeStateBootstrap(root, escalation.state);
 
     // The terminal UI commits a DIFFERENT decision: the escalation proof is
     // superseded and exactly one fresh live answer exists afterwards.
@@ -672,7 +731,7 @@ test("ledger: commitCheckpointAnswer keeps ONE live answer per question across c
     // The superseded escalation proof can never authorize its own decision.
     const policy = afterMint.checkpoint_policy!;
     const rejected = validateCheckpointDecision(afterMint, {
-      run_id: "main",
+      run_id: RUN_ID,
       stage_id: "implementation",
       checkpoint_id: "approve_implementation",
       checkpoint_kind: policy.rules.approve_implementation!.kind,
@@ -714,13 +773,14 @@ test("ledger: stale top-level work identity is forbidden when the active capabil
     const profile = debugCycleProfile(policy);
     registerWorkflowProfiles([profile]);
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "dev", agent: "dev" }],
     });
     writeStateBootstrap(root, {
-      schema: 1,
+      schema: 2,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
       branch: "main",
-      run_key: "main",
       classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: profile.name },
       task: "stale identity",
       workflow_override: false,
@@ -735,10 +795,10 @@ test("ledger: stale top-level work identity is forbidden when the active capabil
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "ledger" });
+    });
     const before = readState(root);
     const staleIdentity = {
-      run_id: "main",
+      run_id: RUN_ID,
       wave_id: "stale-wave",
       slice_id: "diagnose",
       session_id: "stale-session",
@@ -784,13 +844,14 @@ test("ledger: a mirrored foreign run_id is rejected by the strict active identit
     const profile = loadProfile("lightweight");
     assert.ok(profile);
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
     writeStateBootstrap(root, {
-      schema: 1,
+      schema: 2,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
       branch: "main",
-      run_key: "main",
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: profile.name },
       task: "foreign run binding",
       workflow_override: false,
@@ -805,7 +866,7 @@ test("ledger: a mirrored foreign run_id is rejected by the strict active identit
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "ledger" });
+    });
     const authorized = authorizeDispatch(root, dispatchAuthOf(issued, "developer-kotlin"));
     assert.equal(authorized.ok, true, authorized.ok ? "authorized" : authorized.error);
     const state = readState(root);
@@ -834,11 +895,11 @@ test("ledger: a mirrored foreign run_id is rejected by the strict active identit
         })),
       },
     };
-    writeFileSync(join(root, ".work-state", "features", "ledger", "state.json"), JSON.stringify(forged, null, 2) + "\n");
+    writeFileSync(runTarget(root, RUN_ID).statePath!, JSON.stringify(forged, null, 2) + "\n");
     const committed = commitCheckpointAnswer(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       stage_cursor: "implementation",
@@ -868,13 +929,14 @@ test("ledger: invalid exact live answer is atomically superseded, never reused",
     const profile = loadProfile("lightweight");
     assert.ok(profile);
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
     writeStateBootstrap(root, {
-      schema: 1,
+      schema: 2,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
       branch: "main",
-      run_key: "main",
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: profile.name },
       task: "invalid live proof",
       workflow_override: false,
@@ -889,11 +951,11 @@ test("ledger: invalid exact live answer is atomically superseded, never reused",
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "ledger" });
+    });
     const request = {
       token: issued.advance_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       stage_cursor: "implementation",
@@ -911,7 +973,7 @@ test("ledger: invalid exact live answer is atomically superseded, never reused",
     const tampered = readState(root);
     tampered.trusted_checkpoint_answers = tampered.trusted_checkpoint_answers!.map((answer) =>
       answer.answer_id === firstId ? { ...answer, binding: "forged-binding" } : answer);
-    writeFileSync(join(root, ".work-state", "features", "ledger", "state.json"), JSON.stringify(tampered, null, 2) + "\n");
+    writeFileSync(runTarget(root, RUN_ID).statePath!, JSON.stringify(tampered, null, 2) + "\n");
 
     const retried = commitCheckpointAnswer(root, request);
     assert.equal(retried.ok, true, retried.ok ? "superseded and minted" : retried.error);
@@ -933,13 +995,14 @@ test("ledger: malformed current-scope sibling blocks already_finalized replay", 
     const profile = loadProfile("lightweight");
     assert.ok(profile);
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "developer-kotlin", agent: "developer-kotlin" }],
     });
     writeStateBootstrap(root, {
-      schema: 1,
+      schema: 2,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
       branch: "main",
-      run_key: "main",
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: profile.name },
       task: "malformed final",
       workflow_override: false,
@@ -954,11 +1017,11 @@ test("ledger: malformed current-scope sibling blocks already_finalized replay", 
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
-    }, { featureSlug: "ledger" });
+    });
     const request = {
       token: issued.advance_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       stage_cursor: "implementation",
@@ -986,7 +1049,7 @@ test("ledger: malformed current-scope sibling blocks already_finalized replay", 
       ...corrupted.typed_checkpoint_decisions!,
       { ...exact, checkpoint_kind: "custom" },
     ];
-    writeFileSync(join(root, ".work-state", "features", "ledger", "state.json"), JSON.stringify(corrupted, null, 2) + "\n");
+    writeFileSync(runTarget(root, RUN_ID).statePath!, JSON.stringify(corrupted, null, 2) + "\n");
     const replay = commitCheckpointAnswer(root, request);
     assert.equal(replay.ok, false);
     if (!replay.ok) {
@@ -1012,13 +1075,14 @@ test("ledger: conflicting current-scope finals are checked before any exact repl
     };
     registerWorkflowProfiles([profile]);
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "approval", kind: "none", expected_roster: [],
     });
     const base: TeamState = {
-      schema: 1,
+      schema: 2,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
       branch: "main",
-      run_key: "main",
       classification: { type: "OPS", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: profile.name },
       task: "conflicting finals",
       workflow_override: false,
@@ -1036,7 +1100,7 @@ test("ledger: conflicting current-scope finals are checked before any exact repl
       updated_at: new Date().toISOString(),
     };
     const decisionBase = {
-      run_id: "main",
+      run_id: RUN_ID,
       stage_id: "approval",
       checkpoint_id: "approve_fix",
       checkpoint_kind: "implementation_approval" as const,
@@ -1052,11 +1116,11 @@ test("ledger: conflicting current-scope finals are checked before any exact repl
       { ...decisionBase, decision: "proceed", rationale: "first" },
       { ...decisionBase, decision: "reject", rationale: "second" },
     ];
-    writeStateBootstrap(root, base, { featureSlug: "ledger" });
+    writeStateBootstrap(root, base);
     const replay = commitCheckpointAnswer(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       stage_cursor: "approval",
@@ -1089,15 +1153,15 @@ test("ledger: reopened two-epoch history is ambiguous unless an exact generation
   };
   registerWorkflowProfiles([profile]);
   const first = createCapability({
-    run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+    run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
     stage_cursor: "approval", kind: "none", expected_roster: [], cursor_epoch: "epoch-one",
   });
   const second = createCapability({
-    run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+    run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
     stage_cursor: "approval", kind: "none", expected_roster: [], cursor_epoch: "epoch-two",
   });
   const baseDecision = {
-    run_id: "main",
+    run_id: RUN_ID,
     stage_id: "approval",
     checkpoint_id: "approve_fix",
     checkpoint_kind: "implementation_approval" as const,
@@ -1122,9 +1186,10 @@ test("ledger: reopened two-epoch history is ambiguous unless an exact generation
     capability_epoch: second.state.issued_for!.cursor_epoch,
   };
   const state: TeamState = {
-    schema: 1,
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
     branch: "main",
-    run_key: "main",
     classification: { type: "OPS", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: profile.name },
     task: "reopened history",
     workflow_override: false,
@@ -1177,9 +1242,10 @@ test("ledger: normalization drops stale policy mirrors and reprojects only the c
   };
   registerWorkflowProfiles([profile]);
   const raw: TeamState = {
-    schema: 1,
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
     branch: "main",
-    run_key: "main",
     classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: profile.name },
     task: "normalizer policy scope",
     workflow_override: false,

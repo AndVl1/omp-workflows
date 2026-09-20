@@ -14,8 +14,8 @@
  *  - A bounded, explicit list of natural-language leading directives
  *    (`действуй автономно`, normalized: case-insensitive, whitespace
  *    collapsed) enables the hint and is stripped together with an optional
- *    `:`, `,` or `;` separator. No fuzzy keyword matching, no
- *    LLM-dependent mode detection.
+ *    `:`, `,` or `;` separator. No fuzzy keyword matching, no LLM-dependent
+ *    mode detection.
  *
  * Authority contract (RC2+): the result is a MECHANICAL HINT, never the
  * autonomy decision. PHASE-0 instructs the main LLM to classify
@@ -42,23 +42,17 @@ export interface AutonomousDirective {
    * MECHANICAL autonomy hint: true when a recognized leading directive was
    * present and stripped. NON-AUTHORITATIVE by contract — the main LLM
    * decides `autonomous` in PHASE-0 from the complete task semantics; this
-   * hint is rendered for mechanical envelope hygiene only and is never
-   * copied into persisted state as the decision.
+   * value is rendered as a hint and never persisted.
    */
   autonomyHint: boolean;
-  /**
-   * Task text after stripping a recognized leading directive (leading
-   * whitespace removed); the verbatim trimmed input when none matched.
-   */
+  /** Task text after stripping a recognized leading directive. */
   task: string;
 }
 
-/** Escape regex metacharacters in a literal directive. */
 function escapeRegExp(source: string): string {
   return source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Build a case-insensitive leading-directive matcher from a literal phrase. */
 function directivePattern(directive: string): RegExp {
   const words = directive.split(/\s+/).map(escapeRegExp);
   return new RegExp(`^(?:${words.join("\\s+")})(?:${DIRECTIVE_SEPARATOR}|$)`, "i");
@@ -66,38 +60,75 @@ function directivePattern(directive: string): RegExp {
 
 const DIRECTIVE_PATTERNS = AUTONOMOUS_DIRECTIVES.map(directivePattern);
 
-/**
- * Parse a raw `<args>` string for the leading autonomy directive.
- *
- * Returns `{ autonomyHint: true, task }` when an exact `[AUTONOMOUS]` token
- * or an approved natural directive opens the input (token followed by
- * whitespace/EOS; natural directive followed by whitespace/EOS or a
- * `: , ;` separator). Otherwise `{ autonomyHint: false, task }` with the
- * trimmed input preserved verbatim.
- *
- * The result is a MECHANICAL HINT (never authoritative): PHASE-0 has the
- * main LLM decide `autonomous` from the full task semantics, and this value
- * is only rendered as non-authoritative metadata.
- */
 export function parseAutonomousDirective(args: string): AutonomousDirective {
   const trimmed = args.trimStart();
-
   if (trimmed.startsWith(AUTONOMOUS_TOKEN)) {
     const rest = trimmed.slice(AUTONOMOUS_TOKEN.length);
-    // Token must stand alone: whitespace or end of input. `[AUTONOMOUS]task`
-    // is ambiguous — keep it literal rather than corrupting the task.
-    if (rest === "" || /^\s/.test(rest)) {
-      return { autonomyHint: true, task: rest.trimStart() };
-    }
+    if (rest === "" || /^\s/.test(rest)) return { autonomyHint: true, task: rest.trimStart() };
     return { autonomyHint: false, task: trimmed };
   }
-
   for (const pattern of DIRECTIVE_PATTERNS) {
     const match = trimmed.match(pattern);
-    if (match) {
-      return { autonomyHint: true, task: trimmed.slice(match[0].length).trimStart() };
-    }
+    if (match) return { autonomyHint: true, task: trimmed.slice(match[0].length).trimStart() };
   }
-
   return { autonomyHint: false, task: trimmed };
+}
+
+export type WorkflowCommandMode = "new" | "resume" | "rework" | "list";
+
+export interface WorkflowCommandParseSuccess {
+  ok: true;
+  /** Undefined means the user did not freeze lifecycle mode; the model/engine chooses after classification. */
+  mode?: WorkflowCommandMode;
+  explicit_mode: boolean;
+  task: string;
+  run_id?: string;
+  all_branches?: boolean;
+}
+
+export interface WorkflowCommandParseFailure {
+  ok: false;
+  code: "lifecycle_request_conflict";
+  error: string;
+}
+
+export type WorkflowCommandParseResult = WorkflowCommandParseSuccess | WorkflowCommandParseFailure;
+
+/** Parse explicit lifecycle options before task text; `--` ends options. */
+export function parseWorkflowCommand(args: string): WorkflowCommandParseResult {
+  const tokens = [...args.matchAll(/\S+/g)].map((match) => ({ value: match[0]!, start: match.index!, end: match.index! + match[0]!.length }));
+  const options: string[] = [];
+  let parsingOptions = true;
+  let task = "";
+  let runId: string | undefined;
+  let allBranches = false;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (!parsingOptions) { task = args.slice(token.start).trim(); break; }
+    if (token.value === "--") { parsingOptions = false; const next = tokens[index + 1]; task = next ? args.slice(next.start).trim() : ""; break; }
+    if (!token.value.startsWith("--")) { parsingOptions = false; task = args.slice(token.start).trim(); break; }
+    if (token.value === "--run") {
+      const value = tokens[index + 1]?.value;
+      if (!value || value === "--" || value.startsWith("--")) return { ok: false, code: "lifecycle_request_conflict", error: "--run requires a run id" };
+      runId = value; index += 1; continue;
+    }
+    if (token.value.startsWith("--run=")) {
+      const value = token.value.slice("--run=".length).trim();
+      if (!value) return { ok: false, code: "lifecycle_request_conflict", error: "--run requires a run id" };
+      runId = value; continue;
+    }
+    if (token.value === "--all-branches") { allBranches = true; continue; }
+    if (token.value === "--new" || token.value === "--resume" || token.value === "--rework" || token.value === "--list") { options.push(token.value.slice(2)); continue; }
+    return { ok: false, code: "lifecycle_request_conflict", error: `unknown workflow option '${token.value}'` };
+  }
+  const explicitModes = [...new Set(options)];
+  if (explicitModes.length > 1) return { ok: false, code: "lifecycle_request_conflict", error: `conflicting lifecycle modes: ${explicitModes.join(", ")}` };
+  const explicit = explicitModes[0] as WorkflowCommandMode | undefined;
+  const mode = explicit;
+  if (runId && mode !== "resume" && mode !== "rework") return { ok: false, code: "lifecycle_request_conflict", error: "--run requires explicit --resume or --rework" };
+  if (allBranches && mode !== "list") return { ok: false, code: "lifecycle_request_conflict", error: "--all-branches is valid only with --list" };
+  if (mode === "list" && (runId || task)) return { ok: false, code: "lifecycle_request_conflict", error: "--list cannot be combined with --run or task text" };
+  if (mode === "new" && !task) return { ok: false, code: "lifecycle_request_conflict", error: "--new requires a task" };
+  if (mode === "rework" && !task) return { ok: false, code: "lifecycle_request_conflict", error: "--rework requires feedback" };
+  return { ok: true, mode, explicit_mode: explicit !== undefined, task, ...(runId ? { run_id: runId } : {}), ...(allBranches ? { all_branches: true } : {}) };
 }

@@ -640,24 +640,35 @@ test("dod-path: snapshot renders dod from the single safe read and refuses swapp
   }
 });
 
-test("dod-path: session-stop backstop refuses a symlinked dod.json at the done-claim", () => {
+test("dod-path: session-stop backstop refuses a symlinked canonical dod.json at the done-claim", () => {
   const root = tmpRoot();
   const outsideDir = mkdtempSync(join(tmpdir(), "dod-outside-"));
+  const runId = "44444444-4444-4444-8444-444444444444";
   try {
-    const workState = join(root, ".work-state");
-    mkdirSync(join(workState, "artifacts"), { recursive: true });
-    writeFileSync(join(workState, "team-state.json"), JSON.stringify({
+    const runDir = join(root, ".work-state", "runs", runId);
+    const artifactsDir = join(runDir, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    writeFileSync(join(runDir, "state.json"), JSON.stringify({
+      schema: 2,
+      run_id: runId,
+      run_key: runId,
+      lifecycle_status: "active",
+      branch: "feature/dod-backstop",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      task: "dod backstop",
+      workflow_override: false,
       stage_cursor: "summary",
-      pause: { kind: "done" },
-      classification: { workflow: "lightweight" },
+      stages: [{ id: "summary", status: "in_progress" }],
+      artifacts: {},
+      pause: { kind: "done", reason: "done claim" },
+      updated_at: new Date().toISOString(),
     }));
     const outsideFile = join(outsideDir, "dod.json");
     writeFileSync(outsideFile, JSON.stringify({
       items: [{ criterion: "criterion", verify_method: "run the focused check", status: "met", evidence: "observed pass" }],
     }));
-    // A dod.json symlinked outside the workspace must be refused, not followed.
-    symlinkSync(outsideFile, join(workState, "artifacts", "dod.json"));
-    const res = dodBackstop({}, { cwd: root });
+    symlinkSync(outsideFile, join(artifactsDir, "dod.json"));
+    const res = dodBackstop({}, { cwd: root, run_id: runId });
     assert.equal(res?.decision, "block");
     assert.match(res?.reason ?? "", /is a symlink/);
     assert.equal((res?.reason ?? "").includes(outsideDir), false, "outside path is never echoed");

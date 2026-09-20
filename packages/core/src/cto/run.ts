@@ -9,8 +9,10 @@
  */
 
 import { buildTeamPlan, validateDecompositionDepth, type PlanTeamInput } from "./plan.js";
-import { newCtoState, writeCtoState } from "./state.js";
+import { newCtoState, writeCtoState, readCtoState } from "./state.js";
+import { acquireExecutionClaim, releaseExecutionClaim } from "../engine/run-store.js";
 import type { ModelClassification } from "../engine/run.js";
+import type { TrustedExecutionContext } from "../engine/types.js";
 import type { CtoState, TeamDef, TeamPlan } from "./types.js";
 
 export interface RunCtoOptions {
@@ -35,6 +37,7 @@ export interface RunCtoOptions {
   standby?: boolean;
   /** Session owning this interactive task run (foreign sessions do not amend it). */
   owner_session?: string;
+  execution?: TrustedExecutionContext;
   log?: (line: string) => void;
 }
 
@@ -63,6 +66,12 @@ export function runCto(opts: RunCtoOptions): RunCtoResult {
   const depth = validateDecompositionDepth(built.plan, opts.profileDepth);
   if (!depth.ok) return { ok: false, reason: depth.reason };
 
+  let claim: ReturnType<typeof acquireExecutionClaim> | undefined;
+  try {
+    if (opts.execution) claim = acquireExecutionClaim(opts.cwd, { run_id: built.plan.id, context: opts.execution, owner_kind: "cto" });
+  } catch (error) {
+    return { ok: false, reason: String(error) };
+  }
   const state = newCtoState({
     id: built.plan.id,
     task: opts.task,
@@ -73,7 +82,20 @@ export function runCto(opts: RunCtoOptions): RunCtoResult {
     ...(opts.standby === true ? { standby: true } : {}),
     ...(opts.owner_session ? { owner_session: opts.owner_session } : {}),
   });
-  const statePath = writeCtoState(state, opts.cwd);
-  opts.log?.(`cto: plan ${built.plan.id} — ${built.plan.teams.length} teams, depth ${depth.depth}, state ${statePath}`);
-  return { ok: true, plan: built.plan, state, statePath };
+  try {
+    const statePath = writeCtoState(state, opts.cwd);
+    opts.log?.(`cto: plan ${built.plan.id} — ${built.plan.teams.length} teams, depth ${depth.depth}, state ${statePath}`);
+    return { ok: true, plan: built.plan, state, statePath };
+  } catch (error) {
+    if (claim && !claim.idempotent) releaseExecutionClaim(opts.cwd, { run_id: built.plan.id, token: claim.claim.token, receipt: "cto-start-rollback" });
+    return { ok: false, reason: String(error) };
+  }
+}
+
+export function finalizeCtoExecution(cwd: string, runId: string, token: string): void {
+  const state = readCtoState(runId, cwd);
+  if (!state) throw new Error(`CTO run '${runId}' is missing`);
+  const terminal = state.pause.kind === "done" || state.integration.status === "done";
+  if (!terminal) return;
+  releaseExecutionClaim(cwd, { run_id: runId, token, receipt: "cto-terminal" });
 }

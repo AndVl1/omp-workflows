@@ -15,12 +15,18 @@
  * null or primitive input never surfaces as a `TypeError`.
  */
 
+import { createHash } from "node:crypto";
 import type {
   CheckpointPolicy,
   DispatchCapabilityState,
+  LifecycleRequest,
+  NewLifecycleRequest,
+  OrdinaryRunIdentity,
   PendingState,
+  PrepareRequestReceipt,
   TeamState,
   TrustedCheckpointAnswer,
+  TrustedExecutionContext,
   TypedCheckpointDecision,
   WorkIdentity,
 } from "./types.js";
@@ -158,6 +164,141 @@ function validateWorkIdentityInto(value: unknown, path: string, issues: ControlP
   if (value.loop_iteration !== undefined && (!Number.isInteger(value.loop_iteration) || (value.loop_iteration as number) < 1)) {
     add(issues, `${path}.loop_iteration`, "must be an integer >= 1");
   }
+}
+// ---------------------------------------------------------------------------
+// Schema-2 ordinary lifecycle
+// ---------------------------------------------------------------------------
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LIFECYCLE_MODES = ["new", "resume", "rework"] as const;
+
+function requireUuid(value: UnknownRecord, key: string, path: string, issues: ControlPlaneIssue[]): void {
+  if (typeof value[key] !== "string" || !UUID_PATTERN.test(value[key] as string)) add(issues, `${path}.${key}`, "must be a UUID");
+}
+
+export function validateOrdinaryRunIdentityValue(value: unknown, path = "$"): ControlPlaneValidation {
+  const issues: ControlPlaneIssue[] = [];
+  if (!isRecord(value)) {
+    add(issues, path, "ordinary run identity must be an object");
+    return { ok: false, issues };
+  }
+  unknownKeys(value, ["schema", "run_id", "run_key", "branch"], path, issues);
+  if (value.schema !== 2) add(issues, `${path}.schema`, "ordinary run identity requires schema 2");
+  requireUuid(value, "run_id", path, issues);
+  requireUuid(value, "run_key", path, issues);
+  requireString(value, "branch", path, issues);
+  if (typeof value.run_id === "string" && typeof value.run_key === "string" && value.run_id !== value.run_key) {
+    add(issues, `${path}.run_key`, "must equal run_id for ordinary runs");
+  }
+  return issues.length > 0 ? { ok: false, issues } : { ok: true };
+}
+
+export function validateTrustedExecutionContextValue(value: unknown, path = "$"): ControlPlaneValidation {
+  const issues: ControlPlaneIssue[] = [];
+  if (!isRecord(value)) {
+    add(issues, path, "trusted execution context must be an object");
+    return { ok: false, issues };
+  }
+  unknownKeys(value, ["session_id", "caller", "process_id", "worktree", "branch", "authority"], path, issues);
+  requireString(value, "session_id", path, issues);
+  requireEnum(value, "caller", ["host", "worker", "system"], path, issues);
+  requireString(value, "worktree", path, issues);
+  requireString(value, "branch", path, issues);
+  requireEnum(value, "authority", ["coordinator", "dispatch", "read"], path, issues);
+  if (value.process_id !== undefined && (!Number.isInteger(value.process_id) || (value.process_id as number) <= 0)) {
+    add(issues, `${path}.process_id`, "must be a positive integer when present");
+  }
+  return issues.length > 0 ? { ok: false, issues } : { ok: true };
+}
+
+function validateLifecycleSelectorValue(value: unknown, path: string, issues: ControlPlaneIssue[]): void {
+  if (!isRecord(value)) {
+    add(issues, path, "selector must be an object");
+    return;
+  }
+  unknownKeys(value, ["run_id", "title", "list_item"], path, issues);
+  if (value.run_id !== undefined) requireUuid(value, "run_id", path, issues);
+  if (value.title !== undefined && !nonEmptyString(value.title)) add(issues, `${path}.title`, "must be non-empty");
+  if (value.list_item !== undefined) {
+    if (!isRecord(value.list_item)) add(issues, `${path}.list_item`, "must be an object");
+    else {
+      unknownKeys(value.list_item, ["snapshot_id", "index", "run_id"], `${path}.list_item`, issues);
+      requireString(value.list_item, "snapshot_id", `${path}.list_item`, issues);
+      requireUuid(value.list_item, "run_id", `${path}.list_item`, issues);
+      if (!Number.isInteger(value.list_item.index) || (value.list_item.index as number) < 0) add(issues, `${path}.list_item.index`, "must be an integer >= 0");
+    }
+  }
+}
+
+export function validateLifecycleRequestValue(value: unknown, path = "$"): ControlPlaneValidation {
+  const issues: ControlPlaneIssue[] = [];
+  if (!isRecord(value)) {
+    add(issues, path, "lifecycle request must be an object");
+    return { ok: false, issues };
+  }
+  if (!LIFECYCLE_MODES.includes(value.mode as typeof LIFECYCLE_MODES[number])) {
+    add(issues, `${path}.mode`, "must be new, resume, or rework");
+    return { ok: false, issues };
+  }
+  const mode = value.mode as string;
+  const baseKeys = ["mode", "request_id", "execution"];
+  const modeKeys = mode === "new"
+    ? ["task", "branch", "classification", "files", "issue"]
+    : mode === "resume"
+      ? ["run_id", "branch", "selector"]
+      : ["run_id", "branch", "feedback", "affected_stage", "selector"];
+  unknownKeys(value, [...baseKeys, ...modeKeys], path, issues);
+  requireString(value, "request_id", path, issues);
+  const executionResult = validateTrustedExecutionContextValue(value.execution, `${path}.execution`);
+  if (!executionResult.ok) issues.push(...executionResult.issues);
+  requireString(value, "branch", path, issues);
+  if (mode === "new") {
+    requireString(value, "task", path, issues);
+    if (value.classification !== undefined && !isRecord(value.classification)) add(issues, `${path}.classification`, "must be an object");
+    if (value.files !== undefined && stringArray(value.files, `${path}.files`, issues) === null) { /* issues already recorded */ }
+    if (value.issue !== undefined && value.issue !== null && !isRecord(value.issue)) add(issues, `${path}.issue`, "must be an object or null");
+  } else {
+    requireUuid(value, "run_id", path, issues);
+    if (value.selector !== undefined) validateLifecycleSelectorValue(value.selector, `${path}.selector`, issues);
+    if (mode === "rework") {
+      requireString(value, "feedback", path, issues);
+      if (value.affected_stage !== undefined) requireString(value, "affected_stage", path, issues);
+    }
+  }
+  if (isRecord(value.execution) && value.execution.branch !== value.branch) add(issues, `${path}.execution.branch`, "must equal request branch");
+  return issues.length > 0 ? { ok: false, issues } : { ok: true };
+}
+
+export function validatePrepareRequestReceiptValue(value: unknown, path = "$"): ControlPlaneValidation {
+  const issues: ControlPlaneIssue[] = [];
+  if (!isRecord(value)) {
+    add(issues, path, "prepare receipt must be an object");
+    return { ok: false, issues };
+  }
+  unknownKeys(value, ["request_id", "payload_hash", "operation", "previous_run_id", "selected_run_id", "committed_at", "continuation"], path, issues);
+  requireString(value, "request_id", path, issues);
+  requireString(value, "payload_hash", path, issues);
+  requireEnum(value, "operation", [...LIFECYCLE_MODES], path, issues);
+  if (value.previous_run_id !== null) requireUuid(value, "previous_run_id", path, issues);
+  requireUuid(value, "selected_run_id", path, issues);
+  requireString(value, "committed_at", path, issues);
+  if (!isRecord(value.continuation)) add(issues, `${path}.continuation`, "must be an object");
+  else {
+    unknownKeys(value.continuation, ["stage", "status"], `${path}.continuation`, issues);
+    requireString(value.continuation, "stage", `${path}.continuation`, issues);
+    requireEnum(value.continuation, "status", ["active", "paused", "complete", "failed", "blocked"], `${path}.continuation`, issues);
+  }
+  return issues.length > 0 ? { ok: false, issues } : { ok: true };
+}
+
+export function validatePrepareReplay(
+  existing: Pick<PrepareRequestReceipt, "request_id" | "payload_hash">,
+  incoming: Pick<PrepareRequestReceipt, "request_id" | "payload_hash">,
+): ControlPlaneValidation {
+  const issues: ControlPlaneIssue[] = [];
+  if (existing.request_id !== incoming.request_id) add(issues, "$.request_id", "request IDs do not match");
+  else if (existing.payload_hash !== incoming.payload_hash) add(issues, "$.payload_hash", "request ID was replayed with a different payload");
+  return issues.length > 0 ? { ok: false, issues } : { ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +619,121 @@ function completionEnvelopeIssues(value: unknown, path: string, issues: ControlP
   }
 }
 
+export function isMigrationDispatchRecordValue(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const completion = value.completion;
+  const envelope = value.completion_envelope;
+  const completionIdentity = isRecord(completion) ? completion.work_identity : undefined;
+  const envelopeIdentity = isRecord(envelope) ? envelope.identity : undefined;
+  return (isRecord(completion) && completion.completed_by === "migration")
+    || (isRecord(envelope) && envelope.completed_by === "migration")
+    || (isRecord(completionIdentity) && completionIdentity.source === "migration")
+    || (isRecord(envelopeIdentity) && envelopeIdentity.source === "migration");
+}
+
+function migrationIdentityIssues(value: unknown, path: string, issues: ControlPlaneIssue[]): void {
+  if (!isRecord(value)) { add(issues, path, "must be an object"); return; }
+  unknownKeys(value, ["source", "migration_id", "run_id", "wave_id", "slice_id", "session_id", "workflow", "stage_id", "stage_cursor", "capability_id", "capability_epoch", "loop_iteration", "slot_id", "task_id", "dispatch_id", "attempt", "worker_id"], path, issues);
+  if (value.source !== "migration") add(issues, `${path}.source`, "must be migration");
+  for (const key of ["migration_id", "run_id", "slice_id", "workflow", "stage_id", "stage_cursor", "capability_id", "capability_epoch", "slot_id", "task_id", "dispatch_id"]) requireString(value, key, path, issues);
+  if (value.wave_id !== null) add(issues, `${path}.wave_id`, "must be null for migration evidence");
+  if (value.session_id !== null) add(issues, `${path}.session_id`, "must be null for migration evidence");
+  if (value.worker_id !== null) add(issues, `${path}.worker_id`, "must be null for migration evidence");
+  if (value.loop_iteration !== undefined && (!Number.isInteger(value.loop_iteration) || (value.loop_iteration as number) < 1)) add(issues, `${path}.loop_iteration`, "must be an integer >= 1");
+  if (value.attempt !== 0) add(issues, `${path}.attempt`, "must be 0 for migration evidence");
+}
+
+function isImmutableMigrationPath(value: unknown): value is string {
+  if (typeof value !== "string" || !value.startsWith("revisions/") || value.includes("\\") || value.includes("\0")) return false;
+  const parts = value.split("/");
+  return parts.length >= 3 && parts[0] === "revisions" && parts.slice(1).every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+function migrationArtifactRefsIssues(value: unknown, path: string, issues: ControlPlaneIssue[]): void {
+  if (!Array.isArray(value)) { add(issues, path, "must be an array"); return; }
+  value.forEach((entry, index) => {
+    const entryPath = `${path}[${index}]`;
+    if (!isRecord(entry)) { add(issues, entryPath, "must be an object"); return; }
+    unknownKeys(entry, ["artifact_id", "path", "sha256", "schema_status", "dod_status"], entryPath, issues);
+    for (const key of ["artifact_id", "path", "sha256"]) requireString(entry, key, entryPath, issues);
+    if (entry.path !== undefined && !isImmutableMigrationPath(entry.path)) add(issues, `${entryPath}.path`, "must reference an immutable revisions path");
+    if (typeof entry.sha256 === "string" && !/^[0-9a-f]{64}$/.test(entry.sha256)) add(issues, `${entryPath}.sha256`, "must be a 64-character lowercase hex digest");
+    requireEnum(entry, "schema_status", ["met", "failed", "not_applicable"], entryPath, issues);
+    requireEnum(entry, "dod_status", ["met", "pending", "failed"], entryPath, issues);
+  });
+}
+
+function migrationEnvelopeIssues(value: unknown, path: string, issues: ControlPlaneIssue[]): void {
+  if (!isRecord(value)) { add(issues, path, "must be an object"); return; }
+  unknownKeys(value, ["schema_version", "identity", "outcome", "terminal_signal", "artifact_refs", "evidence_ref", "conflict_ref", "completed_by", "emitted_at"], path, issues);
+  if (value.schema_version !== 1) add(issues, `${path}.schema_version`, "must be 1");
+  migrationIdentityIssues(value.identity, `${path}.identity`, issues);
+  if (value.outcome !== "succeeded") add(issues, `${path}.outcome`, "must be succeeded for migration evidence");
+  if (value.terminal_signal !== "migration_verified") add(issues, `${path}.terminal_signal`, "must be migration_verified");
+  migrationArtifactRefsIssues(value.artifact_refs, `${path}.artifact_refs`, issues);
+  requireString(value, "evidence_ref", path, issues);
+  if (typeof value.evidence_ref === "string" && (!isImmutableMigrationPath(value.evidence_ref) || !value.evidence_ref.endsWith("/succeeded-slots.json"))) add(issues, `${path}.evidence_ref`, "must reference immutable succeeded-slots evidence");
+  if (value.conflict_ref !== null) add(issues, `${path}.conflict_ref`, "must be null for verified migration evidence");
+  if (value.completed_by !== "migration") add(issues, `${path}.completed_by`, "must be migration");
+  requireString(value, "emitted_at", path, issues);
+}
+
+function migrationTaskId(capabilityId: string, issued: UnknownRecord, slotId: string): string {
+  const seed = `${capabilityId}|${String(issued.run_key)}|${String(issued.branch)}|${String(issued.workflow)}|${String(issued.stage_cursor)}|${slotId}`;
+  return `task-${createHash("sha256").update(seed).digest("hex").slice(0, 32)}`;
+}
+
+function validateMigrationDispatchRecordInto(recordValue: unknown, recordPath: string, issues: ControlPlaneIssue[], capability: UnknownRecord, issued: UnknownRecord): void {
+  if (!isRecord(recordValue)) { add(issues, recordPath, "must be an object"); return; }
+  unknownKeys(recordValue, ["id", "role", "agent", "status", "attempt", "created_at", "completed_at", "completion", "completion_envelope"], recordPath, issues);
+  for (const key of ["id", "role", "agent", "created_at", "completed_at"]) requireString(recordValue, key, recordPath, issues);
+  if (recordValue.status !== "succeeded") add(issues, `${recordPath}.status`, "must be succeeded for migration evidence");
+  if (recordValue.attempt !== 0) add(issues, `${recordPath}.attempt`, "must be 0 for migration evidence");
+  const expectedRoles = Array.isArray(capability.expected_roles) ? capability.expected_roles as string[] : [];
+  if (nonEmptyString(recordValue.role) && expectedRoles.length > 0 && !expectedRoles.includes(recordValue.role as string)) add(issues, `${recordPath}.role`, "is not part of the fresh capability roster");
+  const roster = Array.isArray(capability.expected_roster) ? capability.expected_roster as UnknownRecord[] : [];
+  if (nonEmptyString(recordValue.role) && nonEmptyString(recordValue.agent) && roster.length > 0 && !roster.some((entry) => isRecord(entry) && entry.role === recordValue.role && entry.agent === recordValue.agent)) add(issues, `${recordPath}.agent`, "does not match the fresh capability roster");
+  const completion = recordValue.completion;
+  if (!isRecord(completion)) { add(issues, `${recordPath}.completion`, "is required for migration evidence"); return; }
+  unknownKeys(completion, ["dispatch_id", "cursor_epoch", "outcome", "artifact_ids", "evidence", "completed_by", "completed_at", "work_identity"], `${recordPath}.completion`, issues);
+  if (completion.dispatch_id !== recordValue.id) add(issues, `${recordPath}.completion.dispatch_id`, "does not match the dispatch record");
+  if (completion.cursor_epoch !== issued.cursor_epoch) add(issues, `${recordPath}.completion.cursor_epoch`, "does not match the capability epoch");
+  if (completion.outcome !== "succeeded") add(issues, `${recordPath}.completion.outcome`, "must be succeeded for migration evidence");
+  if (!Array.isArray(completion.artifact_ids) || completion.artifact_ids.some((id) => !isSafeSegment(id))) add(issues, `${recordPath}.completion.artifact_ids`, "must be safe artifact segments");
+  if (completion.completed_by !== "migration") add(issues, `${recordPath}.completion.completed_by`, "must be migration");
+  requireString(completion, "evidence", `${recordPath}.completion`, issues);
+  requireString(completion, "completed_at", `${recordPath}.completion`, issues);
+  if (completion.completed_at !== recordValue.completed_at) add(issues, `${recordPath}.completion.completed_at`, "does not match the record completion time");
+  migrationIdentityIssues(completion.work_identity, `${recordPath}.completion.work_identity`, issues);
+  const identity = isRecord(completion.work_identity) ? completion.work_identity : undefined;
+  if (identity) {
+    for (const [field, actual, expected] of [["run_id", identity.run_id, issued.run_key], ["workflow", identity.workflow, issued.workflow], ["stage_id", identity.stage_id, issued.stage_cursor], ["slice_id", identity.slice_id, issued.stage_cursor], ["stage_cursor", identity.stage_cursor, issued.stage_cursor], ["capability_id", identity.capability_id, capability.capability_id], ["capability_epoch", identity.capability_epoch, issued.cursor_epoch], ["loop_iteration", identity.loop_iteration, issued.loop_iteration], ["dispatch_id", identity.dispatch_id, recordValue.id], ["slot_id", identity.slot_id, recordValue.role]] as Array<[string, unknown, unknown]>) {
+      if (actual !== expected) add(issues, `${recordPath}.completion.work_identity.${field}`, "does not match the migration capability projection");
+    }
+    if (typeof identity.task_id === "string" && typeof capability.capability_id === "string" && typeof identity.slot_id === "string") {
+      const expectedTask = migrationTaskId(capability.capability_id, issued, identity.slot_id);
+      if (identity.task_id !== expectedTask) add(issues, `${recordPath}.completion.work_identity.task_id`, "does not match the deterministic migration task binding");
+    }
+  }
+  const envelope = recordValue.completion_envelope;
+  if (envelope === undefined) { add(issues, `${recordPath}.completion_envelope`, "is required for migration evidence"); return; }
+  migrationEnvelopeIssues(envelope, `${recordPath}.completion_envelope`, issues);
+  if (isRecord(envelope) && identity && isRecord(envelope.identity) && !controlPlaneValueEquals(envelope.identity, identity)) add(issues, `${recordPath}.completion_envelope.identity`, "does not match migration completion identity");
+  if (isRecord(envelope) && identity && typeof identity.migration_id === "string") {
+    const revisionPrefix = `revisions/${identity.migration_id}/`;
+    if (envelope.evidence_ref !== `${revisionPrefix}succeeded-slots.json`) add(issues, `${recordPath}.completion_envelope.evidence_ref`, "must bind to this identity's immutable migration revision");
+    if (Array.isArray(envelope.artifact_refs)) {
+      envelope.artifact_refs.forEach((entry, index) => {
+        if (isRecord(entry) && (typeof entry.path !== "string" || !entry.path.startsWith(revisionPrefix))) add(issues, `${recordPath}.completion_envelope.artifact_refs[${index}].path`, "must bind to this identity's immutable migration revision");
+      });
+    }
+  }
+  if (isRecord(envelope) && Array.isArray(envelope.artifact_refs) && Array.isArray(completion.artifact_ids)) {
+    const ids = envelope.artifact_refs.map((entry) => isRecord(entry) ? entry.artifact_id : undefined);
+    if (JSON.stringify(ids) !== JSON.stringify(completion.artifact_ids)) add(issues, `${recordPath}.completion_envelope.artifact_refs`, "artifact ids must match migration completion");
+  }
+}
+
 function isSafeSegment(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value !== "." && value !== ".." && /^[A-Za-z0-9._-]+$/.test(value);
 }
@@ -487,11 +743,16 @@ function validateDispatchRecordInto(recordValue: unknown, recordPath: string, is
     add(issues, recordPath, "must be an object");
     return;
   }
-  unknownKeys(recordValue, ["id", "role", "agent", "tool_call_id", "status", "attempt", "created_at", "completed_at", "completion", "work_identity", "pending", "completion_envelope"], recordPath, issues);
+  if (isMigrationDispatchRecordValue(recordValue)) {
+    validateMigrationDispatchRecordInto(recordValue, recordPath, issues, capability, issued);
+    return;
+  }
+  unknownKeys(recordValue, ["id", "role", "agent", "tool_call_id", "origin_session_id", "status", "attempt", "created_at", "completed_at", "completion", "work_identity", "pending", "completion_envelope"], recordPath, issues);
   for (const key of ["id", "role", "agent", "created_at"]) requireString(recordValue, key, recordPath, issues);
   requireEnum(recordValue, "status", ["authorized", "running", "pending", "succeeded", "failed", "cancelled"], recordPath, issues);
   requireInteger(recordValue, "attempt", recordPath, issues, 1);
   if (recordValue.tool_call_id !== undefined && !nonEmptyString(recordValue.tool_call_id)) add(issues, `${recordPath}.tool_call_id`, "must be a non-empty string");
+  if (recordValue.origin_session_id !== undefined && !nonEmptyString(recordValue.origin_session_id)) add(issues, `${recordPath}.origin_session_id`, "must be a non-empty string");
   const expectedRoles = Array.isArray(capability.expected_roles) ? capability.expected_roles as string[] : [];
   if (nonEmptyString(recordValue.role) && expectedRoles.length > 0 && !expectedRoles.includes(recordValue.role)) {
     add(issues, `${recordPath}.role`, "is not part of the capability's expected roles");
@@ -635,8 +896,9 @@ export function validateDispatchCapabilityValue(value: unknown, path = "$"): Con
   if (!isRecord(issued)) {
     add(issues, `${path}.issued_for`, "must be an object");
   } else {
-    unknownKeys(issued, ["run_key", "branch", "workflow", "profile_hash", "stage_cursor", "cursor_epoch", "loop_iteration", "checkpoint_policy_hash"], `${path}.issued_for`, issues);
+    unknownKeys(issued, ["run_key", "branch", "workflow", "profile_hash", "stage_cursor", "cursor_epoch", "rework_generation", "loop_iteration", "checkpoint_policy_hash"], `${path}.issued_for`, issues);
     for (const key of ["run_key", "branch", "workflow", "profile_hash", "stage_cursor", "cursor_epoch"]) requireString(issued, key, `${path}.issued_for`, issues);
+    if (issued.rework_generation !== undefined && (!Number.isInteger(issued.rework_generation) || (issued.rework_generation as number) < 0)) add(issues, `${path}.issued_for.rework_generation`, "must be an integer >= 0");
     if (issued.loop_iteration !== undefined && (!Number.isInteger(issued.loop_iteration) || (issued.loop_iteration as number) < 1)) {
       add(issues, `${path}.issued_for.loop_iteration`, "must be an integer >= 1");
     }
@@ -750,6 +1012,7 @@ export function validateCapabilityStateBinding(state: unknown, path = "$"): Cont
       ["workflow", isRecord(state.classification) ? state.classification.workflow : undefined, issued.workflow],
       ["profile_hash", state.profile_hash, issued.profile_hash],
       ["cursor_epoch", state.cursor_epoch, issued.cursor_epoch],
+      ["rework_generation", state.rework_generation, issued.rework_generation],
       ["stage_cursor", state.stage_cursor, issued.stage_cursor],
     ];
     for (const [field, stateValue, issuedValue] of comparisons) {
@@ -815,6 +1078,7 @@ function validateActiveNestedDispatchIdentities(
     : [];
   const byDispatch = new Map(records.map((record) => [record.id, record]));
   records.forEach((record, index) => {
+    if (isMigrationDispatchRecordValue(record)) return;
     const recordPath = `${path}.dispatches[${index}]`;
     validateActiveDispatchIdentityInto(record.work_identity, `${recordPath}.work_identity`, issues, capability, issued, record);
     if (isRecord(record.pending)) {
@@ -898,6 +1162,9 @@ export function validateActiveDispatchCapabilityValue(value: unknown, path = "$"
     add(issues, `${path}.issued_for`, "must be an object for an active dispatch capability");
     return issues.length > 0 ? { ok: false, issues } : { ok: true };
   }
+  if (issued.rework_generation !== undefined && (!Number.isInteger(issued.rework_generation) || (issued.rework_generation as number) < 0)) {
+    add(issues, `${path}.issued_for.rework_generation`, "must be an integer >= 0 when present");
+  }
   if (!Number.isInteger(issued.loop_iteration) || (issued.loop_iteration as number) < 1) {
     add(issues, `${path}.issued_for.loop_iteration`, "is required for an active (loop-scoped) capability");
   }
@@ -907,13 +1174,14 @@ export function validateActiveDispatchCapabilityValue(value: unknown, path = "$"
   const records = Array.isArray(cap.dispatches)
     ? cap.dispatches.filter((record): record is UnknownRecord => isRecord(record))
     : [];
+  const liveRecords = records.filter((record) => !isMigrationDispatchRecordValue(record));
   if (cap.kind === "single") {
-    if (records.length === 0 && cap.work_identity !== undefined) {
+    if (liveRecords.length === 0 && cap.work_identity !== undefined) {
       add(issues, `${path}.work_identity`, "is forbidden before the single dispatch is authorized");
-    } else if (records.length > 0 && cap.work_identity === undefined) {
+    } else if (liveRecords.length > 0 && cap.work_identity === undefined) {
       add(issues, `${path}.work_identity`, "is required for an active single-dispatch capability");
-    } else if (records.length > 0 && isRecord(cap.work_identity)) {
-      const latest = records[records.length - 1];
+    } else if (liveRecords.length > 0 && isRecord(cap.work_identity)) {
+      const latest = liveRecords[liveRecords.length - 1];
       if (latest && cap.work_identity.dispatch_id !== latest.id) {
         add(issues, `${path}.work_identity.dispatch_id`, "must project the latest single dispatch record");
       }

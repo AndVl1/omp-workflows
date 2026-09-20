@@ -1,15 +1,9 @@
 /**
- * Focused tests for the `/session-report` fullstack custom-TS command
- * (pragmatic architecture, frontend slice).
+ * Focused tests for the `/session-report` fullstack custom-TS command.
  *
- * The command is a thin orchestration shell over the core report API
- * (buildSessionReport → renderReportHtml → writeReport). These tests drive
- * the real command factory with fake CustomCommandAPI/HookCommandContext and
- * real core functions against temp project roots:
- *   - argument parsing (bare / kind / id= / --full / errors)
- *   - per-feature, legacy, and per-CTO target-path selection
- *   - static overwrite semantics (re-run rewrites the same path)
- *   - error paths never write a report
+ * The command is a thin orchestration shell over canonical/core report APIs.
+ * These tests cover parsing, canonical/CTO target paths, migration gating for
+ * legacy ordinary state, and error paths that never write a report.
  */
 
 import { test } from "node:test";
@@ -20,7 +14,6 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -144,6 +137,11 @@ test("command: parses /session-report arguments", () => {
     selector: { kind: "do-work", id: "my-feature" },
     options: { includeFullArtifacts: true },
   });
+  assert.deepEqual(parseSessionReportArgs(["do-work", "id=123e4567-e89b-12d3-a456-426614174000", "revision=rev-7"]), {
+    selector: { kind: "do-work", id: "123e4567-e89b-12d3-a456-426614174000" },
+    revision_id: "rev-7",
+    options: {},
+  });
 
   const unknown = parseSessionReportArgs(["oops"]);
   assert.ok(unknown.error?.includes("unknown argument: oops"));
@@ -153,22 +151,22 @@ test("command: parses /session-report arguments", () => {
   assert.ok(emptyId.error?.includes("empty id"));
 });
 
-test("command: chooses per-feature, legacy, and per-CTO target paths", () => {
-  const featureReport = {
+test("command: chooses canonical run/revision and per-CTO target paths", () => {
+  const runId = "123e4567-e89b-12d3-a456-426614174000";
+  const canonicalReport = {
     kind: "do-work",
-    source: { id: "my-feature", isLegacy: false },
-  } as SessionReport;
-  const legacyReport = {
-    kind: "do-work",
-    source: { id: "legacy", isLegacy: true },
+    source: { id: runId, isLegacy: false },
   } as SessionReport;
   const ctoReport = {
     kind: "cto",
     source: { id: "run-9", isLegacy: false },
   } as SessionReport;
 
-  assert.equal(sessionReportTargetPath(featureReport), ".work-state/features/my-feature/report.html");
-  assert.equal(sessionReportTargetPath(legacyReport), ".work-state/report.html");
+  assert.equal(sessionReportTargetPath(canonicalReport), `.work-state/runs/${runId}/report.html`);
+  assert.equal(
+    sessionReportTargetPath(canonicalReport, "rev-7"),
+    `.work-state/runs/${runId}/revisions/rev-7/report.html`,
+  );
   assert.equal(sessionReportTargetPath(ctoReport), ".work-state/cto/run-9/report.html");
 });
 
@@ -180,36 +178,26 @@ test("command: /session-report factory boots", () => {
   assert.ok(cmd.description.includes("/session-report [do-work|cto]"));
 });
 
-test("command: bare invocation auto-detects the latest do-work session and writes the feature report", async () => {
+test("command: bare ordinary report requires an explicit canonical run after cutover", async () => {
   const { root, notifyCalls } = makeProject();
   writeDoWorkFixture(root, "report-test");
   const cmd = sessionReportFactory(fakeApi(root) as never);
   const result = await cmd.execute([], fakeCtx(root, notifyCalls) as never);
 
-  const target = join(root, ".work-state", "features", "report-test", "report.html");
-  assert.ok(existsSync(target), "report.html written under .work-state/features/<slug>/");
-  const html = readFileSync(target, "utf8");
-  assert.ok(html.startsWith("<!doctype html>"), "report is a standalone HTML file");
-  assert.ok(html.includes("Build the /session-report command"), "task rendered");
-  assert.ok(result.includes(".work-state/features/report-test/report.html"), "status names the output path");
-  assert.ok(result.includes("report-test"), "status names the session id");
-  assert.equal(notifyCalls.length, 1, "user notified once");
-  assert.ok(notifyCalls[0]!.includes("session-report:"), "notify prefix");
+  assert.match(result, /migration_required/);
+  assert.ok(!existsSync(join(root, ".work-state", "features", "report-test", "report.html")));
+  assert.equal(notifyCalls.length, 0);
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: --full embeds sanitized artifact bodies into the report", async () => {
+test("command: ordinary report rejects legacy feature artifacts without canonical import", async () => {
   const { root } = makeProject();
   writeDoWorkFixture(root, "report-test");
   const cmd = sessionReportFactory(fakeApi(root) as never);
   const result = await cmd.execute(["do-work", "id=report-test", "--full"], fakeCtx(root, []) as never);
 
-  const target = join(root, ".work-state", "features", "report-test", "report.html");
-  assert.ok(existsSync(target));
-  const html = readFileSync(target, "utf8");
-  assert.ok(html.includes("Show full content"), "expandable artifact body present");
-  assert.ok(html.includes("Implementation plan"), "sanitized body content embedded");
-  assert.ok(result.startsWith("Session report written:"), "success status");
+  assert.match(result, /migration_required/);
+  assert.ok(!existsSync(join(root, ".work-state", "features", "report-test", "report.html")));
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -231,7 +219,7 @@ test("command: cto sessions write to .work-state/cto/<runId>/report.html", async
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: legacy root state writes to .work-state/report.html", async () => {
+test("command: legacy ordinary root requires migration before reporting", async () => {
   const { root } = makeProject();
   const wsDir = join(root, ".work-state");
   mkdirSync(wsDir, { recursive: true });
@@ -239,26 +227,18 @@ test("command: legacy root state writes to .work-state/report.html", async () =>
   const cmd = sessionReportFactory(fakeApi(root) as never);
 
   const result = await cmd.execute(["do-work", "id=legacy"], fakeCtx(root, []) as never);
-  const target = join(root, ".work-state", "report.html");
-  assert.ok(existsSync(target), "legacy report written next to team-state.json");
-  assert.ok(result.includes(".work-state/report.html"));
+  assert.match(result, /migration_required/);
+  assert.ok(!existsSync(join(root, ".work-state", "report.html")));
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: re-running overwrites the same report path (static snapshot semantics)", async () => {
+test("command: legacy report reruns remain migration-gated", async () => {
   const { root } = makeProject();
   writeDoWorkFixture(root, "report-test");
   const cmd = sessionReportFactory(fakeApi(root) as never);
-  const target = join(root, ".work-state", "features", "report-test", "report.html");
-
-  await cmd.execute(["do-work", "id=report-test"], fakeCtx(root, []) as never);
-  const firstStat = statSync(target);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  await cmd.execute(["do-work", "id=report-test"], fakeCtx(root, []) as never);
-
-  const secondStat = statSync(target);
-  assert.ok(secondStat.mtimeMs >= firstStat.mtimeMs, "same path rewritten on re-run");
-  assert.ok(readFileSync(target, "utf8").startsWith("<!doctype html>"));
+  const result = await cmd.execute(["do-work", "id=report-test"], fakeCtx(root, []) as never);
+  assert.match(result, /migration_required/);
+  assert.ok(!existsSync(join(root, ".work-state", "features", "report-test", "report.html")));
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -274,22 +254,21 @@ test("command: unknown arguments return usage and write nothing", async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: unknown session id returns a build error and writes nothing", async () => {
+test("command: unmapped legacy session id requires migration and writes nothing", async () => {
   const { root } = makeProject();
   writeDoWorkFixture(root, "report-test");
   const cmd = sessionReportFactory(fakeApi(root) as never);
   const result = await cmd.execute(["id=ghost"], fakeCtx(root, []) as never);
-  assert.ok(result.startsWith("ERROR: could not build session report"));
-  assert.ok(result.includes('id "ghost"'), "error names the missing session");
+  assert.match(result, /migration_required/);
   assert.ok(!existsSync(join(root, ".work-state", "features", "ghost", "report.html")));
   rmSync(root, { recursive: true, force: true });
 });
 
-test("command: empty project returns a build error", async () => {
+test("command: empty ordinary workspace reports migration_required", async () => {
   const { root } = makeProject();
   const cmd = sessionReportFactory(fakeApi(root) as never);
   const result = await cmd.execute([], fakeCtx(root, []) as never);
-  assert.ok(result.startsWith("ERROR: could not build session report"));
+  assert.match(result, /migration_required/);
   assert.ok(!existsSync(join(root, ".work-state")), "no .work-state created on failure");
   rmSync(root, { recursive: true, force: true });
 });

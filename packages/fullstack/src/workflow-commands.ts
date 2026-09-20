@@ -18,7 +18,7 @@ import {
 	registerWorkflowCommands as registerCoreWorkflowCommands,
 	type WorkflowCommandOptions,
 } from "@andvl1/omp-workflows-core";
-import { fullstackOwnerForCwd, resolveSessionCwd } from "./index.js";
+import { fullstackOwnerForCwd, getFullstackWorkflowSessionController, resolveSessionCwd } from "./index.js";
 
 /**
  * Fullstack is an adapter over the core command service. It supplies the
@@ -27,11 +27,12 @@ import { fullstackOwnerForCwd, resolveSessionCwd } from "./index.js";
  */
 export function registerWorkflowCommands(
 	pi: ExtensionAPI,
-	options: Omit<WorkflowCommandOptions, "owner" | "resolveCwd"> = {},
+	options: Omit<WorkflowCommandOptions, "owner" | "resolveCwd" | "getSessionController"> = {},
 ): void {
 	registerCoreWorkflowCommands(pi, {
 		...options,
 		resolveCwd: resolveSessionCwd,
 		owner: fullstackOwnerForCwd,
+		getSessionController: getFullstackWorkflowSessionController,
 	});
 }

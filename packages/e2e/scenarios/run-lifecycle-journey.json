@@ -1,0 +1,58 @@
+{
+  "id": "run-lifecycle-journey",
+  "title": "Run lifecycle: A -> B -> C -> A rework",
+  "description": "Registered /do-work terminal journey for independent runs, branch isolation and rework. The operator drives every command through the existing ux-e2e terminal harness and records the visible workflow_prepare receipts.",
+  "task": { "file": "run-lifecycle-journey-task.md" },
+  "params": {
+    "slug": "run-lifecycle-journey",
+    "branch": "feat/run-lifecycle-a",
+    "task": "exercise independent ordinary runs and rework through the registered /do-work command"
+  },
+  "stages": [
+    {
+      "id": "new_a",
+      "name": "A: first independent run",
+      "expect": ["workflow_prepare", "operation[^\\n]*new", "selected.*run|run.*selected"]
+    },
+    {
+      "id": "new_b_same_branch",
+      "name": "B: new run on the same branch",
+      "expect": ["workflow_prepare", "operation[^\\n]*new", "previous.*run|detached|saved progress", "created.*selected|selected.*created"]
+    },
+    {
+      "id": "new_c_other_branch",
+      "name": "C: new run after changing branch",
+      "expect": ["workflow_prepare", "operation[^\\n]*new", "feat/run-lifecycle-c", "selected.*run|run.*selected"]
+    },
+    {
+      "id": "list_selection",
+      "name": "Stable list selection without UUID",
+      "expect": ["run_selection_required|/do-work --list", "branch", "status", "stage"]
+    },
+    {
+      "id": "rework_a",
+      "name": "A: rework selected by task name",
+      "expect": ["workflow_prepare", "operation[^\\n]*rework", "revision|snapshot", "rework_generation", "previous.*evidence|evidence.*previous"]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 900000,
+    "checkpointPollMs": 2000
+  },
+  "screenshots": {
+    "on": ["stage_start", "stage_end", "error"]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

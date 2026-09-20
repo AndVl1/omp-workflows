@@ -5,8 +5,8 @@
 Последовательный milestone core. Интеграционный владелец — единственный writer общих типов, exports и файлов хранения; конкретных владельцев core/fullstack/internal/e2e назначить при apply по `design.md`, до параллельной записи. Основание: `run-lifecycle` и `run-context-isolation`.
 
 - [ ] 1.1 В `engine/types.ts` и `control-plane-contract.ts` определить schema-2 ordinary run identity, lifecycle request `new | resume | rework`, trusted execution context и typed errors; согласовать `run_id`, `run_key`, `WorkIdentity.run_id`. Проверка: validators отвергают несовпадающие идентичности, неизвестную schema и старую неоднозначную continuation-форму, сохраняя CTO namespace.
-- [ ] 1.2 В `engine/run-lifecycle.ts` реализовать выбор намерения/кандидата по `design.md` Decisions 1–2 без I/O и OMP API: название/однозначный фрагмент, пункт показанного списка, optional технический ID. Проверка: явный selector не имеет fallback, одинаковые названия дают понятный выбор, добавление run не переназначает номер прежнего списка; terminal resume даёт `run_terminal`, новая задача не зависит от history.
-- [ ] 1.3 Добавить prepare request identity и exact-replay контракт в typed validation. Проверка: тот же request/payload возвращает тот же запуск, изменённый payload с прежним request ID отвергается, новый пользовательский запрос с тем же текстом остаётся независимым.
+- [x] 1.2 В `engine/run-lifecycle.ts` реализовать выбор намерения/кандидата по `design.md` Decisions 1–2 без I/O и OMP API: название/однозначный фрагмент, пункт показанного списка, optional технический ID. Проверка: явный selector не имеет fallback, одинаковые названия дают понятный выбор, добавление run не переназначает номер прежнего списка; terminal resume даёт `run_terminal`, новая задача не зависит от history.
+- [x] 1.3 Добавить prepare request identity и exact-replay контракт в typed validation. Проверка: тот же request/payload возвращает тот же запуск, изменённый payload с прежним request ID отвергается, новый пользовательский запрос с тем же текстом остаётся независимым.
 
 ## 2. Canonical storage and transactions
 

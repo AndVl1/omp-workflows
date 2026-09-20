@@ -7,6 +7,10 @@ import {
 	parseEnvelope as parseCtoEnvelope,
 } from "./cto.js";
 import { buildDoWorkPrompt, parseWorkEnvelope, type ParsedWorkEnvelope } from "./do-work.js";
+import { parseWorkflowCommand } from "./envelope.js";
+import { createSelectionSnapshot } from "../engine/run-store.js";
+import { resolveActiveBranch } from "../engine/state.js";
+import type { WorkflowSessionController } from "../engine/host-controller.js";
 import {
 	claimWorkflowOwners,
 	type WorkflowOwnerSource,
@@ -37,6 +41,8 @@ export interface WorkflowCommandOptions {
 	 */
 	resolveCwd?: (ctx: unknown) => string | undefined;
 	owner?: WorkflowOwnerSource;
+	/** Reuse the bundle-owned controller shared with core workflow tools/hooks. */
+	getSessionController?: (ctx: unknown, cwd: string) => WorkflowSessionController | undefined;
 }
 /**
  * Resolve the project root from the session manager first. A missing cwd is
@@ -58,7 +64,7 @@ type CommandPromptBuilder = (
 	ctx: ExtensionCommandContext,
 	cwd: string | undefined,
 ) => string;
-type BeforeCommandExecute = (cwd: string | undefined) => void;
+type BeforeCommandExecute = (cwd: string | undefined, ctx: ExtensionCommandContext) => void;
 
 function registerPromptCommand(
 	pi: ExtensionAPI,
@@ -74,7 +80,7 @@ function registerPromptCommand(
 			// Resolve once and pass this exact value through both authorization and
 			// prompt construction. The context may drift while a session is active.
 			const cwd = resolveCwd(ctx);
-			beforeExecute?.(cwd);
+			beforeExecute?.(cwd, ctx);
 			pi.sendUserMessage(buildPrompt(args.trim(), ctx, cwd));
 		},
 	});
@@ -110,9 +116,17 @@ function buildDoWorkCommandPrompt(
 	}
 
 	if (!cwd) return "ERROR: workflow cwd unavailable.";
-	const envelope = parseWorkEnvelope(args, cwd);
-	if (!envelope.task) return "ERROR: empty task after stripping prefix.";
-	ctx.ui.notify(`${displayName}: ${envelope.task.slice(0, 60)} (workflow pending)`, "info");
+	const command = parseWorkflowCommand(args);
+	if (!command.ok) return `ERROR [${command.code}]: ${command.error}`;
+	if (command.mode === "list") {
+		const snapshot = createSelectionSnapshot(cwd, { includeTerminal: true, ...(command.all_branches ? {} : { branch: resolveActiveBranch(cwd) }) });
+		if (snapshot.candidates.length === 0) return "No workflow runs found.";
+		return snapshot.candidates.map((candidate, index) => String(index + 1) + ". " + candidate.title + " — " + candidate.branch + " — " + candidate.status + " — " + candidate.stage + " (snapshot_id=" + snapshot.snapshot_id + "; index=" + index + "; run_id=" + candidate.run_id + ")").join("\n");
+	}
+	const parsed = parseWorkEnvelope(command.task, cwd);
+	if (command.mode === "new" && !parsed.task) return "ERROR: empty task after stripping prefix.";
+	const envelope: ParsedWorkEnvelope = { ...parsed, mode: command.mode, ...(command.run_id ? { run_id: command.run_id } : {}) };
+	ctx.ui.notify(`${displayName}: ${envelope.task || command.mode} (workflow pending)`, "info");
 	return promptBuilder(envelope, cwd);
 }
 
@@ -145,6 +159,12 @@ function claimCommandOwner(options: WorkflowCommandOptions, cwd: string): void {
 	const owner = typeof options.owner === "function" ? options.owner(cwd) : options.owner;
 	const claim = claimWorkflowOwners(cwd, ["workflow_registration"], owner);
 	if (!claim.ok) throw new Error(`${claim.code}: ${claim.error}`);
+}
+
+function bindCommandController(options: WorkflowCommandOptions, cwd: string | undefined, ctx: ExtensionCommandContext): void {
+	if (!options.getSessionController) return;
+	if (!cwd) throw new Error("WORKFLOW_CONTEXT_REJECTED: workflow cwd unavailable");
+	if (!options.getSessionController(ctx, cwd)) throw new Error("WORKFLOW_CONTEXT_REJECTED: trusted session identity is unavailable");
 }
 
 /** Register workflow entry points during extension load, before OMP snapshots slash suggestions. */
@@ -180,7 +200,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			options.doWorkDescription ?? doWorkDescription(names.doWork, names.team),
 			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "do-work", names, promptBuilder, cwd),
 			resolveEffectiveCwd,
-			claimForCommand,
+			(cwd, ctx) => { claimForCommand?.(cwd); bindCommandController(options, cwd, ctx); },
 		);
 		registerPromptCommand(
 			pi,
@@ -188,7 +208,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			options.teamDescription ?? teamDescription(names.doWork),
 			(args, ctx, cwd) => buildDoWorkCommandPrompt(args, ctx, "team", names, promptBuilder, cwd),
 			resolveEffectiveCwd,
-			claimForCommand,
+			(cwd, ctx) => { claimForCommand?.(cwd); bindCommandController(options, cwd, ctx); },
 		);
 		registerPromptCommand(
 			pi,
@@ -196,7 +216,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			options.ctoDescription ?? ctoDescription(names.cto),
 			(args, ctx, cwd) => buildCtoCommandPrompt(args, ctx, names.cto, cwd),
 			resolveEffectiveCwd,
-			claimForCommand,
+			(cwd, ctx) => { claimForCommand?.(cwd); bindCommandController(options, cwd, ctx); },
 		);
 	};
 

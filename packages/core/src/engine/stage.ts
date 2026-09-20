@@ -23,7 +23,8 @@
 import { buildDispatchMarker, dispatchTaskId } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { readFileSync } from "node:fs";
 import { persistReturnedArtifacts, readArtifact, writeArtifact } from "./artifacts.js";
 import { resolveConfig } from "./config.js";
 import { type ScopeFlags } from "./scope.js";
@@ -32,6 +33,7 @@ import { namespacedArtifactId, sanitizeSlot } from "./fan-in.js";
 import { PRD_SOURCE_ARTIFACT_IDS, validateProductPrdDocument, writeProductPrdDocument } from "./product-prd.js";
 import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
 import type {
+  CapturedDispatchContext,
   DispatchSlot,
   Profile,
   RosterPolicy,
@@ -78,9 +80,12 @@ export interface StageContext {
   }) => Promise<OrchestratorResult | void> | OrchestratorResult | void;
   onStageStart?: (stageId: string) => void;
   onStageComplete?: (stageId: string, status: StageOutcome["status"]) => void;
+  captured?: CapturedDispatchContext;
   /** Present when strict durable execution is armed. */
   durable?: {
-    authorize: (role: string, agent: string) => { ok: true; dispatchId: string } | { ok: false; error: string };
+    /** Resolve and hash every canonical input before native dispatch. */
+    readInputs?: (stageId: string) => { ok: true; inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> } | { ok: false; error: string };
+    authorize: (role: string, agent: string) => { ok: true; dispatchId: string; captured?: CapturedDispatchContext } | { ok: false; error: string };
     complete: (dispatchId: string, output: string, outcome: "succeeded" | "failed", artifactIds?: string[]) => { ok: true } | { ok: false; error: string };
     pending?: (dispatchId: string, reason?: "provider_running" | "awaiting_result" | "transport_reconnect", providerRef?: string) => { ok: true } | { ok: false; error: string };
     advance: (evidence: string) => { ok: true; handoff?: { capability_id: string; dispatch_token: string; advance_token: string; cursor_epoch: string } } | { ok: false; error: string };
@@ -441,6 +446,51 @@ async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: str
   return validateProduced(stage, ctx, [], "orchestrator stage (inline)");
 }
 
+export type RequiredStageInputRead =
+  | { ok: true; inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> }
+  | { ok: false; error: string };
+
+/**
+ * Read the canonical JSON inputs for a stage before any provider dispatch.
+ * The manifest is persisted in TeamState when the durable callback is used;
+ * this pure reader only resolves safe paths and verifies declared hashes.
+ */
+export function readRequiredStageInputs(stage: StageDef, state: TeamState, artifactsDir: string): RequiredStageInputRead {
+  const declared = state.required_inputs?.[stage.id];
+  const baseManifest: Array<{ artifact_id: string; path: string; sha256?: string }> = declared && declared.length > 0
+    ? declared
+    : (stage.consumes ?? []).map((artifact_id) => ({ artifact_id, path: `${artifact_id}.json` }));
+  const decisionManifest: Array<{ artifact_id: string; path: string; sha256?: string }> = (state.decisions ?? [])
+    .filter((decision) => Boolean(decision.artifact_id))
+    .map((decision) => ({ artifact_id: decision.artifact_id!, path: `${decision.artifact_id}.json` }));
+  const manifest = Array.from(new Map([...baseManifest, ...decisionManifest].map((input) => [`${input.artifact_id}:${input.path}`, input])).values());
+  const root = resolve(artifactsDir);
+  const inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> = [];
+  for (const input of manifest) {
+    if (!input.artifact_id || !input.path || isAbsolute(input.path) || input.path.includes("\\") || input.path.split("/").some((segment) => segment === ".." || segment === "")) {
+      return { ok: false, error: `recovery_required: unsafe required input path for ${input.artifact_id}` };
+    }
+    const path = resolve(root, input.path);
+    const rel = relative(root, path);
+    if (!rel || rel === ".." || rel.startsWith("../") || isAbsolute(rel)) return { ok: false, error: `recovery_required: required input ${input.artifact_id} escapes artifacts directory` };
+    let content: string;
+    try {
+      content = readFileSync(path, "utf8");
+    } catch (error) {
+      return { ok: false, error: `recovery_required: required input ${input.artifact_id} is unreadable: ${(error as Error).message}` };
+    }
+    try {
+      JSON.parse(content);
+    } catch (error) {
+      return { ok: false, error: `recovery_required: required input ${input.artifact_id} is not valid JSON: ${(error as Error).message}` };
+    }
+    const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
+    if (input.sha256 && input.sha256 !== sha256) return { ok: false, error: `recovery_required: required input ${input.artifact_id} hash does not match its persisted manifest` };
+    inputs.push({ artifact_id: input.artifact_id, path: input.path, sha256, content });
+  }
+  return { ok: true, inputs };
+}
+
 function persistTaskArtifacts(ctx: StageContext, result: TaskResult): { ids: string[]; error?: string } {
   try {
     return { ids: persistReturnedArtifacts(ctx.artifactsDir, result.artifacts ?? {}) };
@@ -465,10 +515,28 @@ function taskEvidence(result: TaskResult, outcome: "succeeded" | "failed"): stri
   return result.output.trim() || result.error?.trim() || (outcome === "failed" ? "task failed" : "task completed");
 }
 
+function hasCompletedDispatchForSlot(state: TeamState, stageId: string, slot: DispatchSlot): boolean {
+  return (state.dispatch_capability?.dispatches ?? []).some((record) => {
+    if (record.status !== "succeeded") return false;
+    const identityStage = record.work_identity?.stage_id;
+    if (identityStage && identityStage !== stageId) return false;
+    return record.work_identity?.slot_id === slot.slot
+      || record.work_identity?.slot_id === slot.slot_id
+      || record.role === slot.slot
+      || record.role === slot.role;
+  });
+}
+
 async function runSingle(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
   const slot = resolveStageDispatchSlots(stage, ctx)[0];
   if (!slot) return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
   const agent = ctx.agent(slot.role);
+  const inputRead = ctx.durable?.readInputs?.(stage.id);
+  if (inputRead && !inputRead.ok) return { stageId: stage.id, status: "failed", note: inputRead.error, artifacts: produces };
+  if (hasCompletedDispatchForSlot(ctx.state, stage.id, slot)) {
+    ctx.log("  single: " + slot.slot + " already succeeded; reusing terminal dispatch");
+    return validateProduced(stage, ctx, produces, "reused succeeded dispatch");
+  }
   const task = buildStagePrompt(stage, ctx, slot.slot);
   ctx.log(`  single: ${agent} (slot=${slot.slot}, role=${slot.role})`);
   const authorized = ctx.durable?.authorize(slot.slot, agent);
@@ -567,10 +635,13 @@ function pairConsiliumResults(roster: DispatchSlot[], tasks: Array<{ name?: stri
 }
 
 async function runConsilium(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  const roster = resolveStageDispatchSlots(stage, ctx);
-  if (roster.length === 0) return { stageId: stage.id, status: "failed", note: "consilium stage resolved to an empty roster", artifacts: produces };
+  const resolvedRoster = resolveStageDispatchSlots(stage, ctx);
+  const roster = resolvedRoster.filter((slot) => !hasCompletedDispatchForSlot(ctx.state, stage.id, slot));
+  if (roster.length === 0) return validateProduced(stage, ctx, produces, "reused succeeded dispatches");
   const multiSlot = roster.length > 1;
   ctx.log(`  consilium: ${roster.map((slot) => slot.slot).join(", ")}${multiSlot ? " (slot-scoped artifacts)" : ""}`);
+  const inputRead = ctx.durable?.readInputs?.(stage.id);
+  if (inputRead && !inputRead.ok) return { stageId: stage.id, status: "failed", note: inputRead.error, artifacts: produces };
   const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot) }));
   const authorized = ctx.durable ? roster.map((slot, i) => ctx.durable!.authorize(slot.slot, tasks[i]!.agent)) : [];
   const denied = authorized.find((a) => !a.ok);

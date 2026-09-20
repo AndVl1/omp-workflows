@@ -29,11 +29,16 @@ import { readObservabilityPointer } from "../observability/recorder.js";
 import { recordStageTransition } from "../observability/hooks.js";
 import {
   beginArtifactJournal,
+  recoverArtifactJournals,
+  markArtifactJournalCommit,
+  markArtifactJournalLifecycle,
+  artifactJournalHasCommitBoundary,
   commitArtifactJournal,
   endArtifactJournal,
   publishAfterStateCommit,
   rollbackArtifactJournal,
 } from "./artifacts.js";
+import { beginLifecycleTransaction, commitLifecycleTransaction, recoverLifecycleTransactions } from "./lifecycle-journal.js";
 import { activeWave, readCtoState } from "../cto/state.js";
 import {
   loadProfile,
@@ -93,6 +98,7 @@ export function resolveActiveBranch(cwd: string): string {
 const WORK_STATE_DIR = ".work-state";
 const ACTIVE_FEATURE = ".active-feature";
 const LEGACY_STATE = "team-state.json";
+const ORDINARY_RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STATE_MD = "team-state.md";
 export function isSafeStateSegment(value: string): boolean {
   return value.length > 0 && value !== "." && value !== ".." && /^[A-Za-z0-9._-]+$/.test(value);
@@ -294,6 +300,20 @@ function validatePolicyBinding(value: unknown, state: StateRecord, path: string,
 
 function validateTypedStateFields(state: StateRecord): string[] {
   const issues: string[] = [];
+  if (state.schema !== undefined && state.schema !== 1 && state.schema !== 2) {
+    issues.push("$.schema must be schema 1 (legacy) or schema 2 (ordinary canonical)");
+  }
+  if (state.schema === 2) {
+    if (!nonEmptyStateString(state.run_id)) issues.push("$.run_id is required for schema 2 ordinary state");
+    if (nonEmptyStateString(state.run_id) && !ORDINARY_RUN_ID_PATTERN.test(state.run_id)) issues.push("$.run_id must be a UUID for schema 2 ordinary state");
+    if (!nonEmptyStateString(state.run_key)) issues.push("$.run_key is required for schema 2 ordinary state");
+    if (nonEmptyStateString(state.run_id) && nonEmptyStateString(state.run_key) && state.run_id !== state.run_key) {
+      issues.push("$.run_key must equal $.run_id for schema 2 ordinary state");
+    }
+    if (state.rework_generation !== undefined && (typeof state.rework_generation !== "number" || !Number.isInteger(state.rework_generation) || state.rework_generation < 0)) {
+      issues.push("$.rework_generation must be an integer >= 0");
+    }
+  }
   const profileFields: StateRecord = {};
   for (const key of ["completion_intent", "roster_policy"]) {
     if (Object.prototype.hasOwnProperty.call(state, key)) profileFields[key] = state[key];
@@ -501,7 +521,7 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
   // exists, a cleared top-level identity must stay cleared — the next
   // dispatch re-binds it, and a synthesized stale-stage identity could
   // silently bind new proofs to a prior stage.
-  if (state.work_identity === undefined && !capability && stageId && nonEmptyStateString(state.run_key ?? state.branch)) state.work_identity = legacyIdentity(state, workflow, stageId, capability);
+  if (state.schema !== 2 && state.work_identity === undefined && !capability && stageId && nonEmptyStateString(state.run_key ?? state.branch)) state.work_identity = legacyIdentity(state, workflow, stageId, capability);
   const identity = isStateRecord(state.work_identity) ? state.work_identity : null;
   for (const candidate of [state.pending, state.completion_envelope]) {
     if (!candidate || !isStateRecord(candidate) || !identity || !isStateRecord(candidate.identity)) continue;
@@ -521,7 +541,12 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
   if (!state.profile_hash && profile) state.profile_hash = targetProfileHash;
   const targetPolicyHash = stableStateHash(checkpoint_policy ?? { default: "required_human", scope: "decision", rules: {} });
   const migration = state.migration as StateRecord | undefined;
-  if (!migration) {
+  // Canonical ordinary runs are schema 2. They may receive typed control-plane
+  // defaults during normalization, but that projection is not a lifecycle
+  // migration and must not invent a schema receipt. Only legacy inputs (schema
+  // 1 or an omitted schema) acquire a synthesized receipt here; an existing
+  // import receipt is always preserved above.
+  if (!migration && state.schema !== 2) {
     const receipt: MigrationReceipt = {
       id: `migration-${stableStateHash(`${String(state.run_key ?? state.branch)}|${workflow}`).slice(0, 24)}`,
       from_schema: 1,
@@ -564,8 +589,6 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
   return (state as unknown as TeamState);
 }
 
-
-
 export interface ResolvedState {
   state: TeamState | null;
   statePath: string | null;
@@ -573,6 +596,8 @@ export interface ResolvedState {
   artifactsDir: string | null;
   isLegacy: boolean;
   isStale: boolean;
+  /** Canonical UUID run target; unlike feature targets it never updates .active-feature. */
+  canonicalRun?: boolean;
   invalid?: boolean;
 }
 
@@ -643,7 +668,7 @@ function resolveBranchOwnedFeatureState(wsDir: string, currentBranch: string): R
 
 export type StateSelector = { kind?: "auto" | "team" | "cto-slice"; runId?: string; sliceId?: string; capabilityId?: string };
 export interface ResolvedActiveRun extends ResolvedState {
-  kind: "legacy-root" | "feature" | "cto-slice";
+  kind: "legacy-root" | "feature" | "run" | "cto-slice";
   runKey: string;
   branch: string;
   workflow: string;
@@ -660,6 +685,33 @@ export interface ResolvedActiveRun extends ResolvedState {
  * root only when the pointed feature state is incomplete. */
 export function resolveCanonicalRun(cwd: string, selector: StateSelector = {}, currentBranch?: string): ResolvedActiveRun | null {
   const branch = currentBranch;
+  if (selector.kind !== "cto-slice" && selector.runId) {
+    const runId = selector.runId;
+    if (!isSafeStateSegment(runId)) throw new Error("ordinary run selector contains an unsafe path segment");
+    const wsDir = resolve(cwd, WORK_STATE_DIR);
+    const runsDir = join(wsDir, "runs");
+    const stateDir = join(runsDir, runId);
+    const statePath = join(stateDir, "state.json");
+    const artifactsDir = join(stateDir, "artifacts");
+    try {
+      const realWorkState = realpathSync(wsDir);
+      const realRuns = existsSync(runsDir) ? realpathSync(runsDir) : runsDir;
+      if (!isWithin(realWorkState, realRuns) || (existsSync(stateDir) && !isWithin(realRuns, realpathSync(stateDir)))) {
+        throw new Error("ordinary run target escapes .work-state/runs");
+      }
+      if (!existsSync(statePath)) return null;
+      if (!isWithin(realpathSync(stateDir), realpathSync(statePath))) throw new Error("ordinary run state escapes its run directory");
+      if (existsSync(artifactsDir) && !isWithin(realpathSync(stateDir), realpathSync(artifactsDir))) throw new Error("ordinary run artifacts escape its run directory");
+      const rejectionIssues: string[] = [];
+      const state = normalizePersistedState(JSON.parse(readFileSync(statePath, "utf8")), rejectionIssues);
+      if (!state || state.schema !== 2 || state.run_id !== runId || state.run_key !== runId) throw new Error(rejectionIssues.join("; ") || "ordinary run state identity is invalid");
+      const staleReason = branch && state.branch !== branch ? `branch mismatch: persisted '${state.branch}', current '${branch}'` : null;
+      return { state, statePath, stateDir, artifactsDir, isLegacy: false, isStale: Boolean(staleReason), canonicalRun: true, kind: "run", runKey: runId, branch: state.branch, workflow: state.classification.workflow, profileHash: state.profile_hash ?? "", stageCursor: state.stage_cursor, cursorEpoch: state.cursor_epoch ?? "", dispatch: state.dispatch_capability ?? null, staleReason };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
   if (selector.kind === "cto-slice" || selector.runId || selector.sliceId) {
     if (!selector.runId || !selector.sliceId) throw new Error("cto-slice selector requires runId and sliceId");
     const runId = selector.runId, sliceId = selector.sliceId;
@@ -676,12 +728,9 @@ export function resolveCanonicalRun(cwd: string, selector: StateSelector = {}, c
     const staleReason = branch && cto.branch !== branch ? `branch mismatch: persisted '${cto.branch}', current '${branch}'` : null;
     return { state: cto as any, statePath: join(cwd, WORK_STATE_DIR, "cto", cto.id, "state.json"), stateDir: join(cwd, WORK_STATE_DIR, "cto", cto.id), artifactsDir: join(cwd, WORK_STATE_DIR, "cto", cto.id, "artifacts"), isLegacy: false, isStale: Boolean(staleReason), kind: "cto-slice", runKey: `cto:${cto.id}:${sliceId}`, branch: cto.branch, workflow: team.workflow ?? "cto", profileHash: String((execution as any).profile_hash ?? ""), stageCursor: String((execution as any).stage_cursor ?? ""), cursorEpoch: String((execution as any).cursor_epoch ?? ""), dispatch: execution, staleReason, selectedTeam: team };
   }
-  const resolved = resolveState(cwd, branch);
-  if (resolved.invalid) throw new Error("workflow state is invalid or unsafe");
-  if (!resolved.state || !resolved.statePath) return null;
-  const state = resolved.state;
-  const kind = resolved.isLegacy ? "legacy-root" : "feature";
-  return { ...resolved, kind, runKey: resolved.isLegacy ? `team:${state.branch}:root` : `team:${state.branch}:${basename(resolved.stateDir ?? "")}`, branch: state.branch, workflow: state.classification.workflow, profileHash: state.profile_hash ?? "", stageCursor: state.stage_cursor, cursorEpoch: state.cursor_epoch ?? "", dispatch: state.dispatch_capability ?? null, staleReason: resolved.isStale ? `branch mismatch: persisted '${state.branch}', current '${branch ?? "unknown"}'` : null };
+  // Unscoped ordinary authority is canonical-run only. Legacy state is read by
+  // the explicit migration importer, never by a generic runtime resolver.
+  return null;
 }
 
 export function resolveState(cwd: string, currentBranch?: string): ResolvedState {
@@ -820,6 +869,7 @@ interface PreparedStateTarget {
   statePath: string;
   artifactsDir: string;
   featureSlug: string | null;
+  canonicalRun: boolean;
 }
 
 function prepareStateTarget(
@@ -841,7 +891,7 @@ function prepareStateTarget(
   }
 
   const featureSlug = target
-    ? target.isLegacy ? null : basename(target.stateDir!)
+    ? target.canonicalRun ? null : target.isLegacy ? null : basename(target.stateDir!)
     : opts.featureSlug ?? deriveFeatureSlugFromBranch(state.branch) ?? "default";
   if (featureSlug && !isSafeStateSegment(featureSlug)) throw new Error("unsafe workflow feature slug");
   let stateDir: string;
@@ -861,7 +911,7 @@ function prepareStateTarget(
     statePath = join(wsDir, LEGACY_STATE);
     artifactsDir = join(wsDir, "artifacts");
   }
-  return validatePreparedTarget(realWorkState, wsDir, { stateDir, statePath, artifactsDir, featureSlug: featureSlug ?? null });
+  return validatePreparedTarget(realWorkState, wsDir, { stateDir, statePath, artifactsDir, featureSlug: featureSlug ?? null, canonicalRun: target?.canonicalRun === true });
 }
 
 /** Run the containment and directory-creation checks for one prepared target. */
@@ -884,7 +934,7 @@ function validatePreparedTarget(realWorkState: string, wsDir: string, prepared: 
   if (!isWithin(realStateDir, realpathSync(dirname(artifactsDir)))) throw new Error("workflow artifacts path escapes its state directory");
   mkdirSync(artifactsDir, { recursive: true });
   if (!isWithin(realStateDir, realpathSync(artifactsDir))) throw new Error("workflow artifacts path escapes its state directory");
-  return { stateDir, statePath, artifactsDir, featureSlug };
+  return { stateDir, statePath, artifactsDir, featureSlug, canonicalRun: prepared.canonicalRun };
 }
 
 /** Reuse a resolved state's exact paths for a transactional commit. */
@@ -896,7 +946,8 @@ function prepareExistingTarget(realWorkState: string, wsDir: string, target: Res
     stateDir: target.stateDir,
     statePath: target.statePath,
     artifactsDir: target.artifactsDir,
-    featureSlug: target.isLegacy ? null : basename(target.stateDir),
+    featureSlug: target.canonicalRun === true || target.isLegacy ? null : basename(target.stateDir),
+    canonicalRun: target.canonicalRun === true,
   });
   if (existsSync(prepared.statePath) && !isWithin(realpathSync(prepared.stateDir), realpathSync(prepared.statePath))) {
     throw new Error("workflow state target escapes its state directory");
@@ -964,30 +1015,36 @@ interface CommittedState {
   state: TeamState;
 }
 
+export interface StatePublication {
+  operation: "new" | "resume" | "rework" | "migration" | "claim";
+  before: Record<string, string | null>;
+  after: Record<string, string | null>;
+}
 
 function commitState(
   cwd: string,
   prepared: PreparedStateTarget,
   state: TeamState,
   stateRevision: number,
+  publication?: StatePublication,
 ): CommittedState {
-  const { stateDir, statePath, artifactsDir, featureSlug } = prepared;
+  const { stateDir, statePath, artifactsDir, featureSlug, canonicalRun } = prepared;
   const rejectionIssues: string[] = [];
   const normalized = normalizePersistedState(state, rejectionIssues);
   if (!normalized) throw new Error(`workflow state contains malformed or conflicting typed control-plane fields: ${rejectionIssues.join("; ") || "unrecognized shape"}`);
   const stamped: TeamState = { ...normalized, state_revision: stateRevision, updated_at: new Date().toISOString() };
-  const obsPointer = featureSlug ? readObservabilityPointerSafe(cwd, featureSlug) : null;
+  const obsPointer = featureSlug && !canonicalRun ? readObservabilityPointerSafe(cwd, featureSlug) : null;
   if (obsPointer) {
     stamped.observability = obsPointer;
-  } else {
+  } else if (!canonicalRun) {
     delete stamped.observability;
   }
 
   const stateContent = JSON.stringify(stamped, null, 2) + "\n";
   const stateMdPath = join(stateDir, STATE_MD);
   const stateMdContent = renderStateMd(stamped);
-  const activePath = featureSlug ? join(resolve(cwd, WORK_STATE_DIR), ACTIVE_FEATURE) : null;
-  const activeContent = featureSlug ? featureSlug + "\n" : null;
+  const activePath = featureSlug && !canonicalRun ? join(resolve(cwd, WORK_STATE_DIR), ACTIVE_FEATURE) : null;
+  const activeContent = featureSlug && !canonicalRun ? featureSlug + "\n" : null;
   // All potentially fallible content generation, old-byte snapshots and temp
   // writes complete before publication. Sidecars publish first; state.json is
   // the single authoritative commit point and is replaced last.
@@ -1007,9 +1064,22 @@ function commitState(
       renameSync(activeWrite.tempPath, activePath);
       activePublished = true;
     }
-    // Authoritative commit point. Nothing after this rename may request or
-    // signal rollback of state/artifact effects.
-    renameSync(stateWrite.tempPath, statePath);
+    // Authoritative commit point. When a lifecycle publication is supplied,
+    // state.json and its control sidecar share one durable journal marker.
+    if (publication) {
+      markArtifactJournalCommit(statePath, stateContent);
+      const transaction = beginLifecycleTransaction({
+        cwd,
+        operation: publication.operation,
+        before: { [statePath]: readRegularFileNoFollow(statePath), ...publication.before },
+        after: { [statePath]: stateContent, ...publication.after },
+      });
+      markArtifactJournalLifecycle(transaction.transaction_id);
+      commitLifecycleTransaction(cwd, transaction.transaction_id);
+    } else {
+      markArtifactJournalCommit(statePath, stateContent);
+      renameSync(stateWrite.tempPath, statePath);
+    }
   } catch (error) {
     if (activePublished && activePath && activeContent !== null) restoreSidecar(activePath, previousActive, activeContent);
     if (stateMdPublished) restoreSidecar(stateMdPath, previousStateMd, stateMdContent);
@@ -1038,14 +1108,14 @@ function commitState(
 
 const STATE_LOCK_FILE = ".state.lock";
 const STATE_LOCK_RETRY_MS = 25;
-const STATE_LOCK_DEFAULT_TIMEOUT_MS = 10_000;
-const STATE_LOCK_RECLAIM_PREFIX = `${STATE_LOCK_FILE}.reclaim.`;
-
+const STATE_LOCK_DEFAULT_TIMEOUT_MS = 30_000;
+const STATE_LOCK_RECLAIM_PREFIX = ".state.lock.reclaim.";
 export type StateTxErrorCode =
   | "state_invalid"
   | "state_missing"
   | "state_conflict"
-  | "state_lock_unavailable";
+  | "state_lock_unavailable"
+  | "recovery_required";
 
 export interface StateSnapshot {
   /** Latest normalized state, or null when the run has not been created yet. */
@@ -1059,21 +1129,19 @@ export interface StateSnapshot {
 
 /**
  * A mutation may fail with its own domain code (e.g. a typed checkpoint
- * code); the transaction itself only ever surfaces the four
- * `StateTxErrorCode` values. The domain code always rides in `code` and its
- * explanation in `error`.
+ * code); the transaction itself only ever surfaces its `StateTxErrorCode` values,
+ * with the explanation carried in `error`.
  */
 export type StateMutationCode = StateTxErrorCode | (string & {});
 
 export type StateMutation<T> =
-  | { op: "commit"; state: TeamState; value?: T }
+  | { op: "commit"; state: TeamState; value?: T; publication?: StatePublication }
   | { op: "discard"; value?: T }
   | { op: "fail"; code: StateMutationCode; error: string };
 
 export type StateUpdateResult<T> =
   | { ok: true; state: TeamState | null; target: ResolvedState; revision: number; committed: boolean; value?: T }
-  // Transaction-level failures always carry one of the four StateTxErrorCode
-  // values; a domain `op: "fail"` passes its own code through verbatim.
+  // Transaction-level failures always carry one of the `StateTxErrorCode` values;
   | { ok: false; code: StateMutationCode; error: string };
 
 interface StateLockOwner {
@@ -1351,6 +1419,50 @@ function releaseStateLock(wsDir: string, token: string): void {
   }
 }
 
+/**
+ * Shared workspace transaction seam for lifecycle control and state changes.
+ * Every caller uses the same lock as updateStateAtomically; recovery runs
+ * while that lock is held, so a malformed or torn lifecycle record fails
+ * closed before any reader or writer can inspect authority.
+ */
+export function withWorkspaceTransaction<T>(
+  cwd: string,
+  action: () => T,
+  opts: { lockTimeoutMs?: number; createIfMissing?: boolean } = {},
+): T {
+  const wsDir = resolve(cwd, WORK_STATE_DIR);
+  if (!existsSync(wsDir)) {
+    if (opts.createIfMissing === false) throw new Error("workspace disappeared before acquiring the read lock");
+    mkdirSync(wsDir, { recursive: true });
+  }
+  const nestedDepth = workspaceLockDepth.get(wsDir) ?? 0;
+  if (nestedDepth > 0) {
+    workspaceLockDepth.set(wsDir, nestedDepth + 1);
+    try { return action(); } finally { workspaceLockDepth.set(wsDir, nestedDepth); }
+  }
+  const lock = acquireStateLock(wsDir, opts.lockTimeoutMs ?? STATE_LOCK_DEFAULT_TIMEOUT_MS);
+  if ("error" in lock) throw new Error(lock.error);
+  workspaceLockDepth.set(wsDir, 1);
+  try {
+    recoverLifecycleTransactions(cwd);
+    recoverArtifactJournals(cwd);
+    return action();
+  } finally {
+    workspaceLockDepth.delete(wsDir);
+    releaseStateLock(wsDir, lock.token);
+  }
+}
+
+/** Read under the shared workspace lock when it exists, without creating a workspace for empty roots. */
+export function withWorkspaceRead<T>(cwd: string, action: () => T, absent: () => T, opts: { lockTimeoutMs?: number } = {}): T {
+  const wsDir = resolve(cwd, WORK_STATE_DIR);
+  // If no workspace exists, linearize at this absence check: never run an
+  // arbitrary reader after releasing the check, because a concurrent writer
+  // could publish a partially visible authority tree.
+  if (!existsSync(wsDir)) return absent();
+  return withWorkspaceTransaction(cwd, action, { ...opts, createIfMissing: false });
+}
+
 interface RawStateSnapshot {
   kind: "present";
   state: TeamState;
@@ -1370,6 +1482,7 @@ export interface StateTransactionTestHooks {
 }
 
 let stateTransactionTestHooks: StateTransactionTestHooks | null = null;
+const workspaceLockDepth = new Map<string, number>();
 
 /** Internal deterministic race/fault seam; not exported from the package index. */
 export function setStateTransactionTestHooks(hooks: StateTransactionTestHooks | null): void {
@@ -1481,7 +1594,7 @@ function casConflict(observed: RawStateRead, current: RawStateRead): string | nu
 export function updateStateAtomically<T>(
   cwd: string,
   mutate: (snapshot: StateSnapshot) => StateMutation<T>,
-  opts: { lockTimeoutMs?: number; target?: ResolvedState; branch?: string; featureSlug?: string } = {},
+  opts: { lockTimeoutMs?: number; target?: ResolvedState; branch?: string; featureSlug?: string; publication?: (snapshot: StateSnapshot, nextState: TeamState, target: ResolvedState) => StatePublication | undefined } = {},
 ): StateUpdateResult<T> {
   const wsDir = resolve(cwd, WORK_STATE_DIR);
   mkdirSync(wsDir, { recursive: true });
@@ -1491,13 +1604,20 @@ export function updateStateAtomically<T>(
   }
   const lock = acquireStateLock(wsDir, opts.lockTimeoutMs ?? STATE_LOCK_DEFAULT_TIMEOUT_MS);
   if ("error" in lock) return { ok: false, code: "state_lock_unavailable", error: lock.error };
-  beginArtifactJournal();
+  try {
+    recoverLifecycleTransactions(cwd);
+    recoverArtifactJournals(cwd);
+  } catch (error) {
+    releaseStateLock(wsDir, lock.token);
+    return { ok: false, code: "recovery_required", error: (error as Error).message };
+  }
+  beginArtifactJournal(cwd);
   let journalFinalized = false;
   const finalizeJournal = (committed: boolean): void => {
     if (journalFinalized) return;
     const journal = endArtifactJournal();
     journalFinalized = true;
-    if (committed) commitArtifactJournal(journal);
+    if (committed || artifactJournalHasCommitBoundary(journal)) commitArtifactJournal(journal);
     else rollbackArtifactJournal(journal);
     stateTransactionTestHooks?.afterJournalFinalize?.({
       committed,
@@ -1600,7 +1720,8 @@ export function updateStateAtomically<T>(
 
     let committed: CommittedState;
     try {
-      committed = commitState(cwd, prepared, mutation.state, revision + 1);
+      const publication = mutation.publication ?? opts.publication?.(snapshot, mutation.state, target);
+      committed = commitState(cwd, prepared, mutation.state, revision + 1, publication);
     } catch (error) {
       return { ok: false, code: "state_invalid", error: `workflow state commit failed: ${(error as Error).message}` };
     }
@@ -1614,6 +1735,7 @@ export function updateStateAtomically<T>(
       artifactsDir: prepared.artifactsDir,
       isLegacy: prepared.featureSlug === null,
       isStale: false,
+      canonicalRun: prepared.canonicalRun,
     };
     return { ok: true, state: committed.state, target: committedTarget, revision: revision + 1, committed: true, value: mutation.value };
   } finally {
@@ -1773,7 +1895,7 @@ export function setStageStatus(
   if (cwd) {
     publishAfterStateCommit(() => {
       try {
-        recordStageTransition(cwd, { stageId, stageStatus: status });
+        recordStageTransition(cwd, { stageId, stageStatus: status, runId: state.run_id });
       } catch {
         // best-effort telemetry — never blocks the state transition
       }
@@ -1795,11 +1917,29 @@ export function reopenFromFeedback(
   const index = state.stages.findIndex((stage) => stage.id === target);
   if (index < 0) throw new Error(`cannot reopen unknown stage: ${target}`);
   const history = [...(state.history ?? []), { task: state.task, feedback, at: new Date().toISOString() }];
+  const {
+    required_input_receipts: _requiredInputReceipts,
+    checkpoint_policy: _checkpointPolicy,
+    checkpoint_policy_binding: _checkpointPolicyBinding,
+    cursor_epoch: _cursorEpoch,
+    dispatch_capability: _dispatchCapability,
+    work_identity: _workIdentity,
+    pending: _pending,
+    child_join: _childJoin,
+    child_joins: _childJoins,
+    completion_envelope: _completionEnvelope,
+    loop_state: _loopState,
+    roster_selection: _rosterSelection,
+    roster_selections: _rosterSelections,
+    migration_succeeded_slots: _migrationSucceededSlots,
+    slot_artifacts: _slotArtifacts,
+    ...reopenedBase
+  } = state;
   const stages = state.stages.map((stage, i) =>
     i >= index ? { ...stage, status: "pending" as const } : stage,
   );
   return {
-    ...state,
+    ...reopenedBase,
     task: `${state.task}\n\nUser feedback: ${feedback}`,
     history,
     stages,

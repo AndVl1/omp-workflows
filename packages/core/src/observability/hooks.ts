@@ -13,9 +13,8 @@
  * the engine's notion of the "active feature".
  */
 
-import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { execSync } from "node:child_process";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+
 import { EventRecorder } from "./recorder.js";
 import { extractSkills } from "./skills.js";
 import type {
@@ -32,7 +31,6 @@ import type {
   WorkIdentity,
 } from "../engine/types.js";
 
-const ACTIVE_FEATURE = ".active-feature";
 const WORK_STATE_DIR = ".work-state";
 
 /** Narrow the OMP extension context to the few fields we read. */
@@ -55,35 +53,31 @@ function currentBranch(cwd: string): string {
   }
 }
 
-/**
- * Resolve the active feature slug. Falls back to "default" so the recorder
- * always has a place to write.
- */
-function activeFeatureSlug(cwd: string): string {
-  const workState = resolve(cwd, WORK_STATE_DIR);
-  const active = resolve(workState, ACTIVE_FEATURE);
-  if (!existsSync(active)) return "default";
-  try {
-    const realRoot = realpathSync(workState);
-    const realPointer = realpathSync(active);
-    const rel = relative(realRoot, realPointer);
-    if (rel !== ACTIVE_FEATURE && (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel))) return "default";
-    const slug = readFileSync(active, "utf8").trim();
-    return /^[A-Za-z0-9._-]+$/.test(slug) ? slug : "default";
-  } catch {
-    return "default";
+const recorderCache = new Map<string, EventRecorder>();
+const selectedRunByCwd = new Map<string, string | undefined>();
+
+export function setObservabilityRun(cwd: string, runId?: string): void {
+  const previous = selectedRunByCwd.get(cwd);
+  if (previous !== runId) {
+    for (const [key, recorder] of recorderCache) {
+      if (key === cwd || (previous && key === cwd + "|" + previous)) void recorder.flush();
+    }
   }
+  selectedRunByCwd.set(cwd, runId);
 }
 
-const recorderCache = new Map<string, EventRecorder>();
-
-function getRecorder(cwd: string): EventRecorder {
-  const cached = recorderCache.get(cwd);
+function getRecorder(cwd: string, explicitRunId?: string): EventRecorder {
+  // A missing explicit scope must never inherit whichever host run happened to
+  // be selected most recently; late worker callbacks would attach to the
+  // wrong run. Host hooks resolve their immutable origin before appending.
+  const runId = explicitRunId;
+  if (!runId) throw new Error("migration_required: observability requires an explicit canonical run scope");
+  const cacheKey = `${cwd}|${runId}`;
+  const cached = recorderCache.get(cacheKey);
   if (cached) return cached;
   const branch = currentBranch(cwd);
-  const featureSlug = activeFeatureSlug(cwd);
-  const rec = new EventRecorder({ cwd, branch, featureSlug });
-  recorderCache.set(cwd, rec);
+  const rec = new EventRecorder({ cwd, branch, runId });
+  recorderCache.set(cacheKey, rec);
   return rec;
 }
 
@@ -93,8 +87,7 @@ function getRecorder(cwd: string): EventRecorder {
  * without relying on real timers.
  */
 export async function flushRecorder(cwd: string): Promise<void> {
-  const rec = recorderCache.get(cwd);
-  if (rec) await rec.flush();
+  for (const [key, rec] of recorderCache) { if (key === cwd || key.startsWith(`${cwd}|`)) await rec.flush(); }
 }
 
 function safeAppend(
@@ -106,7 +99,7 @@ function safeAppend(
     console.warn(`[observability] ${reason}`);
   };
   try {
-    void getRecorder(cwd).append(ev).catch(reject);
+    void getRecorder(cwd, ev.runId).append(ev).catch(reject);
   } catch (error) {
     reject(error);
   }
@@ -114,7 +107,7 @@ function safeAppend(
 
 export function recordToolCallAttempt(
   cwd: string,
-  event: { toolName?: string; toolCallId?: string; input?: unknown } & Partial<ObservabilitySignalFields>,
+  event: { toolName?: string; toolCallId?: string; input?: unknown; runId?: string } & Partial<ObservabilitySignalFields>,
   decision: "allowed" | "blocked",
   reason?: string,
 ): void {
@@ -131,6 +124,7 @@ export function recordToolCallAttempt(
     subagentTaskChars: taskChars,
     gateDecision: decision,
     gateReason: reason,
+    runId: event.runId,
   });
 }
 
@@ -302,6 +296,8 @@ function signalMetadata(event: unknown, ctx: unknown): ObservabilitySignalFields
   if (Array.isArray(artifactSummaries)) metadata.artifact_summaries = artifactSummaries as ObservabilityArtifactSummary[];
   const idempotencyKey = firstField(sources, "idempotency_key", "idempotencyKey");
   if (typeof idempotencyKey === "string") metadata.idempotency_key = idempotencyKey;
+  const runId = firstField(sources, "runId", "run_id");
+  if (typeof runId === "string" && runId.length > 0) metadata.runId = runId;
   return metadata;
 }
 

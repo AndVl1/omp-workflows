@@ -41,12 +41,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import {
-  advanceCursor,
-  authorizeDispatch,
-  beginCapability,
-  completeDispatch,
+  advanceCursor as advanceCursorRaw,
+  authorizeDispatch as authorizeDispatchRaw,
+  beginCapability as beginCapabilityRaw,
+  completeDispatch as completeDispatchRaw,
   createCapability,
-  persistPendingDispatch,
+  persistPendingDispatch as persistPendingDispatchRaw,
   type IssuedCapability,
 } from "../src/engine/durable.js";
 import {
@@ -55,13 +55,16 @@ import {
   recordTrustedCheckpointAnswer,
 } from "../src/engine/checkpoints.js";
 import { loadProfile, profileHash, registerWorkflowProfiles, type Profile } from "../src/engine/profile.js";
-import { updateStateAtomically, writeStateBootstrap } from "../src/engine/state.js";
+import { updateStateAtomically as updateStateAtomicallyRaw, writeStateBootstrap as writeStateBootstrapRaw } from "../src/engine/state.js";
 import { finalizeWorkflowRun, run } from "../src/engine/run.js";
+import { readRunControl, runStatePath, runTarget } from "../src/engine/run-store.js";
 import { validateActiveCapabilityStateBinding, validateActiveDispatchCapabilityValue } from "../src/engine/control-plane-contract.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
-import type { CheckpointPolicy, TeamState, TypedCheckpointDecision, WorkIdentity } from "../src/engine/types.js";
+import type { CheckpointPolicy, TeamState, TypedCheckpointDecision, WorkIdentity, TrustedExecutionContext } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
+
+const RUN_ID = "33333333-3333-4333-8333-333333333333";
 
 const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 // The spawned child loads the engine through the tsx loader with the module
@@ -69,12 +72,81 @@ const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 // child process does not exist at author time), so a dynamic import inside
 // the child script is the point of the test seam.
 const ENGINE_STATE_URL = pathToFileURL(join(REPO_ROOT, "packages/core/src/engine/state.ts")).href;
+const ENGINE_RUN_STORE_URL = pathToFileURL(join(REPO_ROOT, "packages/core/src/engine/run-store.ts")).href;
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 
 function initGit(root: string, branch = "main"): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
 }
+
+type DispatchAuth = Parameters<typeof authorizeDispatchRaw>[1];
+
+function executionContext(root: string): TrustedExecutionContext {
+  return {
+    session_id: "approval-closure-session",
+    caller: "host",
+    process_id: process.pid,
+    worktree: root,
+    branch: "main",
+    authority: "coordinator",
+  };
+}
+
+function statePathFor(root: string): string {
+  return runTarget(root, RUN_ID).statePath!;
+}
+
+function artifactsDirFor(root: string): string {
+  return runTarget(root, RUN_ID).artifactsDir!;
+}
+
+function writeStateBootstrap(root: string, state: TeamState, _options?: Parameters<typeof writeStateBootstrapRaw>[2]): { statePath: string; artifactsDir: string } {
+  const target = runTarget(root, RUN_ID);
+  mkdirSync(target.stateDir!, { recursive: true });
+  mkdirSync(target.artifactsDir!, { recursive: true });
+  return writeStateBootstrapRaw(root, state, { target });
+}
+
+function updateStateAtomically(root: string, mutate: Parameters<typeof updateStateAtomicallyRaw>[1], options?: Parameters<typeof updateStateAtomicallyRaw>[2]) {
+  return updateStateAtomicallyRaw(root, mutate, { ...(options ?? {}), target: runTarget(root, RUN_ID) });
+}
+
+function authorizeDispatch(root: string, input: DispatchAuth) {
+  return authorizeDispatchRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input });
+}
+
+function persistPendingDispatch(root: string, input: Parameters<typeof persistPendingDispatchRaw>[1]) {
+  return persistPendingDispatchRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input });
+}
+
+function completeDispatch(root: string, input: Parameters<typeof completeDispatchRaw>[1], options?: Parameters<typeof completeDispatchRaw>[2]) {
+  return completeDispatchRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input }, { runId: RUN_ID, ...(options ?? {}) });
+}
+
+function advanceCursor(root: string, input: DispatchAuth, options?: Parameters<typeof advanceCursorRaw>[2]) {
+  return advanceCursorRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input }, { runId: RUN_ID, ...(options ?? {}) });
+}
+
+function beginCapability(root: string, requested?: Parameters<typeof beginCapabilityRaw>[1], options?: Parameters<typeof beginCapabilityRaw>[2]) {
+  return beginCapabilityRaw(root, requested, { runId: RUN_ID, ...(options ?? {}) });
+}
+
+const terminalProfile: Profile = {
+  name: "closure-terminal",
+  title: "Closure terminal",
+  description: "one-stage workflow",
+  match: { type: ["OPS"] },
+  stages: [{ id: "only", title: "Only", type: "orchestrator" }],
+};
+
+const dispatchProfile: Profile = {
+  name: "closure-dispatch",
+  title: "Closure dispatch",
+  description: "one single-dispatch stage",
+  match: { type: ["OPS"] },
+  stages: [{ id: "build", title: "Build", type: "single" }],
+};
 
 function scopedPolicy(defaultRule: CheckpointPolicy["default"]): CheckpointPolicy {
   return {
@@ -95,24 +167,6 @@ function scopedPolicy(defaultRule: CheckpointPolicy["default"]): CheckpointPolic
     rationale: "closure policy",
   };
 }
-
-/** Single orchestrator stage: terminal advance with no next stage. */
-const terminalProfile: Profile = {
-  name: "closure-terminal",
-  title: "Closure terminal",
-  description: "one-stage workflow",
-  match: { type: ["OPS"] },
-  stages: [{ id: "only", title: "Only", type: "orchestrator" }],
-};
-
-/** Single dispatch stage: authorize -> pending -> terminal completion. */
-const dispatchProfile: Profile = {
-  name: "closure-dispatch",
-  title: "Closure dispatch",
-  description: "one single-dispatch stage",
-  match: { type: ["OPS"] },
-  stages: [{ id: "build", title: "Build", type: "single" }],
-};
 
 /** Checkpoint stage for policy/loop scope and ledger regressions. */
 const scopedProfile: Profile = {
@@ -147,7 +201,6 @@ registerWorkflowProfiles([terminalProfile, dispatchProfile, scopedProfile, rollb
 interface SeedOptions {
   profile: Profile;
   stageCursor: string;
-  slug?: string;
   capability?: TeamState["dispatch_capability"];
   stageStatus?: "pending" | "in_progress";
   workIdentity?: WorkIdentity;
@@ -155,19 +208,25 @@ interface SeedOptions {
 }
 
 function seedState(root: string, opts: SeedOptions): IssuedCapability {
-  const slug = opts.slug ?? "closure";
   const issued = opts.capability
     ? ({ capability_id: opts.capability.capability_id!, dispatch_token: "seeded", advance_token: "seeded", state: opts.capability } as IssuedCapability)
     : createCapability({
-        run_key: "main", branch: "main", workflow: opts.profile.name, profile_hash: profileHash(opts.profile),
+        run_key: RUN_ID, branch: "main", workflow: opts.profile.name, profile_hash: profileHash(opts.profile),
         stage_cursor: opts.stageCursor, kind: "none", expected_roster: [],
       });
   const state = {
-    schema: 1 as const,
+    schema: 2 as const,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
+    lifecycle_status: "active" as const,
+    rework_generation: 0,
     branch: "main",
-    run_key: "main",
+    title: "approval closure",
     classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: opts.profile.name },
     task: "approval closure",
+    required_inputs: Object.fromEntries(opts.profile.stages.map((stage) => [stage.id, []])),
+    required_input_receipts: {},
+    decisions: [],
     workflow_override: false,
     issue: null,
     stage_cursor: opts.stageCursor,
@@ -183,7 +242,7 @@ function seedState(root: string, opts: SeedOptions): IssuedCapability {
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
   } as TeamState;
-  writeStateBootstrap(root, state, { featureSlug: slug });
+  writeStateBootstrap(root, state);
   return issued;
 }
 
@@ -258,7 +317,7 @@ test("closure: a dead lock is reclaimed; a live foreign lock is never stolen; an
     });
     assert.equal(reclaimed.ok, true, reclaimed.ok ? "dead lock reclaimed" : reclaimed.error);
     assert.ok(!existsSync(lockPath), "the reclaimed lock is released after the transaction");
-    assert.equal((JSON.parse(readFileSync(join(root, ".work-state", "features", "closure", "state.json"), "utf8")) as TeamState).task, "reclaimed");
+    assert.equal((JSON.parse(readFileSync(statePathFor(root), "utf8")) as TeamState).task, "reclaimed");
 
     const begun = beginCapability(root);
     assert.equal(begun.ok, true, begun.ok ? "begin took the lock cleanly" : begun.error);
@@ -282,16 +341,17 @@ test("closure: five real competing processes reclaim one dead lock with mutual e
       // node -e CODE a b c numbers extra args from argv[1] (argv[0] is the
       // binary): the engine URL is argv[1], root and id follow.
       const { updateStateAtomically } = await import(process.argv[1]);
-      const [root, id] = process.argv.slice(2);
+      const { runTarget } = await import(process.argv[2]);
+      const [root, id, runId] = process.argv.slice(3);
       const result = updateStateAtomically(root, (snapshot) => {
         if (!snapshot.state) return { op: "fail", code: "state_missing", error: "no state" };
         const notes = Array.isArray(snapshot.state.notes) ? snapshot.state.notes : [];
         return { op: "commit", state: { ...snapshot.state, notes: [...notes, id] } };
-      }, { lockTimeoutMs: 30000 });
+      }, { target: runTarget(root, runId), lockTimeoutMs: 30000 });
       process.stdout.write(JSON.stringify({ id, ok: result.ok, code: result.ok ? null : result.code, error: result.ok ? null : result.error }));
     `;
     const children = ["c1", "c2", "c3", "c4", "c5"].map((id) =>
-      spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", childScript, ENGINE_STATE_URL, root, id], {
+      spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", childScript, ENGINE_STATE_URL, ENGINE_RUN_STORE_URL, root, id, RUN_ID], {
         cwd: REPO_ROOT,
         stdio: ["ignore", "pipe", "pipe"],
       }));
@@ -305,7 +365,7 @@ test("closure: five real competing processes reclaim one dead lock with mutual e
     for (const result of results) {
       assert.equal(result.ok, true, `child ${result.id} must win the lock eventually: ${String(result.error)}`);
     }
-    const persisted = JSON.parse(readFileSync(join(root, ".work-state", "features", "closure", "state.json"), "utf8")) as { notes?: string[] };
+    const persisted = JSON.parse(readFileSync(statePathFor(root), "utf8")) as { notes?: string[] };
     assert.deepEqual([...(persisted.notes ?? [])].sort(), ["c1", "c2", "c3", "c4", "c5"], "every competing transaction commits exactly once");
     assert.ok(!existsSync(lockPath), "the lock is fully released after all competitors finish");
     const litter = readdirSync(join(root, ".work-state")).filter((entry) => entry.startsWith(".state.lock"));
@@ -331,7 +391,7 @@ test("closure: guarded reclaim never displaces a live generation created after s
     const childScript = `
       import fs from "node:fs";
       import { syncBuiltinESMExports } from "node:module";
-      const [engineUrl, root, lockPath, stalePidText, inspectedBarrier, releaseBarrier, renameObserved] = process.argv.slice(1);
+      const [engineUrl, runStoreUrl, root, lockPath, stalePidText, inspectedBarrier, releaseBarrier, renameObserved, runId] = process.argv.slice(1);
       const stalePid = Number(stalePidText);
       const originalRename = fs.renameSync.bind(fs);
       fs.renameSync = (source, destination) => {
@@ -349,12 +409,13 @@ test("closure: guarded reclaim never displaces a live generation created after s
         return originalKill(pid, signal);
       };
       const { updateStateAtomically } = await import(engineUrl);
-      const result = updateStateAtomically(root, () => ({ op: "discard" }), { lockTimeoutMs: 500 });
+      const { runTarget } = await import(runStoreUrl);
+      const result = updateStateAtomically(root, () => ({ op: "discard" }), { target: runTarget(root, runId), lockTimeoutMs: 500 });
       process.stdout.write(JSON.stringify(result));
     `;
     child = spawn(process.execPath, [
       "--import", "tsx", "--input-type=module", "-e", childScript,
-      ENGINE_STATE_URL, root, lockPath, String(stalePid), inspectedBarrier, releaseBarrier, renameObserved,
+      ENGINE_STATE_URL, ENGINE_RUN_STORE_URL, root, lockPath, String(stalePid), inspectedBarrier, releaseBarrier, renameObserved, RUN_ID,
     ], { cwd: REPO_ROOT, stdio: ["ignore", "pipe", "pipe"] });
 
     const waitCell = new Int32Array(new SharedArrayBuffer(4));
@@ -406,6 +467,7 @@ test("closure: run observes a checkpoint decision committed while advance waits 
       cwd: root,
       branch: "main",
       autonomous: false,
+      execution: executionContext(root),
       classification: {
         type: "BUG_FIX",
         complexity: "QUICK",
@@ -417,7 +479,9 @@ test("closure: run observes a checkpoint decision committed while advance waits 
         call: async () => ({ id: "unused", output: "unused", artifacts: {}, exitCode: 0 }),
       },
       orchestrate: async () => {
-        const statePath = join(root, ".work-state", "features", "main", "state.json");
+        const selectedRunId = readRunControl(root).execution_claim?.run_id;
+        assert.equal(typeof selectedRunId, "string", "the trusted run claim selects the canonical run");
+        const statePath = runStatePath(root, selectedRunId!);
         const current = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
         const trusted = recordTrustedCheckpointAnswer(current, {
           answer_id: "closure/checkpoint-race",
@@ -447,15 +511,16 @@ test("closure: run observes a checkpoint decision committed while advance waits 
         if (!appended.ok) throw new Error(appended.error);
         const encodedState = Buffer.from(JSON.stringify(appended.state)).toString("base64");
         const childScript = `
-          const [engineUrl, root, barrier, encodedState] = process.argv.slice(1);
+          const [engineUrl, runStoreUrl, root, barrier, encodedState, runId] = process.argv.slice(1);
           const fs = await import("node:fs");
           const { updateStateAtomically } = await import(engineUrl);
+          const { runTarget } = await import(runStoreUrl);
           const nextState = JSON.parse(Buffer.from(encodedState, "base64").toString("utf8"));
           const result = updateStateAtomically(root, () => {
             fs.writeFileSync(barrier, "entered");
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
             return { op: "commit", state: nextState };
-          }, { lockTimeoutMs: 5000 });
+          }, { target: runTarget(root, runId), lockTimeoutMs: 5000 });
           if (!result.ok) {
             process.stderr.write(JSON.stringify(result));
             process.exitCode = 1;
@@ -463,7 +528,7 @@ test("closure: run observes a checkpoint decision committed while advance waits 
         `;
         decisionChild = spawn(process.execPath, [
           "--import", "tsx", "--input-type=module", "-e", childScript,
-          ENGINE_STATE_URL, root, childEntered, encodedState,
+          ENGINE_STATE_URL, ENGINE_RUN_STORE_URL, root, childEntered, encodedState, selectedRunId!,
         ], { cwd: REPO_ROOT, stdio: ["ignore", "ignore", "pipe"] });
         const runningChild = decisionChild;
         decisionChildExit = new Promise<void>((resolve, reject) => {
@@ -497,9 +562,10 @@ test("closure: terminal finalization classifies state committed while it waits f
     initGit(root);
     seedState(root, { profile: terminalProfile, stageCursor: "only", stageStatus: "pending" });
     const childScript = `
-      const [engineUrl, root, barrier] = process.argv.slice(1);
+      const [engineUrl, runStoreUrl, root, barrier, runId] = process.argv.slice(1);
       const fs = await import("node:fs");
       const { updateStateAtomically } = await import(engineUrl);
+      const { runTarget } = await import(runStoreUrl);
       const result = updateStateAtomically(root, (snapshot) => {
         fs.writeFileSync(barrier, "entered");
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
@@ -511,7 +577,7 @@ test("closure: terminal finalization classifies state committed while it waits f
             pause: { kind: "none", reason: "" },
           },
         };
-      }, { lockTimeoutMs: 5000 });
+      }, { target: runTarget(root, runId), lockTimeoutMs: 5000 });
       if (!result.ok) {
         process.stderr.write(JSON.stringify(result));
         process.exitCode = 1;
@@ -519,7 +585,7 @@ test("closure: terminal finalization classifies state committed while it waits f
     `;
     child = spawn(process.execPath, [
       "--import", "tsx", "--input-type=module", "-e", childScript,
-      ENGINE_STATE_URL, root, childEntered,
+      ENGINE_STATE_URL, ENGINE_RUN_STORE_URL, root, childEntered, RUN_ID,
     ], { cwd: REPO_ROOT, stdio: ["ignore", "ignore", "pipe"] });
     const runningChild = child;
     const childExit = new Promise<void>((resolve, reject) => {
@@ -531,7 +597,7 @@ test("closure: terminal finalization classifies state committed while it waits f
     const deadline = Date.now() + 5_000;
     while (!existsSync(childEntered) && Date.now() < deadline) Atomics.wait(waitCell, 0, 0, 10);
     assert.ok(existsSync(childEntered), "concurrent terminal writer holds the lock before finalization");
-    const finalized = finalizeWorkflowRun(root);
+    const finalized = finalizeWorkflowRun(root, RUN_ID);
     await childExit;
     assert.equal(finalized.stages[0]?.status, "done");
     assert.deepEqual(finalized.pause, { kind: "done", reason: "" }, "terminal decision uses the fresh committed stage status");
@@ -550,7 +616,7 @@ test("closure: deleting the state file during a transaction is a state_conflict,
   try {
     initGit(root);
     seedState(root, { profile: terminalProfile, stageCursor: "only", stageStatus: "pending" });
-    const statePath = join(root, ".work-state", "features", "closure", "state.json");
+    const statePath = statePathFor(root);
     const result = updateStateAtomically(root, (snapshot) => {
       assert.ok(snapshot.state);
       // A lockless writer deleted the state while this transaction held the
@@ -580,7 +646,7 @@ function completeCapabilityFixture(): Record<string, unknown> {
     dispatch_token_hash: "a".repeat(64),
     advance_token_hash: "b".repeat(64),
     issued_for: {
-      run_key: "main", branch: "main", workflow: "closure-terminal",
+      run_key: RUN_ID, branch: "main", workflow: "closure-terminal",
       profile_hash: profileHash(terminalProfile), stage_cursor: "only",
       cursor_epoch: "epoch-1", loop_iteration: 1, checkpoint_policy_hash: null,
     },
@@ -625,7 +691,7 @@ test("closure: a capability missing only its dispatch ledger is a structured pub
     initGit(root);
     const profile = terminalProfile;
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "only", kind: "none", expected_roster: [],
     });
     // Shape-valid (the persisted shape keeps dispatches optional) but not
@@ -637,7 +703,7 @@ test("closure: a capability missing only its dispatch ledger is a structured pub
     const advanced = advanceCursor(root, {
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       profile_hash: profileHash(profile),
@@ -658,7 +724,7 @@ test("closure: public pending transition rejects every forged modern dispatch id
   try {
     initGit(root);
     const issued = createCapability({
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: dispatchProfile.name,
       profile_hash: profileHash(dispatchProfile),
@@ -670,7 +736,7 @@ test("closure: public pending transition rejects every forged modern dispatch id
     const auth = {
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: dispatchProfile.name,
       profile_hash: profileHash(dispatchProfile),
@@ -684,7 +750,7 @@ test("closure: public pending transition rejects every forged modern dispatch id
     assert.equal(authorized.ok, true, authorized.ok ? "authorized" : authorized.error);
     assert.ok(authorized.ok && authorized.record);
     const dispatchId = authorized.record.id;
-    const statePath = join(root, ".work-state", "features", "closure", "state.json");
+    const statePath = statePathFor(root);
     const baseline = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
 
     const identityFields: Array<{ field: keyof WorkIdentity; value: string | number }> = [
@@ -756,20 +822,21 @@ function publishMapping(root: string): void {
 
 test("closure: a deferred roster stage keeps no capability after the cursor move and workflow_begin arms it", () => {
   const root = mkdtempSync(join(tmpdir(), "closure-deferred-"));
-  const statePath = join(root, ".work-state", "features", "closure-deferred", "state.json");
+  const statePath = statePathFor(root);
   try {
     initGit(root);
     const profile = loadProfile("full-feature");
     assert.ok(profile);
     const persistedHash = profileHash(profile);
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: "full-feature", profile_hash: persistedHash,
+      run_key: RUN_ID, branch: "main", workflow: "full-feature", profile_hash: persistedHash,
       stage_cursor: "clarify", kind: "none", expected_roster: [],
     });
     const state = {
-      schema: 1 as const,
+      schema: 2 as const,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
       branch: "main",
-      run_key: "main",
       classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
       task: "deferred roster closure",
       workflow_override: false,
@@ -785,13 +852,23 @@ test("closure: a deferred roster stage keeps no capability after the cursor move
       cursor_epoch: issued.state.issued_for!.cursor_epoch,
       dispatch_capability: issued.state,
     } as TeamState;
-    writeStateBootstrap(root, state, { featureSlug: "closure-deferred" });
+    writeStateBootstrap(root, state);
 
-    const artifactsDir = join(root, ".work-state", "features", "closure-deferred", "artifacts");
+    const artifactsDir = artifactsDirFor(root);
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "closure", branch: "main", constraints: [] }));
     writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: [{ path: "a.ts", why: "x" }], summary: "explored" }));
     writeFileSync(join(artifactsDir, "clarifications.json"), JSON.stringify({ questions: [], answers: ["proceed"] }));
+    const withArtifacts = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+    writeStateBootstrap(root, {
+      ...withArtifacts,
+      artifacts: {
+        ...(withArtifacts.artifacts ?? {}),
+        discovery: "artifacts/discovery.json",
+        exploration: "artifacts/exploration.json",
+        clarifications: "artifacts/clarifications.json",
+      },
+    });
 
     // Resolve the checkpoint so the advance reaches the cursor move.
     const persistedState = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
@@ -803,14 +880,14 @@ test("closure: a deferred roster stage keeps no capability after the cursor move
       checkpoint_id: "user_answers",
       decision: "proceed",
     });
-    writeStateBootstrap(root, trusted.state, { featureSlug: "closure-deferred" });
+    writeStateBootstrap(root, trusted.state);
     const policy = profile.checkpoint_policy!;
     const recorded = updateStateAtomically(root, (snapshot) => {
       assert.ok(snapshot.state);
       return { op: "commit", state: {
         ...snapshot.state,
         typed_checkpoint_decisions: [{
-          run_id: "main",
+          run_id: RUN_ID,
           stage_id: "clarify",
           checkpoint_id: "user_answers",
           checkpoint_kind: policy.rules.user_answers!.kind,
@@ -832,7 +909,7 @@ test("closure: a deferred roster stage keeps no capability after the cursor move
     const advanced = advanceCursor(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: "full-feature",
       profile_hash: persistedHash,
@@ -862,7 +939,7 @@ test("closure: a deferred roster stage keeps no capability after the cursor move
 
 test("closure: a terminal advance does not rotate the epoch; the completed capability stays strictly bound", () => {
   const root = mkdtempSync(join(tmpdir(), "closure-terminal-"));
-  const statePath = join(root, ".work-state", "features", "closure", "state.json");
+  const statePath = statePathFor(root);
   try {
     initGit(root);
     const issued = seedState(root, { profile: terminalProfile, stageCursor: "only" });
@@ -870,7 +947,7 @@ test("closure: a terminal advance does not rotate the epoch; the completed capab
     const advanced = advanceCursor(root, {
       token: issued.advance_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: terminalProfile.name,
       profile_hash: profileHash(terminalProfile),
@@ -898,19 +975,19 @@ test("closure: a terminal advance does not rotate the epoch; the completed capab
 
 test("closure: terminal completion clears the root pending lifecycle and returns the committed state", () => {
   const root = mkdtempSync(join(tmpdir(), "closure-pending-"));
-  const statePath = join(root, ".work-state", "features", "closure", "state.json");
+  const statePath = statePathFor(root);
   try {
     initGit(root);
     const profile = dispatchProfile;
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "build", kind: "single", expected_roster: [{ role: "dev", agent: "dev" }],
     });
     seedState(root, { profile, stageCursor: "build", capability: issued.state });
     const auth = {
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       profile_hash: profileHash(profile),
@@ -949,14 +1026,14 @@ test("closure: terminal completion clears the root pending lifecycle and returns
 
 test("closure: authorizing mutations reject a capability whose policy hash or loop iteration left the stage window", () => {
   const root = mkdtempSync(join(tmpdir(), "closure-scope-"));
-  const statePath = join(root, ".work-state", "features", "closure", "state.json");
+  const statePath = statePathFor(root);
   try {
     initGit(root);
     const profile = scopedProfile;
     const declaredHash = checkpointPolicyHash(scopedPolicy("autonomous_allowed"));
 
     const wrongHash = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "build", kind: "none", expected_roster: [],
       checkpoint_policy_hash: "0".repeat(64),
     });
@@ -964,7 +1041,7 @@ test("closure: authorizing mutations reject a capability whose policy hash or lo
     const wrongHashAdvance = advanceCursor(root, {
       token: wrongHash.advance_token,
       capability_id: wrongHash.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       profile_hash: profileHash(profile),
@@ -977,16 +1054,16 @@ test("closure: authorizing mutations reject a capability whose policy hash or lo
     if (!wrongHashAdvance.ok) assert.match(wrongHashAdvance.error, /checkpoint policy hash does not match the current stage declaration/);
 
     const wrongIteration = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "build", kind: "none", expected_roster: [],
       loop_iteration: 2,
       checkpoint_policy_hash: declaredHash,
     });
-    writeStateBootstrap(root, { ...JSON.parse(readFileSync(statePath, "utf8")) as TeamState, dispatch_capability: wrongIteration.state, cursor_epoch: wrongIteration.state.issued_for!.cursor_epoch }, { featureSlug: "closure" });
+    writeStateBootstrap(root, { ...JSON.parse(readFileSync(statePath, "utf8")) as TeamState, dispatch_capability: wrongIteration.state, cursor_epoch: wrongIteration.state.issued_for!.cursor_epoch });
     const wrongIterationAdvance = advanceCursor(root, {
       token: wrongIteration.advance_token,
       capability_id: wrongIteration.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       profile_hash: profileHash(profile),
@@ -1001,15 +1078,15 @@ test("closure: authorizing mutations reject a capability whose policy hash or lo
     // The correctly bound capability passes the scope gate (and reaches the
     // expected unresolved-checkpoint pause instead).
     const bound = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "build", kind: "none", expected_roster: [],
       checkpoint_policy_hash: declaredHash,
     });
-    writeStateBootstrap(root, { ...JSON.parse(readFileSync(statePath, "utf8")) as TeamState, dispatch_capability: bound.state, cursor_epoch: bound.state.issued_for!.cursor_epoch }, { featureSlug: "closure" });
+    writeStateBootstrap(root, { ...JSON.parse(readFileSync(statePath, "utf8")) as TeamState, dispatch_capability: bound.state, cursor_epoch: bound.state.issued_for!.cursor_epoch });
     const boundAdvance = advanceCursor(root, {
       token: bound.advance_token,
       capability_id: bound.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       profile_hash: profileHash(profile),
@@ -1031,12 +1108,12 @@ test("closure: authorizing mutations reject a capability whose policy hash or lo
 
 test("closure: a current-scope legacy mirror decision conflicts and replays exactly like the typed ledger", () => {
   const root = mkdtempSync(join(tmpdir(), "closure-mirror-"));
-  const statePath = join(root, ".work-state", "features", "closure", "state.json");
+  const statePath = statePathFor(root);
   try {
     initGit(root);
     const profile = scopedProfile;
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "build", kind: "none", expected_roster: [],
       checkpoint_policy_hash: checkpointPolicyHash(scopedPolicy("autonomous_allowed")),
     });
@@ -1049,7 +1126,7 @@ test("closure: a current-scope legacy mirror decision conflicts and replays exac
       actor: "system:closure",
       rationale: "mirror first",
       decided_at: new Date().toISOString(),
-      run_id: "main",
+      run_id: RUN_ID,
       checkpoint_id: "gate_ok",
       checkpoint_kind: "clarification",
       authorization: "policy_auto",
@@ -1063,7 +1140,7 @@ test("closure: a current-scope legacy mirror decision conflicts and replays exac
     const persisted = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
 
     const decision = (over: Partial<TypedCheckpointDecision>): TypedCheckpointDecision => ({
-      run_id: "main",
+      run_id: RUN_ID,
       stage_id: "build",
       checkpoint_id: "gate_ok",
       checkpoint_kind: "clarification",
@@ -1102,7 +1179,7 @@ test("closure: a current-scope legacy mirror decision conflicts and replays exac
 
 test("closure: a stale work_identity is rejected by every authorizing path", () => {
   const root = mkdtempSync(join(tmpdir(), "closure-identity-"));
-  const statePath = join(root, ".work-state", "features", "closure", "state.json");
+  const statePath = statePathFor(root);
   try {
     initGit(root);
     seedState(root, { profile: scopedProfile, stageCursor: "build", workIdentity: staleIdentity() });
@@ -1133,12 +1210,12 @@ test("closure: a stale work_identity is rejected by every authorizing path", () 
 
 test("closure: fan-in synthesis writes of a rejected advance are rolled back", () => {
   const root = mkdtempSync(join(tmpdir(), "closure-rollback-"));
-  const statePath = join(root, ".work-state", "features", "closure", "state.json");
+  const statePath = statePathFor(root);
   try {
     initGit(root);
     const profile = rollbackProfile;
     const issued = createCapability({
-      run_key: "main", branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
+      run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
       stage_cursor: "research", kind: "consilium",
       expected_roster: [
         { role: "analyst#1", agent: "analyst" },
@@ -1146,13 +1223,18 @@ test("closure: fan-in synthesis writes of a rejected advance are rolled back", (
       ],
     });
     seedState(root, { profile, stageCursor: "research", capability: issued.state });
-    const artifactsDir = join(root, ".work-state", "features", "closure", "artifacts");
+    const artifactsDir = artifactsDirFor(root);
     mkdirSync(artifactsDir, { recursive: true });
+    const seededState = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+    writeStateBootstrap(root, {
+      ...seededState,
+      artifacts: { ...(seededState.artifacts ?? {}), synthesis: "artifacts/synthesis.json" },
+    });
 
     const auth = {
       token: issued.dispatch_token,
       capability_id: issued.capability_id,
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: profile.name,
       profile_hash: profileHash(profile),

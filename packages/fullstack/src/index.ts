@@ -22,14 +22,18 @@ import type {
   SessionStartEvent,
 } from "@oh-my-pi/pi-coding-agent";
 import {
+  createWorkflowSessionController,
   createWorkflowToolAdapter,
   findActiveCtoRun,
   registerTeamWorkflow,
   readAgentMapping,
+  resolveActiveBranch,
   type ModelRoleEntry,
   type RoleConfig,
   type ScopeRuntimeClassTable,
+  type TrustedExecutionContext,
   type WorkflowOwnerIdentity,
+  type WorkflowSessionController,
   type WorkflowToolAdapter,
 } from "@andvl1/omp-workflows-core";
 import { registerWorkflowCommands } from "./workflow-commands.js";
@@ -251,6 +255,241 @@ function beforeAgentStartMarkerHandler(
 const subagentTreeRef: { current: SubagentTreeController | null } = { current: null };
 /** One dispatcher per interactive main session/cwd; subagents must not poll Telegram. */
 const dispatcherStopsByCwd = new Map<string, () => void>();
+/** One lifecycle controller for the trusted host session currently bound to this bundle. */
+type CapturedHostSession = { cwd: string; sessionId: string; mode: "tui" | "rpc" };
+const workflowSessionRef: { current: WorkflowSessionController | null } = { current: null };
+const workflowSessionCapturedAtHostStart = { current: false };
+const capturedHostSessionRef: { current: CapturedHostSession | null } = { current: null };
+
+function contextSessionId(ctx: unknown): string | undefined {
+  if (!ctx || typeof ctx !== "object") return undefined;
+  const value = ctx as {
+    session_id?: unknown;
+    sessionId?: unknown;
+    sessionManager?: { getSessionId?: () => unknown };
+  };
+  if (typeof value.session_id === "string" && value.session_id.length > 0) return value.session_id;
+  if (typeof value.sessionId === "string" && value.sessionId.length > 0) return value.sessionId;
+  try {
+    const sessionId = value.sessionManager?.getSessionId?.();
+    return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function authoritativeHostSession(ctx: unknown): { cwd: string; sessionId: string } | undefined {
+  if (!ctx || typeof ctx !== "object") return undefined;
+  const manager = (ctx as {
+    sessionManager?: {
+      getCwd?: () => unknown;
+      getSessionId?: () => unknown;
+    };
+  }).sessionManager;
+  if (!manager || typeof manager.getCwd !== "function" || typeof manager.getSessionId !== "function") return undefined;
+  try {
+    const cwd = manager.getCwd();
+    const sessionId = manager.getSessionId();
+    return typeof cwd === "string" && cwd.length > 0 && typeof sessionId === "string" && sessionId.length > 0
+      ? { cwd, sessionId }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function trustedHostSession(ctx: unknown): boolean {
+  if (!ctx || typeof ctx !== "object") return false;
+  const value = ctx as { mode?: unknown; hasUI?: unknown };
+  if (value.mode !== undefined && value.mode !== "tui" && value.mode !== "rpc") return false;
+  if (value.hasUI === false) return false;
+  if ("mode" in value || "hasUI" in value) {
+    return value.hasUI === true && (value.mode === "tui" || value.mode === "rpc")
+      || authoritativeHostSession(ctx) !== undefined;
+  }
+  return authoritativeHostSession(ctx) !== undefined;
+}
+
+function captureHostSession(ctx: unknown, authoritative: { cwd: string; sessionId: string }): CapturedHostSession | undefined {
+  if (!ctx || typeof ctx !== "object") return undefined;
+  const value = ctx as { mode?: unknown; hasUI?: unknown };
+  if (value.hasUI !== true || (value.mode !== "tui" && value.mode !== "rpc")) return undefined;
+  return { ...authoritative, mode: value.mode };
+}
+
+function createWorkflowSession(cwd: string, sessionId: string): WorkflowSessionController | undefined {
+  try {
+    const context: TrustedExecutionContext = {
+      session_id: sessionId,
+      caller: "host",
+      process_id: process.pid,
+      worktree: cwd,
+      branch: resolveActiveBranch(cwd),
+      authority: "coordinator",
+    };
+    return createWorkflowSessionController({ cwd, context });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Bind the shared controller before core command/tool registration sees a
+ * session_start event. Subagent session events are deliberately ignored:
+ * they must never replace or release the interactive host's controller.
+ */
+function bindWorkflowSession(ctx: unknown): void {
+  if (!trustedHostSession(ctx)) return;
+  const authoritative = authoritativeHostSession(ctx);
+  if (!authoritative) return;
+  const cwd = authoritative.cwd;
+  const sessionId = authoritative.sessionId;
+  const existing = workflowSessionRef.current;
+  if (existing) {
+    try {
+      existing.release("host-session-replaced");
+    } catch {
+      // Keep the existing binding on failed release; the worktree remains
+      // conservatively busy until the owner can be reconciled.
+      return;
+    }
+    workflowSessionRef.current = null;
+    workflowSessionCapturedAtHostStart.current = false;
+    capturedHostSessionRef.current = null;
+  }
+  workflowSessionRef.current = createWorkflowSession(cwd, sessionId) ?? null;
+  workflowSessionCapturedAtHostStart.current = workflowSessionRef.current !== null;
+  capturedHostSessionRef.current = workflowSessionRef.current
+    ? captureHostSession(ctx, authoritative) ?? null
+    : null;
+}
+function releaseWorkflowSession(ctx: unknown): void {
+  const authoritative = authoritativeHostSession(ctx);
+  if (!authoritative || !trustedHostSession(ctx)) return;
+  const controller = workflowSessionRef.current;
+  if (!controller) return;
+  try {
+    const controllerContext = controller.context();
+    if (
+      controllerContext.session_id !== authoritative.sessionId ||
+      resolve(controllerContext.worktree) !== resolve(authoritative.cwd)
+    ) return;
+    controller.release("host-session-stop");
+    workflowSessionRef.current = null;
+    workflowSessionCapturedAtHostStart.current = false;
+    capturedHostSessionRef.current = null;
+  } catch {
+    // Preserve the controller and claim on failure; clearing it would hide a
+    // live ownership conflict and permit an unsafe replacement.
+  }
+}
+/**
+ * Core's workflow-tool adapter invokes this callback only after its captured
+ * session_start profile has passed the trusted interactive-session gate. The
+ * callback may therefore normalize a UI-less RPC tool context through the
+ * controller captured at that trusted ingress, but never through cwd alone.
+ */
+function capturedHostControllerForTool(
+  ctx: unknown,
+  cwd: string,
+  requestedSession: string | undefined,
+): WorkflowSessionController | undefined {
+  const captured = capturedHostSessionRef.current;
+  const controller = workflowSessionRef.current;
+  if (
+    !workflowSessionCapturedAtHostStart.current ||
+    !captured ||
+    !controller ||
+    !ctx ||
+    typeof ctx !== "object"
+  ) return undefined;
+  if (resolve(captured.cwd) !== resolve(cwd)) return undefined;
+  if (requestedSession && requestedSession !== captured.sessionId) return undefined;
+  const value = ctx as { mode?: unknown; hasUI?: unknown };
+  if (captured.mode === "rpc") {
+    if (value.hasUI !== false || (value.mode !== undefined && value.mode !== "rpc")) return undefined;
+  } else if (value.hasUI !== true || (value.mode !== undefined && value.mode !== "tui")) {
+    return undefined;
+  }
+  try {
+    const controllerContext = controller.context();
+    if (
+      controllerContext.session_id !== captured.sessionId ||
+      resolve(controllerContext.worktree) !== resolve(captured.cwd)
+    ) return undefined;
+    return controller;
+  } catch {
+    return undefined;
+  }
+}
+
+function captureTrustedProfile(
+  ctx: unknown,
+  authoritative: { cwd: string; sessionId: string },
+): void {
+  const captured = captureHostSession(ctx, authoritative);
+  if (captured) {
+    capturedHostSessionRef.current = captured;
+    workflowSessionCapturedAtHostStart.current = true;
+  }
+}
+
+/**
+ * Shared accessor passed to commands, tools, and core hooks. It creates a
+ * controller only when a trusted host session supplies a real session ID and
+ * sessionManager-authoritative worktree, and never replaces an existing
+ * controller without a proven host-session transition.
+ */
+export function getFullstackWorkflowSessionController(ctx: unknown, cwd: string): WorkflowSessionController | undefined {
+  const requestedSession = contextSessionId(ctx);
+  const authoritative = authoritativeHostSession(ctx);
+  if (!authoritative) return undefined;
+  if (
+    !requestedSession ||
+    authoritative.sessionId !== requestedSession ||
+    resolve(authoritative.cwd) !== resolve(cwd) ||
+    !trustedHostSession(ctx)
+  ) return undefined;
+  const controller = workflowSessionRef.current;
+  if (controller) {
+    try {
+      const controllerContext = controller.context();
+      const sameWorktree = resolve(controllerContext.worktree) === resolve(authoritative.cwd);
+      if (sameWorktree && controllerContext.session_id === authoritative.sessionId) {
+        captureTrustedProfile(ctx, authoritative);
+        return controller;
+      }
+      // A replacement is valid only after manager-proven identity and a
+      // successful release. ctx.cwd/tool arguments never select a worktree.
+      controller.release("host-session-replaced");
+      workflowSessionRef.current = null;
+      workflowSessionCapturedAtHostStart.current = false;
+      capturedHostSessionRef.current = null;
+    } catch {
+      // Preserve the current owner when replacement release fails.
+      return undefined;
+    }
+  }
+  const created = createWorkflowSession(authoritative.cwd, authoritative.sessionId);
+  workflowSessionRef.current = created ?? null;
+  captureTrustedProfile(ctx, authoritative);
+  return created;
+}
+
+/** Adapter-only bridge for core's already profile-authenticated tool calls. */
+function getFullstackWorkflowToolSessionController(
+  ctx: unknown,
+  cwd: string,
+): WorkflowSessionController | undefined {
+  return getFullstackWorkflowSessionController(ctx, cwd)
+    ?? capturedHostControllerForTool(ctx, cwd, contextSessionId(ctx));
+}
+
+function registerWorkflowSessionController(pi: ExtensionAPI): void {
+  if (typeof (pi as { on?: unknown }).on !== "function") return;
+  pi.on("session_start", (_event: unknown, ctx: unknown) => bindWorkflowSession(ctx));
+  pi.on("session_stop", (_event: unknown, ctx: unknown) => releaseWorkflowSession(ctx));
+  pi.on("session_shutdown", (_event: unknown, ctx: unknown) => releaseWorkflowSession(ctx));
+}
 
 /**
  * Session-level main-session classification for fullstack-owned event
@@ -296,6 +535,7 @@ const fullstackWorkflowToolAdapter: WorkflowToolAdapter = createWorkflowToolAdap
   resolveCwd: resolveSessionCwd,
   owner: fullstackOwnerForCwd,
   isMainSession: isMainSessionContext,
+  getSessionController: getFullstackWorkflowToolSessionController,
   beforeBegin: async cwd => { await waitForFullstackAgentMappings(cwd); },
   mappingSummary: summarizeAgentMapping,
 });
@@ -307,6 +547,7 @@ export function registerWorkflowTools(pi: ExtensionAPI): void {
 
 
 export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
+  registerWorkflowSessionController(pi);
   registerTeamWorkflow(pi, {
     label: "omp-workflows-fullstack",
     roles: fullstackPreset.roles,
@@ -316,13 +557,14 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     scopeUiClasses: fullstackPreset.scopeUiClasses,
     resolveCwd: resolveSessionCwd,
     owner: fullstackOwnerForCwd,
+    getSessionController: getFullstackWorkflowSessionController,
   });
   registerWorkflowTools(pi);
   // URL-first lecture research acquisition — main-session only; core owns the
   // workflow state boundary, this bundle owns the provider-specific acquire tool.
   if (pi.zod) {
     const { z } = pi.zod;
-    registerLectureAcquireTool(pi, z, { resolveSessionCwd, isMainSessionContext });
+    registerLectureAcquireTool(pi, z, { resolveSessionCwd, isMainSessionContext, getSessionController: getFullstackWorkflowSessionController });
   }
   // Register the three workflow entry points while the extension is loaded.
   // OMP snapshots registered commands before it discovers project-local
@@ -400,7 +642,8 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     // its immediate first tick drains it. No active run -> no ACK (standby
     // creation belongs to /cto, not the dispatcher).
     if (channelSet.profile.direction === "rw") {
-      const active = findActiveCtoRun(cwd);
+      const sessionId = contextSessionId(ctx);
+      const active = sessionId ? findActiveCtoRun(cwd, { sessionId }) : null;
       if (active) {
         queueCtoDelivery(cwd, active.runId, {
           id: `${active.runId}/system/ack/${Date.now()}`,

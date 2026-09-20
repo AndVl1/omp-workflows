@@ -42,6 +42,7 @@ interface AgentStartEvent {
 
 interface AgentStartContext {
   cwd: string;
+  run_id?: string;
 }
 
 interface ToolCallEvent {
@@ -57,13 +58,10 @@ export function classificationToolGate(event: ToolCallEvent, ctx: AgentStartCont
   if (event.toolName !== "task") return;
   const wsDir = resolve(ctx.cwd, WORK_STATE_DIR);
   if (!existsSync(wsDir)) return;
-  const active = join(wsDir, ACTIVE_FEATURE);
-  const legacy = join(wsDir, LEGACY_STATE);
-  if (!existsSync(active) && !existsSync(legacy)) return;
-  if (resolveState(ctx.cwd).invalid) {
-    return { block: true, reason: "BLOCK (P5): workflow state is malformed or unsafe; refusing task launch." };
-  }
-  if (!resolveStatePath(ctx.cwd)) {
+  const canonical = ctx.run_id && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ctx.run_id) ? join(wsDir, "runs", ctx.run_id, "state.json") : null;
+  if (!canonical) return;
+  if (!existsSync(canonical)) return { block: true, reason: "BLOCK (P5): selected canonical workflow run is missing." };
+  if (!resolveStatePath(ctx.cwd, ctx.run_id)) {
     return { block: true, reason: "BLOCK (P5): classification state is missing. Complete PHASE 0, write .work-state/team-state.json, then launch agents." };
   }
   // The complete classification contract is enforced pre-execution. The
@@ -73,7 +71,7 @@ export function classificationToolGate(event: ToolCallEvent, ctx: AgentStartCont
   return monotonicGate(event, ctx);
 }
 export function classificationGate(event: AgentStartEvent, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
-  const statePath = resolveStatePath(ctx.cwd);
+  const statePath = resolveStatePath(ctx.cwd, ctx.run_id);
   if (!statePath) return;
 
   let raw: string;
@@ -184,20 +182,10 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
   }
 }
 
-function resolveStatePath(cwd: string): string | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return null;
-  const active = join(wsDir, ".active-feature");
-  if (existsSync(active)) {
-    const slug = readFileSync(active, "utf8").trim();
-    if (isSafeStateSegment(slug)) {
-      const path = join(wsDir, "features", slug, "state.json");
-      if (existsSync(path)) return path;
-    }
-  }
-  const legacy = join(wsDir, "team-state.json");
-  if (existsSync(legacy)) return legacy;
-  return null;
+function resolveStatePath(cwd: string, runId?: string): string | null {
+  if (!runId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) return null;
+  const canonical = join(resolve(cwd, WORK_STATE_DIR), "runs", runId, "state.json");
+  return existsSync(canonical) ? canonical : null;
 }
 
 /**

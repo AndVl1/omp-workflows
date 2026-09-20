@@ -45,6 +45,7 @@ import {
   buildManifest,
   buildSessionSnapshots,
   isSafePathKey,
+  listCanonicalRunSources,
   listSessions,
   preflightLinks,
   publishVisualize,
@@ -128,14 +129,14 @@ export function parseWorkflowViewArgs(args: string[]): ParsedWorkflowViewArgs {
 }
 
 const USAGE = [
-  "Usage: /workflow-view [do-work|cto|legacy] [id=<slug|runId>] [--all] [--full]",
+  "Usage: /workflow-view [do-work|cto|legacy] [id=<runId>] [--all] [--full]",
   "",
-  "  (bare)      latest discoverable workflow session (partial view)",
-  "  do-work     latest do-work session (feature or legacy)",
-  "  cto         latest CTO run",
-  "  legacy      the legacy root session (team-state.json)",
-  "  id=<...>    pick a specific session id",
-  "  --all       complete view: every discoverable session",
+  "  (bare)      choose an explicit canonical run or CTO namespace",
+  "  do-work     canonical ordinary run (graph view may be unavailable)",
+  "  cto         CTO run in the explicit CTO namespace",
+  "  legacy      migration input only; runtime viewer is unavailable",
+  "  id=<runId>  pick a specific canonical run or CTO run",
+  "  --all       complete view for supported non-canonical sessions",
   "  --full      embed redacted full artifact bodies (bounded caps)",
   "",
   "Writes a self-contained offline view (index.md, index.html, manifest.json +",
@@ -232,17 +233,46 @@ export function formatWorkflowViewStatus(snapshot: VisualizationSnapshot, result
   lines.push("Open .work-state/visualize/index.html in a browser to view the bundle.");
   return lines.join("\n");
 }
+const CANONICAL_RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 
 const factory = (api: CustomCommandAPI): CustomCommand => ({
   name: "workflow-view",
   description:
-    "Render the workflow specification view as a self-contained offline bundle under .work-state/visualize. /workflow-view [do-work|cto|legacy] [id=<slug|runId>] [--all] [--full]",
+    "Render supported CTO workflow state as a self-contained offline bundle under .work-state/visualize. Canonical ordinary graph rendering is currently unavailable. /workflow-view [do-work|cto|legacy] [id=<runId>] [--all] [--full]",
   async execute(args: string[], ctx: HookCommandContext): Promise<string> {
     const cwd = ctx.cwd ?? api.cwd;
     if (!cwd) return "ERROR: no cwd available.";
 
     const parsed = parseWorkflowViewArgs(args);
     if (parsed.error) return `ERROR: ${parsed.error}\n\n${USAGE}`;
+    const canonicalRuns = listCanonicalRunSources(cwd);
+    if (parsed.selector.kind === "legacy") {
+      return "ERROR [migration_required]: legacy workflow state is import-only; select its canonical run before using workflow-view.";
+    }
+    if (parsed.selector.kind !== "cto" && canonicalRuns.length === 0) {
+      return (
+        "ERROR [migration_required]: no canonical ordinary run is available for workflow-view. " +
+        "Import/select a canonical run first; legacy state is not a runtime fallback."
+      );
+    }
+    const canonicalScope = parsed.selector.kind !== "cto";
+    if (canonicalScope && (canonicalRuns.length > 0 || (parsed.selector.id !== undefined && CANONICAL_RUN_ID.test(parsed.selector.id)))) {
+      if (parsed.selector.id) {
+        const canonical = canonicalRuns.find(entry => entry.run_id === parsed.selector.id);
+        if (!canonical) {
+          return `ERROR: canonical run '${parsed.selector.id}' was not found; choose one of: ${canonicalRuns.map(entry => entry.run_id).join(", ")}`;
+        }
+        return (
+          `ERROR: workflow-view is unavailable for canonical run '${canonical.run_id}' because its graph renderer is not adapted. ` +
+          `Use /session-report do-work id=${canonical.run_id} or workflow_status with selector.run_id.`
+        );
+      }
+      return (
+        "ERROR: workflow-view is unavailable for canonical runs because its graph renderer is not adapted. " +
+        `Use /session-report with an explicit run id; available runs: ${canonicalRuns.map(entry => `${entry.title} [${entry.run_id}]`).join(", ")}`
+      );
+    }
 
     const discovered = listSessions(cwd);
     const selection = selectWorkflowSessions(discovered, parsed.selector);

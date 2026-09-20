@@ -15,19 +15,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { beginCapability, type RosterBeginSelection } from "../src/engine/durable.js";
-import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
-import { writeStateBootstrap, resolveState } from "../src/engine/state.js";
+import { beginCapability as rawBeginCapability, type RosterBeginSelection } from "../src/engine/durable.js";
+import { resolveWorkflowContract as rawResolveWorkflowContract } from "../src/engine/workflow-contract.js";
+import { writeStateBootstrap, resolveCanonicalRun } from "../src/engine/state.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { buildAgentMapping, validateAgentMappingState, writeAgentMapping, type AgentMappingState } from "../src/engine/agent-mapping.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TeamState } from "../src/engine/types.js";
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
+const RUN_ID = "33333333-3333-4333-8333-333333333333";
 
 const poolRoles = {
   analyst: "analyst",
@@ -55,29 +56,50 @@ function publishMapping(root: string): void {
 function writeFreshState(root: string): void {
   const profile = loadProfile("full-feature");
   assert.ok(profile);
-  const state: TeamState = {
-    schema: 1,
+  const runDir = join(root, ".work-state", "runs", RUN_ID);
+  const artifactsDir = join(runDir, "artifacts");
+  mkdirSync(artifactsDir, { recursive: true });
+  writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "roster seam regression", branch: "main", constraints: [] }));
+  writeFileSync(join(runDir, "state.json"), JSON.stringify({
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
+    lifecycle_status: "active",
+    rework_generation: 0,
     branch: "main",
-    run_key: "main",
+    title: "roster seam regression",
     classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
     task: "roster seam regression",
     workflow_override: false,
     issue: null,
+    required_inputs: {},
+    required_input_receipts: {},
     stage_cursor: "exploration",
     stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" ? "done" as const : stage.id === "exploration" ? "in_progress" as const : "pending" as const })),
-    artifacts: {},
+    artifacts: { discovery: "artifacts/discovery.json" },
+    cursor_epoch: "roster-epoch",
     pause: { kind: "none" as const, reason: "" },
     policy: { strict_orchestrator: true },
     profile_hash: profileHash(profile),
     scope: NO_SCOPE,
     updated_at: new Date().toISOString(),
-  };
-  writeStateBootstrap(root, state, { featureSlug: "seam" });
+  }) + "\n");
+}
+
+function beginCapability(root: string, selection?: RosterBeginSelection, options: Parameters<typeof rawBeginCapability>[2] = {}) {
+  return rawBeginCapability(root, selection, { runId: RUN_ID, ...options });
+}
+
+function resolveWorkflowContract(root: string) {
+  return rawResolveWorkflowContract(root, { runId: RUN_ID });
+}
+function resolveState(root: string): ReturnType<typeof resolveCanonicalRun> {
+  return resolveCanonicalRun(root, { runId: RUN_ID }, "main");
 }
 
 function frozenSelection(root: string): NonNullable<TeamState["roster_selection"]> | undefined {
-  const resolved = resolveState(root);
-  return resolved.state?.roster_selection;
+  const raw = JSON.parse(readFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), "utf8")) as TeamState;
+  return raw.roster_selection;
 }
 
 test("workflow_instructions is readable before capability issuance and exposes the allowed pool", () => {

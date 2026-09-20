@@ -39,7 +39,7 @@ function withConfig(root: string, config: unknown): void {
   writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify(config));
 }
 
-function withActiveRun(root: string): void {
+function withActiveRun(root: string, ownerSession = "session-direct"): void {
   const runDir = join(root, ".work-state", "cto", "run-one");
   mkdirSync(runDir, { recursive: true });
   const now = new Date().toISOString();
@@ -51,7 +51,7 @@ function withActiveRun(root: string): void {
       task: "Some task",
       branch: "main",
       autonomous: true,
-      plan: { id: "run-one", task: "Some task", teams: [], created_at: now },
+      owner_session: ownerSession,
       teams: [],
       integration: { status: "pending" },
       pause: { kind: "none", reason: "" },
@@ -692,22 +692,22 @@ test("ask gate: blocks only with a validated RW primary AND an active run", () =
     const gate = createAskRedirectGate();
 
     // no config -> ask passes
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "no config -> pass");
+    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" }), undefined, "no config -> pass");
 
     // http-only (RO, no validated rw primary) + active run -> ask passes
     withConfig(root, { adapter: "http", http: { url: "https://x" } });
     withActiveRun(root);
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "http-only + active run -> pass (RO fallback)");
+    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" }), undefined, "http-only + active run -> pass (RO fallback)");
 
     // telegram rw + active run -> blocked with the outbox contract
     withConfig(root, { adapter: "telegram", telegram: { token: "t", chatId: "c" } });
-    const blocked = gate({ toolName: "ask" }, { cwd: root });
+    const blocked = gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" });
     assert.ok(blocked?.block === true, "telegram rw + active run -> blocked");
     assert.ok(blocked?.reason.includes("outbox"), "reason names the outbox route");
 
     // telegram rw but NO active run -> ask passes (normal interactive work)
     rmSync(join(root, ".work-state"), { recursive: true, force: true });
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "rw channel without run -> pass");
+    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" }), undefined, "rw channel without run -> pass");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -721,12 +721,12 @@ test("ask gate: explicit validated RW primary blocks; declared-rw incapable kind
     // explicit validated RW primary (mock: inbound+outbound) + active run -> blocked
     withConfig(root, { channels: [{ id: "control", adapter: "mock", direction: "read-write", primary: true }] });
     withActiveRun(root);
-    const blocked = gate({ toolName: "ask" }, { cwd: root });
+    const blocked = gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" });
     assert.ok(blocked?.block === true, "explicit validated RW primary + active run -> blocked");
 
     // explicit declared-rw incapable kind (http: no inbound -> ro) + active run -> passes
     withConfig(root, { channels: [{ id: "sink", adapter: "http", direction: "read-write" }] });
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "explicit declared-rw http downgrades to ro -> ask passes");
+    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" }), undefined, "explicit declared-rw http downgrades to ro -> ask passes");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

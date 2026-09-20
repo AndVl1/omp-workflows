@@ -12,6 +12,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { workerWriteScopeGate, orchestratorWriteGate } from "../src/gates/orchestrator-write.js";
+const RUN_ID = "33333333-3333-4333-8333-333333333333";
+
 
 const SCOPE = { enabled: true, allow: ["src/**", "test/**"], deny: ["src/secret/**"] };
 
@@ -71,11 +73,14 @@ test("write_scope: non-worker actors and non-write tools are unaffected", () => 
 test("write_scope: composed after orchestratorWriteGate — the orchestrator gate remains authoritative", () => {
   const cwd = mkdtempSync(join(tmpdir(), "wscope-gate-"));
   try {
-    // A strict workflow state activates the orchestrator gate.
-    const stateDir = join(cwd, ".work-state");
-    mkdirSync(stateDir, { recursive: true });
-    writeFileSync(join(stateDir, "team-state.json"), JSON.stringify({
-      schema: 1,
+    const runDir = join(cwd, ".work-state", "runs", RUN_ID);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "state.json"), JSON.stringify({
+      schema: 2,
+      run_id: RUN_ID,
+      run_key: RUN_ID,
+      lifecycle_status: "active",
+      title: "write scope",
       branch: "feat/x",
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
       task: "t",
@@ -88,22 +93,22 @@ test("write_scope: composed after orchestratorWriteGate — the orchestrator gat
       policy: { strict_orchestrator: true },
       updated_at: new Date().toISOString(),
     }));
-    // Canonical state writes are blocked by the orchestrator gate regardless
-    // of write_scope (write_scope can only add blocks, never lift them).
-    const stateWrite = { toolName: "write", input: { path: join(cwd, ".work-state", "team-state.json") } };
-    const gateResult = orchestratorWriteGate(stateWrite, { cwd, actor: "worker", hasUI: false });
+    const strictContext = { cwd, run_id: RUN_ID, actor: "worker" as const, hasUI: false };
+
+    const stateWrite = { toolName: "write", input: { path: join(cwd, ".work-state", "runs", RUN_ID, "state.json") } };
+    const gateResult = orchestratorWriteGate(stateWrite, strictContext);
     assert.equal(gateResult?.block, true, "orchestrator gate still blocks canonical state writes");
-    const scopeResult = workerWriteScopeGate(stateWrite, { cwd, actor: "worker", hasUI: false, writeScope: SCOPE });
+    const scopeResult = workerWriteScopeGate(stateWrite, { ...strictContext, writeScope: SCOPE });
     assert.ok(scopeResult === undefined || scopeResult.block === true, "write_scope never weakens the orchestrator boundary");
-    // Worker source writes that the orchestrator gate permits are narrowed
-    // further by write_scope; a write inside scope stays allowed end-to-end.
+
     const sourceWrite = { toolName: "write", input: { path: "src/a.ts" } };
-    const throughOrchestrator = orchestratorWriteGate(sourceWrite, { cwd, actor: "worker", hasUI: false });
+    const throughOrchestrator = orchestratorWriteGate(sourceWrite, strictContext);
     assert.equal(throughOrchestrator, undefined, "orchestrator gate permits worker source writes");
-    assert.equal(workerWriteScopeGate(sourceWrite, { cwd, actor: "worker", hasUI: false, writeScope: SCOPE }), undefined, "in-scope write passes both gates");
+    assert.equal(workerWriteScopeGate(sourceWrite, { ...strictContext, writeScope: SCOPE }), undefined, "in-scope write passes both gates");
+
     const outOfScope = { toolName: "write", input: { path: "lib/other.ts" } };
-    assert.equal(orchestratorWriteGate(outOfScope, { cwd, actor: "worker", hasUI: false }), undefined);
-    assert.equal(workerWriteScopeGate(outOfScope, { cwd, actor: "worker", hasUI: false, writeScope: SCOPE })?.block, true, "out-of-scope write is narrowed after the orchestrator gate");
+    assert.equal(orchestratorWriteGate(outOfScope, strictContext), undefined);
+    assert.equal(workerWriteScopeGate(outOfScope, { ...strictContext, writeScope: SCOPE })?.block, true, "out-of-scope write is narrowed after the orchestrator gate");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

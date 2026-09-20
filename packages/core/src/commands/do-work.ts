@@ -1,11 +1,14 @@
-import { parseAutonomousDirective } from "./envelope.js";
+import { parseAutonomousDirective, type WorkflowCommandMode } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
-import { DETACHED_BRANCH, NO_GIT_BRANCH, resolveActiveBranch, resolveState } from "../engine/state.js";
+import { DETACHED_BRANCH, NO_GIT_BRANCH, resolveActiveBranch } from "../engine/state.js";
+import { createWorkflowReadSelector } from "../engine/read-selector.js";
 import { resolveConfig, type ResolvedConfig } from "../engine/config.js";
 import type { Complexity, TaskType, WorkflowName } from "../engine/types.js";
 
 export interface ParsedWorkEnvelope {
   task: string;
+  mode?: WorkflowCommandMode;
+  run_id?: string;
   /**
    * MECHANICAL hint from the leading-directive parser. NON-AUTHORITATIVE:
    * PHASE-0 has the main LLM decide `autonomous` from the full task
@@ -68,13 +71,13 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
   const branchMeta = envelope.branch
     ? `Branch: \`${envelope.branch}\` (canonical session branch; persist this exact value)\n`
     : "Branch: (no git work tree; strict workflow transitions cannot start)\n";
-  const resolvedState = resolveState(cwd, envelope.branch ?? undefined);
-  let continuation = "No existing do-work state was found. Start a new workflow.";
-  if (resolvedState.state && !resolvedState.isStale && resolvedState.statePath) {
+  let continuation = "No canonical run is selected yet. Prepare a new workflow or resolve the explicit run selector through the trusted session controller.";
+  if (envelope.run_id) {
+    const selected = createWorkflowReadSelector(cwd, envelope.branch ? { branch: envelope.branch } : {}).read(envelope.run_id);
     continuation = [
-      `Existing workflow state found at \`${resolvedState.statePath}\`. This is a resumable continuation, not a new task.`,
-      "Read it before choosing stages; preserve its classification, artifacts, stage history, and prior task text.",
-      "If the user reports a defect in the previous result, append the feedback to the task/history, reopen the smallest affected stage, reset only that stage and its downstream stages to pending, and continue from there.",
+      `Canonical workflow state found at \`${selected.state_path}\`. This is a resumable continuation, not a new task.`,
+      "Read it through workflow_status/instructions before choosing stages; preserve its classification, artifacts, stage history, and prior task text.",
+      "If the user reports a defect in the previous result, pass feedback and the affected stage to workflow_prepare in rework mode.",
       "Do not discard or overwrite completed artifacts unless the reopened stage produces a replacement artifact.",
     ].join("\n");
   }
@@ -82,7 +85,12 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "/do-work classification pass — understand the task before selecting a workflow.",
     "",
     "### Task",
-    envelope.task,
+    envelope.task || "(task supplied by the selected run)",
+    "",
+    "### Lifecycle request",
+    `Mode: ${envelope.mode ?? "unspecified (model chooses after classification)"}`,
+    envelope.run_id ? `Run selector: \`${envelope.run_id}\`` : "Run selector: resolve from the session/list context",
+    "Explicit mode is authoritative; do not reinterpret it from task wording or state presence.",
     "",
     "### Metadata",
     issueMeta + branchMeta,

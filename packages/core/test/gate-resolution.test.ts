@@ -3,17 +3,20 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
-import { registerTeamWorkflow } from "../src/index.js";
-import type { RoleConfig } from "../src/engine/types.js";
+import { createWorkflowSessionController, registerTeamWorkflow } from "../src/index.js";
+import type { RoleConfig, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
 
-const genericRoles: RoleConfig["roles"] = {
-  worker: "worker",
-};
+const genericRoles: RoleConfig["roles"] = { worker: "worker" };
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
 
-function minimalState(branch = "feature/gates") {
+function minimalState(): TeamState {
   return {
-    schema: 1,
-    branch,
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
+    lifecycle_status: "active",
+    title: "gate regression",
+    branch: "feature/gates",
     classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
     task: "gate regression",
     issue: null,
@@ -22,69 +25,71 @@ function minimalState(branch = "feature/gates") {
     stages: [{ id: "implementation", status: "in_progress" }],
     artifacts: {},
     pause: { kind: "none", reason: "" },
+    policy: { strict_orchestrator: true },
     updated_at: new Date(0).toISOString(),
   };
 }
 
-test("runtime registers the canonical tool-call gate chain in order", () => {
-  const registrations: string[] = [];
+function writeCanonicalState(root: string, state: TeamState): void {
+  const runDir = join(root, ".work-state", "runs", RUN_ID);
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, "state.json"), JSON.stringify(state));
+}
+
+function trustedContext(root: string): TrustedExecutionContext {
+  return {
+    session_id: "gate-regression-session",
+    caller: "host",
+    process_id: process.pid,
+    worktree: root,
+    branch: "feature/gates",
+    authority: "coordinator",
+  };
+}
+
+function registerGate(root: string, selected = true): (event: unknown, ctx: unknown) => unknown {
   const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const pi = {
     setLabel() {},
     on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
-      registrations.push(name);
       if (name === "tool_call") handlers.push(handler);
     },
   };
-  registerTeamWorkflow(pi as never, { roles: genericRoles });
-  const toolCallIndex = registrations.indexOf("tool_call");
-  assert.ok(toolCallIndex >= 2);
-  assert.deepEqual(registrations.slice(toolCallIndex - 2, toolCallIndex + 1), [
-    "before_agent_start",
-    "session_stop",
-    "tool_call",
-  ]);
-  assert.ok(handlers.length >= 1);
-  // An unarmed workspace must retain normal task compatibility: all gates allow.
-  const root = mkdtempSync(join(tmpdir(), "omp-gate-order-"));
+  const controller = selected
+    ? createWorkflowSessionController({ cwd: root, context: trustedContext(root) })
+    : undefined;
+  if (controller) controller.bind(RUN_ID);
+  registerTeamWorkflow(pi as never, {
+    roles: genericRoles,
+    getSessionController: () => controller,
+  });
+  assert.equal(handlers.length, 1);
+  return handlers[0]!;
+}
+
+test("history without a selected run does not gate task compatibility", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-gate-history-"));
   try {
-    const result = handlers[0]!({ toolName: "task", input: { task: "ordinary task" } }, { cwd: root });
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(minimalState()));
+    const handler = registerGate(root, false);
+    const result = handler({ toolName: "task", input: { task: "ordinary task" } }, { cwd: root });
     assert.equal(result, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("armed malformed state is rejected before dispatch can be authorized", () => {
-  const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
-  const pi = { setLabel() {}, on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "tool_call") handlers.push(handler); } };
-  registerTeamWorkflow(pi as never);
-  const root = mkdtempSync(join(tmpdir(), "omp-gate-armed-"));
+test("selected canonical run rejects malformed classification before dispatch", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-gate-malformed-"));
   try {
-    mkdirSync(join(root, ".work-state"), { recursive: true });
-    const armed = { ...minimalState(), policy: { strict_orchestrator: true } };
-    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(armed));
-    const result = handlers[0]!({ toolName: "task", input: { task: "prompt-only" } }, { cwd: root }) as { block?: boolean; reason?: string } | undefined;
-    assert.equal(result?.block, true);
-    assert.match(result?.reason ?? "", /classification|capability|dispatch/i);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("malformed classification task is fail-closed through the actual gate chain", () => {
-  const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
-  const pi = { setLabel() {}, on(name: string, handler: (event: unknown, ctx: unknown) => unknown) { if (name === "tool_call") handlers.push(handler); } };
-  registerTeamWorkflow(pi as never);
-  const root = mkdtempSync(join(tmpdir(), "omp-gate-malformed-classification-"));
-  try {
-    mkdirSync(join(root, ".work-state"), { recursive: true });
     const armed = {
       ...minimalState(),
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false },
-      policy: { strict_orchestrator: true },
-    };
-    writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(armed));
-    const result = handlers[0]!({ toolName: "task", input: { task: "prompt-only" } }, { cwd: root }) as { block?: boolean; reason?: string } | undefined;
+    } as TeamState;
+    writeCanonicalState(root, armed);
+    const handler = registerGate(root);
+    const result = handler({ toolName: "task", input: { task: "prompt-only" } }, { cwd: root }) as { block?: boolean; reason?: string } | undefined;
     assert.equal(result?.block, true);
     assert.match(result?.reason ?? "", /malformed classification|workflow/i);
   } finally {

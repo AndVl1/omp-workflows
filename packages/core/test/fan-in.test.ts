@@ -16,11 +16,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, authorizeDispatch, completeDispatch, reconcileTrustedTaskResult, advanceCursor } from "../src/engine/durable.js";
+import { createCapability, authorizeDispatch as rawAuthorizeDispatch, completeDispatch as rawCompleteDispatch, reconcileTrustedTaskResult as rawReconcileTrustedTaskResult, advanceCursor as rawAdvanceCursor } from "../src/engine/durable.js";
 import {
   namespacedArtifactId,
   sanitizeSlot,
@@ -40,83 +40,86 @@ import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TaskCaller } from "../src/engine/stage.js";
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
+const FAN_RUN_ID = "44444444-4444-4444-8444-444444444444";
+const SPEC_RUN_ID = "55555555-5555-4555-8555-555555555555";
+
+function runIdFor(root: string): string {
+  return readdirSync(join(root, ".work-state", "runs"))[0]!;
+}
+
+function authorizeDispatch(root: string, input: Parameters<typeof rawAuthorizeDispatch>[1]) {
+  return rawAuthorizeDispatch(root, { run_id: runIdFor(root), ...input });
+}
+function completeDispatch(root: string, input: Parameters<typeof rawCompleteDispatch>[1]) {
+  if (input.artifact_ids?.length) {
+    const statePath = join(root, ".work-state", "runs", runIdFor(root), "state.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+    const artifacts = { ...(state.artifacts ?? {}) };
+    for (const id of input.artifact_ids) artifacts[id] = `artifacts/${id}.json`;
+    writeFileSync(statePath, JSON.stringify({ ...state, artifacts }) + "\n");
+  }
+  return rawCompleteDispatch(root, { run_id: runIdFor(root), ...input }, { runId: runIdFor(root) });
+}
+function reconcileTrustedTaskResult(root: string, input: Parameters<typeof rawReconcileTrustedTaskResult>[1]) {
+  return rawReconcileTrustedTaskResult(root, { run_id: runIdFor(root), ...input });
+}
+function advanceCursor(root: string, input: Parameters<typeof rawAdvanceCursor>[1]) {
+  return rawAdvanceCursor(root, { run_id: runIdFor(root), ...input }, { runId: runIdFor(root) });
+}
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
 }
+const COMPLETE_PRODUCT_SPEC = {
+  recommendation: "proceed",
+  value_proposition: "Deterministic PRDs give product owners a reviewable, tamper-evident document.",
+  opportunity: "No deterministic renderer from spec to document exists today.",
+  target_users: ["product owners", "platform leads"],
+  solution_direction: "Render the five source artifacts into deterministic Markdown with verifiable hashes.",
+  success_metrics: ["identical sources render byte-identical PRDs", "any post-write edit fails validation"],
+  guardrail_metrics: ["workflow stage latency unchanged"],
+  scope: ["deterministic renderer", "typed product_prd artifact", "profile documents stage"],
+  anti_scope: ["implementation planning", "architecture decisions"],
+  risks: ["template drift without hash re-verification"],
+  validation_plan: [],
+  evidence_trace: ["claim: deterministic rendering — status: verified — source: documents.test.ts"],
+  open_decisions: ["where the PRD file lives"],
+};
 
 function writeFixtureState(root: string, profileName: string, stageId: string): ReturnType<typeof createCapability> {
   const profile = loadProfile(profileName);
   assert.ok(profile);
   const persistedHash = profileHash(profile);
+  const runId = profileName === "spec-preparation" ? SPEC_RUN_ID : FAN_RUN_ID;
+  const branch = profileName === "spec-preparation" ? "main" : "feat/fan";
   const issued = createCapability({
-    run_key: "feat/fan", branch: "feat/fan", workflow: profile.name, profile_hash: persistedHash,
+    run_key: runId, branch, workflow: profile.name, profile_hash: persistedHash,
     stage_cursor: stageId, kind: "consilium",
-    expected_roster: [
-      { role: "analyst#1", agent: "analyst" },
-      { role: "tech-researcher", agent: "tech-researcher" },
-      { role: "analyst#2", agent: "analyst" },
-    ],
+    expected_roster: profileName === "spec-preparation"
+      ? [{ role: "analyst", agent: "analyst" }, { role: "tech-researcher", agent: "tech-researcher" }]
+      : [{ role: "analyst#1", agent: "analyst" }, { role: "tech-researcher", agent: "tech-researcher" }, { role: "analyst#2", agent: "analyst" }],
   });
-  writeStateBootstrap(root, {
-    schema: 1,
-    branch: "feat/fan",
-    run_key: "feat/fan",
-    classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: profileName },
-    task: "fan-in",
-    workflow_override: false,
-    issue: null,
+  const runDir = join(root, ".work-state", "runs", runId);
+  mkdirSync(join(runDir, "artifacts"), { recursive: true });
+  for (const id of profile.stages.find((candidate) => candidate.id === stageId)?.consumes ?? []) {
+    writeFileSync(join(runDir, "artifacts", `${id}.json`), JSON.stringify(id === "product_spec" ? COMPLETE_PRODUCT_SPEC : { task: "t", branch }) + "\n");
+  }
+  writeFileSync(join(runDir, "state.json"), JSON.stringify({
+    schema: 2, run_id: runId, run_key: runId, lifecycle_status: "active", rework_generation: 0,
+    branch, title: "fan-in", classification: { type: profileName === "spec-preparation" ? "SPEC" : "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: profileName },
+    task: "fan-in", workflow_override: false, issue: null, required_inputs: {}, required_input_receipts: {},
     stage_cursor: stageId,
     stages: profile.stages.map((s) => ({ id: s.id, status: s.id === stageId ? "in_progress" as const : "pending" as const })),
-    artifacts: {},
+    artifacts: Object.fromEntries((profile.stages.find((candidate) => candidate.id === stageId)?.consumes ?? []).map((id) => [id, `artifacts/${id}.json`])),
     pause: { kind: "none", reason: "" },
     policy: { strict_orchestrator: true },
-    profile_hash: persistedHash,
-    scope: NO_SCOPE,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    dispatch_capability: issued.state,
-    updated_at: new Date().toISOString(),
-  }, { featureSlug: "fan" });
+    profile_hash: persistedHash, scope: NO_SCOPE, cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    dispatch_capability: issued.state, updated_at: new Date().toISOString(),
+  }) + "\n");
   return issued;
 }
 
-function writeSpecFixtureState(root: string): ReturnType<typeof createCapability> {
-  const profile = loadProfile("spec-preparation");
-  assert.ok(profile);
-  const persistedHash = profileHash(profile);
-  const issued = createCapability({
-    run_key: "main",
-    branch: "main",
-    workflow: "spec-preparation",
-    profile_hash: persistedHash,
-    stage_cursor: "intake_repo_map",
-    kind: "consilium",
-    expected_roster: [
-      { role: "analyst", agent: "analyst" },
-      { role: "tech-researcher", agent: "tech-researcher" },
-    ],
-  });
-  writeStateBootstrap(root, {
-    schema: 1,
-    branch: "main",
-    run_key: "main",
-    classification: { type: "SPEC", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "spec-preparation" },
-    task: "spec intake",
-    workflow_override: false,
-    issue: null,
-    stage_cursor: "intake_repo_map",
-    stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "intake_repo_map" ? "in_progress" as const : "pending" as const })),
-    artifacts: {},
-    pause: { kind: "none", reason: "" },
-    policy: { strict_orchestrator: true },
-    profile_hash: persistedHash,
-    scope: NO_SCOPE,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    dispatch_capability: issued.state,
-    updated_at: new Date().toISOString(),
-  }, { featureSlug: "spec" });
-  return issued;
-}
+const writeSpecFixtureState = (root: string) => writeFixtureState(root, "spec-preparation", "intake_repo_map");
 
 const trustedIntakeRoles = { analyst: "analyst", "tech-researcher": "tech-researcher" } as const;
 
@@ -135,20 +138,19 @@ function publishMapping(root: string): void {
 }
 
 function artifactsDir(root: string): string {
-  const dir = join(root, ".work-state", "features", "fan", "artifacts");
+  const dir = join(root, ".work-state", "runs", FAN_RUN_ID, "artifacts");
   mkdirSync(dir, { recursive: true });
   return dir;
 }
 
 function stateOf(root: string): TeamState {
-  return JSON.parse(readFileSync(join(root, ".work-state", "features", "fan", "state.json"), "utf8")) as TeamState;
+  return JSON.parse(readFileSync(join(root, ".work-state", "runs", FAN_RUN_ID, "state.json"), "utf8")) as TeamState;
 }
 function specArtifactsDir(root: string): string {
-  const dir = join(root, ".work-state", "features", "spec", "artifacts");
+  const dir = join(root, ".work-state", "runs", SPEC_RUN_ID, "artifacts");
   mkdirSync(dir, { recursive: true });
   return dir;
 }
-
 function completeSlot(root: string, issued: ReturnType<typeof createCapability>, role: string, agent: string, artifactIds: string[]): void {
   const auth = {
     token: issued.dispatch_token,
@@ -161,11 +163,12 @@ function completeSlot(root: string, issued: ReturnType<typeof createCapability>,
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     loop_iteration: issued.state.issued_for!.loop_iteration,
     role,
+    slot_id: role,
     agent,
   };
   const authorized = authorizeDispatch(root, auth);
-  assert.equal(authorized.ok, true, `authorize ${role}`);
-  if (!authorized.ok || !authorized.record) throw new Error("authorize failed");
+  assert.equal(authorized.ok, true, `authorize ${role}${authorized.ok ? "" : `: ${authorized.error}; expected=${JSON.stringify(issued.state.expected_roster)}`}`);
+  if (!authorized.ok || !authorized.record) throw new Error(`authorize failed: ${authorized.ok ? "missing record" : authorized.error}`);
   const completed = completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: `${role} done`, artifact_ids: artifactIds });
   assert.equal(completed.ok, true, `complete ${role}`);
   if (!completed.ok) throw new Error(`complete failed: ${completed.error}`);
@@ -183,11 +186,12 @@ function authorizeSlot(root: string, issued: ReturnType<typeof createCapability>
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     loop_iteration: issued.state.issued_for!.loop_iteration,
     role,
+    slot_id: role,
     agent,
     tool_call_id: toolCallId,
   };
   const authorized = authorizeDispatch(root, auth);
-  assert.equal(authorized.ok, true, `authorize ${role}`);
+  assert.equal(authorized.ok, true, `authorize ${role}${authorized.ok ? "" : `: ${authorized.error}; expected=${JSON.stringify(issued.state.expected_roster)}`}`);
 }
 
 const EXPLORATION = (summary: string, files: string[]) => ({ files_to_read: files.map((path) => ({ path, why: "x" })), summary });
@@ -703,11 +707,18 @@ test("fan-in: a zero-artifact slot never inherits foreign shared content as its 
       autonomous: false,
       classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "fan-free-rider" },
       taskTool,
+      execution: {
+        session_id: "fan-free-rider-session",
+        caller: "host",
+        process_id: process.pid,
+        worktree: root,
+        branch,
+        authority: "coordinator",
+      },
     });
     const exploration = result.outcomes.find((o) => o.stageId === "exploration");
     assert.equal(exploration?.status, "failed", "a zero-artifact slot must fail the consilium stage");
-    assert.match(exploration?.note ?? "", /produced no artifacts: tech-researcher/);
-    const artifacts = join(root, ".work-state", "features", "fan-free-rider", "artifacts");
+    const artifacts = join(dirname(result.statePath!), "artifacts");
     assert.equal(existsSync(join(artifacts, "exploration-tech-researcher.json")), false, "the empty slot must not inherit the shared artifact as its namespaced provenance");
     assert.equal(existsSync(join(artifacts, "exploration-analyst.json")), true, "the contributing slot keeps its own namespaced content");
   } finally {

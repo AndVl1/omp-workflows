@@ -35,13 +35,20 @@ import type {
 import {
 	buildDoWorkPrompt,
 	claimWorkflowOwners,
+	createWorkflowReadSelector,
+	createWorkflowSessionController,
 	createWorkflowToolAdapter,
 	parseWorkEnvelope,
+	parseWorkflowCommand,
 	registerTeamWorkflow,
 	registerWorkflowCommands,
+	resolveActiveBranch,
 	writeRuntimeConfig,
 	workflowOwnerFor,
+	type RegisterOptions,
+	type TrustedExecutionContext,
 	type WorkflowCapability,
+	type WorkflowSessionController,
 	type WorkflowToolAdapter,
 } from "@andvl1/omp-workflows-core";
 
@@ -88,6 +95,131 @@ const NAMESPACED_DESCRIPTIONS = {
 		"CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /omp-cto <task>; /omp-cto alone starts STANDBY (tasks arrive via messenger inbox). Runs in-session — never task(agent=cto)",
 } as const;
 
+interface InternalSessionBinding {
+	cwd: string;
+	interactive: boolean;
+	sessionId?: string;
+	controller?: WorkflowSessionController;
+}
+
+/**
+ * The bundle owns one trusted controller per host extension instance/session.
+ * The mapping is deliberately process-local: it is only an adapter seam and
+ * never a source of run authority. Core's canonical controller/read APIs own
+ * run selection and lifecycle mutation.
+ */
+const sessionBindings = new WeakMap<object, InternalSessionBinding>();
+
+function sessionIdFromContext(ctx: unknown): string | undefined {
+	if (!ctx || typeof ctx !== "object") return undefined;
+	const objectContext = ctx as { session_id?: unknown; sessionId?: unknown; sessionManager?: unknown };
+	const manager = objectContext.sessionManager;
+	if (manager && typeof manager === "object" && "getSessionId" in manager && typeof manager.getSessionId === "function") {
+		try {
+			const sessionManager = manager as { getSessionId: () => unknown };
+			const sessionId = sessionManager.getSessionId();
+			if (typeof sessionId === "string" && sessionId.length > 0) return sessionId;
+		} catch {
+			// Fall through to the host context fields.
+		}
+	}
+	const sessionId = objectContext.session_id ?? objectContext.sessionId;
+	return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
+}
+
+function trustedInteractiveSession(ctx: unknown): boolean {
+	if (!ctx || typeof ctx !== "object") return false;
+	const host = ctx as { mode?: unknown; hasUI?: unknown };
+	return host.hasUI === true && (host.mode === "tui" || host.mode === "rpc");
+}
+
+/**
+ * Release and forget the current controller before a host-session binding is
+ * replaced or stopped. A failed release is retained as a conservative busy
+ * binding; it is never silently converted into an unowned session.
+ */
+function releaseSessionBinding(pi: object, receipt: string): boolean {
+	const prior = sessionBindings.get(pi);
+	try {
+		prior?.controller?.release(receipt);
+		sessionBindings.delete(pi);
+		return true;
+	} catch {
+		console.warn(`[${COMMAND_NAME}]`, JSON.stringify({
+			bundle: OMP_INTERNAL_BUNDLE_ID,
+			code: "session_controller_release_failed",
+			receipt,
+		}));
+		return false;
+	}
+}
+
+function buildTrustedController(
+	cwd: string,
+	sessionId: string,
+): WorkflowSessionController | undefined {
+	try {
+		const context: TrustedExecutionContext = {
+			session_id: sessionId,
+			caller: "host",
+			process_id: process.pid,
+			worktree: cwd,
+			branch: resolveActiveBranch(cwd),
+			authority: "coordinator",
+		};
+		return createWorkflowSessionController({ cwd, context });
+	} catch {
+		// Leave the session unbound until a valid trusted context is available.
+		return undefined;
+	}
+}
+
+/**
+ * Capture the host session before any lifecycle callback can suspend. A
+ * replacement releases the old coordinator before the new binding is stored;
+ * pending workers remain reserved by core's release semantics. Hosts that do
+ * not expose a session ID remain unbound until a later trusted ingress
+ * supplies one.
+ */
+function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
+	if (!releaseSessionBinding(pi, "host-session-replaced")) return;
+
+	const sessionId = sessionIdFromContext(ctx);
+	const interactive = trustedInteractiveSession(ctx);
+	const controller = interactive && sessionId ? buildTrustedController(cwd, sessionId) : undefined;
+	sessionBindings.set(pi, {
+		cwd,
+		interactive,
+		...(sessionId ? { sessionId } : {}),
+		...(controller ? { controller } : {}),
+	});
+}
+
+/**
+ * Return the captured controller only for its originating workspace/session.
+ * Never infer a run from cwd, selection, or a later callback. If the trusted
+ * host session initially omitted its ID, bind lazily from a later ingress
+ * context that exposes the host session manager's ID.
+ */
+function sharedSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
+	const binding = sessionBindings.get(pi);
+	if (!binding || binding.cwd !== cwd || !binding.interactive) return undefined;
+	if (ctx && typeof ctx === "object") {
+		// Host tool contexts carry actor as a trusted in-process discriminator.
+		const hostContext = ctx as { actor?: unknown };
+		const actor = hostContext.actor;
+		if (actor === "worker" || actor === "lead") return undefined;
+	}
+	const requestedSession = sessionIdFromContext(ctx);
+	if (requestedSession && binding.sessionId && requestedSession !== binding.sessionId) return undefined;
+	if (binding.controller) return binding.controller;
+	if (!requestedSession) return undefined;
+	const controller = buildTrustedController(cwd, requestedSession);
+	if (!controller) return undefined;
+	binding.sessionId = requestedSession;
+	binding.controller = controller;
+	return controller;
+}
 /** Entry points already wired for a given pi instance (idempotent per host). */
 const activatedEngines = new WeakSet<object>();
 
@@ -173,8 +305,7 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 
 	// Registration presets shared verbatim by engine wiring and the config
 	// seed: core's writeRuntimeConfig writes exactly these values when the
-	// file is absent and returns untouched when it exists.
-	const registrationOpts = {
+	const registrationOpts: RegisterOptions = {
 		label: OMP_INTERNAL_BUNDLE_ID,
 		roles: defaultOmpInternalRoles,
 		scopeMap: defaultOmpInternalScopeMap,
@@ -184,6 +315,7 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 		workflowProfiles: profiles,
 		resolveCwd: resolveSessionCwd,
 		owner: privateOmpOwnerForCwd,
+		getSessionController: (ctx, sessionCwd) => sharedSessionController(pi, ctx, sessionCwd),
 	};
 
 	// Seed-if-absent BEFORE the short-circuit and before ANY discovery
@@ -214,11 +346,12 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 		const adapter: WorkflowToolAdapter = createWorkflowToolAdapter({
 			resolveCwd: resolveSessionCwd,
 			owner: privateOmpOwnerForCwd,
+			getSessionController: (ctx, sessionCwd) => sharedSessionController(pi, ctx, sessionCwd),
 			// Hand the fresh, provenance-checked mapping to core so workflow_begin
 			// authorizes from this session's discovery — in memory, never from the
 			// persisted mapping file. A failed refresh rejects here, which blocks
 			// the begin (fail closed) instead of letting a stale roster stand in.
-			beforeBegin: (cwd) => waitForInternalAgentMappings(cwd),
+			beforeBegin: (sessionCwd) => waitForInternalAgentMappings(sessionCwd),
 		});
 		adapter.register(pi);
 	} catch (error) {
@@ -317,37 +450,70 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 				pi.sendUserMessage(formatDiagnostic(outcome));
 				return;
 			}
-			const envelope = parseWorkEnvelope(trimmed, cwd);
-			if (!envelope.task) {
+			const command = parseWorkflowCommand(trimmed);
+			if (!command.ok) {
+				pi.sendUserMessage(`ERROR [${command.code}]: ${command.error}`);
+				return;
+			}
+			if (command.mode === "list") {
+				// Listing is a canonical read snapshot, not a fresh catalog
+				// sort. The snapshot ID/index pair is the selector binding that
+				// workflow_prepare must later revalidate under lock.
+				const sharedController = command.all_branches ? undefined : sharedSessionController(pi, ctx, cwd);
+				const selector = sharedController?.readSelector() ?? createWorkflowReadSelector(
+					cwd,
+					command.all_branches ? {} : { branch: resolveActiveBranch(cwd) },
+				);
+				const snapshot = selector.list({ includeTerminal: true });
+				pi.sendUserMessage(
+					snapshot.candidates.length === 0
+						? "No workflow runs found."
+						: snapshot.candidates
+								.map(
+									(candidate, index) =>
+										`${index + 1}. ${candidate.title} — ${candidate.branch} — ${candidate.status} — ${candidate.stage} (snapshot_id=${snapshot.snapshot_id}; index=${index}; run_id=${candidate.run_id})`,
+								)
+								.join("\n"),
+				);
+				return;
+			}
+			const parsed = parseWorkEnvelope(command.task, cwd);
+			if (!parsed.task && !command.mode) {
 				pi.sendUserMessage(
 					"[omp-workflow-team] Usage: /omp-workflow-team <task description> (or `/omp-workflow-team validate`).",
 				);
 				return;
 			}
+			const envelope = {
+				...parsed,
+				...(command.mode ? { mode: command.mode } : {}),
+				...(command.run_id ? { run_id: command.run_id } : {}),
+			};
 			pi.sendUserMessage(buildDoWorkPrompt(envelope, cwd));
 		},
 	});
-
 	// Namespaced core registration surface: `/omp-do-work`, `/omp-team`,
 	// `/omp-cto`. Descriptors publish eagerly during extension load so OMP's
-	// slash-suggestion snapshot sees them; the marker gate lives in the
-	// resolver (`resolveGatedCommandCwd`) and in the owner source
-	// (`privateOmpOwnerForMarkedWorkspace`), so an unmarked session claims
-	// zero owners and never receives a workflow dispatch. Core registers its
-	// own session_start claim handler here — it must run BEFORE the
-	// engine-activation handler below so `workflow_registration` is claimed
-	// first and `ensureEngineActivation` then idempotently claims all three
-	// capabilities under the single private owner.
+	// slash-suggestion snapshot sees them; marker gating remains in the cwd
+	// resolver and owner source, so unmarked sessions claim nothing.
 	registerWorkflowCommands(pi, {
 		namespace: COMMAND_NAMESPACE,
 		...NAMESPACED_DESCRIPTIONS,
 		owner: privateOmpOwnerForMarkedWorkspace,
 		resolveCwd: resolveGatedCommandCwd,
+		getSessionController: (ctx, cwd) => sharedSessionController(pi, ctx, cwd),
 	});
 
 	pi.on("session_start", (_event: unknown, ctx: unknown) => {
 		const cwd = resolveSessionCwd(ctx);
-		if (!cwd) return;
+		if (!cwd || !detectWorkspaceMarkers(cwd).ok) {
+			releaseSessionBinding(pi, "host-session-unavailable");
+			return;
+		}
+		// Capture trusted host/session identity before kicking off any async
+		// discovery. Later tool callbacks use this closure, never a new run
+		// selected while discovery is suspended.
+		captureSessionBinding(pi, ctx, cwd);
 		// Activation FIRST: on a clean marked workspace it synchronously seeds
 		// the default omp-* role config (write-if-absent), so the refresh
 		// kicked below resolves real roles on the very first session instead
@@ -380,5 +546,8 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 				}));
 			});
 		}
+	});
+	pi.on("session_stop", () => {
+		releaseSessionBinding(pi, "host-session-stop");
 	});
 }

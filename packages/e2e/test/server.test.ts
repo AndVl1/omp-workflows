@@ -461,6 +461,21 @@ test('server: session.json + pty metadata written', async t => {
   );
 });
 
+test('server: restart archives prior raw transcript instead of erasing evidence', async t => {
+  const scratch = makeScratch();
+  const first = await startTestSession({ cwd: scratch, noPty: true, token: 'first' });
+  writeFileSync(first.transcriptPath, '{"t":"o","d":"saved decision"}\n');
+  await first.close();
+
+  const second = await startTestSession({ cwd: scratch, noPty: true, token: 'second' });
+  t.after(() => second.close());
+  const sessionJson = JSON.parse(readFileSync(second.sessionJsonPath, 'utf8')) as Record<string, unknown>;
+  const previous = sessionJson.previous_transcript;
+  assert.equal(typeof previous, 'string');
+  assert.ok(previous !== null && readFileSync(previous as string, 'utf8').includes('saved decision'));
+  assert.equal(readFileSync(second.transcriptPath, 'utf8'), '', 'new session has a clean current transcript');
+});
+
 test('server: session.json records user_config.path when the user overlay file is present', async t => {
   // When the operator drops `<scratch>/.omp/ux-e2e-overlay.user.json`
   // into the scratch dir, the harness must record the resolved path in

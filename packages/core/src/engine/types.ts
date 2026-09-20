@@ -106,6 +106,8 @@ export interface CapabilityBinding {
   profile_hash: string;
   stage_cursor: string;
   cursor_epoch: string;
+  /** Rework generation of the active authority window. */
+  rework_generation?: number;
   /** 1-based; 1 on the first pass, `loop_state.reentries + 1` after a loop-back. */
   loop_iteration: number;
   /** Hash of the active-stage checkpoint policy declaration; null when none. */
@@ -283,6 +285,156 @@ export interface RosterSelection {
   selected_at: string;
   frozen_at: string;
 }
+/** Ordinary workflow lifecycle is deliberately separate from the CTO namespace. */
+export const ORDINARY_RUN_SCHEMA = 2 as const;
+export type OrdinaryRunSchema = typeof ORDINARY_RUN_SCHEMA;
+export type LifecycleMode = "new" | "resume" | "rework";
+export type LifecycleOperation = LifecycleMode;
+export type LifecycleStatus = "active" | "paused" | "complete" | "failed" | "blocked";
+
+/**
+ * Canonical ordinary-run identity. `run_id` and `run_key` are intentionally
+ * redundant on disk so old capability bindings remain readable, but MUST be
+ * equal for schema-2 ordinary runs. CTO state keeps its own `id` namespace.
+ */
+export interface OrdinaryRunIdentity {
+  schema: OrdinaryRunSchema;
+  run_id: string;
+  run_key: string;
+  branch: string;
+}
+
+export interface TrustedExecutionContext {
+  session_id: string;
+  caller: "host" | "worker" | "system";
+  process_id?: number;
+  worktree: string;
+  branch: string;
+  authority: "coordinator" | "dispatch" | "read";
+}
+
+export interface LifecycleSelector {
+  run_id?: string;
+  title?: string;
+  list_item?: {
+    snapshot_id: string;
+    index: number;
+    run_id: string;
+  };
+}
+
+export interface LifecycleRequestBase {
+  mode: LifecycleMode;
+  request_id: string;
+  execution: TrustedExecutionContext;
+}
+
+export interface NewLifecycleRequest extends LifecycleRequestBase {
+  mode: "new";
+  task: string;
+  branch: string;
+  classification?: Classification;
+  files?: string[];
+  issue?: { number: number; url?: string } | null;
+}
+
+export interface ResumeLifecycleRequest extends LifecycleRequestBase {
+  mode: "resume";
+  run_id: string;
+  branch: string;
+  selector?: LifecycleSelector;
+}
+
+export interface ReworkLifecycleRequest extends LifecycleRequestBase {
+  mode: "rework";
+  run_id: string;
+  branch: string;
+  feedback: string;
+  affected_stage?: string;
+  selector?: LifecycleSelector;
+}
+
+export type LifecycleRequest = NewLifecycleRequest | ResumeLifecycleRequest | ReworkLifecycleRequest;
+
+export interface PrepareRequestReceipt {
+  request_id: string;
+  payload_hash: string;
+  operation: LifecycleOperation;
+  previous_run_id: string | null;
+  selected_run_id: string;
+  committed_at: string;
+  continuation: {
+    stage: string;
+    status: LifecycleStatus;
+  };
+}
+
+export interface RunCandidate {
+  run_id: string;
+  title: string;
+  task: string;
+  branch: string;
+  status: LifecycleStatus;
+  stage: string;
+  updated_at: string;
+  rework_generation: number;
+}
+
+export interface RunSelectionSnapshot {
+  snapshot_id: string;
+  created_at: string;
+  branch: string | null;
+  candidates: RunCandidate[];
+}
+
+export interface WorktreeExecutionClaim {
+  token: string;
+  owner_kind: "workflow" | "cto";
+  run_id: string;
+  coordinator_session_id: string;
+  coordinator_process_id?: number;
+  ownership_epoch: string;
+  worker_ids: string[];
+  released_at: string | null;
+  release_receipt?: string;
+}
+
+export interface RunControl {
+  schema: OrdinaryRunSchema;
+  revision: number;
+  runs: Record<string, RunCandidate>;
+  selections: Record<string, { run_id: string; branch: string; selected_at: string; active: boolean }>;
+  execution_claim: WorktreeExecutionClaim | null;
+  prepare_receipts: Record<string, PrepareRequestReceipt>;
+  selection_snapshots: Record<string, RunSelectionSnapshot>;
+}
+
+export type LifecycleErrorCode =
+  | "run_not_found"
+  | "run_selection_required"
+  | "no_active_run"
+  | "run_busy"
+  | "run_context_mismatch"
+  | "run_terminal"
+  | "run_state_invalid"
+  | "lifecycle_request_conflict"
+  | "recovery_required"
+  | "migration_required";
+
+export interface LifecycleErrorShape {
+  code: LifecycleErrorCode;
+  message: string;
+  run_id?: string;
+  branch?: string;
+  unchanged: true;
+  next_action?: string;
+}
+
+/**
+ * Stable identity carried by dispatch, native results, child joins,
+ * completion envelopes and observability. `dispatch_id` identifies an
+ * attempt; `task_id` remains stable for the same slot assignment.
+ */
 
 /**
  * Stable identity carried by dispatch, native results, child joins,
@@ -347,6 +499,29 @@ export type CompletionOutcome = "pending" | "succeeded" | "failed" | "cancelled"
 export type CompletionTerminalSignal = "workflow_complete" | "native_tool_result" | "provider_terminal" | "contract_failure";
 export type CompletionSchemaStatus = "met" | "failed";
 export type CompletionDodStatus = "met" | "pending" | "failed";
+export type MigrationCompletionSchemaStatus = CompletionSchemaStatus | "not_applicable";
+
+// Migration projections are persisted audit evidence only. They never enter a
+// live task/result adapter and deliberately do not satisfy WorkIdentity.
+export interface MigrationWorkIdentity {
+  source: "migration";
+  migration_id: string;
+  run_id: string;
+  wave_id: null;
+  slice_id: string;
+  session_id: null;
+  workflow: WorkflowName;
+  stage_id: string;
+  stage_cursor: string;
+  capability_id: string;
+  capability_epoch: string;
+  loop_iteration?: number;
+  slot_id: string;
+  task_id: string;
+  dispatch_id: string;
+  attempt: 0;
+  worker_id: null;
+}
 
 export interface CompletionArtifactRef {
   artifact_id: string;
@@ -369,6 +544,26 @@ export interface CompletionEnvelope {
   evidence_ref: string | null;
   conflict_ref: string | null;
   completed_by: "workflow_complete" | "synchronous_tool_result" | "engine_task_caller";
+  emitted_at: string;
+}
+
+export interface MigrationCompletionArtifactRef {
+  artifact_id: string;
+  path: string;
+  sha256: string;
+  schema_status: MigrationCompletionSchemaStatus;
+  dod_status: CompletionDodStatus;
+}
+
+export interface MigrationCompletionEnvelope {
+  schema_version: 1;
+  identity: MigrationWorkIdentity;
+  outcome: "succeeded";
+  terminal_signal: "migration_verified";
+  artifact_refs: MigrationCompletionArtifactRef[];
+  evidence_ref: string;
+  conflict_ref: null;
+  completed_by: "migration";
   emitted_at: string;
 }
 
@@ -545,6 +740,8 @@ export interface DispatchRecord {
   role: string;
   agent: string;
   tool_call_id?: string;
+  /** Origin host session captured before native task execution. */
+  origin_session_id?: string;
   /**
    * `pending` is resumable background work, never an elapsed-time failure.
    * Legacy records remain readable during migration.
@@ -559,6 +756,39 @@ export interface DispatchRecord {
   completion_envelope?: CompletionEnvelope;
 }
 
+
+export interface MigrationDispatchCompletion {
+  dispatch_id: string;
+  cursor_epoch: string;
+  outcome: "succeeded";
+  artifact_ids: string[];
+  evidence: string;
+  completed_by: "migration";
+  completed_at: string;
+  work_identity: MigrationWorkIdentity;
+}
+
+export interface MigrationDispatchRecord {
+  id: string;
+  role: string;
+  agent: string;
+  /** Explicitly absent on disk; optional never keeps read-only projections type-compatible with live summaries. */
+  tool_call_id?: never;
+  /** Explicitly absent on disk; migration evidence never names an origin host session. */
+  origin_session_id?: never;
+  status: "succeeded";
+  attempt: 0;
+  created_at: string;
+  completed_at: string;
+  completion: MigrationDispatchCompletion;
+  /** Explicitly absent on disk; imported evidence is not a live work identity. */
+  work_identity?: never;
+  /** Explicitly absent on disk; imported evidence cannot be resumed as pending work. */
+  pending?: never;
+  completion_envelope: MigrationCompletionEnvelope;
+}
+
+export type PersistedDispatchRecord = DispatchRecord | MigrationDispatchRecord;
 
 /**
  * A resolved dispatch occurrence for a stage. `slot` is the stable unique
@@ -614,7 +844,7 @@ export interface DispatchCapabilityState {
   work_identity?: WorkIdentity;
   pending?: PendingState[];
   status?: "ready" | "dispatched" | "joining" | "complete" | "invalidated";
-  dispatches?: DispatchRecord[];
+  dispatches?: PersistedDispatchRecord[];
 }
 
 export interface JoinSummary {
@@ -764,12 +994,27 @@ export interface LoopState {
 }
 
 export interface TeamState {
-  schema: 1;
+  /** Schema 2 is the canonical ordinary-run writer; schema 1 remains a read-only legacy input. */
+  schema: 1 | 2;
+  /** Canonical schema-2 ordinary identity. Legacy states may omit it until migration. */
+  run_id?: string;
+  run_key?: string;
+  title?: string;
+  lifecycle_status?: LifecycleStatus;
+  rework_generation?: number;
+  rework_feedback?: Array<{ feedback: string; affected_stage: string; at: string }>;
+  /** Branch remains execution context, never run identity. */
   branch: string;
   classification: Classification;
   task: string;
   /** User feedback and prior task text retained across continuations. */
   history?: Array<{ task: string; feedback?: string; at: string }>;
+  /** Required stage inputs are resolved by workflow_instructions before dispatch. */
+  required_inputs?: Record<string, Array<{ artifact_id: string; path: string; sha256?: string }>>;
+  /** Hash-bound receipts proving required inputs were read before dispatch. */
+  required_input_receipts?: Record<string, { stage_id: string; capability_id: string; cursor_epoch: string; rework_generation: number; read_at: string; inputs: Array<{ artifact_id: string; path: string; sha256: string }> }>;
+  /** User decisions are persisted as evidence and are not inferred from chat history. */
+  decisions?: Array<{ id: string; summary: string; artifact_id?: string; at: string }>;
   /** Legacy read-compat input; never overrides typed completion/checkpoint policy. */
   autonomous?: boolean;
   workflow_override: boolean;
@@ -808,7 +1053,6 @@ export interface TeamState {
   };
   profile_hash?: string;
   cursor_epoch?: string;
-  run_key?: string;
   dispatch_capability?: DispatchCapabilityState;
   /** Stable identity for the current work item, when migrated/issued. */
   work_identity?: WorkIdentity;
@@ -833,9 +1077,19 @@ export interface TeamState {
   join_summary?: JoinSummary;
   /** Durable bounded-loop state (additive). */
   loop_state?: LoopState;
+  /** Hash-bound succeeded dispatches imported from a legacy partial stage; consumed as terminal history on begin. */
+  migration_succeeded_slots?: Record<string, Array<{ dispatch_id: string; role: string; agent: string; slot_id?: string; task_id?: string; artifact_ids: string[] }>>;
   /** Per-slot consilium artifact provenance + synthesis evidence (additive). */
   slot_artifacts?: Record<string, StageSlotRecords>;
   observability?: ObservabilityPointer;
+}
+export interface CapturedDispatchContext {
+  run_id: string;
+  dispatch_id: string;
+  capability_id: string;
+  ownership_epoch?: string;
+  rework_generation: number;
+  origin_session_id?: string;
 }
 
 export interface RoleConfig {

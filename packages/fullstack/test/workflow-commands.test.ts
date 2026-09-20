@@ -17,6 +17,7 @@ function commandHarness(
 	transformPrompt: (prompt: string) => string = prompt => prompt,
 	sessionCwd = process.cwd(),
 	startSession = true,
+	sessionId = "session-direct",
 ): {
 	commands: Map<string, Registered>;
 	prompts: string[];
@@ -31,7 +32,15 @@ function commandHarness(
 		on(name: string, handler: SessionStartHandler) {
 			if (name !== "session_start") return;
 			sessionStarts.push(handler);
-			if (startSession) handler({}, { cwd: sessionCwd });
+			if (startSession) {
+				handler({}, {
+					cwd: sessionCwd,
+					session_id: sessionId,
+					mode: "tui",
+					hasUI: true,
+					sessionManager: { getSessionId: () => sessionId, getCwd: () => sessionCwd },
+				});
+			}
 		},
 		registerCommand(name: string, options: Registered) {
 			commands.set(name, options);
@@ -55,7 +64,7 @@ function context(cwd: string, notifications: string[], sessionId = "session-dire
 		},
 		sessionManager: {
 			getSessionId: () => sessionId,
-			...(sessionCwd ? { getCwd: () => sessionCwd } : {}),
+			getCwd: () => sessionCwd ?? cwd,
 		},
 	};
 }
@@ -105,9 +114,8 @@ test("fullstack: workflow commands use the session manager cwd after a context c
 	const stale = mkdtempSync(join(tmpdir(), "omp-command-stale-"));
 	try {
 		execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-		const { commands, prompts } = commandHarness(prompt => prompt, canonical);
+		const { commands, prompts } = commandHarness(prompt => prompt, canonical, true, "session-drift");
 		await commands.get("do-work")?.handler("Canonical branch task", context(stale, [], "session-drift", canonical));
-
 		assert.equal(prompts.length, 1);
 		assert.match(prompts[0] ?? "", /Branch: `main`/);
 		assert.doesNotMatch(prompts[0] ?? "", /no git work tree/);

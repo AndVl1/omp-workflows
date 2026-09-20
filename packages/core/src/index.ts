@@ -21,7 +21,7 @@ import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { orchestratorWriteGate, workerWriteScopeGate } from "./gates/orchestrator-write.js";
-import { dispatchGate, trustedDispatchRequests } from "./gates/dispatch.js";
+import { dispatchGate, parseDispatchMarker, trustedDispatchRequests, type DispatchMarker } from "./gates/dispatch.js";
 import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 import { classificationGate, classificationToolGate } from "./gates/classification.js";
 import { monotonicGate } from "./gates/monotonic.js";
@@ -34,11 +34,14 @@ import { registerObservabilityHooks, recordToolCallAttempt } from "./observabili
 import { authorizeDispatchTrusted, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, recordCheckpointDecision, validateCheckpointAsk, commitCheckpointAnswer, hashDispatchSecret } from "./engine/durable.js";
 import { loadProfile, registerWorkflowProfiles } from "./engine/profile.js";
 import { prepareWorkflowState, type ModelClassification, type WorkflowPrepareOptions } from "./engine/run.js";
-import { resolveActiveBranch, resolveState } from "./engine/state.js";
+import { resolveActiveBranch } from "./engine/state.js";
 import { findCurrentCheckpointDecision } from "./engine/checkpoints.js";
 import { resolveWorkflowContract } from "./engine/workflow-contract.js";
+import { createWorkflowSessionController, type WorkflowSessionController } from "./engine/host-controller.js";
+import { createWorkflowReadSelector } from "./engine/read-selector.js";
+import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, locateDispatchByToolCall, locateDispatchesByToolCall, readSelectionSnapshot, readRunControl, readRunState, resolveRunSelection, listRuns, runStatePath, type DispatchOrigin } from "./engine/run-store.js";
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
-import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof } from "./engine/types.js";
+import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector } from "./engine/types.js";
 import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
 import type { ScopeRuntimeClassTable } from "./engine/scope.js";
 import type { DispatchAuth, RosterBeginSelection } from "./engine/durable.js";
@@ -231,6 +234,8 @@ export interface RegisterOptions {
    * default — shipped workflows keep the single-writer model.
    */
   writeScope?: WorkerWriteScope;
+  /** Shared session controller used by command/tool ingress and lifecycle gates. */
+  getSessionController?: (ctx: unknown, cwd: string) => WorkflowSessionController | undefined;
 }
 
 export type CommandId = "do-work" | "team" | "cto" | "init-team" | "interview" | "omp-model-roles";
@@ -264,6 +269,8 @@ export interface WorkflowToolAdapterOptions {
    */
   beforeBegin?: (cwd: string) => void | AgentMappingState | undefined | Promise<void | AgentMappingState | undefined>;
   mappingSummary?: (cwd: string) => unknown;
+  /** Reuse the exact bundle-owned controller shared with command ingress and hooks. */
+  getSessionController?: (ctx: unknown, cwd: string) => WorkflowSessionController | undefined;
 }
 
 export interface WorkflowToolAdapter {
@@ -326,6 +333,23 @@ function resolveCwdFromContext(ctx: unknown): string | undefined {
   return typeof value.cwd === "string" && value.cwd.length > 0 ? value.cwd : undefined;
 }
 
+function sessionIdFromContext(ctx: unknown): string | undefined {
+  if (!ctx || typeof ctx !== "object") return undefined;
+  const value = ctx as { session_id?: unknown; sessionId?: unknown; sessionManager?: unknown };
+  if (typeof value.session_id === "string" && value.session_id.length > 0) return value.session_id;
+  if (typeof value.sessionId === "string" && value.sessionId.length > 0) return value.sessionId;
+  const manager = value.sessionManager;
+  if (manager && typeof manager === "object" && "getSessionId" in manager && typeof manager.getSessionId === "function") {
+    try {
+      const id = manager.getSessionId();
+      return typeof id === "string" && id.length > 0 ? id : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 function ownerAtCwd(source: WorkflowOwnerSource, cwd: string): WorkflowOwnerIdentity {
   return typeof source === "function" ? source(canonicalProjectRoot(cwd)) : source;
 }
@@ -381,6 +405,188 @@ export function writeRuntimeConfig(opts: RegisterOptions, cwd = opts.cwd): strin
  * presets and an owner identity; core only registers reusable gates and
  * caller-supplied runtime data.
  */
+function taskMarkers(input: unknown): DispatchMarker[] | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const record = input as Record<string, unknown>;
+  const values = Array.isArray(record.tasks) ? record.tasks : [record];
+  const markers = values.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const task = (value as Record<string, unknown>).task;
+    return typeof task === "string" ? parseDispatchMarker(task) : null;
+  });
+  return markers.length > 0 && markers.every((marker): marker is DispatchMarker => marker !== null) ? markers : undefined;
+}
+
+type NativeTaskResult = { index?: unknown; exitCode?: unknown; output?: unknown; stderr?: unknown; error?: unknown; aborted?: unknown };
+type TaskOutcomeBatch = {
+  mapped: Array<{ origin: DispatchOrigin; outcome: "succeeded" | "failed"; evidence: string }>;
+  unresolved: DispatchOrigin[];
+};
+
+/**
+ * Migration dispatch records are persisted audit evidence, not native
+ * completion authority. Hooks receive untyped `details`, and a provider may
+ * echo a projection either as a record/envelope or as JSON text content, so
+ * reject the migration provenance before marker/origin fallback can turn it
+ * into a live result.
+ */
+function nativeRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function migrationIdentity(value: unknown): boolean {
+  if (!nativeRecord(value)) return false;
+  return value.source === "migration"
+    && typeof value.migration_id === "string"
+    && typeof value.run_id === "string"
+    && typeof value.stage_id === "string"
+    && typeof value.capability_id === "string"
+    && typeof value.slot_id === "string"
+    && typeof value.task_id === "string"
+    && typeof value.dispatch_id === "string"
+    && value.attempt === 0;
+}
+
+function migrationIdentityMarker(value: unknown): boolean {
+  if (!nativeRecord(value)) return false;
+  return value.source === "migration";
+}
+
+function migrationEnvelopeMarker(value: unknown): boolean {
+  if (!nativeRecord(value)) return false;
+  return value.source === "migration"
+    || value.completed_by === "migration"
+    || value.terminal_signal === "migration_verified"
+    || migrationIdentityMarker(value.identity);
+}
+
+function migrationCompletionMarker(value: unknown): boolean {
+  if (!nativeRecord(value)) return false;
+  return value.source === "migration"
+    || value.completed_by === "migration"
+    || value.terminal_signal === "migration_verified"
+    || migrationIdentityMarker(value.work_identity);
+}
+
+function migrationDispatchRecordMarker(value: unknown): boolean {
+  if (!nativeRecord(value)) return false;
+  return value.source === "migration"
+    || migrationCompletionMarker(value.completion)
+    || migrationEnvelopeMarker(value.completion_envelope)
+    || migrationIdentityMarker(value.work_identity);
+}
+
+/**
+ * Inspect only protocol-shaped completion carriers. Worker output and
+ * artifact payloads are deliberately opaque; a migration-looking data field
+ * does not become a rejection unless it occupies an identity/completion
+ * position in the native result envelope.
+ */
+function nativeMigrationCarrier(value: unknown): boolean {
+  if (migrationIdentity(value)) return true;
+  if (!nativeRecord(value)) return false;
+  if (
+    value.completed_by === "migration"
+    || value.terminal_signal === "migration_verified"
+    || migrationIdentityMarker(value.identity)
+    || migrationIdentityMarker(value.work_identity)
+  ) return true;
+  if (migrationEnvelopeMarker(value.completion_envelope) || migrationCompletionMarker(value.completion)) return true;
+  if (migrationDispatchRecordMarker(value.dispatch_record) || migrationDispatchRecordMarker(value.record)) return true;
+  if (Array.isArray(value.results)) return value.results.some((row) => nativeMigrationCarrier(row));
+  return false;
+}
+
+function nativeMigrationIngress(value: unknown): boolean {
+  if (nativeMigrationCarrier(value)) return true;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text.startsWith("{") && !text.startsWith("[")) return false;
+    try {
+      return nativeMigrationIngress(JSON.parse(text));
+    } catch {
+      return false;
+    }
+  }
+  if (!Array.isArray(value)) return false;
+  return value.some((part) => {
+    if (nativeMigrationCarrier(part)) return true;
+    if (!nativeRecord(part) || part.type !== "text" || typeof part.text !== "string") return false;
+    return nativeMigrationIngress(part.text);
+  });
+}
+
+function taskOutcomeRows(
+  input: unknown,
+  details: unknown,
+  fallbackEvidence: string,
+  origins: DispatchOrigin[],
+): TaskOutcomeBatch | undefined {
+  const markers = taskMarkers(input);
+  if (!markers || markers.length !== origins.length) return undefined;
+  const detailsRecord = details && typeof details === "object" && !Array.isArray(details) ? details as Record<string, unknown> : undefined;
+  const rows = Array.isArray(detailsRecord?.results) ? detailsRecord.results as NativeTaskResult[] : [];
+  const byIndex = new Map<number, NativeTaskResult>();
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)
+      || !Number.isInteger(row.index) || (row.index as number) < 0 || (row.index as number) >= markers.length || byIndex.has(row.index as number)) return undefined;
+    byIndex.set(row.index as number, row);
+  }
+  const originByIndex: DispatchOrigin[] = [];
+  const used = new Set<string>();
+  for (let index = 0; index < markers.length; index += 1) {
+    const marker = markers[index]!;
+    const matching = origins.filter((origin) =>
+      origin.stage_id === marker.stage
+      && origin.cursor_epoch === marker.cursor
+      && (!marker.capability_id || origin.capability_id === marker.capability_id)
+      && (!marker.slot_id || origin.slot_id === marker.slot_id)
+      && (!marker.task_id || origin.task_id === marker.task_id),
+    ).filter((origin) => !used.has(origin.dispatch_id));
+    const positional = !marker.slot_id && !marker.task_id ? origins[index] : undefined;
+    const origin = matching.length === 1 ? matching[0] : matching.length === 0 ? positional : undefined;
+    if (!origin || used.has(origin.dispatch_id)) return undefined;
+    used.add(origin.dispatch_id);
+    originByIndex.push(origin);
+  }
+  if (used.size !== origins.length) return undefined;
+  const mapped: TaskOutcomeBatch["mapped"] = [];
+  const unresolved: DispatchOrigin[] = [];
+  for (let index = 0; index < originByIndex.length; index += 1) {
+    const row = byIndex.get(index);
+    const origin = originByIndex[index]!;
+    if (!row) {
+      unresolved.push(origin);
+      continue;
+    }
+    const failed = row.exitCode !== 0
+      || row.aborted === true
+      || (typeof row.error === "string" && row.error.length > 0);
+    const rowEvidence = [row.error, row.stderr, row.output]
+      .find((value): value is string => typeof value === "string" && value.trim().length > 0);
+    mapped.push({
+      origin,
+      outcome: failed ? "failed" : "succeeded",
+      evidence: rowEvidence?.trim() ?? (fallbackEvidence || (failed ? "task failed" : "task completed")),
+    });
+  }
+  return { mapped, unresolved };
+}
+
+function taskMarkerFilter(input: unknown): { runId: string; capabilityId?: string; stageId: string; cursorEpoch: string } | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const markers = taskMarkers(input);
+  if (!markers) return undefined;
+  const first = markers[0]!;
+  if (markers.some((marker) => marker!.run !== first.run
+    || marker!.stage !== first.stage
+    || marker!.cursor !== first.cursor
+    || marker!.kind !== first.kind
+    || (marker!.capability_id ?? "") !== (first.capability_id ?? "")
+    || JSON.stringify([...marker!.roles].sort()) !== JSON.stringify([...first.roles].sort()))) return undefined;
+  return { runId: first.run, ...(first.capability_id ? { capabilityId: first.capability_id } : {}), stageId: first.stage, cursorEpoch: first.cursor };
+}
+
 export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
   if (opts.cwd && opts.owner) {
     assertOwner(opts.cwd, ["workflow_registration", "config_writer"], opts.owner);
@@ -395,6 +601,8 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     if (!cwd) return;
     assertOwner(cwd, ["workflow_registration", "config_writer"], opts.owner);
     writeRuntimeConfig(opts, cwd);
+    const runId = opts.getSessionController?.(ctx, cwd)?.selectedRunId();
+    if (runId) restoreDispatchOrigins(cwd, runId);
   };
   if (opts.cwd) bindSession({ cwd: opts.cwd });
   else if ((opts.owner || opts.roles || opts.scopeMap || opts.flags || opts.rosterOverrides) && typeof pi.on === "function") {
@@ -403,49 +611,73 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
 
   // @ts-expect-error -- ExtensionAPI.on(string, handler) overload is enough at runtime; we type the handler explicitly.
   pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string };
-    const r1 = classificationGate(event as unknown as Parameters<typeof classificationGate>[0], c);
+    const c = ctx as { cwd: string; session_id?: string; sessionId?: string };
+    const selectedController = c.cwd ? opts.getSessionController?.(ctx, c.cwd) : undefined;
+    const selectedRunId = selectedController?.selectedRunId();
+    const gateContext = { ...c, ...(selectedRunId ? { run_id: selectedRunId } : {}) };
+    const r1 = classificationGate(event as unknown as Parameters<typeof classificationGate>[0], gateContext);
     if (r1?.block) return r1;
-    const r2 = monotonicGate(event, c);
+    const r2 = monotonicGate(event, gateContext);
     if (r2?.block) return r2;
   });
   pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
     const c = ctx as { cwd: string };
-    return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], c);
+    const controller = c.cwd ? opts.getSessionController?.(ctx, c.cwd) : undefined;
+    const run_id = controller?.selectedRunId();
+    return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], { ...c, ...(run_id ? { run_id } : {}) });
   });
   pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string; hasUI?: boolean; actor?: "orchestrator" | "worker" | "lead" };
+    const c = ctx as { cwd: string; hasUI?: boolean; actor?: "orchestrator" | "worker" | "lead"; session_id?: string; sessionId?: string };
+    const sharedController = c.cwd ? opts.getSessionController?.(ctx, c.cwd) : undefined;
+    const gateContext = { ...c, ...(sharedController?.selectedRunId() ? { run_id: sharedController.selectedRunId() } : {}) };
     let result: { block?: boolean; reason?: string } | undefined;
     const run = (candidate: { block?: boolean; reason?: string } | void) => { if (!result && candidate?.block) result = candidate; };
     run(ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]));
     run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], c));
-    run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], c));
-    run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], c));
+    run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], gateContext));
+    run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], gateContext));
     run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...c, writeScope: opts.writeScope }));
     run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], c));
     run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], c));
-    run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], c));
+    run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], { ...c, controller: sharedController }));
+    let eventRunId = sharedController?.selectedRunId();
     if (!result && event.toolName === "task") {
       const authorization = trustedDispatchRequests(
         event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
-        c,
+        { ...c, session_id: c.session_id ?? c.sessionId, controller: sharedController },
       );
       if (!authorization.ok) {
         run({ block: true, reason: authorization.reason });
       } else {
         for (const request of authorization.requests) {
+          if (request.run_id) eventRunId = request.run_id;
           const authorized = authorizeDispatchTrusted(c.cwd, request);
           if (!authorized.ok) {
             run({ block: true, reason: `dispatch authorization failed: ${authorized.error}` });
             break;
           }
+          if (authorized.record?.tool_call_id && request.run_id) {
+            rememberDispatchOrigin(authorized.record.tool_call_id, {
+              cwd: c.cwd,
+              run_id: request.run_id,
+              dispatch_id: authorized.record.id,
+              ...(request.origin_session_id ? { origin_session_id: request.origin_session_id } : {}),
+              ...(authorized.record.work_identity ? {
+                capability_id: authorized.record.work_identity.capability_id,
+                stage_id: authorized.record.work_identity.stage_id,
+                cursor_epoch: authorized.record.work_identity.capability_epoch,
+                slot_id: authorized.record.work_identity.slot_id,
+                task_id: authorized.record.work_identity.task_id,
+              } : {}),
+            });
+          }
         }
       }
     }
     if (!result && opts.observability !== false) {
-      recordToolCallAttempt(c.cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, "allowed");
+      recordToolCallAttempt(c.cwd, { ...(event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }), ...(eventRunId ? { runId: eventRunId } : {}) }, "allowed");
     } else if (opts.observability !== false) {
-      recordToolCallAttempt(c.cwd, event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }, "blocked", result?.reason);
+      recordToolCallAttempt(c.cwd, { ...(event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }), ...(eventRunId ? { runId: eventRunId } : {}) }, "blocked", result?.reason);
     }
     return result;
   });
@@ -453,25 +685,95 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     if (event.toolName !== "task") return;
     const c = ctx as { cwd?: string };
     if (!c.cwd) return;
+    if (nativeMigrationIngress(event.input) || nativeMigrationIngress(event.details) || nativeMigrationIngress(event.content)) {
+      console.warn(`omp workflow task reconciliation rejected: migration-only completion provenance for tool call ${event.toolCallId}`);
+      return;
+    }
     const details = (event as unknown as { details?: { async?: { state?: string } } }).details;
     const asyncState = details?.async?.state;
-    if (asyncState === "running" || asyncState === "spawned" || asyncState === "scheduled") return;
+    const asyncActive = asyncState === "running" || asyncState === "spawned" || asyncState === "scheduled";
     const content = event.content
       .filter((part): part is { type: "text"; text: string } => part.type === "text")
       .map((part) => part.text)
       .join("\n")
       .trim();
     const evidence = content || (event.isError ? "native task failed" : "native task completed");
-    const reconciled = reconcileTrustedTaskResult(c.cwd, {
-      tool_call_id: event.toolCallId,
-      outcome: event.isError ? "failed" : "succeeded",
-      evidence,
-    });
-    if (!reconciled.ok && !reconciled.error.includes("unknown or already reconciled")) {
-      console.warn(`omp workflow task reconciliation failed: ${reconciled.error}`);
+    // The original task input carries the trusted structured marker. Use its
+    // canonical run only to select an already persisted dispatch origin; the
+    // marker itself never authorizes or invents a dispatch.
+    const markerFilter = taskMarkerFilter(event.input);
+    const origins = markerFilter ? knownDispatchOrigins(event.toolCallId, markerFilter) : [];
+    if (origins.length === 0) {
+      console.warn(`omp workflow task reconciliation rejected: no exact origin for tool call ${event.toolCallId}`);
+      return;
+    }
+    const outcomes = taskOutcomeRows(event.input, event.details, evidence, origins);
+    if (!outcomes) {
+      console.warn("omp workflow task reconciliation rejected: incomplete or ambiguous batch result for tool call " + event.toolCallId);
+      return;
+    }
+    const terminalWholeCallError = !asyncActive && (event.isError || (asyncState === "failed" && content.length > 0));
+    const unresolvedPendingReason = asyncActive
+      ? (asyncState === "running" ? "provider_running" as const : "awaiting_result" as const)
+      : terminalWholeCallError ? undefined : "transport_reconnect" as const;
+    const unresolvedEvidence = terminalWholeCallError
+      ? evidence
+      : `transport_reconnect: task result omitted terminal row; recovery required (tool call ${event.toolCallId})`;
+    const asyncPendingEvidence = asyncActive
+      ? `native task provider acknowledgement (${String(asyncState)}); awaiting result (tool call ${event.toolCallId})`
+      : undefined;
+    for (const { origin, outcome, evidence: slotEvidence } of outcomes.mapped) {
+      const reconciled = reconcileTrustedTaskResult(origin.cwd, {
+        run_id: origin.run_id,
+        dispatch_id: origin.dispatch_id,
+        tool_call_id: event.toolCallId,
+        ...(origin.capability_id ? { capability_id: origin.capability_id } : {}),
+        ...(origin.cursor_epoch ? { cursor_epoch: origin.cursor_epoch } : {}),
+        ...(origin.slot_id ? { slot_id: origin.slot_id } : {}),
+        ...(origin.task_id ? { task_id: origin.task_id } : {}),
+        outcome,
+        evidence: slotEvidence,
+      });
+      if (!reconciled.ok && !reconciled.error.includes("unknown or already reconciled")) {
+        console.warn("omp workflow task reconciliation failed: " + reconciled.error);
+      }
+    }
+    for (const origin of outcomes.unresolved) {
+      const reconciled = reconcileTrustedTaskResult(origin.cwd, {
+        run_id: origin.run_id,
+        dispatch_id: origin.dispatch_id,
+        tool_call_id: event.toolCallId,
+        ...(origin.capability_id ? { capability_id: origin.capability_id } : {}),
+        ...(origin.cursor_epoch ? { cursor_epoch: origin.cursor_epoch } : {}),
+        ...(origin.slot_id ? { slot_id: origin.slot_id } : {}),
+        ...(origin.task_id ? { task_id: origin.task_id } : {}),
+        // The durable pending branch ignores outcome/evidence; these fields
+        // remain required by its terminal input shape and are never persisted
+        // when pending is true.
+        outcome: "failed",
+        evidence: asyncPendingEvidence ?? unresolvedEvidence,
+        ...(unresolvedPendingReason
+          ? { pending: true, pending_reason: unresolvedPendingReason, provider_ref: event.toolCallId }
+          : {}),
+      });
+      if (!reconciled.ok && !reconciled.error.includes("unknown or already reconciled")) {
+        console.warn("omp workflow task reconciliation failed: " + reconciled.error);
+      }
     }
   });
-  registerObservabilityHooks(pi, { enabled: opts.observability, toolCall: false });
+  registerObservabilityHooks(pi, {
+    enabled: opts.observability,
+    toolCall: false,
+    getRunId: (ctx, cwd) => opts.getSessionController?.(ctx, cwd)?.selectedRunId(),
+    getEventScope: (event, _ctx, _cwd) => {
+      const value = event && typeof event === "object" ? event as { toolCallId?: string; toolName?: string; input?: unknown } : {};
+      if (value.toolName !== "task" || !value.toolCallId) return undefined;
+      const markerFilter = taskMarkerFilter(value.input);
+      const origins = markerFilter ? knownDispatchOrigins(value.toolCallId, markerFilter) : [];
+      const origin = origins[0];
+      return origin ? { cwd: origin.cwd, runId: origin.run_id, ...(origin.origin_session_id ? { originSessionId: origin.origin_session_id } : {}) } : undefined;
+    },
+  });
 }
 /**
  * Legacy per-call main-session heuristic. Consulted ONLY when no
@@ -516,6 +818,8 @@ interface HostSessionProfile {
   mode: string;
   hasUI: boolean;
   ui: unknown;
+  session_id?: string;
+  cwd?: string;
 }
 
 type WorkflowToolResult = { content: [{ type: "text"; text: string }]; details: unknown };
@@ -524,14 +828,15 @@ function toolResult(value: unknown): WorkflowToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
 }
 
-function workflowStateSummary(cwd: string, mappingSummary?: (cwd: string) => unknown): unknown {
-  const resolved = resolveState(cwd);
-  if (resolved.invalid) return { ok: false, code: "WORKFLOW_STATE_INVALID", error: "workflow state path is invalid or unsafe" };
-  if (!resolved.state) return { ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow state not found" };
-  const state = resolved.state;
+function workflowStateSummary(cwd: string, mappingSummary?: (cwd: string) => unknown, runId?: string, _requireSelectedRun = false): unknown {
+  if (!runId) return { ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" };
+  const state = readRunState(cwd, runId);
+  if (!state) return { ok: false, code: "WORKFLOW_RUN_NOT_FOUND", error: `run ${runId} was not found` }; 
   const capability = state.dispatch_capability;
   return {
     ok: true,
+    run_id: runId,
+    state_path: runStatePath(cwd, runId),
     branch: state.branch,
     workflow: state.classification?.workflow,
     stage_cursor: state.stage_cursor,
@@ -561,6 +866,17 @@ function workflowStateSummary(cwd: string, mappingSummary?: (cwd: string) => unk
       : null,
   };
 }
+function resolveToolRunId(cwd: string, selector?: LifecycleSelector, controller?: WorkflowSessionController): string | undefined {
+  if (!selector) return controller?.selectedRunId();
+  if (selector.run_id) return selector.run_id;
+  const branch = resolveActiveBranch(cwd);
+  const candidates = listRuns(cwd, { branch, includeTerminal: true });
+  const snapshot = selector.list_item ? readSelectionSnapshot(cwd, selector.list_item.snapshot_id) : undefined;
+  const resolved = resolveRunSelection({ mode: "rework", candidates, currentBranch: branch, selector, snapshot });
+  if (!resolved.ok) throw resolved.error;
+  return resolved.candidate.run_id;
+}
+
 
 /**
  * Core-owned typed workflow tool registration. Bundles adapt only cwd,
@@ -578,14 +894,32 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   // runtime mode and the mode's UI context, so the handler observes the
   // final values.
   let hostSession: HostSessionProfile | null = null;
+  let sessionController: WorkflowSessionController | null = null;
   if (typeof (pi as { on?: unknown }).on === "function") {
     pi.on("session_start", (_event: unknown, ctx: unknown) => {
-      const c = ctx as { mode?: unknown; hasUI?: unknown; ui?: unknown } | undefined;
+      const c = ctx as { mode?: unknown; hasUI?: unknown; ui?: unknown; cwd?: unknown; session_id?: unknown; sessionId?: unknown } | undefined;
+      const cwd = typeof c?.cwd === "string" ? c.cwd : options.cwd;
+      const sessionId = typeof c?.session_id === "string" ? c.session_id : typeof c?.sessionId === "string" ? c.sessionId : undefined;
       hostSession = {
         mode: typeof c?.mode === "string" ? c.mode : "print",
         hasUI: c?.hasUI === true,
         ui: c?.ui,
+        ...(sessionId ? { session_id: sessionId } : {}),
+        ...(cwd ? { cwd } : {}),
       };
+      sessionController = cwd ? options.getSessionController?.(ctx, cwd) ?? null : null;
+      if (!sessionController && !options.getSessionController && sessionId && cwd && hostSession.hasUI && (hostSession.mode === "tui" || hostSession.mode === "rpc")) {
+        try {
+          const branch = resolveActiveBranch(cwd);
+          const context: TrustedExecutionContext = { session_id: sessionId, caller: "host", process_id: process.pid, worktree: cwd, branch, authority: "coordinator" };
+          sessionController = createWorkflowSessionController({ cwd, context });
+        } catch {
+          sessionController = null;
+        }
+      }
+    });
+    pi.on("session_stop", () => {
+      try { sessionController?.release("host-session-stop"); } finally { sessionController = null; hostSession = null; }
     });
   }
   /**
@@ -612,8 +946,14 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         error: "workflow control tools are available only in the interactive main session (terminal TUI or connected RPC client)",
       });
     }
+    if (hostSession !== null && !hostSession.session_id && !sessionIdFromContext(ctx)) {
+      return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "trusted session identity is unavailable; bind through the host session manager" });
+    }
     const cwd = options.cwd ?? resolveCwd(ctx);
     if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+    if (options.getSessionController && !options.getSessionController(ctx, cwd)) {
+      return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "shared workflow session controller is unavailable" });
+    }
     try {
       assertOwner(cwd, ["workflow_tools"], options.owner);
     } catch (error) {
@@ -622,6 +962,20 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     return null;
   };
   const currentCwd = (ctx: unknown): string | undefined => options.cwd ?? resolveCwd(ctx);
+  const controllerFor = (ctx: unknown, cwd: string): WorkflowSessionController => {
+    const shared = options.getSessionController?.(ctx, cwd);
+    if (options.getSessionController && !shared) throw new Error("WORKFLOW_CONTEXT_REJECTED: shared workflow session controller is unavailable");
+    if (shared) {
+      sessionController = shared;
+      return shared;
+    }
+    if (sessionController && sessionController.context().worktree === cwd) return sessionController;
+    const sessionId = hostSession?.session_id ?? sessionIdFromContext(ctx);
+    if (!sessionId) throw new Error("WORKFLOW_CONTEXT_REJECTED: trusted session identity is unavailable");
+    const branch = resolveActiveBranch(cwd);
+    sessionController = createWorkflowSessionController({ cwd, context: { session_id: sessionId, caller: "host", process_id: process.pid, worktree: cwd, branch, authority: "coordinator" } });
+    return sessionController;
+  };
   const classificationParameters = z.object({
     type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"]),
     complexity: z.enum(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]),
@@ -633,14 +987,22 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_prepare",
     label: "Prepare workflow state",
-    description: "Persist PHASE-0 classification and initialize or reopen engine-owned workflow state.",
+    description: "Persist an explicit new, resume, or rework lifecycle request; selectors are resolved against the captured session and revalidated under the workspace lock.",
     parameters: z.object({
-      task: z.string().min(1),
-      branch: z.string().min(1),
+      mode: z.enum(["new", "resume", "rework"]).default("new"),
+      task: z.string().min(1).optional(),
+      branch: z.string().min(1).optional(),
+      run_id: z.string().min(1).optional(),
+      selector: z.object({
+        run_id: z.string().min(1).optional(),
+        title: z.string().min(1).optional(),
+        list_item: z.object({ snapshot_id: z.string().min(1), index: z.number().int().min(0), run_id: z.string().min(1) }).strict().optional(),
+      }).strict().optional(),
+      feedback: z.string().min(1).optional(),
+      affected_stage: z.string().min(1).optional(),
       classification: classificationParameters.optional(),
       files: z.array(z.string().min(1)).optional(),
       issue: z.union([z.number().int(), z.object({ number: z.number().int(), url: z.string().optional() })]).nullable().default(null),
-      continuation: z.object({ feedback: z.string().min(1), stageId: z.string().min(1) }).optional(),
     }) as never,
     async execute(_id, params, _signal, _update, ctx) {
       const denied = contextError(ctx);
@@ -648,35 +1010,47 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       const cwd = currentCwd(ctx);
       if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
       const input = params as {
-        task: string;
-        branch: string;
+        mode?: "new" | "resume" | "rework";
+        task?: string;
+        branch?: string;
+        run_id?: string;
+        selector?: LifecycleSelector;
+        feedback?: string;
+        affected_stage?: string;
         classification?: ModelClassification;
         files?: string[];
         issue?: number | { number: number; url?: string } | null;
-        continuation?: { feedback: string; stageId: string };
       };
-      if (!input.continuation && !input.classification) {
-        return toolResult({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "new workflow preparation requires a complete classification" });
+      const mode = input.mode ?? "new";
+      if (mode === "new" && (!input.task || !input.classification)) {
+        return toolResult({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "new workflow preparation requires task and complete classification" });
+      }
+      if (mode === "rework" && !input.feedback) {
+        return toolResult({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "rework requires feedback" });
       }
       try {
-        const prepared = prepareWorkflowState({
+        const controller = controllerFor(ctx, cwd);
+        const prepared = controller.prepare({
+          mode,
           task: input.task,
-          cwd,
-          branch: input.branch,
+          run_id: input.run_id,
+          selector: input.selector,
+          feedback: input.feedback,
+          affected_stage: input.affected_stage,
           autonomous: input.classification?.autonomous ?? false,
           classification: input.classification,
           files: input.files,
           issue: typeof input.issue === "number" ? { number: input.issue } : input.issue ?? null,
-          continuation: input.continuation,
-        } satisfies WorkflowPrepareOptions);
+          request_id: typeof _id === "string" && _id.length > 0 ? _id : undefined,
+        });
         return toolResult({
           ok: true,
-          transition: "prepare",
+          transition: prepared.transition,
           state_path: prepared.statePath,
           artifacts_dir: prepared.artifactsDir,
           workflow: prepared.profile.name,
           classification: prepared.classification,
-          state: workflowStateSummary(cwd, options.mappingSummary),
+          state: workflowStateSummary(cwd, options.mappingSummary, prepared.state.run_id),
         });
       } catch (error) {
         return toolResult({ ok: false, code: "WORKFLOW_PREPARE_FAILED", error: String(error) });
@@ -712,40 +1086,61 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         // attempt that must clear the engine's structural gate or
         // workflow_begin fails closed; it never silently selects the
         // persisted mapping.
+        const controller = controllerFor(ctx, cwd);
+        const runId = controller.selectedRunId();
+        if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
         const handoff = await options.beforeBegin?.(cwd);
         const trustedMapping = handoff === undefined ? undefined : handoff as unknown as AgentMappingState;
-        const transition = beginCapability(cwd, input.selection, trustedMapping !== undefined ? { trustedMapping } : undefined);
-        if (!transition.ok) return toolResult({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? workflowStateSummary(cwd, options.mappingSummary) : undefined });
-        return toolResult({ ok: true, transition: "begin", handoff: transition.handoff, state: workflowStateSummary(cwd, options.mappingSummary) });
+        const transition = beginCapability(cwd, input.selection, { ...(trustedMapping !== undefined ? { trustedMapping } : {}), runId });
+        if (!transition.ok) return toolResult({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? workflowStateSummary(cwd, options.mappingSummary, runId) : undefined });
+        return toolResult({ ok: true, transition: "begin", handoff: transition.handoff, state: workflowStateSummary(cwd, options.mappingSummary, runId) });
       } catch (error) {
         return toolResult({ ok: false, code: "WORKFLOW_BEGIN_FAILED", error: String(error) });
       }
     },
   });
+  const selectorParameters = z.object({
+    selector: z.object({
+      run_id: z.string().min(1).optional(),
+      title: z.string().min(1).optional(),
+      list_item: z.object({ snapshot_id: z.string().min(1), index: z.number().int().min(0), run_id: z.string().min(1) }).strict().optional(),
+    }).strict().optional(),
+  }).strict();
   pi.registerTool({
     name: "workflow_status",
     label: "Workflow status",
-    description: "Read the current durable workflow stage and dispatch status.",
-    parameters: emptyParameters,
-    async execute(_id, _params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = currentCwd(ctx);
-      return toolResult(cwd ? workflowStateSummary(cwd, options.mappingSummary) : { ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-    },
-  });
-  pi.registerTool({
-    name: "workflow_instructions",
-    label: "Workflow instructions",
-    description: "Read the current structured workflow stage contract.",
-    parameters: emptyParameters,
-    async execute(_id, _params, _signal, _update, ctx) {
+    description: "Read one selected run's durable stage and dispatch status; an explicit selector never falls back to current selection.",
+    parameters: selectorParameters as never,
+    async execute(_id, params, _signal, _update, ctx) {
       const denied = contextError(ctx);
       if (denied) return denied;
       const cwd = currentCwd(ctx);
       if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
       try {
-        return toolResult(resolveWorkflowContract(cwd));
+        const input = params as { selector?: LifecycleSelector };
+        const controller = controllerFor(ctx, cwd);
+        return toolResult(workflowStateSummary(cwd, options.mappingSummary, resolveToolRunId(cwd, input.selector, controller), true));
+      } catch (error) {
+        return toolResult({ ok: false, code: "WORKFLOW_STATUS_FAILED", error: String(error) });
+      }
+    },
+  });
+  pi.registerTool({
+    name: "workflow_instructions",
+    label: "Workflow instructions",
+    description: "Read one selected run's structured workflow stage contract.",
+    parameters: selectorParameters as never,
+    async execute(_id, params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = currentCwd(ctx);
+      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      try {
+        const input = params as { selector?: LifecycleSelector };
+        const controller = controllerFor(ctx, cwd);
+        const runId = resolveToolRunId(cwd, input.selector, controller);
+        if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no workflow run is selected for this trusted session" });
+        return toolResult(resolveWorkflowContract(cwd, { runId, branch: resolveActiveBranch(cwd) }));
       } catch (error) {
         return toolResult({ ok: false, code: "WORKFLOW_RESOLUTION_FAILED", error: String(error) });
       }
@@ -777,7 +1172,10 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
       const input = params as DispatchAuth & { dispatch_id: string; evidence: string; artifact_ids?: string[]; outcome: "succeeded" | "failed" | "cancelled" };
       try {
-        const transition = completeDispatch(cwd, { ...input, completed_by: "workflow_complete" });
+        const controller = controllerFor(ctx, cwd);
+        const runId = controller.selectedRunId();
+        if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
+        const transition = completeDispatch(cwd, { ...input, completed_by: "workflow_complete" }, { runId });
         return transition.ok
           ? toolResult({ ok: true, transition: "complete", dispatch_id: input.dispatch_id, state: transition.state, record: transition.record })
           : toolResult({ ok: false, code: "WORKFLOW_COMPLETE_REJECTED", error: transition.error, dispatch_id: input.dispatch_id });
@@ -835,9 +1233,12 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         run_id?: string;
       };
       try {
-        const transition = recordCheckpointDecision(cwd, input);
+        const controller = controllerFor(ctx, cwd);
+        const runId = input.run_id ?? controller.selectedRunId();
+        if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
+        const transition = recordCheckpointDecision(cwd, { ...input, run_id: runId });
         return transition.ok
-          ? toolResult({ ok: true, transition: "checkpoint", checkpoint: input.checkpoint, state: workflowStateSummary(cwd, options.mappingSummary) })
+          ? toolResult({ ok: true, transition: "checkpoint", checkpoint: input.checkpoint, state: workflowStateSummary(cwd, options.mappingSummary, runId) })
           : toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_REJECTED", error: transition.error });
       } catch (error) {
         return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_FAILED", error: String(error) });
@@ -880,7 +1281,12 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         checkpoint_kind: string;
         loop_iteration: number;
         question?: string;
+        run_id?: string;
       };
+      const controller = controllerFor(ctx, cwd);
+      const selectedRunId = input.run_id ?? controller.selectedRunId();
+      if (!selectedRunId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
+      const scopedInput = { ...input, run_id: selectedRunId };
       const abortedResult = () => toolResult({
         ok: false,
         code: "WORKFLOW_CHECKPOINT_ASK_ABORTED",
@@ -892,7 +1298,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         // presented for an unauthenticated, stale, malformed, or
         // already-resolved request. The same validation runs again on the
         // freshly persisted state after the dialog resolves.
-        const preflight = validateCheckpointAsk(cwd, input);
+        const preflight = validateCheckpointAsk(cwd, scopedInput);
         if (!preflight.ok) return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_REJECTED", error: preflight.error });
         const { stage, rule, allowed } = preflight.context;
         const existing = findCurrentCheckpointDecision(preflight.context.state, stage);
@@ -904,7 +1310,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
             decision: existing.decision,
             already_recorded: true,
             next: "decision already recorded; resume with workflow_advance using the current handoff",
-            state: workflowStateSummary(cwd, options.mappingSummary),
+            state: workflowStateSummary(cwd, options.mappingSummary, selectedRunId),
           });
         }
         // Privileged ingest boundary: the answer may come only from a real
@@ -1034,6 +1440,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         // supersedes every stale live proof and mints one engine-UUID answer
         // or reuses the exact live proof — always in the same commit.
         const committed = commitCheckpointAnswer(cwd, {
+          run_id: selectedRunId,
           token: input.token,
           capability_id: input.capability_id,
           run_key: input.run_key,
@@ -1068,7 +1475,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
             decision: committed.decision,
             already_recorded: true,
             next: "decision already recorded; resume with workflow_advance using the current handoff",
-            state: workflowStateSummary(cwd, options.mappingSummary),
+            state: workflowStateSummary(cwd, options.mappingSummary, selectedRunId),
           });
         }
         if (!committed.answer || !committed.proof) {
@@ -1084,7 +1491,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
           loop_iteration: input.loop_iteration,
           actor_provenance: { kind: "user", ref: committed.answer.reference, proof: committed.proof },
           next: "call workflow_checkpoint now with authorization='human', this exact actor_provenance and decision, checkpoint_kind, rationale, loop_iteration, and the handoff identity fields — copy each returned value verbatim",
-          state: workflowStateSummary(cwd, options.mappingSummary),
+          state: workflowStateSummary(cwd, options.mappingSummary, selectedRunId),
         });
       } catch (error) {
         return toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_ASK_FAILED", error: String(error) });
@@ -1118,11 +1525,14 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         // mapping from another transition or project: only an explicit
         // undefined keeps the persisted mapping; runtime null or a value
         // failing the engine's structural gate fails the advance closed.
+        const controller = controllerFor(ctx, cwd);
+        const runId = controller.selectedRunId();
+        if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
         const handoff = await options.beforeBegin?.(cwd);
         const trustedMapping = handoff === undefined ? undefined : handoff as unknown as AgentMappingState;
-        const transition = advanceCursor(cwd, input, trustedMapping !== undefined ? { trustedMapping } : undefined);
+        const transition = advanceCursor(cwd, input, { ...(trustedMapping !== undefined ? { trustedMapping } : {}), runId });
         return transition.ok
-          ? toolResult({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, handoff: transition.handoff, state: workflowStateSummary(cwd, options.mappingSummary) })
+          ? toolResult({ ok: true, transition: "advance", stage_cursor: transition.state.stage_cursor, cursor_epoch: transition.state.cursor_epoch, handoff: transition.handoff, state: workflowStateSummary(cwd, options.mappingSummary, runId) })
           : toolResult({ ok: false, code: "WORKFLOW_ADVANCE_REJECTED", error: transition.error });
       } catch (error) {
         return toolResult({ ok: false, code: "WORKFLOW_ADVANCE_FAILED", error: String(error) });
@@ -1298,11 +1708,11 @@ export {
   type ScopeResolutionOptions,
 } from "./engine/scope.js";
 export {
-  updateStateAtomically,
+  withWorkspaceTransaction,
   setStageStatus,
   setPause,
   checkMonotonic,
-  resolveState,
+  resolveActiveBranch,
   resolveCanonicalRun,
   type ResolvedActiveRun,
   type StateSelector,
@@ -1312,6 +1722,83 @@ export {
   type StateTxErrorCode,
   reopenFromFeedback,
 } from "./engine/state.js";
+export {
+  resolveLifecycleIntent,
+  selectRunCandidate,
+  validateLifecycleRequest,
+  validateTrustedExecutionContext,
+  lifecyclePayloadHash,
+  createLifecycleRequestId,
+  validateExactPrepareReplay,
+  assertValidLifecycleRequest,
+  assertTrustedExecutionContext,
+  newRequestForTask,
+  LifecycleError,
+  type LifecycleIntent,
+  type LifecycleIntentSource,
+  type RunSelectionResult,
+} from "./engine/run-lifecycle.js";
+export {
+  readRunControl,
+  updateRunControl,
+  runTarget,
+  runStatePath,
+  readRunState,
+  listRuns,
+  candidateForState,
+  createSelectionSnapshot,
+  resolveRunSelection,
+  acquireExecutionClaim,
+  releaseExecutionClaim,
+  handoverExecutionClaim,
+  persistCanonicalRun,
+  updateCanonicalRun,
+  recordPrepareReceipt,
+  previousReceipt,
+  selectSession,
+  sessionSelection,
+  snapshotCanonicalRun,
+  lifecycleTransactionPath,
+  ordinaryRunIdentity,
+  resumeCanonicalRun,
+  finalizeCanonicalRun,
+  terminalControlPublication,
+  locateDispatchByToolCall,
+  locateDispatchesByToolCall,
+  type ClaimResult,
+  type DispatchLocator,
+  type CanonicalRunCommitOptions,
+} from "./engine/run-store.js";
+export {
+  validateOrdinaryRunIdentityValue,
+  validateTrustedExecutionContextValue,
+  validateLifecycleRequestValue,
+  validatePrepareRequestReceiptValue,
+  validatePrepareReplay,
+} from "./engine/control-plane-contract.js";
+export {
+  beginLifecycleTransaction,
+  commitLifecycleTransaction,
+  recoverLifecycleTransactions,
+  lifecycleTransactionStatus,
+  LifecycleRecoveryError,
+  type LifecycleTransactionStatus,
+  type LifecycleTransactionRecord,
+  type LifecycleFileContent,
+} from "./engine/lifecycle-journal.js";
+export {
+  discoverLegacySources,
+  preflightLegacyMigration,
+  migrateLegacySource,
+  recoverLegacyMigrations,
+  type LegacySource,
+  type LegacyDiscovery,
+  type LegacyDiscoveryIssue,
+  type MigrationPreflight,
+  type MigrationFailure,
+  type MigrationResult,
+  type MigrationOutcome,
+} from "./engine/run-migration.js";
 export {
   writeArtifact,
   readArtifact,
@@ -1475,6 +1962,26 @@ export type {
   FanInConflictRecord,
   LoopIterationRecord,
   LoopState,
+  OrdinaryRunSchema,
+  OrdinaryRunIdentity,
+  LifecycleMode,
+  LifecycleOperation,
+  LifecycleStatus,
+  TrustedExecutionContext,
+  LifecycleSelector,
+  LifecycleRequestBase,
+  NewLifecycleRequest,
+  ResumeLifecycleRequest,
+  ReworkLifecycleRequest,
+  LifecycleRequest,
+  PrepareRequestReceipt,
+  RunCandidate,
+  RunSelectionSnapshot,
+  WorktreeExecutionClaim,
+  RunControl,
+  LifecycleErrorCode,
+  LifecycleErrorShape,
+  CapturedDispatchContext,
 } from "./engine/types.js";
 // ── CTO sub-orchestration (pure engine) ────────────────────────────────────
 export { MAX_TEAMS, MAX_DECOMPOSITION_DEPTH } from "./cto/types.js";
@@ -1529,7 +2036,7 @@ export {
 	findWaveBySourceId,
 } from "./cto/state.js";
 export { teamDoDComplete, integrationDoD, ctoBackstop } from "./cto/gates.js";
-export { runCto, ctoRunId, type RunCtoOptions, type RunCtoResult } from "./cto/run.js";
+export { runCto, ctoRunId, finalizeCtoExecution, type RunCtoOptions, type RunCtoResult } from "./cto/run.js";
 export {
   ctoCommand,
   parseEnvelope as parseCtoEnvelope,
@@ -1667,8 +2174,11 @@ export { dissentGate } from "./cto/gates.js";
 export {
 	buildSessionReport,
 	writeReport,
+	buildCanonicalRunReport,
 } from "./report/assemble.js";
 export { renderReportHtml } from "./report/html.js";
+export { resolveCanonicalRunSource, listCanonicalRunSources } from "./report/canonical-source.js";
+export type { CanonicalReportSelector, CanonicalRunReportSource, CanonicalRunReportListEntry } from "./report/canonical-source.js";
 export { renderMarkdownDocumentHtml } from "./report/markdown.js";
 export type { MarkdownDocumentOptions } from "./report/markdown.js";
 export { redactReportBody } from "./report/redact.js";
@@ -1701,3 +2211,24 @@ export type {
 // definitions of those three names (different unions) remain reachable via
 // the additive `@andvl1/omp-workflows-core/visualize` subpath export.
 export * from "./visualize/index.js";
+
+export {
+  createWorkflowReadSelector,
+  type ReadSelectorContext,
+  type WorkflowReadSelector,
+  type WorkflowRunRead,
+} from "./engine/read-selector.js";
+export {
+  createWorkflowSessionController,
+  type WorkflowSessionController,
+  type WorkflowSessionControllerOptions,
+  type WorkflowControllerPrepareRequest,
+} from "./engine/host-controller.js";
+export {
+  parseWorkflowCommand,
+  type WorkflowCommandMode,
+  type WorkflowCommandParseResult,
+  type WorkflowCommandParseSuccess,
+  type WorkflowCommandParseFailure,
+} from "./commands/envelope.js";
+

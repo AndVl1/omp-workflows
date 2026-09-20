@@ -16,6 +16,7 @@ const genericRoles = {
   "regression-oracle": "qa",
   "security-tester": "security-tester",
 } as const;
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
 
 function initGit(root: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
@@ -24,18 +25,29 @@ function initGit(root: string): void {
 function writeStateFixture(root: string, capability: NonNullable<TeamState["dispatch_capability"]>, profileHashValue: string): void {
   const profile = loadProfile("feature-regression");
   assert.ok(profile);
-  writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
-    schema: 1,
+  const runDir = join(root, ".work-state", "runs", RUN_ID);
+  mkdirSync(join(runDir, "artifacts"), { recursive: true });
+  writeFileSync(join(runDir, "artifacts", "regression_intake.json"), JSON.stringify({ summary: "intake" }) + "\n");
+  writeFileSync(join(runDir, "state.json"), JSON.stringify({
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
+    lifecycle_status: "active",
+    rework_generation: 0,
     branch: "main",
-    run_key: "main",
+    title: "mapping refresh regression",
     classification: { type: "REGRESS", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "feature-regression" },
     task: "mapping refresh regression",
+    required_inputs: {},
+    required_input_receipts: {},
+    workflow_override: false,
+    issue: null,
     stage_cursor: "surface_mapping",
     stages: profile.stages.map(stage => ({
       id: stage.id,
       status: stage.id === "surface_mapping" ? "in_progress" : stage.id === "discovery_intake" ? "done" : "pending",
     })),
-    artifacts: {},
+    artifacts: { regression_intake: "artifacts/regression_intake.json" },
     scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null },
     policy: { strict_orchestrator: true },
     pause: { kind: "none", reason: "" },
@@ -67,7 +79,7 @@ test("beginCapability reissues an undispatched capability after mapping refresh"
     assert.ok(profile);
     const persistedHash = profileHash(profile);
     const stale = createCapability({
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: "feature-regression",
       profile_hash: persistedHash,
@@ -78,7 +90,7 @@ test("beginCapability reissues an undispatched capability after mapping refresh"
     publishMapping(root, ["analyst"]);
     writeStateFixture(root, stale.state, persistedHash);
 
-    const begun = beginCapability(root);
+    const begun = beginCapability(root, undefined, { runId: RUN_ID });
     assert.equal(begun.ok, true);
     assert.deepEqual(begun.ok && begun.handoff?.expected_roster, [{ role: "regression-planner", agent: "analyst" }]);
     assert.notEqual(begun.ok && begun.handoff?.capability_id, stale.capability_id);
@@ -97,7 +109,7 @@ test("beginCapability fails closed when no eligible or generic agent exists", ()
     const persistedHash = profileHash(profile);
     publishMapping(root, ["scout"]);
     writeStateFixture(root, createCapability({
-      run_key: "main",
+      run_key: RUN_ID,
       branch: "main",
       workflow: "feature-regression",
       profile_hash: persistedHash,
@@ -106,7 +118,7 @@ test("beginCapability fails closed when no eligible or generic agent exists", ()
       expected_roster: [{ role: "regression-planner", agent: "regression-planner" }],
     }).state, persistedHash);
 
-    const begun = beginCapability(root);
+    const begun = beginCapability(root, undefined, { runId: RUN_ID });
     assert.equal(begun.ok, false);
     assert.match(begun.error, /no available agent mapping/);
     assert.match(begun.error, /regression-planner/);

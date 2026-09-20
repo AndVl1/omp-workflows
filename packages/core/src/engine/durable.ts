@@ -1,17 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
-import { normalizePersistedState, resolveState, isSafeStateSegment, resolveActiveBranch, updateStateAtomically, type ResolvedState, type StateMutation, type StateUpdateResult } from "./state.js";
+import { normalizePersistedState, resolveState, resolveCanonicalRun, isSafeStateSegment, resolveActiveBranch, updateStateAtomically, type ResolvedState, type StateMutation, type StateUpdateResult, type StateSnapshot } from "./state.js";
 import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole, type ResolvedConfig } from "./config.js";
 import { validateAgentMappingState, type AgentMappingDiagnostic, type AgentMappingState } from "./agent-mapping.js";
 import { resolveScope, type ScopeFlags } from "./scope.js";
-import { resolveStageDispatchSlots, selectRoster, type RosterSelectionContext } from "./stage.js";
+import { readRequiredStageInputs, resolveStageDispatchSlots, selectRoster, type RosterSelectionContext } from "./stage.js";
 import { readArtifact, writeArtifact } from "./artifacts.js";
 import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
 import { buildDispatchMarker, dispatchTaskId } from "../gates/dispatch.js";
-import { validateActiveCapabilityStateBinding, validateActiveDispatchCapabilityValue, validateDispatchCapabilityValue } from "./control-plane-contract.js";
+import { isMigrationDispatchRecordValue, validateActiveCapabilityStateBinding, validateActiveDispatchCapabilityValue, validateDispatchCapabilityValue } from "./control-plane-contract.js";
 import { evaluatePredicate } from "./predicate.js";
 import {
   activeRunIdOf,
@@ -44,6 +44,7 @@ import {
   DEFAULT_ARTIFACT_CONTRACT_POLICY,
   type ArtifactContractPolicy,
 } from "./artifact-contract.js";
+import { runTarget, terminalControlPublication } from "./run-store.js";
 import type {
   CapabilityBinding,
   CheckpointAnswerProof,
@@ -59,6 +60,11 @@ import type {
   CompletionEnvelope,
   DispatchCompletion,
   DispatchRecord,
+  MigrationCompletionArtifactRef,
+  MigrationDispatchRecord,
+  MigrationWorkIdentity,
+  PersistedDispatchRecord,
+  DispatchCapabilityState,
   LoopState,
   PendingState,
   RosterSelection,
@@ -67,10 +73,12 @@ import type {
   TrustedCheckpointAnswer,
   TypedCheckpointDecision,
   WorkIdentity,
+  CapturedDispatchContext,
 } from "./types.js";
 import { PRD_SOURCE_ARTIFACT_IDS, writeProductPrdDocument } from "./product-prd.js";
 
 export type DispatchAuth = {
+  run_id?: string;
   token: string;
   capability_id: string;
   run_key: string;
@@ -93,6 +101,7 @@ export type DispatchAuth = {
   agent?: string;
   expected_count?: number;
   tool_call_id?: string;
+  origin_session_id?: string;
   pending?: boolean;
   pending_reason?: PendingState["pending_reason"];
   provider_ref?: string;
@@ -148,7 +157,7 @@ const activeCapability = (value: TeamState["dispatch_capability"]): ActiveCapabi
   // shape validator but are not active: they must be re-issued via
   // workflow_begin before they can authorize anything.
   if (!validateActiveDispatchCapabilityValue(value).ok) return null;
-  const cap = value as ActiveCapability;
+  const cap = value as unknown as ActiveCapability;
   // Sequence invariant beyond per-record shape: a role may repeat only after
   // its latest record reached a terminal failure or cancellation.
   const latestByRole = new Map<string, DispatchRecord>();
@@ -277,7 +286,8 @@ function toMutation(core: RecordCore): TransitionMutation {
     : { op: "discard", value: core.result };
 }
 
-function runTransition(cwd: string, mutate: (state: TeamState, target: ResolvedState) => RecordCore): TransitionResult {
+function runTransition(cwd: string, mutate: (state: TeamState, target: ResolvedState) => RecordCore, opts: { terminalPublication?: boolean; runId?: string } = {}): TransitionResult {
+  if (!opts.runId) return { ok: false, error: "canonical run_id is required for durable mutation" };
   const outcome = updateStateAtomically<TransitionResult>(cwd, (snapshot) => {
     if (!snapshot.state) return failTransition("state_missing", "state not found");
     if (snapshot.target.isStale) {
@@ -286,7 +296,10 @@ function runTransition(cwd: string, mutate: (state: TeamState, target: ResolvedS
       return { op: "discard", value: { ok: false, error: "workflow state is stale for the active branch", state: snapshot.state } };
     }
     return toMutation(mutate(snapshot.state, snapshot.target));
-  });
+  }, opts.terminalPublication || opts.runId ? {
+    ...(opts.runId ? { target: runTarget(cwd, opts.runId) } : {}),
+    ...(opts.terminalPublication ? { publication: (snapshot: StateSnapshot, nextState: TeamState) => terminalControlPublication(cwd, snapshot.state, nextState) } : {}),
+  } : undefined);
   if (!outcome.ok) return { ok: false, error: outcome.error };
   if (!outcome.value) return { ok: false, error: "state transaction completed without a result" };
   // The returned state is the COMMITTED, normalized and revision-stamped
@@ -449,7 +462,7 @@ function declaredCheckpointPolicyHash(workflow: TeamState["classification"]["wor
 
 export function createCapability(input: {
   run_key: string; branch: string; workflow: TeamState["classification"]["workflow"]; profile_hash: string;
-  stage_cursor: string; cursor_epoch?: string; kind: "none" | "single" | "consilium"; expected_roles?: string[];
+  stage_cursor: string; cursor_epoch?: string; rework_generation?: number; kind: "none" | "single" | "consilium"; expected_roles?: string[];
   dispatch_secret?: string; advance_secret?: string;
   expected_roster?: Array<{ role: string; agent: string; slot_id?: string; semantic_role?: string; occurrence?: number; facet?: string | null }>;
   roster_selection?: TeamState["roster_selection"];
@@ -475,7 +488,7 @@ export function createCapability(input: {
     advance_token_hash: hash(advance_token),
     issued_for: {
       run_key: input.run_key, branch: input.branch, workflow: input.workflow, profile_hash: input.profile_hash,
-      stage_cursor: input.stage_cursor, cursor_epoch,
+      stage_cursor: input.stage_cursor, cursor_epoch, rework_generation: input.rework_generation ?? 0,
       loop_iteration: input.loop_iteration ?? 1,
       checkpoint_policy_hash: declaredPolicyHash,
     },
@@ -489,6 +502,311 @@ export function createCapability(input: {
   };
   return { capability_id: state.capability_id, dispatch_token, advance_token, state };
 }
+/**
+ * Convert imported succeeded-slot evidence into terminal dispatch history under
+ * the freshly issued capability. Native begin and direct run() share this
+ * boundary so imported successes are never dispatched again.
+ */
+type VerifiedMigrationSlot = {
+  dispatch_id: string;
+  role: string;
+  agent: string;
+  slot_id?: string;
+  task_id?: string;
+  artifact_ids: string[];
+};
+
+type MigrationEvidence = {
+  completed_at: string;
+  evidence_ref: string;
+  artifact_refs: MigrationCompletionArtifactRef[];
+};
+
+function trustedRevisionFile(root: string, relativePath: string): { path: string; bytes: Buffer } | null {
+  if (!relativePath || isAbsolute(relativePath) || relativePath.split(/[\\/]/).some((part) => part === ".." || part === "")) return null;
+  const candidate = join(root, relativePath);
+  const rootResolved = resolve(root);
+  const candidateResolved = resolve(candidate);
+  const rel = relative(rootResolved, candidateResolved);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  try {
+    const info = lstatSync(candidate);
+    if (!info.isFile() || info.isSymbolicLink()) return null;
+    const realRoot = realpathSync(rootResolved);
+    const realCandidate = realpathSync(candidate);
+    const realRel = relative(realRoot, realCandidate);
+    if (realRel === ".." || realRel.startsWith(`..${sep}`) || isAbsolute(realRel)) return null;
+    return { path: candidate, bytes: readFileSync(candidate) };
+  } catch {
+    return null;
+  }
+}
+
+function jsonObject(bytes: Buffer): Record<string, unknown> | null {
+  try {
+    const value = JSON.parse(bytes.toString("utf8")) as unknown;
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function migrationRevisionRoot(target: ResolvedState, state: TeamState): { root: string; runRoot: string; id: string } | null {
+  const stateDir = target.stateDir;
+  const id = state.migration?.id;
+  const runId = state.run_id ?? state.run_key;
+  if (!stateDir || !id || !isSafeStateSegment(id) || !runId || basename(resolve(stateDir)) !== runId) return null;
+  try {
+    // The canonical run root is the already-resolved target for this run. Do
+    // not realpath the revisions ancestor: a symlink there would otherwise
+    // become a new trusted root outside the canonical run tree.
+    const runRoot = realpathSync(resolve(stateDir));
+    const revisionsPath = join(runRoot, "revisions");
+    const revisionsInfo = lstatSync(revisionsPath);
+    if (!revisionsInfo.isDirectory() || revisionsInfo.isSymbolicLink()) return null;
+    const revisionPath = join(revisionsPath, id);
+    const revisionInfo = lstatSync(revisionPath);
+    if (!revisionInfo.isDirectory() || revisionInfo.isSymbolicLink()) return null;
+    const root = realpathSync(revisionPath);
+    const rel = relative(revisionsPath, root);
+    if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+    return { root, runRoot, id };
+  } catch {
+    return null;
+  }
+}
+
+function findLegacyArtifactPath(rawState: Record<string, unknown>, artifactId: string): { key: string; path: string } | null {
+  const artifacts = rawState.artifacts;
+  if (!artifacts || typeof artifacts !== "object" || Array.isArray(artifacts)) return null;
+  const entries = Object.entries(artifacts as Record<string, unknown>).filter(([, value]) => typeof value === "string");
+  const exact = entries.filter(([key]) => key === artifactId);
+  const byName = entries.filter(([, value]) => {
+    const normalized = String(value).replace(/\\/g, "/");
+    const base = normalized.slice(normalized.lastIndexOf("/") + 1);
+    const stem = base.endsWith(".json") ? base.slice(0, -5) : base;
+    return base === artifactId || stem === artifactId;
+  });
+  const candidates = exact.length > 0 ? exact : byName;
+  if (candidates.length !== 1) return null;
+  return { key: candidates[0]![0], path: String(candidates[0]![1]).replace(/\\/g, "/") };
+}
+
+function verifyMigrationEvidence(state: TeamState, target: ResolvedState, stageId: string, slot: VerifiedMigrationSlot): MigrationEvidence | null {
+  const revision = migrationRevisionRoot(target, state);
+  if (!revision) return null;
+  const slotsFile = trustedRevisionFile(revision.root, "succeeded-slots.json");
+  const legacyStateFile = trustedRevisionFile(revision.root, "state.json");
+  const manifestFile = trustedRevisionFile(revision.root, "manifest.json");
+  const receiptFile = trustedRevisionFile(revision.runRoot, "migration-receipt.json");
+  if (!slotsFile || !legacyStateFile || !manifestFile || !receiptFile) return null;
+  const slotsDoc = jsonObject(slotsFile.bytes);
+  const legacyState = jsonObject(legacyStateFile.bytes);
+  const manifest = jsonObject(manifestFile.bytes);
+  const receipt = jsonObject(receiptFile.bytes);
+  if (!slotsDoc || !legacyState || !manifest || !receipt || !Array.isArray(slotsDoc.slots) || !Array.isArray(manifest.files)) return null;
+  const sourceId = typeof manifest.source_id === "string" ? manifest.source_id : "";
+  const sourceHash = typeof manifest.source_hash === "string" ? manifest.source_hash : "";
+  if (!sourceId || !sourceHash || slotsDoc.source_id !== sourceId || slotsDoc.source_hash !== sourceHash || receipt.source_id !== sourceId || receipt.source_hash !== sourceHash || receipt.migration_id !== revision.id || receipt.run_id !== (state.run_id ?? state.run_key) || receipt.status !== "published") return null;
+  const rawStateSha = createHash("sha256").update(legacyStateFile.bytes).digest("hex");
+  if (typeof manifest.state_sha256 !== "string" || typeof receipt.state_sha256 !== "string" || manifest.state_sha256 !== receipt.state_sha256 || rawStateSha !== receipt.state_sha256) return null;
+  const receiptManifest = Array.isArray(receipt.file_manifest)
+    ? receipt.file_manifest.filter((entry): entry is Record<string, unknown> => entry !== null && typeof entry === "object" && !Array.isArray(entry))
+    : [];
+  const trustedSucceededSlots = Array.isArray(receipt.succeeded_slots)
+    ? receipt.succeeded_slots.filter((candidate): candidate is Record<string, unknown> => candidate !== null && typeof candidate === "object" && !Array.isArray(candidate))
+    : [];
+  if (trustedSucceededSlots.length === 0) return null;
+  const trustedMatches = trustedSucceededSlots.filter((candidate) => candidate.dispatch_id === slot.dispatch_id);
+  if (trustedMatches.length !== 1) return null;
+  const trusted = trustedMatches[0]!;
+  if (trusted.role !== slot.role || trusted.agent !== slot.agent) return null;
+  const trustedArtifactIds = Array.isArray(trusted.artifact_ids) ? trusted.artifact_ids.filter((id): id is string => typeof id === "string") : [];
+  if (JSON.stringify(trustedArtifactIds) !== JSON.stringify(slot.artifact_ids)) return null;
+  const roleSlots = trustedSucceededSlots.filter((candidate) => candidate.role === trusted.role);
+  const occurrence = roleSlots.findIndex((candidate) => candidate.dispatch_id === slot.dispatch_id) + 1;
+  if (occurrence < 1) return null;
+  const trustedRawSlotId = typeof trusted.slot_id === "string" ? trusted.slot_id : undefined;
+  if (legacyState.dispatch_capability === undefined) return null;
+  const slotMatches = slotsDoc.slots.filter((candidate): candidate is Record<string, unknown> => candidate !== null && typeof candidate === "object" && !Array.isArray(candidate) && candidate.dispatch_id === slot.dispatch_id);
+  if (slotMatches.length !== 1) return null;
+  const recorded = slotMatches[0]!;
+  const recordedRole = typeof recorded.role === "string" ? recorded.role : "";
+  const slotId = slot.slot_id ?? slot.role;
+  const expectedSlotId = trustedRawSlotId ?? (roleSlots.length > 1 ? slot.role + "#" + occurrence : slot.role);
+  // Historical proof rows may omit slot_id; in that case bind the row to
+  // the deterministic occurrence already established by trusted receipt order.
+  // Any explicit proof slot id remains authoritative and must match exactly.
+  const recordedSlot = typeof recorded.slot_id === "string" ? recorded.slot_id : expectedSlotId;
+  if (recordedRole !== slot.role || recordedSlot !== slotId || recorded.agent !== slot.agent || slotId !== expectedSlotId) return null;
+  const recordedArtifacts = Array.isArray(recorded.artifact_ids) ? recorded.artifact_ids.filter((id): id is string => typeof id === "string") : [];
+  if (JSON.stringify(recordedArtifacts) !== JSON.stringify(slot.artifact_ids)) return null;
+  const capability = legacyState.dispatch_capability;
+  const dispatches = capability && typeof capability === "object" && !Array.isArray(capability) && Array.isArray((capability as Record<string, unknown>).dispatches)
+    ? (capability as Record<string, unknown>).dispatches as unknown[]
+    : [];
+  const legacyDispatches = dispatches.filter((candidate): candidate is Record<string, unknown> => {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    return (candidate as Record<string, unknown>).id === slot.dispatch_id;
+  });
+  if (legacyDispatches.length !== 1) return null;
+  const legacyDispatch = legacyDispatches[0]!;
+  if (legacyDispatch.status !== "succeeded" || legacyDispatch.role !== slot.role || legacyDispatch.agent !== slot.agent) return null;
+  const legacyIdentity = legacyDispatch.work_identity && typeof legacyDispatch.work_identity === "object" && !Array.isArray(legacyDispatch.work_identity)
+    ? legacyDispatch.work_identity as Record<string, unknown>
+    : null;
+  if (legacyIdentity && typeof legacyIdentity.slot_id === "string" && legacyIdentity.slot_id !== slotId) return null;
+  if (legacyIdentity && typeof legacyIdentity.stage_id === "string" && legacyIdentity.stage_id !== stageId) return null;
+  if ((!legacyIdentity || typeof legacyIdentity.stage_id !== "string") && typeof legacyState.stage_cursor === "string" && legacyState.stage_cursor !== stageId) return null;
+  const legacyCompletion = legacyDispatch.completion && typeof legacyDispatch.completion === "object" && !Array.isArray(legacyDispatch.completion)
+    ? legacyDispatch.completion as Record<string, unknown>
+    : null;
+  if (!legacyCompletion || legacyCompletion.outcome !== "succeeded") return null;
+  if (Array.isArray(legacyCompletion.artifact_ids) && JSON.stringify(legacyCompletion.artifact_ids) !== JSON.stringify(slot.artifact_ids)) return null;
+  const manifestEntries = manifest.files.filter((entry): entry is Record<string, unknown> => entry !== null && typeof entry === "object" && !Array.isArray(entry));
+  const artifactRefs: MigrationCompletionArtifactRef[] = [];
+  for (const artifactId of slot.artifact_ids) {
+    const mapping = findLegacyArtifactPath(legacyState, artifactId);
+    if (!mapping) return null;
+    const normalized = mapping.path.replaceAll("\\", "/");
+    const sourceKind = normalized.startsWith("artifacts/") ? "artifacts" : "state";
+    const relativePath = sourceKind === "artifacts" ? normalized.slice("artifacts/".length) : normalized.startsWith("state/") ? normalized.slice("state/".length) : normalized;
+    const candidates = manifestEntries.filter((entry) => {
+      if (entry.source_kind !== "artifacts" && entry.source_kind !== "state") return false;
+      const relativeMatch = entry.path === relativePath && entry.source_kind === sourceKind;
+      // Legacy artifact references are resolved relative to the established
+      // artifacts root, so a bare `foo.json` must match an artifacts manifest
+      // entry rather than being guessed as a state path. Ambiguous duplicate
+      // paths fail closed below.
+      const manifestPathMatch = entry.path === normalized;
+      const sourcePath = typeof entry.source_path === "string" ? entry.source_path.replaceAll("\\", "/") : "";
+      const sourceMatch = sourcePath !== "" && sourcePath === normalized;
+      return relativeMatch || manifestPathMatch || sourceMatch;
+    });
+    if (candidates.length !== 1) return null;
+    const manifestEntry = candidates[0]!;
+    const manifestKind = manifestEntry.source_kind as "artifacts" | "state";
+    const manifestPath = typeof manifestEntry.path === "string" ? manifestEntry.path : "";
+    if (!manifestPath || typeof manifestEntry.sha256 !== "string") return null;
+    const receiptMatches = receiptManifest.filter((entry) => entry.path === manifestPath && entry.source_kind === manifestKind && entry.sha256 === manifestEntry.sha256);
+    if (receiptMatches.length !== 1) return null;
+    const receiptSourcePath = typeof receiptMatches[0]!.source_path === "string" ? receiptMatches[0]!.source_path.replaceAll("\\", "/") : "";
+    const manifestSourcePath = typeof manifestEntry.source_path === "string" ? manifestEntry.source_path.replaceAll("\\", "/") : "";
+    if (receiptSourcePath !== manifestSourcePath) return null;
+    const fileRelative = `${manifestKind}/${manifestPath}`;
+    const file = trustedRevisionFile(revision.root, fileRelative);
+    if (!file || createHash("sha256").update(file.bytes).digest("hex") !== receiptMatches[0]!.sha256) return null;
+    const schemaId = mapping.key;
+    let schemaStatus: MigrationCompletionArtifactRef["schema_status"] = "not_applicable";
+    const schema = artifactSchemaFor(schemaId);
+    if (schema) {
+      try {
+        const parsed = JSON.parse(file.bytes.toString("utf8")) as unknown;
+        schemaStatus = validateProducedArtifact(schemaId, parsed).ok ? "met" : "failed";
+      } catch {
+        schemaStatus = "failed";
+      }
+    }
+    artifactRefs.push({
+      artifact_id: artifactId,
+      path: `revisions/${revision.id}/${fileRelative}`,
+      sha256: manifestEntry.sha256,
+      schema_status: schemaStatus,
+      dod_status: "pending",
+    });
+  }
+  const completedAt = typeof legacyDispatch.completed_at === "string"
+    ? legacyDispatch.completed_at
+    : typeof legacyCompletion.completed_at === "string"
+      ? legacyCompletion.completed_at
+      : state.migration?.migrated_at;
+  if (!completedAt) return null;
+  return { completed_at: completedAt, evidence_ref: `revisions/${revision.id}/succeeded-slots.json`, artifact_refs: artifactRefs };
+}
+
+type MigrationMaterializationResult =
+  | { ok: true; records: MigrationDispatchRecord[] }
+  | { ok: false; error: string };
+
+export function materializeMigratedDispatches(
+  state: TeamState,
+  capability: DispatchCapabilityState,
+  workflow: string,
+  stageId: string,
+  target?: ResolvedState,
+): MigrationMaterializationResult {
+  const issued = capability.issued_for;
+  const migrationId = state.migration?.id;
+  const migratedSlots = state.migration_succeeded_slots?.[stageId] ?? [];
+  if (migratedSlots.length === 0) return { ok: true, records: [] };
+  if (!issued || !capability.capability_id || !target || !migrationId || !isSafeStateSegment(migrationId)) {
+    return { ok: false, error: `recovery_required: migration evidence for stage '${stageId}' has no trusted revision binding` };
+  }
+  const records: MigrationDispatchRecord[] = [];
+  for (const slot of migratedSlots) {
+    const slotId = slot.slot_id ?? slot.role;
+    if (!slot.dispatch_id || !slot.role || !slot.agent || !slotId || !Array.isArray(slot.artifact_ids)) {
+      return { ok: false, error: `recovery_required: malformed migration evidence slot for stage '${stageId}'` };
+    }
+    const roster = capability.expected_roster?.find((entry) => entry.role === slotId);
+    if (!roster) return { ok: false, error: `recovery_required: migrated slot '${slotId}' is absent from the fresh capability roster` };
+    const evidence = verifyMigrationEvidence(state, target, stageId, { ...slot, slot_id: slotId, agent: slot.agent });
+    if (!evidence) return { ok: false, error: `recovery_required: immutable migration evidence for slot '${slotId}' is missing or inconsistent` };
+    const taskId = dispatchTaskId(capability.capability_id, issued.run_key, issued.branch, issued.workflow, issued.stage_cursor, slotId);
+    const identity: MigrationWorkIdentity = {
+      source: "migration",
+      migration_id: migrationId,
+      run_id: issued.run_key,
+      wave_id: null,
+      slice_id: issued.stage_cursor,
+      session_id: null,
+      workflow: issued.workflow,
+      stage_id: issued.stage_cursor,
+      stage_cursor: issued.stage_cursor,
+      capability_id: capability.capability_id,
+      capability_epoch: issued.cursor_epoch,
+      loop_iteration: issued.loop_iteration,
+      slot_id: slotId,
+      task_id: taskId,
+      dispatch_id: slot.dispatch_id,
+      attempt: 0,
+      worker_id: null,
+    };
+    const completion = {
+      dispatch_id: slot.dispatch_id,
+      cursor_epoch: issued.cursor_epoch,
+      outcome: "succeeded" as const,
+      artifact_ids: slot.artifact_ids,
+      evidence: evidence.evidence_ref,
+      completed_by: "migration" as const,
+      completed_at: evidence.completed_at,
+      work_identity: identity,
+    };
+    records.push({
+      id: slot.dispatch_id,
+      role: slotId,
+      agent: roster.agent,
+      status: "succeeded",
+      attempt: 0,
+      created_at: evidence.completed_at,
+      completed_at: evidence.completed_at,
+      completion,
+      completion_envelope: {
+        schema_version: 1,
+        identity,
+        outcome: "succeeded",
+        terminal_signal: "migration_verified",
+        artifact_refs: evidence.artifact_refs,
+        evidence_ref: evidence.evidence_ref,
+        conflict_ref: null,
+        completed_by: "migration",
+        emitted_at: now(),
+      },
+    });
+  }
+  return { ok: true, records };
+}
+
 function reissueActiveCapability(cap: ActiveCapability, checkpointPolicyHash?: string | null): IssuedCapability {
   const dispatch_token = randomUUID();
   const advance_token = randomUUID();
@@ -715,7 +1033,24 @@ function clearPolicyProjection(next: TeamState): void {
  * decision here, and a malformed handoff fails closed. Callers without a
  * handoff keep the persisted-mapping fallback.
  */
-export function beginCapability(cwd: string, requested?: RosterBeginSelection, options?: TrustedMappingOptions): TransitionResult {
+function attachRequiredInputReceipt(state: TeamState, target: ResolvedState, stage: StageDef): { ok: true; state: TeamState } | { ok: false; error: string } {
+  if (!target.artifactsDir) return { ok: false, error: "recovery_required: selected run artifacts directory is unavailable" };
+  const read = readRequiredStageInputs(stage, state, target.artifactsDir);
+  if (!read.ok) return { ok: false, error: `recovery_required: ${read.error}` };
+  const capability = state.dispatch_capability;
+  if (!capability?.capability_id) return { ok: false, error: "recovery_required: dispatch capability unavailable for required-input receipt" };
+  const receipt = {
+    stage_id: stage.id,
+    capability_id: capability.capability_id,
+    cursor_epoch: state.cursor_epoch ?? capability.issued_for?.cursor_epoch ?? "",
+    rework_generation: state.rework_generation ?? 0,
+    read_at: now(),
+    inputs: read.inputs.map((input) => ({ artifact_id: input.artifact_id, path: input.path, sha256: input.sha256 })),
+  };
+  return { ok: true, state: { ...state, required_inputs: { ...(state.required_inputs ?? {}), [stage.id]: receipt.inputs }, required_input_receipts: { ...(state.required_input_receipts ?? {}), [stage.id]: receipt } } };
+}
+
+export function beginCapability(cwd: string, requested?: RosterBeginSelection, options?: TrustedMappingOptions & { runId?: string }): TransitionResult {
   return runTransition(cwd, (state, target) => {
     if (!target.statePath) return rejectTransition("workflow state not found", state);
     const workflow = state.classification?.workflow;
@@ -900,11 +1235,12 @@ export function beginCapability(cwd: string, requested?: RosterBeginSelection, o
           updated_at: now(),
         };
         if (!stageDeclaration.declaration) clearPolicyProjection(next);
-        return commitTransition(next, { ok: true, state: next, handoff: handoffFromState(next, { capability_id: reissued.capability_id, dispatch_token: reissued.dispatch_token, advance_token: reissued.advance_token }, stage) });
+        const receipted = attachRequiredInputReceipt(next, target, stage);
+        if (!receipted.ok) return rejectTransition(receipted.error, state);
+        return commitTransition(receipted.state, { ok: true, state: receipted.state, handoff: handoffFromState(receipted.state, { capability_id: reissued.capability_id, dispatch_token: reissued.dispatch_token, advance_token: reissued.advance_token }, stage) });
       }
     }
     const resetState = stageEntry.status === "in_progress" ? state : resetReopenedStageState(state, target, profile, stage.id, existing);
-    const retainedDispatches = stageEntry.status === "in_progress" ? existingDispatches : [];
     const issued = createCapability({
       run_key: resetState.run_key ?? resetState.branch,
       branch: resetState.branch,
@@ -912,12 +1248,20 @@ export function beginCapability(cwd: string, requested?: RosterBeginSelection, o
       profile_hash: persistedHash,
       stage_cursor: stage.id,
       cursor_epoch: capabilityEpoch,
+      rework_generation: resetState.rework_generation ?? 0,
       kind,
       expected_roster: expectedRoster,
       roster_selection: rosterSelection,
       loop_iteration: stageIteration.iteration,
       checkpoint_policy_hash: stageDeclaration.declaration?.policy_hash ?? null,
     });
+    // Imported successes become terminal history under the fresh capability.
+    const materialized = materializeMigratedDispatches(resetState, issued.state, workflow, stage.id, target);
+    if (!materialized.ok) return rejectTransition(materialized.error, state);
+    const migratedDispatches = materialized.records;
+    const byDispatch = new Map<string, PersistedDispatchRecord>();
+    for (const record of [...existingDispatches, ...migratedDispatches]) byDispatch.set(record.id, record);
+    const retainedDispatches = [...byDispatch.values()];
     // A freshly issued capability starts with no root lifecycle projection.
     // Single dispatch authorization will create the sole valid projection;
     // consilium identities always remain per-dispatch.
@@ -939,13 +1283,21 @@ export function beginCapability(cwd: string, requested?: RosterBeginSelection, o
     delete next.work_identity;
     delete next.pending;
     delete next.completion_envelope;
+    if (next.migration_succeeded_slots) {
+      const remainingMigrated = { ...next.migration_succeeded_slots };
+      delete remainingMigrated[stage.id];
+      if (Object.keys(remainingMigrated).length > 0) next.migration_succeeded_slots = remainingMigrated;
+      else delete next.migration_succeeded_slots;
+    }
     if (!stageDeclaration.declaration) clearPolicyProjection(next);
-    return commitTransition(next, {
+    const receipted = attachRequiredInputReceipt(next, target, stage);
+    if (!receipted.ok) return rejectTransition(receipted.error, state);
+    return commitTransition(receipted.state, {
       ok: true,
-      state: next,
-      handoff: handoffFromState(next, { capability_id: issued.capability_id, dispatch_token: issued.dispatch_token, advance_token: issued.advance_token }, stage),
+      state: receipted.state,
+      handoff: handoffFromState(receipted.state, { capability_id: issued.capability_id, dispatch_token: issued.dispatch_token, advance_token: issued.advance_token }, stage),
     });
-  });
+  }, options?.runId ? { runId: options.runId } : undefined);
 }
 
 function auth(cap: ActiveCapability, a: DispatchAuth, secretHash: string): string | null {
@@ -981,11 +1333,21 @@ function authorizeRecord(
   if (input.task_id !== undefined && input.task_id !== taskId) return rejectTransition("task identity mismatch", state);
   const recordsForRole = cap.dispatches.filter((record) => record.role === role);
   const latest = recordsForRole[recordsForRole.length - 1];
+  if (latest && isMigrationDispatchRecordValue(latest)) return rejectTransition("migration completion evidence is not a live dispatch", state);
   if (latest && latest.status !== "failed" && latest.status !== "cancelled") {
     const sameTool = Boolean(input.tool_call_id && latest.tool_call_id === input.tool_call_id);
     const sameTask = Boolean(input.task_id && latest.work_identity?.task_id === input.task_id);
-    if (sameTask && !latest.tool_call_id && input.tool_call_id) {
-      const rebound: DispatchRecord = { ...latest, tool_call_id: input.tool_call_id };
+    const activePreexecution = latest.status === "authorized" || latest.status === "running";
+    // A first trusted hook may bind the tool-call identity to an internal
+    // preauthorization that intentionally had no provider call id yet. This
+    // is the only task-identity bootstrap; it never creates a second worker.
+    const bootstrapOriginCompatible = latest.origin_session_id === undefined
+      || latest.origin_session_id === input.origin_session_id;
+    if (sameTask && !latest.tool_call_id && input.tool_call_id && activePreexecution && bootstrapOriginCompatible) {
+      const rebound: DispatchRecord = {
+        ...latest,
+        tool_call_id: input.tool_call_id,
+      };
       const reboundState: TeamState = {
         ...state,
         dispatch_capability: { ...cap, dispatches: cap.dispatches.map((candidate) => candidate.id === latest.id ? rebound : candidate) },
@@ -993,7 +1355,15 @@ function authorizeRecord(
       };
       return commitTransition(reboundState, { ok: true, state: reboundState, record: rebound });
     }
-    if ((sameTool || sameTask) && (!input.task_id || latest.work_identity?.task_id === input.task_id)) return replayTransition({ ok: true, state, record: latest });
+    // Physical SDK hook re-entry is idempotent only for the exact original
+    // call, the exact originating host session, and a still-live dispatch.
+    // A matching task marker alone must never authorize a new provider call.
+    const sameOriginSession = latest.origin_session_id === undefined
+      ? sameTool
+      : latest.origin_session_id === input.origin_session_id;
+    if (sameTool && sameOriginSession && activePreexecution) {
+      return replayTransition({ ok: true, state, record: latest });
+    }
   }
   if (latest && (!input.retry_of || input.retry_of !== latest.id || (latest.status !== "failed" && latest.status !== "cancelled"))) {
     return rejectTransition("retry requires an explicit terminal failure linkage", state);
@@ -1008,6 +1378,7 @@ function authorizeRecord(
     role,
     agent: rosterEntry.agent,
     tool_call_id: input.tool_call_id,
+    ...(input.origin_session_id ? { origin_session_id: input.origin_session_id } : {}),
     status: "authorized",
     attempt,
     created_at: now(),
@@ -1043,10 +1414,11 @@ export function authorizeDispatch(cwd: string, authInput: DispatchAuth): Transit
     const coherence = authorizeCoherenceError(state, cap);
     if (coherence) return rejectTransition(coherence, state);
     return authorizeRecord(state, target, cap, authInput);
-  });
+  }, authInput.run_id ? { runId: authInput.run_id } : undefined);
 }
 
 export interface TrustedDispatchInput {
+  run_id?: string;
   capability_id: string;
   run_key: string;
   branch: string;
@@ -1063,6 +1435,7 @@ export interface TrustedDispatchInput {
   tool_call_id: string;
   expected_count?: number;
   retry_of?: string;
+  origin_session_id?: string;
 }
 
 /** Authorize a task after the trusted runtime gate validated its marker: one cross-process transaction. */
@@ -1099,9 +1472,11 @@ export function authorizeDispatchTrusted(cwd: string, input: TrustedDispatchInpu
       tool_call_id: input.tool_call_id,
       expected_count: input.expected_count,
       retry_of: input.retry_of,
+      origin_session_id: input.origin_session_id,
+      run_id: input.run_id,
       ...(input.loop_iteration !== undefined ? { loop_iteration: input.loop_iteration } : {}),
     });
-  });
+  }, input.run_id ? { runId: input.run_id } : undefined);
 }
 
 type CompletionInput = {
@@ -1119,6 +1494,7 @@ function pendingRecord(
   reason: PendingState["pending_reason"] = "provider_running",
   providerRef?: string,
 ): RecordCore {
+  if (isMigrationDispatchRecordValue(record)) return rejectTransition("migration completion evidence is not a live dispatch", state);
   if (record.status === "succeeded" || record.status === "failed" || record.status === "cancelled") return rejectTransition("terminal dispatch cannot become pending", state);
   const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
   const previous = record.pending;
@@ -1154,7 +1530,10 @@ function pendingRecord(
 export function persistPendingDispatch(
   cwd: string,
   input: DispatchAuth & { dispatch_id: string; pending_reason?: PendingState["pending_reason"]; provider_ref?: string },
+  options?: { runId?: string },
 ): TransitionResult {
+  const runId = options?.runId ?? input.run_id;
+  if (!runId) return { ok: false, error: "canonical run_id is required for pending dispatch persistence" };
   return runTransition(cwd, (state) => {
     const cap = activeCapability(state.dispatch_capability);
     if (!cap) return rejectTransition("dispatch capability unavailable", state);
@@ -1166,11 +1545,50 @@ export function persistPendingDispatch(
     if (!record) return rejectTransition("unknown dispatch", state);
     if (input.role !== undefined && input.role !== record.role) return rejectTransition("dispatch slot mismatch", state);
     return pendingRecord(state, cap, record, input.pending_reason, input.provider_ref);
-  });
+  }, { runId });
 }
 
 /** Alias retained for adapters that name the transition as a lifecycle update. */
 export const markDispatchPending = persistPendingDispatch;
+
+function hasMigrationProvenance(value: unknown, seen = new Set<unknown>()): boolean {
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  const candidate = value as Record<string, unknown>;
+  if (candidate.source === "migration" || candidate.completed_by === "migration" || candidate.terminal_signal === "migration_verified") return true;
+  for (const key of ["identity", "work_identity", "parent", "child", "completion_envelope"]) {
+    if (hasMigrationProvenance(candidate[key], seen)) return true;
+  }
+  return false;
+}
+
+function registerProducedArtifactBindings(
+  state: TeamState,
+  target: ResolvedState,
+  cap: ActiveCapability,
+  artifactIds: string[],
+): TeamState {
+  if (artifactIds.length === 0 || !target.artifactsDir) return state;
+  const profile = loadProfile(cap.issued_for.workflow);
+  const stage = profile?.stages.find((candidate) => candidate.id === cap.issued_for.stage_cursor);
+  const declared = stage ? new Set(stageProduces(stage)) : new Set<string>();
+  if (declared.size === 0) return state;
+  const artifacts = { ...(state.artifacts ?? {}) };
+  let changed = false;
+  for (const id of artifactIds) {
+    if (!declared.has(id) || !isSafeStateSegment(id)) continue;
+    const value = readArtifact(target.artifactsDir, id);
+    if (value === null) continue;
+    const contract = validateProducedArtifact(id, value, artifactContractPolicy);
+    if (!contract.ok) continue;
+    const path = `artifacts/${id}.json`;
+    if (artifacts[id] !== path) {
+      artifacts[id] = path;
+      changed = true;
+    }
+  }
+  return changed ? { ...state, artifacts } : state;
+}
 
 function completeRecord(
   state: TeamState,
@@ -1179,10 +1597,17 @@ function completeRecord(
   record: DispatchRecord,
   input: CompletionInput,
 ): RecordCore {
+  if (isMigrationDispatchRecordValue(record)) return rejectTransition("migration completion evidence is not a live dispatch", state);
   if (cap.status === "invalidated" || cap.status === "complete") return rejectTransition("capability invalidated", state);
   if (!input.evidence.trim()) return rejectTransition("completion evidence required", state);
   const artifact_ids = input.artifact_ids ?? [];
   const artifactDir = target.artifactsDir ?? "";
+  // Publish only files that the active stage declares, are present under the
+  // canonical artifacts directory, and pass their shipped contract. This is
+  // an additive same-transaction binding: it does not restore invalidated
+  // outputs or replace the state snapshot, so concurrent dispatch updates are
+  // preserved by the enclosing CAS transaction.
+  state = registerProducedArtifactBindings(state, target, cap, artifact_ids);
   const declaredArtifacts = state.artifacts ?? {};
   const unsafeArtifacts = new Set(artifact_ids).size !== artifact_ids.length || artifact_ids.some((id) => !isSafeStateSegment(id));
   const previousCompletion = record.completion;
@@ -1192,7 +1617,7 @@ function completeRecord(
     && sameOutcome
     && previousCompletion.artifact_ids.length === 0
     && artifact_ids.length > 0;
-  const missingArtifacts = artifact_ids.some((id) => !existsSync(join(artifactDir, `${id}.json`)) && !Object.prototype.hasOwnProperty.call(declaredArtifacts, id));
+  const missingArtifacts = artifact_ids.some((id) => !Object.prototype.hasOwnProperty.call(declaredArtifacts, id) && !Object.values(state.slot_artifacts ?? {}).some((stage) => Object.values(stage.slots ?? {}).some((slot) => Object.prototype.hasOwnProperty.call(slot, id))));
   if (unsafeArtifacts || (missingArtifacts && !deferredNativeArtifacts)) return rejectTransition("declared artifact missing or unsafe", state);
   if (previousCompletion && !(sameOutcome && sameArtifacts) && !deferredNativeArtifacts) return rejectTransition("conflicting replay", state);
   const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
@@ -1354,7 +1779,7 @@ function snapshotSlotArtifacts(
 function hashValue(value: unknown): string {
   return hash(JSON.stringify(value));
 }
-export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_id: string } & Partial<CompletionInput>): TransitionResult {
+export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_id: string } & Partial<CompletionInput>, options?: { runId?: string }): TransitionResult {
   return runTransition(cwd, (state, target) => {
     const cap = activeCapability(state.dispatch_capability);
     if (!cap) return rejectTransition("dispatch capability unavailable", state);
@@ -1369,10 +1794,11 @@ export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_i
     if (input.task_id !== undefined && input.task_id !== record.work_identity?.task_id) return rejectTransition("dispatch task mismatch", state);
     if (input.agent !== undefined && input.agent !== record.agent) return rejectTransition("dispatch agent mismatch", state);
     if (input.tool_call_id !== undefined && record.tool_call_id !== undefined && input.tool_call_id !== record.tool_call_id) return rejectTransition("dispatch tool-call mismatch", state);
+    if (hasMigrationProvenance(input)) return rejectTransition("migration completion evidence is not a live dispatch", state);
     if (input.pending === true) return pendingRecord(state, cap, record, input.pending_reason, input.provider_ref);
     if (!input.outcome || !input.evidence) return rejectTransition("terminal completion outcome and evidence are required", state);
     return completeRecord(state, target, cap, record, input as CompletionInput);
-  });
+  }, options?.runId ? { runId: options.runId } : undefined);
 }
 
 /** Reconcile a native task result without exposing capability secrets to hooks. */
@@ -1385,6 +1811,7 @@ export function reconcileTrustedTaskResult(cwd: string, input: {
   slot_id?: string;
   task_id?: string;
   work_identity?: WorkIdentity;
+  captured?: CapturedDispatchContext;
   outcome: DispatchCompletion["outcome"];
   evidence: string;
   artifact_ids?: string[];
@@ -1392,8 +1819,10 @@ export function reconcileTrustedTaskResult(cwd: string, input: {
   pending_reason?: PendingState["pending_reason"];
   provider_ref?: string;
   terminal_signal?: CompletionEnvelope["terminal_signal"];
+  run_id?: string;
 }): TransitionResult {
-  if (!input.tool_call_id && !input.dispatch_id && !input.work_identity) return { ok: false, error: "dispatch identity required" };
+  if (hasMigrationProvenance(input)) return { ok: false, error: "migration completion evidence is not a live dispatch" };
+  if (!input.tool_call_id && !input.dispatch_id && !input.work_identity && !input.captured) return { ok: false, error: "dispatch identity required" };
   // Candidate resolution AND the pending/terminal mutation run in ONE
   // transaction: the join below is computed from the freshly persisted
   // dispatch ledger under the lock, never from a pre-lock snapshot.
@@ -1404,6 +1833,14 @@ export function reconcileTrustedTaskResult(cwd: string, input: {
     if (input.cursor_epoch && input.cursor_epoch !== cap.issued_for.cursor_epoch) return rejectTransition("cursor epoch mismatch", state);
     const coherence = authorizeCoherenceError(state, cap);
     if (coherence) return rejectTransition(coherence, state);
+    if (input.captured) {
+      const expectedRun = state.run_id ?? state.run_key;
+      if (!expectedRun || input.captured.run_id !== expectedRun) return rejectTransition("captured dispatch run mismatch", state);
+      if (input.captured.capability_id !== cap.capability_id) return rejectTransition("captured capability mismatch", state);
+      if (input.captured.rework_generation !== (state.rework_generation ?? 0)) return rejectTransition("captured rework generation is stale", state);
+      if (input.dispatch_id && input.dispatch_id !== input.captured.dispatch_id) return rejectTransition("captured dispatch mismatch", state);
+      input = { ...input, dispatch_id: input.captured.dispatch_id, capability_id: input.captured.capability_id };
+    }
     const candidates = cap.dispatches.filter((record) => {
       if (input.dispatch_id && record.id !== input.dispatch_id) return false;
       if (input.tool_call_id && record.tool_call_id !== input.tool_call_id) return false;
@@ -1424,7 +1861,7 @@ export function reconcileTrustedTaskResult(cwd: string, input: {
       completed_by: "synchronous_tool_result",
       terminal_signal: input.terminal_signal ?? "native_tool_result",
     });
-  });
+  }, { runId: input.run_id });
 }
 function stageProduces(stage: StageDef): string[] {
   if (Array.isArray(stage.produces)) return stage.produces;
@@ -1702,12 +2139,12 @@ function renderStageDocument(stage: StageDef, target: ResolvedState): { ok: true
   return { ok: true };
 }
 
-export function advanceCursor(cwd: string, input: DispatchAuth, options?: TrustedMappingOptions): TransitionResult {
+export function advanceCursor(cwd: string, input: DispatchAuth, options?: TrustedMappingOptions & { runId?: string }): TransitionResult {
   // One cross-process transaction: authentication, capability validation and
   // the join/advance/re-entry decision all run against the freshly persisted
   // state under the lock; handoff secrets are derived from the committed
   // state and the commit is CAS-guarded.
-  return runTransition(cwd, (rawState, target) => {
+  const result = runTransition(cwd, (rawState, target) => {
   const cap = activeCapability(rawState.dispatch_capability);
   if (!cap) return rejectTransition("dispatch capability unavailable", rawState);
   const error = auth(cap, input, cap.advance_token_hash);
@@ -1965,6 +2402,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
         cursor_epoch: epoch,
         kind: nextKind,
         expected_roster: expectedRoster,
+        rework_generation: state.rework_generation ?? cap.issued_for.rework_generation ?? 0,
         loop_iteration: nextIteration,
         checkpoint_policy_hash: nextDeclaration.declaration?.policy_hash ?? null,
       });
@@ -2024,8 +2462,12 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
   }
   delete next.pending;
   delete next.completion_envelope;
-  return commitTransition(next, { ok: true, state: next, handoff: armedStage && handoffSecrets ? handoffFromState(next, handoffSecrets, armedStage) : undefined });
-  });
+  const handoff = handoffSecrets && armedStage ? handoffFromState(next, handoffSecrets, armedStage) : undefined;
+  return handoff
+    ? commitTransition(next, { ok: true, state: next, handoff })
+    : commitTransition(next, { ok: true, state: next });
+  }, { terminalPublication: true, ...(options?.runId ? { runId: options.runId } : {}) });
+  return result;
 }
 
 /**
@@ -2105,6 +2547,7 @@ function reenterLoop(
         kind,
         expected_roster: expectedRoster,
         roster_selection: rosterSelection,
+        rework_generation: state.rework_generation ?? cap.issued_for.rework_generation ?? 0,
         loop_iteration: iteration,
         checkpoint_policy_hash: backDeclaration.declaration?.policy_hash ?? null,
       });
@@ -2128,9 +2571,27 @@ function reenterLoop(
   // `roster_selections` history retains it for audit.
   const priorLoopSelection = state.roster_selection?.stage_id === backToStage.id ? state.roster_selection : undefined;
   const { roster_selection: _carriedLoopSelection, ...carriedLoopState } = state;
+  const loopBackIndex = profile.stages.findIndex((stage) => stage.id === backToStage.id);
+  const regeneratedArtifacts = new Set(loopBackIndex < 0 ? [] : profile.stages.slice(loopBackIndex).flatMap((stage) => stageProduces(stage)));
+  const retainedRequiredInputs = Object.fromEntries(Object.entries(carriedLoopState.required_inputs ?? {}).map(([stageId, inputs]) => [
+    stageId,
+    inputs.map((input) => {
+      if (!regeneratedArtifacts.has(input.artifact_id)) return input;
+      const { sha256: _staleHash, ...declaration } = input;
+      return declaration;
+    }),
+  ]));
+  const retainedInputReceipts = Object.fromEntries(Object.entries(carriedLoopState.required_input_receipts ?? {}).filter(([, receipt]) =>
+    !receipt.inputs.some((input) => regeneratedArtifacts.has(input.artifact_id)),
+  ));
+  const loopStateBase = { ...carriedLoopState };
+  if (Object.keys(retainedRequiredInputs).length > 0) loopStateBase.required_inputs = retainedRequiredInputs;
+  else delete loopStateBase.required_inputs;
+  if (Object.keys(retainedInputReceipts).length > 0) loopStateBase.required_input_receipts = retainedInputReceipts;
+  else delete loopStateBase.required_input_receipts;
   const { roster_selection: _completedLoopSelection, ...completedLoopCap } = cap;
   const next: TeamState = {
-    ...carriedLoopState,
+    ...loopStateBase,
     ...policyProjectionFor(backDeclaration.declaration, backToStage.id, cap.issued_for.profile_hash),
     stage_cursor: backToStage.id,
     cursor_epoch: epoch,
@@ -2198,6 +2659,7 @@ function sameIdentity(left: WorkIdentity | undefined, right: WorkIdentity | unde
 
 /** Append a child result to the durable parent ledger without positional joins. */
 export function appendChildJoin(cwd: string, input: ChildJoinInput): TransitionResult {
+  if (hasMigrationProvenance(input)) return { ok: false, error: "migration completion evidence is not a live child join" };
   return runTransition(cwd, (state, target) => {
     const cap = activeCapability(state.dispatch_capability);
     if (!cap) return rejectTransition("dispatch capability unavailable", state);
@@ -2267,7 +2729,7 @@ export function appendChildJoin(cwd: string, input: ChildJoinInput): TransitionR
       updated_at: now(),
     };
     return commitTransition(next, { ok: true, state: next, child_join: joined });
-  });
+  }, { runId: input.parent.run_id });
 }
 
 export const joinChild = appendChildJoin;
@@ -2294,6 +2756,9 @@ export interface CheckpointDecisionInput extends DispatchAuth {
  * commit is CAS-guarded against concurrent writers.
  */
 export function recordCheckpointDecision(cwd: string, input: CheckpointDecisionInput): TransitionResult {
+  if (!input.run_id) return { ok: false, error: "no_active_run: canonical workflow run is required" };
+  const target = resolveCanonicalRun(cwd, { kind: "team", runId: input.run_id }, input.branch);
+  if (!target) return { ok: false, error: "run_not_found: canonical workflow run is missing" };
   const outcome = updateStateAtomically<{ state: TeamState }>(cwd, (snapshot) => {
     const state = snapshot.state;
     if (!state) return { op: "fail", code: "state_missing", error: "state not found" };
@@ -2354,7 +2819,7 @@ export function recordCheckpointDecision(cwd: string, input: CheckpointDecisionI
       return { op: "discard", value: { state } };
     }
     return { op: "commit", state: appended.state, value: { state: appended.state } };
-  });
+  }, { target });
   if (!outcome.ok) return { ok: false, error: outcome.error };
   if (!outcome.value) return { ok: false, error: "state transaction completed without a result" };
   // The returned state is the committed, normalized/stamped state on disk.
@@ -2430,10 +2895,13 @@ function capabilityStageScopeError(state: TeamState, cap: ActiveCapability): str
 
 /** Binding coherence plus current-stage scope: every authorizing mutation. */
 function authorizeCoherenceError(state: TeamState, cap: ActiveCapability): string | null {
+  if ((cap.issued_for.rework_generation ?? 0) !== (state.rework_generation ?? 0)) return "capability rework generation is stale";
   return capabilityStateCoherenceError(state, cap) ?? capabilityStageScopeError(state, cap);
 }
 
 export interface CheckpointAskRequest {
+  /** Canonical ordinary run selected by the trusted session. */
+  run_id?: string;
   token: string;
   capability_id: string;
   run_key: string;
@@ -2545,7 +3013,9 @@ function checkpointAskContextFor(state: TeamState, input: CheckpointAskRequest):
  * dialog is open rejects instead of persisting a stale answer.
  */
 export function validateCheckpointAsk(cwd: string, input: CheckpointAskRequest): CheckpointAskPreflight {
-  const target = resolveState(cwd, resolveActiveBranch(cwd));
+  if (!input.run_id) return { ok: false, error: "no_active_run: no canonical workflow run is selected for this trusted session" };
+  const target = resolveCanonicalRun(cwd, { kind: "team", runId: input.run_id }, input.branch);
+  if (!target) return { ok: false, error: `run_not_found: canonical run ${input.run_id} was not found` };
   if (target.invalid) {
     // A state whose ONLY rejection is a malformed dispatch capability is a
     // capability failure, not a generic unsafe-path failure: the ask
@@ -2576,6 +3046,7 @@ export function validateCheckpointAsk(cwd: string, input: CheckpointAskRequest):
 }
 
 export interface CheckpointAnswerCommitInput {
+  run_id?: string;
   token: string;
   capability_id: string;
   run_key: string;
@@ -2660,6 +3131,9 @@ function markAnswersSuperseded(state: TeamState, answerIds: ReadonlySet<string>)
  * engine-generated (`randomUUID`), never derived from record counts.
  */
 export function commitCheckpointAnswer(cwd: string, input: CheckpointAnswerCommitInput): CheckpointAnswerCommitResult {
+  if (!input.run_id) return { ok: false, kind: "rejected", code: "no_active_run", error: "canonical workflow run is required" };
+  const target = resolveCanonicalRun(cwd, { kind: "team", runId: input.run_id }, input.branch);
+  if (!target) return { ok: false, kind: "rejected", code: "run_not_found", error: "canonical workflow run is missing" };
   const result = updateStateAtomically<CommitPayload>(cwd, (snapshot) => {
     const state = snapshot.state;
     if (!state) return { op: "fail", code: "state_missing", error: "workflow state not found" };
@@ -2797,7 +3271,7 @@ export function commitCheckpointAnswer(cwd: string, input: CheckpointAnswerCommi
       state: next,
       value: { kind: "success", outcome: "minted", checkpoint_kind: declaration.rule.kind, allowed, answer: minted.answer, proof: minted.proof },
     };
-  });
+  }, { target });
   if (!result.ok || !result.value) {
     return { ok: false, kind: "rejected", code: result.ok ? "state_conflict" : result.code, error: result.ok ? "state transaction completed without a result" : result.error };
   }
@@ -2824,6 +3298,7 @@ export function commitCheckpointAnswer(cwd: string, input: CheckpointAnswerCommi
 }
 
 export function reconcileTaskResult(cwd: string, input: {
+  run_id?: string;
   dispatch_id?: string;
   tool_call_id?: string;
   slot_id?: string;
@@ -2877,5 +3352,5 @@ export function reconcileTaskResult(cwd: string, input: {
       evidence,
       completed_by: "synchronous_tool_result",
     });
-  });
+  }, { runId: input.run_id });
 }

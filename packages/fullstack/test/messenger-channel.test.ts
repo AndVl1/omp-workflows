@@ -15,7 +15,7 @@ function withChannel(root: string, adapter: "telegram" | "http" | null): void {
   );
 }
 
-function withActiveRun(root: string): void {
+function withActiveRun(root: string, ownerSession = "session-direct"): void {
   const runDir = join(root, ".work-state", "cto", "run-one");
   mkdirSync(runDir, { recursive: true });
   const now = new Date().toISOString();
@@ -27,6 +27,7 @@ function withActiveRun(root: string): void {
       task: "Some task",
       branch: "main",
       autonomous: true,
+      owner_session: ownerSession,
       plan: { id: "run-one", task: "Some task", teams: [], created_at: now },
       teams: [],
       integration: { status: "pending" },
@@ -48,28 +49,34 @@ test("messenger: channelMode reads .omp/escalation.json", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
-
-test("messenger: ask gate blocks only when telegram + active CTO run", () => {
+test("messenger: ask gate blocks only for an owned CTO run and session", () => {
   const root = mkdtempSync(join(tmpdir(), "ask-gate-"));
   try {
     const gate = createAskRedirectGate();
+    const ownedContext = { cwd: root, session_id: "session-direct" };
 
     // no channel -> ask passes
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "no channel -> pass");
+    assert.equal(gate({ toolName: "ask" }, ownedContext), undefined, "no channel -> pass");
 
     // telegram channel, no active run -> ask passes (normal interactive work)
     withChannel(root, "telegram");
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "telegram without run -> pass");
+    assert.equal(gate({ toolName: "ask" }, ownedContext), undefined, "telegram without run -> pass");
 
-    // telegram + active run -> ask blocked with the outbox contract
+    // telegram + owned active run -> ask blocked with the outbox contract
     withActiveRun(root);
-    const blocked = gate({ toolName: "ask" }, { cwd: root });
+    const blocked = gate({ toolName: "ask" }, ownedContext);
     assert.ok(blocked?.block === true, "ask blocked in messenger mode");
     assert.ok(blocked?.reason.includes("outbox"), "block reason names the outbox route");
     assert.ok(blocked?.reason.includes("answers/"), "block reason names the answers dir");
+    assert.ok(blocked?.reason.includes("run-one"), "block reason names the owned run");
+
+    // A foreign session must not route to the owned run.
+    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "foreign-session" }), undefined);
+    // Missing origin session is never allowed to use a global latest-run fallback.
+    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined);
 
     // other tools unaffected
-    assert.equal(gate({ toolName: "read" }, { cwd: root }), undefined, "non-ask tools pass");
+    assert.equal(gate({ toolName: "read" }, ownedContext), undefined, "non-ask tools pass");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -8,14 +8,13 @@
  * fail closed for strict-state writes.
  */
 import { isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
-import { resolveState } from "../engine/state.js";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 
 interface ToolCallEvent {
   toolName: string;
   input?: Record<string, unknown> | string;
 }
-interface ToolCallContext { cwd: string; hasUI?: boolean; actor?: Actor }
+interface ToolCallContext { cwd: string; run_id?: string; hasUI?: boolean; actor?: Actor }
 
 type Actor = "orchestrator" | "worker" | "lead";
 
@@ -23,7 +22,7 @@ export function orchestratorWriteGate(
   event: ToolCallEvent,
   ctx: ToolCallContext,
 ): { block?: boolean; reason?: string } | void {
-  if (!hasStrictOrchestratorState(ctx.cwd)) return;
+  if (!hasStrictOrchestratorState(ctx.cwd, ctx.run_id)) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
   // The host invokes mounted `xd://` devices through the generic write
   // transport. That transport is not a project filesystem mutation.
@@ -130,7 +129,16 @@ function isWorkStatePath(path: string, cwd: string): boolean {
 function isCanonicalStatePath(path: string, cwd: string): boolean {
   const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
   const canonical = (rel: string): boolean =>
-    rel === ".active-feature" || rel === "team-state.json" || /^features\/[^/]+\/state\.json$/.test(rel) || /^cto\/[^/]+\/state\.json$/.test(rel);
+    rel === ".active-feature"
+    || rel === "team-state.json"
+    || rel === "run-control.json"
+    || /^features\/[^/]+\/state\.json$/.test(rel)
+    || /^cto\/[^/]+\/state\.json$/.test(rel)
+    || /^runs\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(?:state\.json|team-state\.md|migration-receipt\.json)$/i.test(rel)
+    || /^runs\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/revisions(?:\/|$)/i.test(rel)
+    || /^lifecycle-transactions\/[^/]+(?:\/transaction\.json)?$/.test(rel)
+    || /^artifact-transactions\/[^/]+\.json$/.test(rel)
+    || /^migrations\/[^/]+\/receipt\.json$/.test(rel);
   const workState = resolve(cwd, ".work-state");
   if (canonical(relative(workState, absolute).split(sep).join("/"))) return true;
   try {
@@ -142,23 +150,27 @@ function isCanonicalStatePath(path: string, cwd: string): boolean {
     return false;
   }
 }
-
 function looksLikeWorkflowStateMutation(command: string): boolean {
-  const workflowPath =
-    /(?:^|[\s"'`/])(?:\.\/)?\.work-state\/(?:team-state\.json|\.active-feature|features\/[A-Za-z0-9._-]+\/state\.json|cto\/[A-Za-z0-9._-]+\/state\.json)(?=$|[\s"'`;&|),])|(?:^|[\s"'`])(?:\.\/)?(?:team-state\.json|\.active-feature)(?=$|[\s"'`;&|),])/i;
+  const workflowPath = new RegExp(
+    String.raw`(?:^|[\s"'\x60/])(?:\./)?\.work-state/(?:team-state\.json|\.active-feature|run-control\.json|features/[A-Za-z0-9._-]+/state\.json|cto/[A-Za-z0-9._-]+/state\.json|lifecycle-transactions/[^\s"'\x60;&|),]+|artifact-transactions/[^\s"'\x60;&|),]+|migrations/[^\s"'\x60;&|),]+|runs/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/(?:state\.json|team-state\.md|migration-receipt\.json|revisions(?:/[^\s"'\x60;&|),]+)?))(?=$|[\s"'\x60;&|),])|(?:^|[\s"'\x60])(?:\./)?(?:team-state\.json|\.active-feature|run-control\.json)(?=$|[\s"'\x60;&|),])`,
+    "i",
+  );
   if (!workflowPath.test(command) && !hasRelativeWorkflowStateContext(command)) return false;
   return /(?:>|>>|tee\b|(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|chmod|rsync|patch|ed|sponge)\b|(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["\'][^"\']*[wax+][^"\']*["\']|git\s+(?:apply|checkout|restore|reset|clean|mv|rm|show|stash)\b)/i.test(command);
 }
 
 function hasRelativeWorkflowStateContext(command: string): boolean {
   const cd = /(?:^|[;&|]\s*)cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi;
-  const rootRelative = /(?:^|[\s"'`])(?:\.\/)?(?:team-state\.json|\.active-feature|(?:features|cto)\/[A-Za-z0-9._-]+\/state\.json)(?=$|[\s"'`;&|),])/i;
-  const nestedRelative = /(?:^|[\s"'`])(?:\.\/)?state\.json(?=$|[\s"'`;&|),])/i;
+  const rootRelative = new RegExp(String.raw`(?:^|[\s"'\x60])(?:\./)?(?:team-state\.json|\.active-feature|(?:features|cto)/[A-Za-z0-9._-]+/state\.json)(?=$|[\s"'\x60;&|),])`, "i");
+  const nestedRelative = /(?:^|[\s"'\x60])(?:state\.json|team-state\.md|migration-receipt\.json)(?=$|[\s"'\x60;&|),])/i;
+  const ordinaryRun = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
+  const workStateRelative = /(?:^|[\s"'\x60])(?:run-control\.json|lifecycle-transactions\/[^\s"'\x60;&|),]+|artifact-transactions\/[^\s"'\x60;&|),]+)(?=$|[\s"'\x60;&|),])/i;
 
   for (const match of command.matchAll(cd)) {
     const directory = (match[1] ?? match[2] ?? match[3] ?? "").replace(/\/+$/, "");
     const afterCd = command.slice((match.index ?? 0) + match[0].length);
-    if (/(?:^|\/)\.work-state$/.test(directory) && rootRelative.test(afterCd)) return true;
+    if (/(?:^|\/)\.work-state$/.test(directory) && (rootRelative.test(afterCd) || workStateRelative.test(afterCd))) return true;
+    if (/(?:^|\/)\.work-state\/runs\/[^/]+$/.test(directory) && ordinaryRun.test(directory.split(/[\\/]/).pop() ?? "") && nestedRelative.test(afterCd)) return true;
     if (/(?:^|\/)\.work-state\/features\/[A-Za-z0-9._-]+$/.test(directory) && nestedRelative.test(afterCd)) return true;
     if (/(?:^|\/)\.work-state\/cto\/[A-Za-z0-9._-]+$/.test(directory) && nestedRelative.test(afterCd)) return true;
   }
@@ -216,10 +228,13 @@ function looksLikeSourceMutation(command: string): boolean {
     || SWITCH_FORCE_BRANCH_MUTATION.test(command);
 }
 
-export function hasStrictOrchestratorState(cwd: string): boolean {
-  const resolved = resolveState(cwd);
-  if (resolved.invalid) return true;
-  return resolved.state?.policy?.strict_orchestrator === true;
+export function hasStrictOrchestratorState(cwd: string, runId?: string): boolean {
+  if (!runId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) return false;
+  const path = join(resolve(cwd, ".work-state"), "runs", runId, "state.json");
+  try {
+    const state = JSON.parse(readFileSync(path, "utf8")) as { policy?: { strict_orchestrator?: boolean } };
+    return state.policy?.strict_orchestrator === true;
+  } catch { return false; }
 }
 
 // ── Bounded write_scope experiment (scope 7) ───────────────────────────────

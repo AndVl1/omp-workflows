@@ -35,9 +35,10 @@ import type { Profile, RoleConfig, StageDef, StageStatus, TeamState } from "../e
 import { assessRunHealth } from "../cto/health.js";
 import { loadTeamDefs } from "../cto/plan.js";
 import type { CtoState, RunHealth, TeamDef, TeamRunStatus } from "../cto/types.js";
-import { readObservabilityPointer } from "../observability/recorder.js";
+import { readCanonicalObservabilityPointer, readObservabilityPointer } from "../observability/recorder.js";
 import type { ObservabilityEvent, ObservabilityPointer } from "../observability/events.js";
 import { redactReportBody } from "./redact.js";
+import { resolveCanonicalRunSource, type CanonicalReportSelector } from "./canonical-source.js";
 import {
   resolveCtoSource,
   resolveDoWorkSource,
@@ -119,6 +120,27 @@ function guessKind(cwd: string, id?: string): SessionKind {
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
+
+/** Build the existing report projection from one canonical run/revision.
+ * This adapter reuses the existing stage/artifact/telemetry assembly; it never
+ * falls back to legacy feature or CTO discovery.
+ */
+export function buildCanonicalRunReport(
+  cwd: string,
+  selector: CanonicalReportSelector,
+  options: BuildSessionReportOptions = {},
+): SessionReport {
+  const source = resolveCanonicalRunSource(cwd, selector);
+  const canonicalPointer = source.read.state.observability ?? readCanonicalObservabilityPointer(cwd, source.run_id, source.revision_id ?? undefined);
+  return assembleDoWork(cwd, {
+    id: source.run_id,
+    state: canonicalPointer ? { ...source.read.state, observability: canonicalPointer } : source.read.state,
+    statePath: source.statePath,
+    stateDir: dirname(source.statePath),
+    artifactsDir: source.artifactsDir,
+    isLegacy: false,
+  }, options);
+}
 
 export function buildSessionReport(
   cwd: string,
@@ -874,12 +896,14 @@ function doWorkTelemetry(
   warnings: string[],
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
   const slug = r.isLegacy ? (deriveFeatureSlug(r.state.branch) ?? "default") : r.id;
-  const pointer = r.state.observability ?? readObservabilityPointer(cwd, slug);
+  const canonicalRun = !r.isLegacy && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(r.id);
+  const pointer = canonicalRun ? readCanonicalObservabilityPointer(cwd, r.id) : (r.state.observability ?? readObservabilityPointer(cwd, slug));
   if (!pointer) {
     warnings.push("no telemetry available for this session");
     return { telemetry: { rollup: null }, events: [] };
   }
-  return buildTelemetry(cwd, slug, pointer, warnings);
+  const runRoot = canonicalRun ? resolve(cwd, WORK_STATE_DIR, "runs", r.id) : undefined;
+  return buildTelemetry(cwd, slug, pointer, warnings, runRoot);
 }
 
 function ctoTelemetry(
@@ -905,8 +929,9 @@ function buildTelemetry(
   slug: string,
   pointer: ObservabilityPointer,
   warnings: string[],
+  canonicalRoot?: string,
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
-  const eventsPath = resolve(cwd, WORK_STATE_DIR, "features", slug, pointer.eventsPath);
+  const eventsPath = canonicalRoot ? resolve(canonicalRoot, pointer.eventsPath) : resolve(cwd, WORK_STATE_DIR, "features", slug, pointer.eventsPath);
   const events = readEventsBounded(eventsPath, warnings);
   const eventCounts: Record<string, number> = {};
   for (const e of events) eventCounts[e.kind] = (eventCounts[e.kind] ?? 0) + 1;
