@@ -178,6 +178,8 @@ export type IssuedCapability = {
 };
 
 export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff; child_join?: ChildJoin } | { ok: false; error: string; state?: TeamState; child_join?: ChildJoin };
+const MIGRATION_DISPATCH_REJECTION = "migration completion evidence is not a live dispatch";
+
 
 export interface CapabilityHandoff {
   capability_id: string;
@@ -550,6 +552,96 @@ function jsonObject(bytes: Buffer): Record<string, unknown> | null {
     return null;
   }
 }
+type TrustedMigrationRevision = {
+  revision: { root: string; runRoot: string; id: string };
+  slotsDoc: Record<string, unknown>;
+  legacyState: Record<string, unknown>;
+  manifest: Record<string, unknown>;
+  receipt: Record<string, unknown>;
+  receiptManifest: Record<string, unknown>[];
+  trustedSucceededSlots: Record<string, unknown>[];
+};
+
+function trustedMigrationRevision(state: TeamState, target: ResolvedState): TrustedMigrationRevision | null {
+  const revision = migrationRevisionRoot(target, state);
+  if (!revision) return null;
+  const slotsFile = trustedRevisionFile(revision.root, "succeeded-slots.json");
+  const legacyStateFile = trustedRevisionFile(revision.root, "state.json");
+  const manifestFile = trustedRevisionFile(revision.root, "manifest.json");
+  const receiptFile = trustedRevisionFile(revision.runRoot, "migration-receipt.json");
+  if (!slotsFile || !legacyStateFile || !manifestFile || !receiptFile) return null;
+  const slotsDoc = jsonObject(slotsFile.bytes);
+  const legacyState = jsonObject(legacyStateFile.bytes);
+  const manifest = jsonObject(manifestFile.bytes);
+  const receipt = jsonObject(receiptFile.bytes);
+  if (!slotsDoc || !legacyState || !manifest || !receipt || !Array.isArray(slotsDoc.slots) || !Array.isArray(manifest.files) || !Array.isArray(receipt.succeeded_slots)) return null;
+  const sourceId = typeof manifest.source_id === "string" ? manifest.source_id : "";
+  const sourceHash = typeof manifest.source_hash === "string" ? manifest.source_hash : "";
+  if (!sourceId || !sourceHash || slotsDoc.source_id !== sourceId || slotsDoc.source_hash !== sourceHash || receipt.source_id !== sourceId || receipt.source_hash !== sourceHash || receipt.migration_id !== revision.id || receipt.run_id !== (state.run_id ?? state.run_key) || receipt.status !== "published") return null;
+  const rawStateSha = createHash("sha256").update(legacyStateFile.bytes).digest("hex");
+  if (typeof manifest.state_sha256 !== "string" || typeof receipt.state_sha256 !== "string" || manifest.state_sha256 !== receipt.state_sha256 || rawStateSha !== receipt.state_sha256) return null;
+  const receiptManifest = Array.isArray(receipt.file_manifest)
+    ? receipt.file_manifest.filter((entry): entry is Record<string, unknown> => entry !== null && typeof entry === "object" && !Array.isArray(entry))
+    : [];
+  const trustedSucceededSlots = receipt.succeeded_slots.filter((candidate): candidate is Record<string, unknown> => candidate !== null && typeof candidate === "object" && !Array.isArray(candidate));
+  return { revision, slotsDoc, legacyState, manifest, receipt, receiptManifest, trustedSucceededSlots };
+}
+
+function sameStringMultiset(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const counts = new Map<string, number>();
+  for (const value of left) counts.set(value, (counts.get(value) ?? 0) + 1);
+  for (const value of right) {
+    const count = counts.get(value);
+    if (!count) return false;
+    if (count === 1) counts.delete(value);
+    else counts.set(value, count - 1);
+  }
+  return counts.size === 0;
+}
+function explicitStringMatches(value: Record<string, unknown>, key: string, expected: string): boolean {
+  return !Object.prototype.hasOwnProperty.call(value, key) || (typeof value[key] === "string" && value[key] === expected);
+}
+function migrationSourceStage(dispatch: Record<string, unknown>, fallbackStage: unknown): string {
+  const identity = dispatch.work_identity && typeof dispatch.work_identity === "object" && !Array.isArray(dispatch.work_identity)
+    ? dispatch.work_identity as Record<string, unknown>
+    : null;
+  return typeof identity?.stage_id === "string"
+    ? identity.stage_id
+    : typeof fallbackStage === "string" ? fallbackStage : "";
+}
+
+function expectedMigrationSlots(
+  stageId: string,
+  proof: TrustedMigrationRevision,
+): Array<Record<string, unknown>> | null {
+  const capability = proof.legacyState.dispatch_capability;
+  const dispatches = capability && typeof capability === "object" && !Array.isArray(capability) && Array.isArray((capability as Record<string, unknown>).dispatches)
+    ? (capability as Record<string, unknown>).dispatches as unknown[]
+    : null;
+  if (!dispatches) return null;
+  const succeeded = dispatches.filter((candidate): candidate is Record<string, unknown> => {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    return (candidate as Record<string, unknown>).status === "succeeded";
+  });
+  const legacyIds = succeeded.map((candidate) => typeof candidate.id === "string" ? candidate.id : "");
+  const trustedIds = proof.trustedSucceededSlots.map((candidate) => typeof candidate.dispatch_id === "string" ? candidate.dispatch_id : "");
+  const slotValues = Array.isArray(proof.slotsDoc.slots) ? proof.slotsDoc.slots as unknown[] : [];
+  const recordedSlots = slotValues.filter((candidate): candidate is Record<string, unknown> => candidate !== null && typeof candidate === "object" && !Array.isArray(candidate));
+  const recordedIds = recordedSlots.map((candidate) => typeof candidate.dispatch_id === "string" ? candidate.dispatch_id : "");
+  if (legacyIds.some((id) => !id) || trustedIds.some((id) => !id) || recordedIds.some((id) => !id) || !sameStringMultiset(legacyIds, trustedIds) || !sameStringMultiset(trustedIds, recordedIds)) return null;
+  const legacyById = new Map(succeeded.map((candidate) => [candidate.id as string, candidate]));
+  const expected: Array<Record<string, unknown>> = [];
+  for (const trusted of proof.trustedSucceededSlots) {
+    const dispatchId = typeof trusted.dispatch_id === "string" ? trusted.dispatch_id : "";
+    const legacy = legacyById.get(dispatchId);
+    if (!legacy) return null;
+    const legacyStage = migrationSourceStage(legacy, proof.legacyState.stage_cursor);
+    if (legacyStage === stageId) expected.push(trusted);
+  }
+  return expected;
+}
+
 
 function migrationRevisionRoot(target: ResolvedState, state: TeamState): { root: string; runRoot: string; id: string } | null {
   const stateDir = target.stateDir;
@@ -593,42 +685,40 @@ function findLegacyArtifactPath(rawState: Record<string, unknown>, artifactId: s
 }
 
 function verifyMigrationEvidence(state: TeamState, target: ResolvedState, stageId: string, slot: VerifiedMigrationSlot): MigrationEvidence | null {
-  const revision = migrationRevisionRoot(target, state);
-  if (!revision) return null;
-  const slotsFile = trustedRevisionFile(revision.root, "succeeded-slots.json");
-  const legacyStateFile = trustedRevisionFile(revision.root, "state.json");
-  const manifestFile = trustedRevisionFile(revision.root, "manifest.json");
-  const receiptFile = trustedRevisionFile(revision.runRoot, "migration-receipt.json");
-  if (!slotsFile || !legacyStateFile || !manifestFile || !receiptFile) return null;
-  const slotsDoc = jsonObject(slotsFile.bytes);
-  const legacyState = jsonObject(legacyStateFile.bytes);
-  const manifest = jsonObject(manifestFile.bytes);
-  const receipt = jsonObject(receiptFile.bytes);
-  if (!slotsDoc || !legacyState || !manifest || !receipt || !Array.isArray(slotsDoc.slots) || !Array.isArray(manifest.files)) return null;
-  const sourceId = typeof manifest.source_id === "string" ? manifest.source_id : "";
-  const sourceHash = typeof manifest.source_hash === "string" ? manifest.source_hash : "";
-  if (!sourceId || !sourceHash || slotsDoc.source_id !== sourceId || slotsDoc.source_hash !== sourceHash || receipt.source_id !== sourceId || receipt.source_hash !== sourceHash || receipt.migration_id !== revision.id || receipt.run_id !== (state.run_id ?? state.run_key) || receipt.status !== "published") return null;
-  const rawStateSha = createHash("sha256").update(legacyStateFile.bytes).digest("hex");
-  if (typeof manifest.state_sha256 !== "string" || typeof receipt.state_sha256 !== "string" || manifest.state_sha256 !== receipt.state_sha256 || rawStateSha !== receipt.state_sha256) return null;
-  const receiptManifest = Array.isArray(receipt.file_manifest)
-    ? receipt.file_manifest.filter((entry): entry is Record<string, unknown> => entry !== null && typeof entry === "object" && !Array.isArray(entry))
-    : [];
-  const trustedSucceededSlots = Array.isArray(receipt.succeeded_slots)
-    ? receipt.succeeded_slots.filter((candidate): candidate is Record<string, unknown> => candidate !== null && typeof candidate === "object" && !Array.isArray(candidate))
-    : [];
-  if (trustedSucceededSlots.length === 0) return null;
+  const proof = trustedMigrationRevision(state, target);
+  if (!proof) return null;
+  const { revision, slotsDoc, legacyState, manifest, receipt, receiptManifest, trustedSucceededSlots } = proof;
   const trustedMatches = trustedSucceededSlots.filter((candidate) => candidate.dispatch_id === slot.dispatch_id);
   if (trustedMatches.length !== 1) return null;
   const trusted = trustedMatches[0]!;
   if (trusted.role !== slot.role || trusted.agent !== slot.agent) return null;
-  const trustedArtifactIds = Array.isArray(trusted.artifact_ids) ? trusted.artifact_ids.filter((id): id is string => typeof id === "string") : [];
+  const trustedArtifactValues = Array.isArray(trusted.artifact_ids) ? trusted.artifact_ids as unknown[] : [];
+  const trustedArtifactIds = trustedArtifactValues.filter((id: unknown): id is string => typeof id === "string");
   if (JSON.stringify(trustedArtifactIds) !== JSON.stringify(slot.artifact_ids)) return null;
-  const roleSlots = trustedSucceededSlots.filter((candidate) => candidate.role === trusted.role);
+  const capability = legacyState.dispatch_capability;
+  if (capability === undefined) return null;
+  const dispatches = capability && typeof capability === "object" && !Array.isArray(capability) && Array.isArray((capability as Record<string, unknown>).dispatches)
+    ? (capability as Record<string, unknown>).dispatches as unknown[]
+    : [];
+  const legacyById = new Map<string, Record<string, unknown>>();
+  for (const candidate of dispatches) {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const record = candidate as Record<string, unknown>;
+    if (typeof record.id === "string") legacyById.set(record.id, record);
+  }
+  const roleSlots = trustedSucceededSlots.filter((candidate) => {
+    if (candidate.role !== trusted.role || typeof candidate.dispatch_id !== "string") return false;
+    const legacy = legacyById.get(candidate.dispatch_id);
+    return legacy !== undefined && migrationSourceStage(legacy, legacyState.stage_cursor) === stageId;
+  });
   const occurrence = roleSlots.findIndex((candidate) => candidate.dispatch_id === slot.dispatch_id) + 1;
   if (occurrence < 1) return null;
   const trustedRawSlotId = typeof trusted.slot_id === "string" ? trusted.slot_id : undefined;
-  if (legacyState.dispatch_capability === undefined) return null;
-  const slotMatches = slotsDoc.slots.filter((candidate): candidate is Record<string, unknown> => candidate !== null && typeof candidate === "object" && !Array.isArray(candidate) && candidate.dispatch_id === slot.dispatch_id);
+  const slotValues = Array.isArray(slotsDoc.slots) ? slotsDoc.slots as unknown[] : [];
+  const slotMatches = slotValues.filter((candidate): candidate is Record<string, unknown> => {
+    if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    return (candidate as Record<string, unknown>).dispatch_id === slot.dispatch_id;
+  });
   if (slotMatches.length !== 1) return null;
   const recorded = slotMatches[0]!;
   const recordedRole = typeof recorded.role === "string" ? recorded.role : "";
@@ -639,12 +729,10 @@ function verifyMigrationEvidence(state: TeamState, target: ResolvedState, stageI
   // Any explicit proof slot id remains authoritative and must match exactly.
   const recordedSlot = typeof recorded.slot_id === "string" ? recorded.slot_id : expectedSlotId;
   if (recordedRole !== slot.role || recordedSlot !== slotId || recorded.agent !== slot.agent || slotId !== expectedSlotId) return null;
-  const recordedArtifacts = Array.isArray(recorded.artifact_ids) ? recorded.artifact_ids.filter((id): id is string => typeof id === "string") : [];
+  const recordedArtifactValues = Array.isArray(recorded.artifact_ids) ? recorded.artifact_ids as unknown[] : [];
+  const recordedArtifacts = recordedArtifactValues.filter((id: unknown): id is string => typeof id === "string");
+
   if (JSON.stringify(recordedArtifacts) !== JSON.stringify(slot.artifact_ids)) return null;
-  const capability = legacyState.dispatch_capability;
-  const dispatches = capability && typeof capability === "object" && !Array.isArray(capability) && Array.isArray((capability as Record<string, unknown>).dispatches)
-    ? (capability as Record<string, unknown>).dispatches as unknown[]
-    : [];
   const legacyDispatches = dispatches.filter((candidate): candidate is Record<string, unknown> => {
     if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return false;
     return (candidate as Record<string, unknown>).id === slot.dispatch_id;
@@ -655,15 +743,38 @@ function verifyMigrationEvidence(state: TeamState, target: ResolvedState, stageI
   const legacyIdentity = legacyDispatch.work_identity && typeof legacyDispatch.work_identity === "object" && !Array.isArray(legacyDispatch.work_identity)
     ? legacyDispatch.work_identity as Record<string, unknown>
     : null;
-  if (legacyIdentity && typeof legacyIdentity.slot_id === "string" && legacyIdentity.slot_id !== slotId) return null;
-  if (legacyIdentity && typeof legacyIdentity.stage_id === "string" && legacyIdentity.stage_id !== stageId) return null;
-  if ((!legacyIdentity || typeof legacyIdentity.stage_id !== "string") && typeof legacyState.stage_cursor === "string" && legacyState.stage_cursor !== stageId) return null;
+  if (legacyIdentity && (
+    !explicitStringMatches(legacyIdentity, "dispatch_id", slot.dispatch_id)
+    || !explicitStringMatches(legacyIdentity, "stage_id", stageId)
+    || !explicitStringMatches(legacyIdentity, "stage_cursor", stageId)
+    || !explicitStringMatches(legacyIdentity, "slot_id", slotId)
+  )) return null;
+  if ((!legacyIdentity || (!Object.prototype.hasOwnProperty.call(legacyIdentity, "stage_id") && !Object.prototype.hasOwnProperty.call(legacyIdentity, "stage_cursor"))) && typeof legacyState.stage_cursor === "string" && legacyState.stage_cursor !== stageId) return null;
   const legacyCompletion = legacyDispatch.completion && typeof legacyDispatch.completion === "object" && !Array.isArray(legacyDispatch.completion)
     ? legacyDispatch.completion as Record<string, unknown>
     : null;
   if (!legacyCompletion || legacyCompletion.outcome !== "succeeded") return null;
+  if (
+    !explicitStringMatches(legacyCompletion, "dispatch_id", slot.dispatch_id)
+    || !explicitStringMatches(legacyCompletion, "stage_id", stageId)
+    || !explicitStringMatches(legacyCompletion, "stage_cursor", stageId)
+    || !explicitStringMatches(legacyCompletion, "slot_id", slotId)
+  ) return null;
   if (Array.isArray(legacyCompletion.artifact_ids) && JSON.stringify(legacyCompletion.artifact_ids) !== JSON.stringify(slot.artifact_ids)) return null;
-  const manifestEntries = manifest.files.filter((entry): entry is Record<string, unknown> => entry !== null && typeof entry === "object" && !Array.isArray(entry));
+  const completionIdentity = legacyCompletion.work_identity === undefined
+    ? null
+    : legacyCompletion.work_identity && typeof legacyCompletion.work_identity === "object" && !Array.isArray(legacyCompletion.work_identity)
+      ? legacyCompletion.work_identity as Record<string, unknown>
+      : null;
+  if (legacyCompletion.work_identity !== undefined && !completionIdentity) return null;
+  if (completionIdentity && (
+    !explicitStringMatches(completionIdentity, "dispatch_id", slot.dispatch_id)
+    || !explicitStringMatches(completionIdentity, "stage_id", stageId)
+    || !explicitStringMatches(completionIdentity, "stage_cursor", stageId)
+    || !explicitStringMatches(completionIdentity, "slot_id", slotId)
+  )) return null;
+  const manifestValues = Array.isArray(manifest.files) ? manifest.files as unknown[] : [];
+  const manifestEntries = manifestValues.filter((entry): entry is Record<string, unknown> => entry !== null && typeof entry === "object" && !Array.isArray(entry));
   const artifactRefs: MigrationCompletionArtifactRef[] = [];
   for (const artifactId of slot.artifact_ids) {
     const mapping = findLegacyArtifactPath(legacyState, artifactId);
@@ -737,11 +848,22 @@ export function materializeMigratedDispatches(
 ): MigrationMaterializationResult {
   const issued = capability.issued_for;
   const migrationId = state.migration?.id;
-  const migratedSlots = state.migration_succeeded_slots?.[stageId] ?? [];
-  if (migratedSlots.length === 0) return { ok: true, records: [] };
-  if (!issued || !capability.capability_id || !target || !migrationId || !isSafeStateSegment(migrationId)) {
+  const canonicalSlots = state.migration_succeeded_slots?.[stageId];
+  if (!migrationId) {
+    if (canonicalSlots !== undefined && canonicalSlots.length > 0) return { ok: false, error: `recovery_required: migration evidence for stage '${stageId}' has no trusted revision binding` };
+    return { ok: true, records: [] };
+  }
+  if (!issued || !capability.capability_id || !target || !isSafeStateSegment(migrationId)) {
     return { ok: false, error: `recovery_required: migration evidence for stage '${stageId}' has no trusted revision binding` };
   }
+  const proof = trustedMigrationRevision(state, target);
+  const expected = proof ? expectedMigrationSlots(stageId, proof) : null;
+  const actualIds = canonicalSlots === undefined ? [] : Array.isArray(canonicalSlots) ? canonicalSlots.map((slot) => typeof slot?.dispatch_id === "string" ? slot.dispatch_id : "") : [""];
+  const expectedIds = expected?.map((slot) => typeof slot.dispatch_id === "string" ? slot.dispatch_id : "") ?? [];
+  if (!expected || actualIds.some((id) => !id) || !sameStringMultiset(actualIds, expectedIds)) {
+    return { ok: false, error: `recovery_required: canonical migration evidence for stage '${stageId}' is missing or inconsistent` };
+  }
+  const migratedSlots = canonicalSlots ?? [];
   const records: MigrationDispatchRecord[] = [];
   for (const slot of migratedSlots) {
     const slotId = slot.slot_id ?? slot.role;
@@ -1333,7 +1455,8 @@ function authorizeRecord(
   if (input.task_id !== undefined && input.task_id !== taskId) return rejectTransition("task identity mismatch", state);
   const recordsForRole = cap.dispatches.filter((record) => record.role === role);
   const latest = recordsForRole[recordsForRole.length - 1];
-  if (latest && isMigrationDispatchRecordValue(latest)) return rejectTransition("migration completion evidence is not a live dispatch", state);
+  if (latest && isMigrationDispatchRecordValue(latest)) return rejectTransition(MIGRATION_DISPATCH_REJECTION, state);
+
   if (latest && latest.status !== "failed" && latest.status !== "cancelled") {
     const sameTool = Boolean(input.tool_call_id && latest.tool_call_id === input.tool_call_id);
     const sameTask = Boolean(input.task_id && latest.work_identity?.task_id === input.task_id);
@@ -1494,7 +1617,8 @@ function pendingRecord(
   reason: PendingState["pending_reason"] = "provider_running",
   providerRef?: string,
 ): RecordCore {
-  if (isMigrationDispatchRecordValue(record)) return rejectTransition("migration completion evidence is not a live dispatch", state);
+  if (isMigrationDispatchRecordValue(record)) return rejectTransition(MIGRATION_DISPATCH_REJECTION, state);
+
   if (record.status === "succeeded" || record.status === "failed" || record.status === "cancelled") return rejectTransition("terminal dispatch cannot become pending", state);
   const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
   const previous = record.pending;
@@ -1532,8 +1656,10 @@ export function persistPendingDispatch(
   input: DispatchAuth & { dispatch_id: string; pending_reason?: PendingState["pending_reason"]; provider_ref?: string },
   options?: { runId?: string },
 ): TransitionResult {
+  if (hasMigrationProvenance(input)) return { ok: false, error: MIGRATION_DISPATCH_REJECTION };
   const runId = options?.runId ?? input.run_id;
   if (!runId) return { ok: false, error: "canonical run_id is required for pending dispatch persistence" };
+
   return runTransition(cwd, (state) => {
     const cap = activeCapability(state.dispatch_capability);
     if (!cap) return rejectTransition("dispatch capability unavailable", state);
@@ -1551,16 +1677,48 @@ export function persistPendingDispatch(
 /** Alias retained for adapters that name the transition as a lifecycle update. */
 export const markDispatchPending = persistPendingDispatch;
 
-function hasMigrationProvenance(value: unknown, seen = new Set<unknown>()): boolean {
-  if (!value || typeof value !== "object" || seen.has(value)) return false;
+const MIGRATION_PROVENANCE_AUTHORITY_KEYS: Record<string, true> = {
+  authority: true, authorities: true, authority_carrier: true, authority_fields: true,
+  captured: true, captured_context: true, captured_dispatch: true, captured_fields: true, fields: true,
+  identity: true, identities: true, work_identity: true, completion: true, completion_envelope: true,
+  parent: true, child: true, child_join: true, child_joins: true, pending: true,
+  dispatch_record: true, record: true, dispatches: true, result: true, results: true, rows: true, details: true,
+  provenance: true, actor_provenance: true, migration: true,
+};
+const MIGRATION_PROVENANCE_IGNORED_KEYS: Record<string, true> = {
+  output: true, stdout: true, stderr: true, error: true, content: true, text: true, message: true,
+  evidence: true, evidence_ref: true, artifact: true, artifacts: true, artifact_payload: true,
+  artifact_content: true, artifact_value: true, artifact_ids: true, artifact_refs: true,
+};
+const MIGRATION_PROVENANCE_MAX_DEPTH = 32;
+const MIGRATION_PROVENANCE_MAX_NODES = 512;
+const MIGRATION_PROVENANCE_MAX_ARRAY_LENGTH = 512;
+
+function hasMigrationProvenance(
+  value: unknown,
+  seen = new Set<unknown>(),
+  depth = 0,
+  budget = { remaining: MIGRATION_PROVENANCE_MAX_NODES },
+  authorityCarrier = false,
+): boolean {
+  if (!value || typeof value !== "object") return false;
+  if (depth > MIGRATION_PROVENANCE_MAX_DEPTH || budget.remaining <= 0) return true;
+  if (seen.has(value)) return false;
   seen.add(value);
+  budget.remaining -= 1;
+  if (Array.isArray(value)) {
+    if (value.length > MIGRATION_PROVENANCE_MAX_ARRAY_LENGTH) return true;
+    return value.some((entry) => hasMigrationProvenance(entry, seen, depth + 1, budget, true));
+  }
   const candidate = value as Record<string, unknown>;
   if (candidate.source === "migration" || candidate.completed_by === "migration" || candidate.terminal_signal === "migration_verified") return true;
-  for (const key of ["identity", "work_identity", "parent", "child", "completion_envelope"]) {
-    if (hasMigrationProvenance(candidate[key], seen)) return true;
+  for (const key in MIGRATION_PROVENANCE_AUTHORITY_KEYS) {
+    if (MIGRATION_PROVENANCE_IGNORED_KEYS[key] || !Object.prototype.hasOwnProperty.call(candidate, key)) continue;
+    if (hasMigrationProvenance(candidate[key], seen, depth + 1, budget, true)) return true;
   }
   return false;
 }
+
 
 function registerProducedArtifactBindings(
   state: TeamState,
@@ -1597,7 +1755,8 @@ function completeRecord(
   record: DispatchRecord,
   input: CompletionInput,
 ): RecordCore {
-  if (isMigrationDispatchRecordValue(record)) return rejectTransition("migration completion evidence is not a live dispatch", state);
+  if (isMigrationDispatchRecordValue(record)) return rejectTransition(MIGRATION_DISPATCH_REJECTION, state);
+
   if (cap.status === "invalidated" || cap.status === "complete") return rejectTransition("capability invalidated", state);
   if (!input.evidence.trim()) return rejectTransition("completion evidence required", state);
   const artifact_ids = input.artifact_ids ?? [];
@@ -1794,7 +1953,8 @@ export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_i
     if (input.task_id !== undefined && input.task_id !== record.work_identity?.task_id) return rejectTransition("dispatch task mismatch", state);
     if (input.agent !== undefined && input.agent !== record.agent) return rejectTransition("dispatch agent mismatch", state);
     if (input.tool_call_id !== undefined && record.tool_call_id !== undefined && input.tool_call_id !== record.tool_call_id) return rejectTransition("dispatch tool-call mismatch", state);
-    if (hasMigrationProvenance(input)) return rejectTransition("migration completion evidence is not a live dispatch", state);
+    if (hasMigrationProvenance(input)) return rejectTransition(MIGRATION_DISPATCH_REJECTION, state);
+
     if (input.pending === true) return pendingRecord(state, cap, record, input.pending_reason, input.provider_ref);
     if (!input.outcome || !input.evidence) return rejectTransition("terminal completion outcome and evidence are required", state);
     return completeRecord(state, target, cap, record, input as CompletionInput);
@@ -1821,7 +1981,8 @@ export function reconcileTrustedTaskResult(cwd: string, input: {
   terminal_signal?: CompletionEnvelope["terminal_signal"];
   run_id?: string;
 }): TransitionResult {
-  if (hasMigrationProvenance(input)) return { ok: false, error: "migration completion evidence is not a live dispatch" };
+  if (hasMigrationProvenance(input)) return { ok: false, error: MIGRATION_DISPATCH_REJECTION };
+
   if (!input.tool_call_id && !input.dispatch_id && !input.work_identity && !input.captured) return { ok: false, error: "dispatch identity required" };
   // Candidate resolution AND the pending/terminal mutation run in ONE
   // transaction: the join below is computed from the freshly persisted
@@ -3310,6 +3471,7 @@ export function reconcileTaskResult(cwd: string, input: {
   isError?: boolean;
   details?: { async?: { state?: string; provider_ref?: string } };
 }): TransitionResult {
+  if (hasMigrationProvenance(input)) return { ok: false, error: MIGRATION_DISPATCH_REJECTION };
   if (!input.dispatch_id && !input.tool_call_id) return { ok: false, error: "dispatch identity required" };
   if (!input.token) return { ok: false, error: "dispatch token required" };
   // Candidate resolution, authentication and the pending/terminal mutation

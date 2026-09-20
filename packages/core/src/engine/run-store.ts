@@ -626,7 +626,8 @@ export function reworkCanonicalRunAtomically(
     }
     const revisionId = `${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomUUID()}`;
     const revisionRoot = join(source, "revisions", revisionId);
-    const files = collectSnapshotFiles(source);
+    const stateContent: LifecycleFileContent = stateRaw;
+    const files = collectSnapshotFiles(source, { "state.json": stateContent });
     const after: Record<string, LifecycleFileContent> = { [statePath]: `${JSON.stringify(nextState, null, 2)}\n` };
     const artifactSha256: Record<string, string> = {};
     for (const [relativePath, content] of Object.entries(files)) {
@@ -634,7 +635,7 @@ export function reworkCanonicalRunAtomically(
       after[join(revisionRoot, relativePath)] = content;
       if (relativePath.startsWith("artifacts/")) artifactSha256[relativePath.slice("artifacts/".length)] = createHash("sha256").update(lifecycleContentBytes(content)).digest("hex");
     }
-    after[join(revisionRoot, "manifest.json")] = `${JSON.stringify({ schema: 2, revision_id: revisionId, run_id: runId, label: "rework", source_state: join(revisionRoot, "state.json"), created_at: new Date().toISOString(), state_sha256: createHash("sha256").update(stateRaw, "utf8").digest("hex"), artifact_sha256: artifactSha256 }, null, 2)}\n`;
+    after[join(revisionRoot, "manifest.json")] = `${JSON.stringify({ schema: 2, revision_id: revisionId, run_id: runId, label: "rework", source_state: join(revisionRoot, "state.json"), created_at: new Date().toISOString(), state_sha256: createHash("sha256").update(lifecycleContentBytes(stateContent)).digest("hex"), artifact_sha256: artifactSha256 }, null, 2)}\n`;
     const controlPathValue = controlPath(cwd);
     const controlBefore = controlContent(cwd);
     const nextSelections = options.context
@@ -734,7 +735,7 @@ function lifecycleContentBytes(content: LifecycleFileContent): Buffer {
   return typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content.data, "base64");
 }
 
-function collectSnapshotFiles(root: string): Record<string, LifecycleFileContent> {
+function collectSnapshotFiles(root: string, overrides: Record<string, LifecycleFileContent> = {}): Record<string, LifecycleFileContent> {
   const files: Record<string, LifecycleFileContent> = {};
   const visit = (directory: string, prefix: string): void => {
     if (!existsSync(directory)) return;
@@ -743,6 +744,11 @@ function collectSnapshotFiles(root: string): Record<string, LifecycleFileContent
       const key = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (entry.isDirectory()) visit(path, key);
       else if (entry.isFile()) {
+        const override = overrides[key];
+        if (override !== undefined) {
+          files[key] = override;
+          continue;
+        }
         const bytes = readFileSync(path);
         try { files[key] = { encoding: "base64", data: bytes.toString("base64") }; }
         catch { throw new LifecycleError("run_state_invalid", `snapshot source cannot encode file '${path}'`); }

@@ -22,11 +22,13 @@ import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
 import { createCapability, advanceCursor, type IssuedCapability } from "../src/engine/durable.js";
 import { writeStateBootstrap } from "../src/engine/state.js";
+import { runTarget } from "../src/engine/run-store.js";
 import { validateProductPrdDocument } from "../src/engine/product-prd.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 
 const FLAGS: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
+const RUN_ID = "88888888-8888-4888-8888-888888888888";
 
 /** Schema-valid fixtures for all five product-discovery source artifacts. */
 function fiveSources(): Record<string, unknown> {
@@ -96,13 +98,16 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
   // Non-dispatch stage: kind "none" with an empty roster — mirrors the
   // engine's own arming for `document` stages (and orchestrator/bash/none).
   const issued = createCapability({
-    run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
+    run_key: RUN_ID, branch, workflow: profile.name, profile_hash: persistedHash,
     stage_cursor: currentStageId, kind: "none", expected_roster: [],
   });
+  const runDir = join(root, ".work-state", "runs", RUN_ID);
+  mkdirSync(runDir, { recursive: true });
   writeStateBootstrap(root, {
-    schema: 1,
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
     branch,
-    run_key: branch,
     classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: profile.name },
     task: "Render the deterministic product PRD document",
     workflow_override: false,
@@ -117,8 +122,8 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
-  }, { featureSlug: "product-prd" });
-  const featureDir = join(root, ".work-state", "features", "product-prd");
+  }, { target: runTarget(root, RUN_ID) });
+  const featureDir = runDir;
   const artifactsDir = join(featureDir, "artifacts");
   mkdirSync(artifactsDir, { recursive: true });
   for (const [id, value] of Object.entries(preArtifacts)) {
@@ -128,7 +133,7 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
 }
 
 function readState(root: string): TeamState {
-  return JSON.parse(readFileSync(join(root, ".work-state", "features", "product-prd", "state.json"), "utf8")) as TeamState;
+  return JSON.parse(readFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), "utf8")) as TeamState;
 }
 
 function advanceAuth(issued: IssuedCapability) {
@@ -148,7 +153,7 @@ function advanceAuth(issued: IssuedCapability) {
 test("durable document advance: the engine renders doc + product_prd before the transition commits", () => {
   const { issued, root, featureDir, artifactsDir } = setupDocumentStage(fiveSources());
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "deterministic document render" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "deterministic document render" }, { runId: RUN_ID });
     assert.equal(advanced.ok, true, "advance succeeds for a fully-sourced document stage");
     if (!advanced.ok) return;
 
@@ -173,7 +178,7 @@ test("durable document advance: a missing source fails closed — nothing render
   delete sources.product_evidence;
   const { issued, root, featureDir, artifactsDir } = setupDocumentStage(sources);
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "attempted document render" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "attempted document render" }, { runId: RUN_ID });
     assert.equal(advanced.ok, false, "a missing source must block the advance");
     if (!advanced.ok) assert.match(advanced.error, /product_evidence/);
 

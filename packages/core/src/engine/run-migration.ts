@@ -415,6 +415,21 @@ function legacyDispatchLedgerIssue(state: Record<string, unknown>): string | nul
   const capabilityStatuses = new Set(["ready", "dispatched", "joining", "complete", "invalidated"]);
   if (typeof value.status !== "string" || !capabilityStatuses.has(value.status)) return "legacy dispatch capability has an unknown status";
   if (!Array.isArray(value.dispatches)) return "legacy dispatch capability.dispatches is missing or not an array";
+  const succeededSlotCounts = new Map<string, number>();
+  for (const candidate of value.dispatches) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const row = candidate as Record<string, unknown>;
+    if (row.status !== "succeeded") continue;
+    const rowIdentity = row.work_identity && typeof row.work_identity === "object" && !Array.isArray(row.work_identity) ? row.work_identity as Record<string, unknown> : undefined;
+    const stage = typeof rowIdentity?.stage_id === "string"
+      ? rowIdentity.stage_id
+      : typeof state.stage_cursor === "string" ? state.stage_cursor : "";
+    const role = typeof row.role === "string" ? row.role : "";
+    const key = `${stage}\0${role}`;
+    succeededSlotCounts.set(key, (succeededSlotCounts.get(key) ?? 0) + 1);
+  }
+  const succeededSlotIds = new Set<string>();
+  const succeededSlotOccurrences = new Map<string, number>();
   for (const key of ["dispatches", "pending"]) {
     const entries = value[key];
     if (entries === undefined) continue;
@@ -424,7 +439,73 @@ function legacyDispatchLedgerIssue(state: Record<string, unknown>): string | nul
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) return "legacy dispatch capability." + key + "[" + index + "] is malformed";
       const status = (entry as Record<string, unknown>).status;
       if (typeof status !== "string" || !LEGACY_DISPATCH_STATUSES.has(status)) return "legacy dispatch capability." + key + "[" + index + "] has an unknown status";
-      if (key === "dispatches" && status === "succeeded" && typeof (entry as Record<string, unknown>).id !== "string") return "legacy dispatch capability.dispatches[" + index + "] has no dispatch id";
+      if (key === "dispatches" && status === "succeeded") {
+        const record = entry as Record<string, unknown>;
+        const dispatchId = record.id;
+        if (typeof dispatchId !== "string") return "legacy dispatch capability.dispatches[" + index + "] has no dispatch id";
+        const completionValue = record.completion;
+        if (!completionValue || typeof completionValue !== "object" || Array.isArray(completionValue)) {
+          return "legacy dispatch capability.dispatches[" + index + "] has no valid completion";
+        }
+        const completion = completionValue as Record<string, unknown>;
+        if (completion.outcome !== "succeeded") return "legacy dispatch capability.dispatches[" + index + "] completion outcome is not succeeded";
+        if (completion.dispatch_id !== undefined && completion.dispatch_id !== dispatchId) {
+          return "legacy dispatch capability.dispatches[" + index + "] completion dispatch id does not match record id";
+        }
+        const recordIdentityValue = record.work_identity;
+        let recordIdentity: Record<string, unknown> | undefined;
+        if (recordIdentityValue !== undefined) {
+          if (!recordIdentityValue || typeof recordIdentityValue !== "object" || Array.isArray(recordIdentityValue)) {
+            return "legacy dispatch capability.dispatches[" + index + "] work identity is malformed";
+          }
+          recordIdentity = recordIdentityValue as Record<string, unknown>;
+          if (recordIdentity.dispatch_id !== undefined && recordIdentity.dispatch_id !== dispatchId) {
+            return "legacy dispatch capability.dispatches[" + index + "] work identity dispatch id does not match record id";
+          }
+          if (recordIdentity.stage_id !== undefined && typeof recordIdentity.stage_id !== "string") {
+            return "legacy dispatch capability.dispatches[" + index + "] work identity stage is malformed";
+          }
+          if (recordIdentity.slot_id !== undefined && typeof recordIdentity.slot_id !== "string") {
+            return "legacy dispatch capability.dispatches[" + index + "] work identity slot is malformed";
+          }
+        }
+        const explicitStage = typeof recordIdentity?.stage_id === "string"
+          ? recordIdentity.stage_id
+          : typeof state.stage_cursor === "string" ? state.stage_cursor : "";
+        const expectedStage = explicitStage;
+        if (recordIdentity?.stage_cursor !== undefined && (typeof recordIdentity.stage_cursor !== "string" || recordIdentity.stage_cursor !== expectedStage)) {
+          return "legacy dispatch capability.dispatches[" + index + "] work identity stage cursor does not match source stage";
+        }
+        const role = typeof record.role === "string" ? record.role : "";
+        const roleKey = `${expectedStage}\0${role}`;
+        const occurrence = (succeededSlotOccurrences.get(roleKey) ?? 0) + 1;
+        succeededSlotOccurrences.set(roleKey, occurrence);
+        const explicitSlot = typeof recordIdentity?.slot_id === "string" ? recordIdentity.slot_id : undefined;
+        const projectedSlot = explicitSlot ?? ((succeededSlotCounts.get(roleKey) ?? 0) > 1 ? role + "#" + occurrence : role);
+        const slotKey = `${expectedStage}\0${projectedSlot}`;
+        if (succeededSlotIds.has(slotKey)) return "legacy dispatch capability.dispatches[" + index + "] reuses a succeeded migration slot id";
+        succeededSlotIds.add(slotKey);
+        const completionIdentityValue = completion.work_identity;
+        if (completionIdentityValue !== undefined) {
+          if (!completionIdentityValue || typeof completionIdentityValue !== "object" || Array.isArray(completionIdentityValue)) {
+            return "legacy dispatch capability.dispatches[" + index + "] completion work identity is malformed";
+          }
+          const completionIdentity = completionIdentityValue as Record<string, unknown>;
+          if (completionIdentity.dispatch_id !== undefined && completionIdentity.dispatch_id !== dispatchId) {
+            return "legacy dispatch capability.dispatches[" + index + "] completion work identity dispatch id does not match record id";
+          }
+          if (completionIdentity.stage_id !== undefined && (typeof completionIdentity.stage_id !== "string" || completionIdentity.stage_id !== expectedStage)) {
+            return "legacy dispatch capability.dispatches[" + index + "] completion work identity stage does not match source stage";
+          }
+          if (completionIdentity.stage_cursor !== undefined && (typeof completionIdentity.stage_cursor !== "string" || completionIdentity.stage_cursor !== expectedStage)) {
+            return "legacy dispatch capability.dispatches[" + index + "] completion work identity stage cursor does not match source stage";
+          }
+          const expectedSlot = projectedSlot;
+          if (completionIdentity.slot_id !== undefined && (typeof completionIdentity.slot_id !== "string" || completionIdentity.slot_id !== expectedSlot)) {
+            return "legacy dispatch capability.dispatches[" + index + "] completion work identity slot does not match source slot";
+          }
+        }
+      }
     }
   }
   return null;
@@ -497,21 +578,27 @@ function migratedSucceededSlots(source: LegacySource, fallbackStage: string): Re
     : [];
   const candidates = records.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object" && !Array.isArray(entry))
     .filter((entry) => entry.status === "succeeded" && typeof entry.id === "string");
+  const stageFor = (entry: Record<string, unknown>): string => {
+    const identity = entry.work_identity && typeof entry.work_identity === "object" && !Array.isArray(entry.work_identity) ? entry.work_identity as Record<string, unknown> : undefined;
+    return typeof identity?.stage_id === "string" ? identity.stage_id : fallbackStage;
+  };
   const roleCounts = new Map<string, number>();
   for (const entry of candidates) {
     const role = typeof entry.role === "string" ? entry.role : "";
-    roleCounts.set(role, (roleCounts.get(role) ?? 0) + 1);
+    const key = `${stageFor(entry)}\0${role}`;
+    roleCounts.set(key, (roleCounts.get(key) ?? 0) + 1);
   }
   const roleSeen = new Map<string, number>();
   const groups: Record<string, Array<{ dispatch_id: string; role: string; agent: string; slot_id?: string; task_id?: string; artifact_ids: string[] }>> = {};
   for (const value of candidates) {
     const identity = value.work_identity && typeof value.work_identity === "object" && !Array.isArray(value.work_identity) ? value.work_identity as Record<string, unknown> : undefined;
     const role = typeof value.role === "string" ? value.role : "";
-    const occurrence = (roleSeen.get(role) ?? 0) + 1;
-    roleSeen.set(role, occurrence);
-    const stageId = typeof identity?.stage_id === "string" ? identity.stage_id : fallbackStage;
+    const stageId = stageFor(value);
+    const roleKey = `${stageId}\0${role}`;
+    const occurrence = (roleSeen.get(roleKey) ?? 0) + 1;
+    roleSeen.set(roleKey, occurrence);
     const explicitSlotId = typeof identity?.slot_id === "string" ? identity.slot_id : undefined;
-    const slotId = explicitSlotId ?? ((roleCounts.get(role) ?? 0) > 1 ? role + "#" + occurrence : role);
+    const slotId = explicitSlotId ?? ((roleCounts.get(roleKey) ?? 0) > 1 ? role + "#" + occurrence : role);
     const completion = value.completion && typeof value.completion === "object" && !Array.isArray(value.completion) ? value.completion as Record<string, unknown> : undefined;
     const artifactIds = Array.isArray(completion?.artifact_ids) ? completion.artifact_ids.filter((id): id is string => typeof id === "string") : [];
     (groups[stageId] ??= []).push({

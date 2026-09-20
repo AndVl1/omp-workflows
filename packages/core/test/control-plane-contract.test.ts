@@ -30,6 +30,7 @@ import {
   validateActiveDispatchCapabilityValue,
   validateCapabilityStateBinding,
   validateDispatchCapabilityValue,
+  validateOrdinaryRunIdentityValue,
   validatePendingStateValue,
   validateTrustedCheckpointAnswerValue,
   validateTypedCheckpointDecisionValue,
@@ -141,6 +142,48 @@ test("contract: null and primitive envelopes return issues, never a TypeError", 
   }
   assert.ok(isRecord({}), "isRecord is the canonical object guard");
 });
+
+test("contract: ordinary schema-2 identity rejects unknown schemas and keeps the CTO namespace separate", () => {
+  const runId = "11111111-1111-4111-8111-111111111111";
+  const identity = { schema: 2, run_id: runId, run_key: runId, branch: "main" };
+  assert.deepEqual(validateOrdinaryRunIdentityValue(identity), { ok: true });
+
+  const unknownSchema = validateOrdinaryRunIdentityValue({ ...identity, schema: 99 });
+  assert.equal(unknownSchema.ok, false, "unknown ordinary schema must fail closed");
+  if (!unknownSchema.ok) assert.ok(unknownSchema.issues.some((issue) => issue.path === "$.schema"));
+
+  const ctoIdentity = validateOrdinaryRunIdentityValue({ schema: 2, id: "cto-run", branch: "main" });
+  assert.equal(ctoIdentity.ok, false, "CTO id namespace is not an ordinary run identity");
+});
+
+test("contract: ordinary identity rejects every run_id/run_key/work_identity.run_id mismatch", () => {
+  const capability = capabilityFixture();
+  const first = "run-a";
+  const second = "run-b";
+  const nested = (run_id: string): WorkIdentity => identityFor(capability, { run_id });
+  const state = (run_id: string, run_key: string, work_identity: WorkIdentity) => ({ schema: 2, run_id, run_key, work_identity });
+  assert.deepEqual(validateCapabilityStateBinding(state(first, first, nested(first))), { ok: true }, "aligned ordinary identity remains valid");
+
+  const mismatches = [
+    state(first, second, nested(first)),
+    state(first, first, nested(second)),
+    state(first, second, nested(second)),
+    state(second, first, nested(second)),
+    state(second, second, nested(first)),
+    state(second, first, nested(first)),
+  ];
+  for (const candidate of mismatches) {
+    const result = validateCapabilityStateBinding(candidate);
+    assert.equal(result.ok, false, `mismatched identity must fail: ${JSON.stringify(candidate)}`);
+    if (!result.ok) {
+      assert.ok(
+        result.issues.some((issue) => issue.path.endsWith(".run_key") || issue.path.endsWith(".work_identity.run_id")),
+        `mismatch must identify the ordinary identity fields: ${JSON.stringify(result.issues)}`,
+      );
+    }
+  }
+});
+
 
 test("contract: kind↔roster cardinality and required binding fields fail closed", () => {
   const base = capabilityFixture();

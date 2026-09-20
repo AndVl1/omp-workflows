@@ -17,8 +17,8 @@ import {
   handoverExecutionClaim,
   listRuns,
   persistCanonicalRun,
-  readRunControl,
   readRunState,
+  runTarget,
   registerTeamWorkflow,
   registerWorkflowTools,
   releaseExecutionClaim,
@@ -29,7 +29,7 @@ import {
   registerWorkflowProfiles,
   type TaskCaller,
 } from "../src/index.js";
-import { authorizeDispatch, completeDispatch, createCapability } from "../src/engine/durable.js";
+import { authorizeDispatch, completeDispatch, createCapability, materializeMigratedDispatches } from "../src/engine/durable.js";
 import { beginLifecycleTransaction, recoverLifecycleTransactions, commitLifecycleTransaction } from "../src/engine/lifecycle-journal.js";
 import { discoverLegacySources, migrateLegacySource } from "../src/engine/run-migration.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
@@ -37,7 +37,9 @@ import { resolveConfig } from "../src/engine/config.js";
 import { buildDispatchMarker } from "../src/gates/dispatch.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { prepareWorkflowState } from "../src/engine/run.js";
+import { readRunControl } from "../src/engine/run-store.js";
 import { normalizePersistedState } from "../src/engine/state.js";
+import { DISPATCH_ORIGIN_LOCATOR_ENV, rememberDispatchOriginLocator } from "../src/dispatch-origin-locator.js";
 const coreIndexUrl = new URL("../src/index.ts", import.meta.url).href;
 const runEngineUrl = new URL("../src/engine/run.ts", import.meta.url).href;
 const migrationEngineUrl = new URL("../src/engine/run-migration.ts", import.meta.url).href;
@@ -55,6 +57,21 @@ type FakePi = {
 
 const BRANCH = "feature/process-acceptance";
 const CLASSIFICATION = { type: "FEATURE" as const, complexity: "QUICK" as const, confidence: "HIGH" as const, autonomous: false, workflow: "lightweight" };
+const MIGRATION_PRODUCT_SPEC = JSON.stringify({
+  recommendation: "proceed",
+  value_proposition: "A traceable specification keeps migration inputs reviewable.",
+  opportunity: "Legacy workflow inputs can be resumed without fabricating authority.",
+  target_users: ["workflow maintainers"],
+  solution_direction: "Preserve declared inputs and immutable evidence while migrating.",
+  success_metrics: ["required product input is readable before dispatch"],
+  guardrail_metrics: ["migration does not alter source bytes"],
+  scope: ["legacy migration"],
+  anti_scope: ["worker re-dispatch"],
+  risks: ["source evidence may be incomplete"],
+  validation_plan: [],
+  evidence_trace: ["status: verified — migration fixture"],
+  open_decisions: [],
+});
 
 function scratch(prefix: string): string {
   const root = mkdtempSync(join(tmpdir(), `${prefix}-`));
@@ -358,6 +375,9 @@ test("process acceptance: interrupted rework snapshot preserves prior ownership"
 // A cold process rebuilds native-result origin from persisted authorization and the original input marker.
 test("process acceptance: cold native result replay mutates the origin run once", async () => {
   const root = scratch("rl-cold-native-result");
+  const locatorRoot = scratch("rl-cold-native-result-locator");
+  const previousLocatorRoot = process.env[DISPATCH_ORIGIN_LOCATOR_ENV];
+  process.env[DISPATCH_ORIGIN_LOCATOR_ENV] = locatorRoot;
   try {
     initGit(root); publishMapping(root);
     const runId = randomUUID();
@@ -412,6 +432,308 @@ test("process acceptance: cold native result replay mutates the origin run once"
     assert.equal(dispatches[0]?.work_identity?.run_id, runId);
     assert.equal(dispatches[0]?.completion?.evidence, "cold process complete");
     assert.equal(dispatches[0]?.completion?.work_identity?.dispatch_id, dispatches[0]?.id);
+  } finally {
+    if (previousLocatorRoot === undefined) delete process.env[DISPATCH_ORIGIN_LOCATOR_ENV];
+    else process.env[DISPATCH_ORIGIN_LOCATOR_ENV] = previousLocatorRoot;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(locatorRoot, { recursive: true, force: true });
+  }
+});
+
+// A fresh host session with no selected run still reconciles through the
+// exact persisted dispatch ledger; callback session identity is unrelated.
+test("process acceptance: fresh-session late native result uses exact durable locator", async () => {
+  const root = scratch("rl-fresh-session-durable-result");
+  const locatorRoot = scratch("rl-fresh-session-durable-result-locator");
+  const previousLocatorRoot = process.env[DISPATCH_ORIGIN_LOCATOR_ENV];
+  process.env[DISPATCH_ORIGIN_LOCATOR_ENV] = locatorRoot;
+  try {
+    initGit(root); publishMapping(root);
+    const runId = randomUUID();
+    const owner = context(root, "durable-origin");
+    persistCanonicalRun(root, canonicalState(runId), { context: owner });
+    const artifacts = join(root, ".work-state", "runs", runId, "artifacts");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "discovery.json"), JSON.stringify({ goal: "fresh session result" }));
+    const begun = beginCapability(root, undefined, { runId });
+    assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
+    assert.ok(begun.ok && begun.handoff);
+    const stage = loadProfile("lightweight")!.stages.find((candidate) => candidate.id === "implementation");
+    assert.ok(stage);
+    const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
+    const input = { agent: "dev", role: "dev", task: marker };
+    const ownerController = createWorkflowSessionController({ cwd: root, context: owner });
+    const ownerBus = fakePi();
+    registerTeamWorkflow(ownerBus.pi as never, { cwd: root, observability: false, getSessionController: () => ownerController });
+    const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "fresh-session-tool", input }, { cwd: root, hasUI: false, session_id: owner.session_id });
+    assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
+    assert.equal(readRunState(root, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
+
+    const child = await childScript(`
+      const { createWorkflowSessionController, registerTeamWorkflow } = await import(${JSON.stringify(coreIndexUrl)});
+      const [root, marker] = process.argv.slice(1);
+      const handlers = {};
+      const pi = {
+        setLabel() {},
+        on(name, handler) { (handlers[name] ??= []).push(handler); },
+      };
+      const controller = createWorkflowSessionController({ cwd: root, context: { session_id: "fresh-host-session", caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
+      if (controller.selectedRunId() !== undefined) throw new Error("fresh host session unexpectedly inherited a selected run");
+      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      const event = {
+        toolName: "task", toolCallId: "fresh-session-tool",
+        input: { agent: "dev", role: "dev", task: marker },
+        content: [{ type: "text", text: "fresh-session complete" }],
+        isError: false,
+        details: { results: [{ index: 0, task: marker, id: "fresh-session-result", exitCode: 0, output: "fresh-session complete", stderr: "" }] },
+      };
+      for (const handler of handlers.tool_result ?? []) await handler(event, { cwd: root, session_id: "late-callback-session" });
+      console.log(JSON.stringify({ selectedRunId: controller.selectedRunId() ?? null }));
+    `, [root, marker]);
+    assert.equal(child.code, 0, child.output);
+    assert.equal(child.signal, null);
+    const state = readRunState(root, runId)!;
+    assert.equal(state.dispatch_capability?.dispatches[0]?.status, "succeeded");
+    assert.equal(state.dispatch_capability?.dispatches[0]?.completion?.evidence, "fresh-session complete");
+  } finally {
+    if (previousLocatorRoot === undefined) delete process.env[DISPATCH_ORIGIN_LOCATOR_ENV];
+    else process.env[DISPATCH_ORIGIN_LOCATOR_ENV] = previousLocatorRoot;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(locatorRoot, { recursive: true, force: true });
+  }
+});
+
+test("process acceptance: fresh restart uses the persisted origin workspace", async () => {
+  const rootA = scratch("rl-fresh-cross-worktree-a");
+  const rootB = scratch("rl-fresh-cross-worktree-b");
+  const locatorRoot = scratch("rl-fresh-cross-worktree-locator");
+  const previousLocatorRoot = process.env[DISPATCH_ORIGIN_LOCATOR_ENV];
+  process.env[DISPATCH_ORIGIN_LOCATOR_ENV] = locatorRoot;
+  try {
+    initGit(rootA); publishMapping(rootA);
+    initGit(rootB); publishMapping(rootB);
+    const runId = randomUUID();
+    const owner = context(rootA, "cross-worktree-origin");
+    persistCanonicalRun(rootA, canonicalState(runId), { context: owner });
+    const artifacts = join(rootA, ".work-state", "runs", runId, "artifacts");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "discovery.json"), JSON.stringify({ goal: "cross-worktree fresh result" }));
+    const begun = beginCapability(rootA, undefined, { runId });
+    assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
+    assert.ok(begun.ok && begun.handoff);
+    const stage = loadProfile("lightweight")!.stages.find((candidate) => candidate.id === "implementation");
+    assert.ok(stage);
+    const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
+    const input = { agent: "dev", role: "dev", task: marker };
+    const ownerController = createWorkflowSessionController({ cwd: rootA, context: owner });
+    const ownerBus = fakePi();
+    registerTeamWorkflow(ownerBus.pi as never, { cwd: rootA, observability: false, getSessionController: () => ownerController });
+    const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "cross-worktree-tool", input }, { cwd: rootA, hasUI: false, session_id: owner.session_id });
+    assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
+    assert.equal(readRunState(rootA, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
+    const child = await childScript(`
+      const { registerTeamWorkflow, createWorkflowSessionController } = await import(${JSON.stringify(coreIndexUrl)});
+      const [root, marker] = process.argv.slice(1);
+      const handlers = {};
+      const pi = {
+        setLabel() {},
+        on(name, handler) { (handlers[name] ??= []).push(handler); },
+      };
+      const controller = createWorkflowSessionController({ cwd: root, context: { session_id: "fresh-cross-worktree-host", caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
+      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      const event = {
+        toolName: "task", toolCallId: "cross-worktree-tool",
+        input: { agent: "dev", role: "dev", task: marker },
+        content: [{ type: "text", text: "cross-worktree complete" }],
+        isError: false,
+        details: { results: [{ index: 0, task: marker, id: "cross-worktree-result", exitCode: 0, output: "cross-worktree complete", stderr: "" }] },
+      };
+      for (const handler of handlers.tool_result ?? []) await handler(event, { cwd: root, session_id: "fresh-cross-worktree-host" });
+    `, [rootB, marker]);
+    assert.equal(child.code, 0, child.output);
+    assert.equal(child.signal, null);
+    const state = readRunState(rootA, runId)!;
+    assert.equal(state.dispatch_capability?.dispatches[0]?.status, "succeeded", "locator discovery must recover the original workspace before canonical verification");
+    assert.equal(state.dispatch_capability?.dispatches[0]?.completion?.evidence, "cross-worktree complete");
+  } finally {
+    if (previousLocatorRoot === undefined) delete process.env[DISPATCH_ORIGIN_LOCATOR_ENV];
+    else process.env[DISPATCH_ORIGIN_LOCATOR_ENV] = previousLocatorRoot;
+    rmSync(rootA, { recursive: true, force: true });
+    rmSync(rootB, { recursive: true, force: true });
+    rmSync(locatorRoot, { recursive: true, force: true });
+  }
+});
+
+test("process acceptance: ambiguous durable locator candidates reject without mutating either origin", async () => {
+  const rootA = scratch("rl-ambiguous-origin-a");
+  const rootB = scratch("rl-ambiguous-origin-b");
+  const callbackRoot = scratch("rl-ambiguous-origin-callback");
+  const locatorRoot = scratch("rl-ambiguous-origin-locator");
+  const previousLocatorRoot = process.env[DISPATCH_ORIGIN_LOCATOR_ENV];
+  process.env[DISPATCH_ORIGIN_LOCATOR_ENV] = locatorRoot;
+  try {
+    initGit(rootA); publishMapping(rootA);
+    initGit(rootB); publishMapping(rootB);
+    initGit(callbackRoot); publishMapping(callbackRoot);
+    const runId = randomUUID();
+    const owner = context(rootA, "ambiguous-origin");
+    persistCanonicalRun(rootA, canonicalState(runId), { context: owner });
+    const artifacts = join(rootA, ".work-state", "runs", runId, "artifacts");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "discovery.json"), JSON.stringify({ goal: "ambiguous locator" }));
+    const begun = beginCapability(rootA, undefined, { runId });
+    assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
+    assert.ok(begun.ok && begun.handoff);
+    const stage = loadProfile("lightweight")!.stages.find((candidate) => candidate.id === "implementation");
+    assert.ok(stage);
+    const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
+    const input = { agent: "dev", role: "dev", task: marker };
+    const ownerController = createWorkflowSessionController({ cwd: rootA, context: owner });
+    const ownerBus = fakePi();
+    registerTeamWorkflow(ownerBus.pi as never, { cwd: rootA, observability: false, getSessionController: () => ownerController });
+    const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "ambiguous-origin-tool", input }, { cwd: rootA, hasUI: false, session_id: owner.session_id });
+    assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
+    const originState = readRunState(rootA, runId)!;
+    const dispatch = originState.dispatch_capability?.dispatches[0];
+    assert.ok(dispatch);
+    cpSync(join(rootA, ".work-state"), join(rootB, ".work-state"), { recursive: true });
+    const identity = dispatch.work_identity;
+    assert.equal(rememberDispatchOriginLocator("ambiguous-origin-tool", {
+      cwd: rootB,
+      run_id: runId,
+      dispatch_id: dispatch.id,
+      ...(dispatch.origin_session_id ? { origin_session_id: dispatch.origin_session_id } : {}),
+      ...(identity?.capability_id ? { capability_id: identity.capability_id } : {}),
+      ...(identity?.stage_id ? { stage_id: identity.stage_id } : {}),
+      ...(identity?.capability_epoch ? { cursor_epoch: identity.capability_epoch } : {}),
+      ...(identity?.slot_id ? { slot_id: identity.slot_id } : {}),
+      ...(identity?.task_id ? { task_id: identity.task_id } : {}),
+    }), true);
+    const child = await childScript(`
+      const { registerTeamWorkflow, createWorkflowSessionController } = await import(${JSON.stringify(coreIndexUrl)});
+      const [root, marker] = process.argv.slice(1);
+      const handlers = {};
+      const pi = {
+        setLabel() {},
+        on(name, handler) { (handlers[name] ??= []).push(handler); },
+      };
+      const controller = createWorkflowSessionController({ cwd: root, context: { session_id: "ambiguous-callback", caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
+      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      const event = {
+        toolName: "task", toolCallId: "ambiguous-origin-tool",
+        input: { agent: "dev", role: "dev", task: marker },
+        content: [{ type: "text", text: "ambiguous complete" }],
+        isError: false,
+        details: { results: [{ index: 0, task: marker, id: "ambiguous-result", exitCode: 0, output: "ambiguous complete", stderr: "" }] },
+      };
+      for (const handler of handlers.tool_result ?? []) await handler(event, { cwd: root, session_id: "ambiguous-callback" });
+    `, [callbackRoot, marker]);
+    assert.equal(child.code, 0, child.output);
+    assert.equal(child.signal, null);
+    assert.equal(readRunState(rootA, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
+    assert.equal(readRunState(rootB, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
+  } finally {
+    if (previousLocatorRoot === undefined) delete process.env[DISPATCH_ORIGIN_LOCATOR_ENV];
+    else process.env[DISPATCH_ORIGIN_LOCATOR_ENV] = previousLocatorRoot;
+    rmSync(rootA, { recursive: true, force: true });
+    rmSync(rootB, { recursive: true, force: true });
+    rmSync(callbackRoot, { recursive: true, force: true });
+    rmSync(locatorRoot, { recursive: true, force: true });
+  }
+});
+
+test("workflow tools ignore a foreign session_stop without dropping the trusted controller", async () => {
+  const root = scratch("rl-session-stop-identity");
+  try {
+    initGit(root); publishMapping(root);
+    const owner = context(root, "trusted-stop-session");
+    const controller = createWorkflowSessionController({ cwd: root, context: owner });
+    const bus = fakePi();
+    registerWorkflowTools(bus.pi as never, { cwd: root, getSessionController: () => controller });
+    await bus.emit("session_start", {}, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const prepare = bus.tools.get("workflow_prepare")!;
+    const params = { mode: "new", task: "session stop identity", classification: CLASSIFICATION };
+    const first = await prepare.execute("session-stop-prepare", params, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const firstValue = record(first.details);
+    assert.equal(firstValue.ok, true, JSON.stringify(firstValue));
+    const firstState = record(firstValue.state);
+    const runId = String(firstState.run_id);
+    const claimBefore = readRunControl(root).execution_claim;
+    await bus.emit("session_start", {}, { cwd: root, mode: "print", hasUI: false, session_id: "foreign-worker-session" });
+    await bus.emit("session_stop", { session_id: "foreign-worker-session" }, { cwd: root, mode: "print", hasUI: false, session_id: "foreign-worker-session" });
+    const status = await bus.tools.get("workflow_status")!.execute("foreign-stop-status", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const statusValue = record(status.details);
+    assert.equal(statusValue.ok, true, JSON.stringify(statusValue));
+    assert.equal(statusValue.run_id, runId);
+    const replay = await prepare.execute("session-stop-prepare", params, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.equal(record(replay.details).ok, true, JSON.stringify(replay.details));
+    assert.deepEqual(readRunControl(root).execution_claim, claimBefore);
+    await bus.emit("session_stop", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workflow_status preserves structured selector failure details", async () => {
+  const root = scratch("rl-selector-error-details");
+  try {
+    initGit(root); publishMapping(root);
+    const owner = context(root, "selector-details-session");
+    const controller = createWorkflowSessionController({ cwd: root, context: owner });
+    const bus = fakePi();
+    registerWorkflowTools(bus.pi as never, { cwd: root, getSessionController: () => controller });
+    await bus.emit("session_start", {}, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const first = controller.prepare({ mode: "new", task: "duplicate selector title", classification: CLASSIFICATION });
+    const second = controller.prepare({ mode: "new", task: "duplicate selector title", classification: CLASSIFICATION });
+    const status = await bus.tools.get("workflow_status")!.execute("selector-details", { selector: { title: "duplicate selector title" } }, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const value = status.details as { ok?: boolean; code?: string; details?: { code?: string; branch?: string; unchanged?: boolean; next_action?: string; candidates?: Array<{ run_id: string }> } };
+    assert.equal(value.ok, false);
+    assert.equal(value.code, "WORKFLOW_STATUS_FAILED");
+    assert.equal(value.details?.code, "run_selection_required");
+    assert.equal(value.details?.branch, BRANCH);
+    assert.equal(value.details?.unchanged, true);
+    assert.equal(typeof value.details?.next_action, "string");
+    assert.deepEqual(new Set(value.details?.candidates?.map((candidate) => candidate.run_id)), new Set([first.state.run_id, second.state.run_id]));
+    const prepare = await bus.tools.get("workflow_prepare")!.execute("selector-prepare-details", { mode: "resume", selector: { title: "duplicate selector title" } }, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const prepareValue = prepare.details as { code?: string; details?: { code?: string; candidates?: Array<{ run_id: string }> } };
+    assert.equal(prepareValue.code, "WORKFLOW_PREPARE_FAILED");
+    assert.equal(prepareValue.details?.code, "run_selection_required");
+    assert.deepEqual(new Set(prepareValue.details?.candidates?.map((candidate) => candidate.run_id)), new Set([first.state.run_id, second.state.run_id]));
+    await bus.emit("session_stop", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workflow_prepare command intent reserves through selector errors and commits once", async () => {
+  const root = scratch("rl-command-intent-boundary");
+  try {
+    initGit(root); publishMapping(root);
+    const owner = context(root, "command-intent-session");
+    const controller = createWorkflowSessionController({ cwd: root, context: owner });
+    const bus = fakePi();
+    registerWorkflowTools(bus.pi as never, { cwd: root, getSessionController: () => controller });
+    await bus.emit("session_start", {}, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const first = controller.prepare({ mode: "new", task: "command intent duplicate", classification: CLASSIFICATION });
+    const second = controller.prepare({ mode: "new", task: "command intent duplicate", classification: CLASSIFICATION });
+    const intent = controller.issueCommandIntent("resume");
+    const prepare = bus.tools.get("workflow_prepare")!;
+    const failed = await prepare.execute("command-intent-failed", {
+      mode: "resume", selector: { title: "command intent duplicate" }, command_intent_id: intent.intent_id,
+    }, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const failedValue = record(failed.details);
+    assert.equal(failedValue.ok, false);
+    assert.equal(record(failedValue.details).code, "run_selection_required");
+    const corrected = await prepare.execute("command-intent-corrected", {
+      mode: "resume", selector: { run_id: second.state.run_id }, command_intent_id: intent.intent_id,
+    }, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.equal(record(corrected.details).ok, true, JSON.stringify(corrected.details));
+    const claimAfterCommit = readRunControl(root).execution_claim;
+    const replay = await prepare.execute("command-intent-replay", {
+      mode: "resume", selector: { run_id: second.state.run_id }, command_intent_id: intent.intent_id,
+    }, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const replayValue = record(replay.details);
+    assert.equal(replayValue.ok, false);
+    assert.equal(replayValue.code, "WORKFLOW_PREPARE_FAILED");
+    assert.equal(record(replayValue.details).code, "lifecycle_request_conflict");
+    assert.deepEqual(readRunControl(root).execution_claim, claimAfterCommit);
+    assert.notEqual(second.state.run_id, first.state.run_id);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -605,6 +927,7 @@ test("process acceptance: migration source conflict is unchanged and succeeded b
     writeFileSync(join(legacyDir, "docs", "design.md"), designDoc);
     const legacyCompletedAt = new Date().toISOString();
     writeFileSync(join(artifacts, "discovery.json"), JSON.stringify({ goal: "legacy input" }));
+    writeFileSync(join(artifacts, "product_spec.json"), MIGRATION_PRODUCT_SPEC);
     const legacyCapability = createCapability({
       run_key: BRANCH, branch: BRANCH, workflow: "spec-preparation", profile_hash: profileHash(loadProfile("spec-preparation")!),
       stage_cursor: "intake_repo_map", rework_generation: 0, kind: "consilium",
@@ -619,8 +942,8 @@ test("process acceptance: migration source conflict is unchanged and succeeded b
     const legacy = {
       schema: 1, branch: BRANCH, run_key: BRANCH, classification: { ...CLASSIFICATION, type: "SPEC", workflow: "spec-preparation" }, task: "docs/design.md", workflow_override: true, issue: null,
       completion_intent: { mode: "complete_outcome", acceptance: "dod_and_artifacts", source: "user", rationale: "legacy completion evidence" },
-      stage_cursor: "intake_repo_map", stages: [{ id: "intake_repo_map", status: "in_progress" }],
-      artifacts: { discovery: "artifacts/discovery.json", binary: "artifacts/binary.bin", bom: "artifacts/bom.txt", design: "docs/design.md" },
+      stage_cursor: "intake_repo_map", stages: [{ id: "intake_repo_map", status: "in_progress" }, { id: "requirements_edge_cases", status: "pending" }],
+      artifacts: { discovery: "artifacts/discovery.json", product_spec: "artifacts/product_spec.json", binary: "artifacts/binary.bin", bom: "artifacts/bom.txt", design: "docs/design.md" },
       scope: { scope: ["analyst", "tech-researcher"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "analyst" },
       pause: { kind: "none", reason: "docs/design.md" },
       dispatch_capability: {
@@ -637,6 +960,15 @@ test("process acceptance: migration source conflict is unchanged and succeeded b
             schema_version: 1, identity: legacyIdentity, outcome: "succeeded", terminal_signal: "workflow_complete",
             artifact_refs: [], evidence_ref: null, conflict_ref: null,
             completed_by: "workflow_complete", emitted_at: legacyCompletedAt,
+          },
+        }, {
+          id: "legacy-dispatch-other-stage", role: "analyst", agent: "analyst", status: "succeeded", attempt: 1,
+          created_at: legacyCompletedAt, completed_at: legacyCompletedAt,
+          work_identity: { stage_id: "requirements_edge_cases", stage_cursor: "requirements_edge_cases" },
+          completion: {
+            dispatch_id: "legacy-dispatch-other-stage", cursor_epoch: legacyCapability.issued_for!.cursor_epoch, outcome: "succeeded",
+            artifact_ids: [], evidence: "stage-local identityless legacy completion", completed_by: "workflow_complete",
+            completed_at: legacyCompletedAt,
           },
         }],
         pending: [],
@@ -655,6 +987,32 @@ test("process acceptance: migration source conflict is unchanged and succeeded b
     if (!conflict.ok) assert.equal(conflict.code, "migration_conflict");
     assert.equal(existsSync(join(root, ".work-state", "runs")), false);
 
+    const rejectMalformedLegacy = (mutate: (dispatch: Record<string, unknown>) => void): void => {
+      const malformedLegacy = JSON.parse(JSON.stringify(legacy)) as Record<string, unknown>;
+      const malformedCapability = malformedLegacy.dispatch_capability as Record<string, unknown>;
+      const malformedDispatches = malformedCapability.dispatches as Array<Record<string, unknown>>;
+      mutate(malformedDispatches[0]!);
+      writeFileSync(join(legacyDir, "state.json"), JSON.stringify(malformedLegacy));
+      const malformedSource = discoverLegacySources(root).sources.find((candidate) => candidate.source_id === "feature:legacy-slot");
+      assert.ok(malformedSource);
+      const malformedMigration = migrateLegacySource(root, malformedSource!);
+      assert.equal(malformedMigration.ok, false);
+      if (!malformedMigration.ok) assert.equal(malformedMigration.code, "recovery_required");
+      assert.equal(existsSync(join(root, ".work-state", "runs")), false);
+    };
+    rejectMalformedLegacy((dispatch) => {
+      const completion = dispatch.completion as Record<string, unknown>;
+      completion.dispatch_id = "wrong-dispatch";
+    });
+    rejectMalformedLegacy((dispatch) => {
+      const identity = dispatch.work_identity as Record<string, unknown>;
+      identity.stage_cursor = "requirements_edge_cases";
+    });
+    rejectMalformedLegacy((dispatch) => {
+      const completion = dispatch.completion as Record<string, unknown>;
+      const identity = completion.work_identity as Record<string, unknown>;
+      identity.slot_id = "tech-researcher";
+    });
     writeFileSync(join(legacyDir, "state.json"), JSON.stringify(legacy));
     publishMapping(root);
     writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { analyst: "analyst", "tech-researcher": "tech-researcher" } }) + "\n");
@@ -687,11 +1045,32 @@ test("process acceptance: migration source conflict is unchanged and succeeded b
     const canonical = migratedState;
     assert.equal(canonical.task, "docs/design.md");
     assert.equal(canonical.migration_succeeded_slots?.intake_repo_map?.[0]?.dispatch_id, "legacy-dispatch");
+    assert.equal(canonical.migration_succeeded_slots?.intake_repo_map?.[0]?.slot_id, "analyst");
+    assert.equal(canonical.migration_succeeded_slots?.requirements_edge_cases?.[0]?.slot_id, "analyst");
+    const laterStageCapability = createCapability({
+      run_key: migrated.run_id, branch: BRANCH, workflow: "spec-preparation",
+      profile_hash: profileHash(loadProfile("spec-preparation")!), stage_cursor: "requirements_edge_cases",
+      rework_generation: 0, kind: "single", expected_roster: [{ role: "analyst", agent: "fresh-analyst" }],
+    });
+    const laterStageMaterialized = materializeMigratedDispatches(
+      canonical,
+      laterStageCapability.state,
+      "spec-preparation",
+      "requirements_edge_cases",
+      runTarget(root, migrated.run_id),
+    );
+    assert.equal(laterStageMaterialized.ok, true, laterStageMaterialized.ok ? "" : laterStageMaterialized.error);
+    if (laterStageMaterialized.ok) {
+      assert.deepEqual(
+        laterStageMaterialized.records.map((record) => ({ id: record.id, role: record.role, agent: record.agent })),
+        [{ id: "legacy-dispatch-other-stage", role: "analyst", agent: "fresh-analyst" }],
+      );
+    }
     assert.ok(typeof canonical.artifacts?.design === "string" && canonical.artifacts.design.endsWith(`/runs/${migrated.run_id}/docs/design.md`));
     const begun = beginCapability(root, undefined, { runId: migrated.run_id });
     assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
     assert.ok(begun.ok && begun.handoff);
-    const liveAuthorized = authorizeDispatch(root, { ...begun.handoff!, role: "tech-researcher", agent: "tech-researcher" });
+    const liveAuthorized = authorizeDispatch(root, { run_id: migrated.run_id, token: begun.handoff!.dispatch_token, ...begun.handoff!, role: "tech-researcher", agent: "tech-researcher" });
     assert.equal(liveAuthorized.ok, true, liveAuthorized.ok ? "" : liveAuthorized.error);
     const dispatches = readRunState(root, migrated.run_id)?.dispatch_capability?.dispatches ?? [];
     assert.equal(dispatches.filter((dispatch) => dispatch.id === "legacy-dispatch").length, 1);
@@ -742,6 +1121,7 @@ test("process acceptance: identity-less migration preserves a live consilium slo
     mkdirSync(artifacts, { recursive: true });
     const artifact = Buffer.from(JSON.stringify({ facts: [{ source: "legacy analyst" }] }));
     writeFileSync(join(artifacts, "spec_intake_repo_map.json"), artifact);
+    writeFileSync(join(artifacts, "product_spec.json"), MIGRATION_PRODUCT_SPEC);
     const runKey = BRANCH;
     const legacyCompletedAt = new Date().toISOString();
     const capability = createCapability({
@@ -755,7 +1135,7 @@ test("process acceptance: identity-less migration preserves a live consilium slo
       task: "identity-less migration", workflow_override: true, issue: null,
       completion_intent: { mode: "complete_outcome", acceptance: "dod_and_artifacts", source: "user", rationale: "verified legacy slot" },
       stage_cursor: "intake_repo_map", stages: [{ id: "intake_repo_map", status: "in_progress" }],
-      artifacts: { spec_intake_repo_map: "artifacts/spec_intake_repo_map.json" },
+      artifacts: { spec_intake_repo_map: "artifacts/spec_intake_repo_map.json", product_spec: "artifacts/product_spec.json" },
       scope: { scope: ["analyst", "tech-researcher"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "analyst" },
       pause: { kind: "none", reason: "" },
       dispatch_capability: {
@@ -776,8 +1156,9 @@ test("process acceptance: identity-less migration preserves a live consilium slo
     writeFileSync(join(legacyDir, "state.json"), JSON.stringify(legacy));
     const emptyDir = join(root, ".work-state", "features", "identityless-empty");
     mkdirSync(join(emptyDir, "artifacts"), { recursive: true });
+    writeFileSync(join(emptyDir, "artifacts", "product_spec.json"), MIGRATION_PRODUCT_SPEC);
     const emptyLegacy = JSON.parse(JSON.stringify(legacy)) as Record<string, unknown>;
-    emptyLegacy.artifacts = {};
+    emptyLegacy.artifacts = { product_spec: "artifacts/product_spec.json" };
     const emptyCapability = emptyLegacy.dispatch_capability as Record<string, unknown>;
     const emptyDispatches = emptyCapability.dispatches as Array<Record<string, unknown>>;
     emptyDispatches[0]!.id = "legacy-empty";
@@ -795,6 +1176,67 @@ test("process acceptance: identity-less migration preserves a live consilium slo
     assert.ok(emptyBegun.ok && emptyBegun.handoff);
     const emptyImported = readRunState(root, emptyMigrated.run_id)?.dispatch_capability?.dispatches.find((dispatch) => dispatch.id === "legacy-empty");
     assert.equal(emptyImported?.attempt, 0);
+    const repeatedDir = join(root, ".work-state", "features", "identityless-repeated");
+    mkdirSync(join(repeatedDir, "artifacts"), { recursive: true });
+    writeFileSync(join(repeatedDir, "artifacts", "product_spec.json"), MIGRATION_PRODUCT_SPEC);
+    const repeatedLegacy = JSON.parse(JSON.stringify(legacy)) as Record<string, unknown>;
+    repeatedLegacy.artifacts = { product_spec: "artifacts/product_spec.json" };
+    const repeatedCapability = repeatedLegacy.dispatch_capability as Record<string, unknown>;
+    const repeatedDispatches = repeatedCapability.dispatches as Array<Record<string, unknown>>;
+    repeatedDispatches[0]!.id = "legacy-repeated-one";
+    const repeatedFirstCompletion = repeatedDispatches[0]!.completion as Record<string, unknown>;
+    repeatedFirstCompletion.dispatch_id = "legacy-repeated-one";
+    repeatedFirstCompletion.artifact_ids = [];
+    repeatedDispatches.push({
+      id: "legacy-repeated-two", role: "analyst", agent: "analyst", status: "succeeded", attempt: 1,
+      created_at: legacyCompletedAt, completed_at: legacyCompletedAt,
+      completion: {
+        dispatch_id: "legacy-repeated-two", cursor_epoch: capability.issued_for!.cursor_epoch, outcome: "succeeded",
+        artifact_ids: [], evidence: "second identityless slot", completed_by: "workflow_complete", completed_at: legacyCompletedAt,
+      },
+    });
+    writeFileSync(join(repeatedDir, "state.json"), JSON.stringify(repeatedLegacy));
+    const repeatedSource = discoverLegacySources(root).sources.find((candidate) => candidate.source_id === "feature:identityless-repeated");
+    assert.ok(repeatedSource);
+    const repeatedMigration = migrateLegacySource(root, repeatedSource!);
+    assert.equal(repeatedMigration.ok, true, repeatedMigration.ok ? "" : repeatedMigration.error);
+    if (!repeatedMigration.ok) return;
+    const repeatedState = readRunState(root, repeatedMigration.run_id)!;
+    const repeatedSlots = repeatedState.migration_succeeded_slots?.intake_repo_map ?? [];
+    assert.deepEqual(repeatedSlots.map((slot) => slot.slot_id), ["analyst#1", "analyst#2"]);
+    assert.notEqual(repeatedSlots[0]?.dispatch_id, repeatedSlots[1]?.dispatch_id);
+    const duplicateDir = join(root, ".work-state", "features", "identityless-duplicate");
+    mkdirSync(join(duplicateDir, "artifacts"), { recursive: true });
+    writeFileSync(join(duplicateDir, "artifacts", "product_spec.json"), MIGRATION_PRODUCT_SPEC);
+    const duplicateLegacy = JSON.parse(JSON.stringify(legacy)) as Record<string, unknown>;
+    duplicateLegacy.artifacts = { product_spec: "artifacts/product_spec.json" };
+    const duplicateCapability = duplicateLegacy.dispatch_capability as Record<string, unknown>;
+    const duplicateDispatches = duplicateCapability.dispatches as Array<Record<string, unknown>>;
+    duplicateDispatches[0]!.id = "legacy-duplicate-identityless";
+    const duplicateFirstCompletion = duplicateDispatches[0]!.completion as Record<string, unknown>;
+    duplicateFirstCompletion.dispatch_id = "legacy-duplicate-identityless";
+    duplicateFirstCompletion.artifact_ids = [];
+    const duplicateIdentity = { stage_id: "intake_repo_map", stage_cursor: "intake_repo_map", slot_id: "analyst#1" };
+    duplicateDispatches.push({
+      id: "legacy-duplicate-explicit", role: "analyst", agent: "analyst", status: "succeeded", attempt: 1,
+      created_at: legacyCompletedAt, completed_at: legacyCompletedAt, work_identity: duplicateIdentity,
+      completion: {
+        dispatch_id: "legacy-duplicate-explicit", cursor_epoch: capability.issued_for!.cursor_epoch, outcome: "succeeded",
+        artifact_ids: [], evidence: "derived duplicate slot", completed_by: "workflow_complete", completed_at: legacyCompletedAt,
+        work_identity: duplicateIdentity,
+      },
+    });
+    writeFileSync(join(duplicateDir, "state.json"), JSON.stringify(duplicateLegacy));
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const canonicalControlBeforeDuplicate = readFileSync(controlPath, "utf8");
+    const runsBeforeDuplicate = listRuns(root, { branch: BRANCH, includeTerminal: true }).map((run) => run.run_id).sort();
+    const duplicateSource = discoverLegacySources(root).sources.find((candidate) => candidate.source_id === "feature:identityless-duplicate");
+    assert.ok(duplicateSource);
+    const duplicateMigration = migrateLegacySource(root, duplicateSource!);
+    assert.equal(duplicateMigration.ok, false);
+    if (!duplicateMigration.ok) assert.equal(duplicateMigration.code, "recovery_required");
+    assert.equal(readFileSync(controlPath, "utf8"), canonicalControlBeforeDuplicate);
+    assert.deepEqual(listRuns(root, { branch: BRANCH, includeTerminal: true }).map((run) => run.run_id).sort(), runsBeforeDuplicate);
     const source = discoverLegacySources(root).sources.find((candidate) => candidate.source_id === "feature:identityless");
     assert.ok(source);
     const migrated = migrateLegacySource(root, source!);
@@ -823,6 +1265,22 @@ test("process acceptance: identity-less migration preserves a live consilium slo
     assert.equal(readFileSync(statePath, "utf8"), tamperedStateBytes.toString("utf8"));
     writeFileSync(statePath, originalStateBytes);
     writeFileSync(proofPath, originalProofBytes);
+    const omittedStageState = JSON.parse(originalStateBytes.toString("utf8")) as TeamState;
+    delete omittedStageState.migration_succeeded_slots!.intake_repo_map;
+    const omittedStageBytes = Buffer.from(`${JSON.stringify(omittedStageState)}\n`);
+    writeFileSync(statePath, omittedStageBytes);
+    const blockedOmittedStage = beginCapability(root, undefined, { runId: migrated.run_id });
+    assert.equal(blockedOmittedStage.ok, false);
+    assert.equal(readFileSync(statePath, "utf8"), omittedStageBytes.toString("utf8"));
+    writeFileSync(statePath, originalStateBytes);
+    const omittedSlotState = JSON.parse(originalStateBytes.toString("utf8")) as TeamState;
+    omittedSlotState.migration_succeeded_slots!.intake_repo_map = [];
+    const omittedSlotBytes = Buffer.from(`${JSON.stringify(omittedSlotState)}\n`);
+    writeFileSync(statePath, omittedSlotBytes);
+    const blockedOmittedSlot = beginCapability(root, undefined, { runId: migrated.run_id });
+    assert.equal(blockedOmittedSlot.ok, false);
+    assert.equal(readFileSync(statePath, "utf8"), omittedSlotBytes.toString("utf8"));
+    writeFileSync(statePath, originalStateBytes);
     const revisionRoot = join(root, ".work-state", "runs", migrated.run_id, "revisions", migrated.migration_id);
     const revisionBackup = `${revisionRoot}.real`;
     externalRevision = mkdtempSync(join(tmpdir(), "rl-external-revision-"));
@@ -856,7 +1314,7 @@ test("process acceptance: identity-less migration preserves a live consilium slo
     const imported = readRunState(root, migrated.run_id)?.dispatch_capability?.dispatches.find((dispatch) => dispatch.id === "legacy-identityless");
     assert.equal(imported?.attempt, 0);
     assert.equal(imported?.work_identity, undefined);
-    const liveAuth = { ...begun.handoff!, role: "tech-researcher", agent: "tech-researcher" };
+    const liveAuth = { ...begun.handoff!, token: begun.handoff!.dispatch_token, run_id: migrated.run_id, role: "tech-researcher", agent: "tech-researcher" };
     const authorized = authorizeDispatch(root, liveAuth);
     assert.equal(authorized.ok, true, authorized.ok ? "" : authorized.error);
     assert.ok(authorized.ok && authorized.record);
@@ -876,12 +1334,11 @@ test("process acceptance: identity-less migration preserves a live consilium slo
       assert.equal(normalizePersistedState(candidate, issues), null, issues.join("; "));
     };
     malformed((dispatch) => {
-      const identity = dispatch.work_identity as Record<string, unknown>;
+      assert.equal(dispatch.work_identity, undefined);
       const completion = dispatch.completion as Record<string, unknown>;
       const completionIdentity = completion.work_identity as Record<string, unknown>;
       const envelope = dispatch.completion_envelope as Record<string, unknown>;
       const envelopeIdentity = envelope.identity as Record<string, unknown>;
-      identity.task_id = "wrong-task";
       completionIdentity.task_id = "wrong-task";
       envelopeIdentity.task_id = "wrong-task";
     });

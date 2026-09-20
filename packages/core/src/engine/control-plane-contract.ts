@@ -175,6 +175,25 @@ const LIFECYCLE_MODES = ["new", "resume", "rework"] as const;
 function requireUuid(value: UnknownRecord, key: string, path: string, issues: ControlPlaneIssue[]): void {
   if (typeof value[key] !== "string" || !UUID_PATTERN.test(value[key] as string)) add(issues, `${path}.${key}`, "must be a UUID");
 }
+/**
+ * Ordinary schema-2 state identity is repeated on the state and the active
+ * work identity. Keep every representation tied to the same run without
+ * changing the separate CTO `id` namespace.
+ */
+function validateOrdinaryStateIdentityBindings(value: UnknownRecord, path: string, issues: ControlPlaneIssue[]): void {
+  if (value.schema !== 2) return;
+  if (typeof value.run_id === "string" && typeof value.run_key === "string" && value.run_id !== value.run_key) {
+    add(issues, `${path}.run_key`, "must equal run_id for ordinary runs");
+  }
+  if (!isRecord(value.work_identity)) return;
+  if (typeof value.run_id === "string" && typeof value.work_identity.run_id === "string" && value.work_identity.run_id !== value.run_id) {
+    add(issues, `${path}.work_identity.run_id`, "must equal run_id for ordinary runs");
+  }
+  if (typeof value.run_key === "string" && typeof value.work_identity.run_id === "string" && value.work_identity.run_id !== value.run_key) {
+    add(issues, `${path}.work_identity.run_id`, "must equal run_key for ordinary runs");
+  }
+}
+
 
 export function validateOrdinaryRunIdentityValue(value: unknown, path = "$"): ControlPlaneValidation {
   const issues: ControlPlaneIssue[] = [];
@@ -187,9 +206,7 @@ export function validateOrdinaryRunIdentityValue(value: unknown, path = "$"): Co
   requireUuid(value, "run_id", path, issues);
   requireUuid(value, "run_key", path, issues);
   requireString(value, "branch", path, issues);
-  if (typeof value.run_id === "string" && typeof value.run_key === "string" && value.run_id !== value.run_key) {
-    add(issues, `${path}.run_key`, "must equal run_id for ordinary runs");
-  }
+  validateOrdinaryStateIdentityBindings(value, path, issues);
   return issues.length > 0 ? { ok: false, issues } : { ok: true };
 }
 
@@ -996,9 +1013,10 @@ export function validateCapabilityStateBinding(state: unknown, path = "$"): Cont
     add(issues, path, "must be an object");
     return { ok: false, issues };
   }
+  validateOrdinaryStateIdentityBindings(state, path, issues);
   const capability = state.dispatch_capability;
   if (capability === undefined || capability === null) {
-    return { ok: true };
+    return issues.length > 0 ? { ok: false, issues } : { ok: true };
   }
   if (!isRecord(capability)) {
     add(issues, `${path}.dispatch_capability`, "must be an object");
@@ -1207,6 +1225,7 @@ export function validateActiveCapabilityStateBinding(state: unknown, path = "$")
     add(issues, path, "must be an object");
     return { ok: false, issues };
   }
+  validateOrdinaryStateIdentityBindings(state, path, issues);
   const capability = state.dispatch_capability;
   if (!isRecord(capability)) {
     add(issues, `${path}.dispatch_capability`, "must be an object");
