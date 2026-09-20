@@ -54,21 +54,13 @@ import { readDoDFileSafe, type DodSafeFileRead, resolveDodPath } from "../engine
 import { loadProfile } from "../engine/profile.js";
 import type { TeamState } from "../engine/types.js";
 import type { CtoState } from "../cto/types.js";
-import {
-  CTO_MD_EVIDENCE,
-  CTO_MD_FINISH_MARKERS,
-  EXCLUDED_SOURCE_NAMES,
-  WORK_STATE_DIR,
-  ctoTeamArtifactsDir,
-  isExcludedSourcePath,
-  type SessionSourceEntry,
-} from "../report/session-source.js";
+import type { CanonicalRunReportSource } from "../report/canonical-source.js";
+import { ctoTeamArtifactsDir, EXCLUDED_SOURCE_NAMES, WORK_STATE_DIR, isExcludedSourcePath, type CtoSessionSource } from "../report/session-source.js";
 import { redactReportBody } from "../report/redact.js";
 import {
   BOUNDED_DIGEST_LENGTH,
   DEFAULT_RENDERER_IDENTITY,
   EMPTY_BODY_MARKER,
-  LEGACY_ROOT_PATH_KEY,
   MAX_COLLECTION_ITEMS,
   MAX_DEPTH,
   MAX_SCALAR_CHARS,
@@ -98,6 +90,8 @@ import {
 import { resolveRenderConfig, type RenderConfig } from "./render-config.js";
 
 // ── Options ──────────────────────────────────────────────────────────────────
+
+type CanonicalVisualizationSource = CanonicalRunReportSource | CtoSessionSource;
 
 export interface BuildSessionSnapshotOptions {
   /** ISO timestamp — the only volatile model field (fixed clock in tests). */
@@ -137,11 +131,9 @@ function asList(value: string | string[] | undefined): string[] {
   return value ? [value] : [];
 }
 
-/** Map a discovered entry kind (+ legacy flag) onto the model SessionKind. */
-function sessionKindOf(entry: SessionSourceEntry): SessionKind {
-  if (entry.kind === "cto") return "cto";
-  if (entry.kind === "do-work" && entry.isLegacy) return "legacy";
-  return "feature";
+/** Canonical ordinary runs use the feature renderer namespace. */
+function sessionKindOf(entry: CanonicalVisualizationSource): SessionKind {
+  return entry.kind === "cto" ? "cto" : "feature";
 }
 
 /** Stable session title — derived from validated identity, never raw text. */
@@ -202,14 +194,25 @@ function workStateRealRoot(cwd: string): string {
 function resolveDeclaredPath(
   cwd: string,
   ref: string,
+  artifactsDir: string,
 ): { absPath: string; label: string } | { invalid: "unsafe-path" | "excluded-path" } {
-  if (isAbsolute(ref) || /^[A-Za-z]:[\\/]/.test(ref) || ref.includes("\\")) return { invalid: "unsafe-path" };
+  if (typeof ref !== "string" || isAbsolute(ref) || /^[A-Za-z]:[\\/]/.test(ref) || ref.includes("\\")) return { invalid: "unsafe-path" };
   const segments = ref.split("/");
   if (segments.some((s) => s === "" || s === "." || s === "..")) return { invalid: "unsafe-path" };
-  const absPath = resolve(cwd, ref);
+
+  // Canonical run state stores artifact references as artifacts/<id>.json.
+  // An already explicit .work-state path is retained only for fixture/import
+  // evidence; there is no slug, active-feature or latest lookup here.
+  const absPath = ref.startsWith(`${WORK_STATE_DIR}/`)
+    ? resolve(cwd, ref)
+    : resolve(artifactsDir, ref.startsWith("artifacts/") ? ref.slice("artifacts/".length) : ref);
   const wsRoot = resolve(cwd, WORK_STATE_DIR);
-  const rel = relative(wsRoot, absPath);
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return { invalid: "unsafe-path" };
+  const wsRel = relative(wsRoot, absPath);
+  if (wsRel === ".." || wsRel.startsWith(`..${sep}`) || isAbsolute(wsRel)) return { invalid: "unsafe-path" };
+  if (!ref.startsWith(`${WORK_STATE_DIR}/`)) {
+    const rootRel = relative(resolve(artifactsDir), absPath);
+    if (rootRel === ".." || rootRel.startsWith(`..${sep}`) || isAbsolute(rootRel)) return { invalid: "unsafe-path" };
+  }
   if (isExcludedSourcePath(cwd, absPath)) return { invalid: "excluded-path" };
   return { absPath, label: cwdRelativeLabel(cwd, absPath) };
 }
@@ -276,63 +279,21 @@ interface StateRead {
   format: "json" | "markdown";
 }
 
-/** Deterministic canonical state text for a session entry (one raw read). */
-function readStateContent(cwd: string, entry: SessionSourceEntry): StateRead {
-  if (entry.kind === "do-work") {
-    if (entry.statePath && existsSync(entry.statePath)) {
-      try {
-        return { text: readFileSync(entry.statePath, "utf8"), label: cwdRelativeLabel(cwd, entry.statePath), format: "json" };
-      } catch {
-        // fall through — unreadable state yields an empty canonical text
-      }
-    }
-    return { text: "", label: entry.statePath ? cwdRelativeLabel(cwd, entry.statePath) : ".work-state", format: "json" };
-  }
-  // CTO: state.json first; markdown-state runs use the evidence/finish files.
+/** Deterministic canonical state text for an explicit run source. */
+function readStateContent(cwd: string, entry: CanonicalVisualizationSource): StateRead {
   if (entry.statePath && existsSync(entry.statePath)) {
     try {
       return { text: readFileSync(entry.statePath, "utf8"), label: cwdRelativeLabel(cwd, entry.statePath), format: "json" };
     } catch {
-      // fall through to the markdown candidates
+      // fall through — unreadable state yields an empty canonical text
     }
   }
-  const candidates = entry.terminalMarkdown ? [...CTO_MD_FINISH_MARKERS] : [...CTO_MD_EVIDENCE];
-  for (const name of candidates) {
-    const p = join(entry.runDir, name);
-    if (existsSync(p)) {
-      try {
-        return { text: readFileSync(p, "utf8"), label: `.work-state/cto/${entry.id}`, format: "markdown" };
-      } catch {
-        continue;
-      }
-    }
-  }
-  return { text: "", label: `.work-state/cto/${entry.id}`, format: "markdown" };
-}
-
-/** First `# ` heading of a markdown state text — the run task (like markdownCtoState). */
-function markdownTask(text: string): string {
-  const line = text.split("\n").find((l) => l.startsWith("# "));
-  return line ? line.replace(/^#\s+/, "").trim() : "";
-}
-
-/**
- * Task for a terminal markdown run: derived from the evidence files exactly
- * like markdownCtoState (cto_discovery.md first, then team-plan.md) — the
- * finish-marker state text (summary.md) is the digest source, not the task.
- */
-function terminalMarkdownTask(runDir: string): string {
-  for (const name of ["cto_discovery.md", "team-plan.md"]) {
-    const p = join(runDir, name);
-    if (!existsSync(p)) continue;
-    try {
-      const task = markdownTask(readFileSync(p, "utf8"));
-      if (task !== "") return task;
-    } catch {
-      // unreadable — try the next evidence file
-    }
-  }
-  return "";
+  const state = entry.kind === "run" ? entry.read?.state : entry.state;
+  return {
+    text: state ? JSON.stringify(state, null, 2) : "",
+    label: entry.statePath ? cwdRelativeLabel(cwd, entry.statePath) : `${WORK_STATE_DIR}/${entry.kind === "cto" ? "cto" : "runs"}/${entry.id}/state.json`,
+    format: "json",
+  };
 }
 
 // ── Artifact plans ───────────────────────────────────────────────────────────
@@ -390,10 +351,10 @@ function scanJsonArtifacts(
   }
 }
 
-/** Do-work artifact plan: state.artifacts (declared) + artifacts dir extras. */
+/** Canonical run artifact plan: state.artifacts (declared) + run-local extras. */
 function planDoWorkArtifacts(
   cwd: string,
-  entry: Extract<SessionSourceEntry, { kind: "do-work" }>,
+  entry: CanonicalRunReportSource,
   state: TeamState,
 ): { plans: ArtifactPlan[]; declaredOrder: string[] } {
   const workflow = state.classification.workflow;
@@ -408,30 +369,44 @@ function planDoWorkArtifacts(
       plans.set(id, { id, declared: true, owner, invalid: "unsafe-id" });
       continue;
     }
-    const resolved = resolveDeclaredPath(cwd, ref);
+    const resolved = resolveDeclaredPath(cwd, ref, entry.artifactsDir);
     if ("invalid" in resolved) {
       plans.set(id, { id, declared: true, owner, invalid: resolved.invalid });
       continue;
     }
-    plans.set(id, { id, declared: true, owner, absPath: resolved.absPath, label: resolved.label, ...(id === "dod" ? { safeRead: readDoDFileSafe(cwd, resolved.absPath) } : {}) });
+    plans.set(id, {
+      id,
+      declared: true,
+      owner,
+      absPath: resolved.absPath,
+      label: resolved.label,
+      ...(id === "dod" ? { safeRead: readDoDFileSafe(cwd, resolved.absPath) } : {}),
+    });
   }
 
-  // Discovered extras: slot files attach to their declared base, anything
-  // else stays unclaimed. Excluded inputs are never discovered.
+  // Discovered extras attach only to this explicit run's artifacts directory.
   scanJsonArtifacts(cwd, entry.artifactsDir, (id, absPath) => {
     if (declared.has(id)) return;
     const base = slotBaseOf(id, declared);
     const owner = base ? (producesByStage.get(base) ?? "") : "";
-    plans.set(id, { id, declared: false, owner, ...(base ? { slotFor: base } : {}), absPath, label: cwdRelativeLabel(cwd, absPath), ...(id === "dod" ? { safeRead: readDoDFileSafe(cwd, absPath) } : {}) });
+    plans.set(id, {
+      id,
+      declared: false,
+      owner,
+      ...(base ? { slotFor: base } : {}),
+      absPath,
+      label: cwdRelativeLabel(cwd, absPath),
+      ...(id === "dod" ? { safeRead: readDoDFileSafe(cwd, absPath) } : {}),
+    });
   });
 
   return { plans: [...plans.values()], declaredOrder };
 }
 
-/** CTO artifact plan: run-local + team compatibility + validated dod_path. */
+/** Explicit CTO JSON artifact plan: run-local + team compatibility + dod_path. */
 function planCtoArtifacts(
   cwd: string,
-  entry: Extract<SessionSourceEntry, { kind: "cto" }>,
+  entry: Extract<CanonicalVisualizationSource, { kind: "cto" }>,
   state: CtoState,
   warnings: string[],
 ): { plans: ArtifactPlan[]; declaredOrder: string[] } {
@@ -439,7 +414,7 @@ function planCtoArtifacts(
   const plans = new Map<string, ArtifactPlan>();
   const reserved = new Set<string>();
   const add = (id: string, owner: string, absPath: string, label: string, safeRead?: DodSafeFileRead): void => {
-    if (reserved.has(id)) return; // fail-closed reservation: no generic fallback
+    if (reserved.has(id)) return;
     if (plans.has(id)) {
       warnings.push(`artifact ${id} exists in multiple locations: first resolution wins`);
       return;
@@ -447,58 +422,30 @@ function planCtoArtifacts(
     plans.set(id, { id, declared: true, owner, absPath, label, ...(safeRead ? { safeRead } : {}) });
   };
 
-  // 1. Canonical team DoD for EVERY team (explicit dod_path or the unset/
-  //    default team artifacts dir), planned BEFORE all generic scans through
-  //    the fd-bound safe read. Plan ids are globally unique: the first
-  //    canonical claim wins, and an unsafe canonical path RESERVES the dod id
-  //    (fail-closed, excluded from rendering) so scans can never provide a
-  //    fallback.
   for (const team of state.teams ?? []) {
-    // Canonical dod_path resolution (directory containing dod.json OR the
-    // dod.json file itself; default team artifacts dir when unset).
     const resolved = resolveDodPath(cwd, team.dod_path, team.id);
-    if (!resolved.ok) {
-      // Fail closed: warn and RESERVE the dod id so run-local and
-      // compatibility scans can never provide a fallback.
-      warnings.push(`declared path for dod is not a safe relative path: excluded from rendering`);
-      reserved.add("dod");
-      continue;
-    }
-    if (isExcludedSourcePath(cwd, resolved.file)) {
-      // Canonical exclusion contract (same predicate as declared paths):
-      // generated visualize output, vibe-report documentation and the
-      // observability event stream are never artifact inputs — warn and
-      // reserve against any generic fallback.
-      warnings.push(`declared path for dod is not a safe relative path: excluded from rendering`);
+    if (!resolved.ok || isExcludedSourcePath(cwd, resolved.file)) {
+      warnings.push("declared path for dod is not a safe relative path: excluded from rendering");
       reserved.add("dod");
       continue;
     }
     const safe = readDoDFileSafe(cwd, resolved.file);
     if (!safe.ok && safe.kind === "missing") {
-      // Absent canonical DoD: reserve against generic fallback but keep the
-      // prior no-artifact behavior — no missing plan is added.
       reserved.add("dod");
       continue;
     }
-    reserved.delete("dod"); // a real canonical file outranks an earlier absence
+    reserved.delete("dod");
     add("dod", team.id, resolved.file, cwdRelativeLabel(cwd, resolved.file), safe);
   }
 
-  // 2. Run-local artifacts: .work-state/cto/<runId>/artifacts/*.json. A
-  //    discovered dod.json is safe-read, never pathname-read.
   scanJsonArtifacts(cwd, join(entry.runDir, "artifacts"), (id, absPath) => {
     add(id, "", absPath, cwdRelativeLabel(cwd, absPath), id === "dod" ? readDoDFileSafe(cwd, absPath) : undefined);
   });
-
-  // 3. Team compatibility dirs: .work-state/artifacts/<teamId>/*.json (a
-  //    discovered dod.json — e.g. the default-dir DoD of a team without a
-  //    configured dod_path — is safe-read, never pathname-read).
   for (const team of state.teams ?? []) {
     scanJsonArtifacts(cwd, ctoTeamArtifactsDir(cwd, team.id), (id, absPath) => {
       add(id, team.id, absPath, cwdRelativeLabel(cwd, absPath), id === "dod" ? readDoDFileSafe(cwd, absPath) : undefined);
     });
   }
-
   return { plans: [...plans.values()], declaredOrder };
 }
 
@@ -857,38 +804,41 @@ function buildStages(
 // ── Session construction ─────────────────────────────────────────────────────
 
 /** Identity for a session entry — usable even when the state is unreadable. */
-function identityBaseOf(entry: SessionSourceEntry): {
+function identityBaseOf(entry: CanonicalVisualizationSource): {
   kind: SessionKind;
   id: string;
   pathKey: string;
 } {
   const kind = sessionKindOf(entry);
-  return {
-    kind,
-    id: entry.id,
-    pathKey: kind === "legacy" ? LEGACY_ROOT_PATH_KEY : entry.id,
-  };
+  return { kind, id: entry.id, pathKey: entry.id };
 }
 
 /**
- * Build the immutable normalized session model for one discovered session
- * entry. Never mutates canonical state; never throws for corrupt peers.
+ * Build the immutable normalized model for one explicitly selected canonical
+ * run/revision. Missing identity is a migration error, never a discovery
+ * request or a latest/slug fallback.
  */
 export function buildSessionSnapshot(
   cwd: string,
-  entry: SessionSourceEntry,
+  entry: CanonicalVisualizationSource,
   generatedAt: string,
   opts?: BuildSessionSnapshotOptions,
 ): VisualizationSession {
+  if (!entry || (entry.kind !== "run" && entry.kind !== "cto") || typeof entry.id !== "string" || entry.id.length === 0 || typeof entry.statePath !== "string" || (entry.kind === "run" ? typeof entry.artifactsDir !== "string" : typeof entry.runDir !== "string")) {
+    throw new Error("migration_required: canonical visualization requires an explicit run_id or exact CTO id");
+  }
+  if (entry.kind === "run" && (!entry.read || typeof entry.run_id !== "string" || entry.run_id.length === 0)) {
+    throw new Error("migration_required: canonical visualization requires an explicit run_id and optional revision_id");
+  }
+
   const identityBase = identityBaseOf(entry);
   const warnings: string[] = [];
   const contributions = new Map<string, DigestArtifactContribution>();
   const stateRead = readStateContent(cwd, entry);
-  const workflow: WorkflowName =
-    entry.kind === "cto" ? "cto" : (entry.state?.classification?.workflow ?? "standard");
+  const state = (entry.kind === "run" ? entry.read.state : entry.state) as TeamState | CtoState | null;
+  const workflow: WorkflowName = entry.kind === "cto" ? "cto" : (state as TeamState | null)?.classification?.workflow ?? "standard";
   const renderConfig = opts?.renderConfig ?? resolveRenderConfig(workflow, opts?.full ?? false);
   const windowBytes = renderConfig.options.readWindowBytes;
-
   const stateBytes = Buffer.byteLength(stateRead.text, "utf8");
   const provenanceFor = (sourceUpdatedAt: string | undefined, profileHash: string | undefined): VisualizationSession["provenance"] => ({
     ...(sourceUpdatedAt !== undefined ? { sourceUpdatedAt } : {}),
@@ -904,30 +854,20 @@ export function buildSessionSnapshot(
     bytes: stateBytes,
     readBytes: stateBytes,
     readWindowBytes: windowBytes,
-    format: stateRead.format,
+    format: "json",
   };
 
   try {
-    // ── Degraded projection: no usable state (corrupt JSON / terminal md). ──
-    if (entry.state === null) {
-      const degradedReasons =
-        entry.kind === "cto" && entry.terminalMarkdown === true
-          ? ["terminal markdown CTO state: visualization-only projection"]
-          : entry.kind === "cto"
-            ? ["unreadable state (JSON or markdown); rendering available content"]
-            : [entry.error ?? "unreadable state; rendering available content"];
+    if (!state) {
       return {
         schema: 1,
         identity: {
           ...identityBase,
           title: sessionTitleFor(identityBase.kind, identityBase.id),
-          task:
-            entry.kind === "cto" && entry.terminalMarkdown === true
-              ? terminalMarkdownTask(entry.runDir)
-              : "",
+          task: "",
           workflow,
-          sourceFormat: stateRead.format,
-          isLegacy: identityBase.kind === "legacy",
+          sourceFormat: "json",
+          isLegacy: false,
           degraded: true,
         },
         status: "degraded",
@@ -936,50 +876,36 @@ export function buildSessionSnapshot(
         source: sessionSource,
         provenance: provenanceFor(undefined, undefined),
         warnings,
-        degradedReasons,
+        degradedReasons: [entry.kind === "cto" ? entry.error ?? "unreadable CTO state" : "unreadable canonical run state"],
       };
     }
 
-    // ── Readable state: normal model construction. ─────────────────────────
     const stageStatuses = new Map<string, string>();
-    let stagesModel: StageProgressEntry[] = [];
-    let artifacts: VisualizationArtifact[] = [];
-    let declaredOrder: readonly string[] = [];
+    let planned: { plans: ArtifactPlan[]; declaredOrder: string[] };
     let task = "";
     let sourceUpdatedAt: string | undefined;
     let profileHash: string | undefined;
-
-    if (entry.kind === "do-work") {
-      const state = entry.state as TeamState;
-      for (const s of state.stages ?? []) stageStatuses.set(s.id, s.status);
-      const planned = planDoWorkArtifacts(cwd, entry, state);
-      declaredOrder = planned.declaredOrder;
-      artifacts = buildArtifactModel(planned.plans, declaredOrder, {
-        cwd,
-        renderConfig,
-        stageStatuses,
-        warnings,
-        contributions,
-      });
-      stagesModel = buildStages(state, artifacts, declaredOrder);
-      task = state.task ?? "";
-      if (stateRead.format === "json") sourceUpdatedAt = state.updated_at;
-      if (state.profile_hash) profileHash = state.profile_hash;
-      if (artifacts.length === 0) warnings.push("no artifacts yet");
+    if (entry.kind === "cto") {
+      planned = planCtoArtifacts(cwd, entry, state as CtoState, warnings);
+      task = (state as CtoState).task ?? "";
+      sourceUpdatedAt = (state as CtoState).updated_at;
     } else {
-      const state = entry.state as CtoState;
-      const planned = planCtoArtifacts(cwd, entry, state, warnings);
-      declaredOrder = planned.declaredOrder;
-      artifacts = buildArtifactModel(planned.plans, declaredOrder, {
-        cwd,
-        renderConfig,
-        stageStatuses,
-        warnings,
-        contributions,
-      });
-      task = state.task ?? "";
-      if (stateRead.format === "json") sourceUpdatedAt = state.updated_at;
+      const ordinary = state as TeamState;
+      for (const stage of ordinary.stages ?? []) stageStatuses.set(stage.id, stage.status);
+      planned = planDoWorkArtifacts(cwd, entry, ordinary);
+      task = ordinary.task ?? "";
+      sourceUpdatedAt = ordinary.updated_at;
+      profileHash = ordinary.profile_hash;
     }
+    const artifacts = buildArtifactModel(planned.plans, planned.declaredOrder, {
+      cwd,
+      renderConfig,
+      stageStatuses,
+      warnings,
+      contributions,
+    });
+    const stagesModel = entry.kind === "cto" ? [] : buildStages(state as TeamState, artifacts, planned.declaredOrder);
+    if (artifacts.length === 0) warnings.push("no artifacts yet");
 
     return {
       schema: 1,
@@ -988,8 +914,8 @@ export function buildSessionSnapshot(
         title: sessionTitleFor(identityBase.kind, identityBase.id),
         task,
         workflow,
-        sourceFormat: stateRead.format,
-        isLegacy: identityBase.kind === "legacy",
+        sourceFormat: "json",
+        isLegacy: false,
         degraded: false,
       },
       status: "complete",
@@ -1000,8 +926,6 @@ export function buildSessionSnapshot(
       warnings,
     };
   } catch (error) {
-    // Never abort a bundle for one session: a build failure degrades the
-    // session with a category-only warning instead of throwing.
     return {
       schema: 1,
       identity: {
@@ -1009,8 +933,8 @@ export function buildSessionSnapshot(
         title: sessionTitleFor(identityBase.kind, identityBase.id),
         task: "",
         workflow,
-        sourceFormat: stateRead.format,
-        isLegacy: identityBase.kind === "legacy",
+        sourceFormat: "json",
+        isLegacy: false,
         degraded: true,
       },
       status: "degraded",
@@ -1025,31 +949,21 @@ export function buildSessionSnapshot(
 }
 
 /**
- * Content-derived session timestamp for the total order (F3). Only
- * timestamps that come from canonical state content (`state.updated_at`)
- * participate: agent-written markdown CTO runs carry no content timestamp,
- * so discovery labels them with the newest run-local filesystem mtime —
- * internal discovery metadata that MUST NOT reorder any rendered surface.
- * Such entries sort deterministically as unknown-timestamp (last, then
- * kind, then id), which is exactly the order the manifest derives from
- * `provenance.sourceUpdatedAt` (absent for markdown state), so the snapshot
- * order, both hubs and the manifest always agree.
+ * Content-derived session timestamp for deterministic canonical ordering.
+ * Only the selected state/revision's updated_at participates.
  */
-function contentUpdatedAtOf(entry: SessionSourceEntry): string | undefined {
-  if (entry.kind === "cto" && entry.format === "markdown") return undefined;
-  return entry.updatedAt ?? undefined;
+/**
+ * Content-derived session timestamp for deterministic canonical ordering.
+ * Only the selected state/revision's updated_at participates.
+ */
+function contentUpdatedAtOf(entry: CanonicalVisualizationSource): string | undefined {
+  return entry.kind === "cto" ? entry.updatedAt ?? undefined : entry.read.state?.updated_at;
 }
 
-/**
- * Build snapshots for every entry in the total deterministic session order
- * (content-derived updated_at desc, then kind, then id — never filesystem
- * order, never mtime). Markdown-state CTO entries have no content timestamp
- * (run-local mtime is internal discovery metadata only) and sort last, then
- * kind, then id — identical to the manifest's `sourceUpdatedAt` order.
- */
+/** Build snapshots for an explicit set of canonical run/revision sources. */
 export function buildSessionSnapshots(
   cwd: string,
-  entries: SessionSourceEntry[],
+  entries: CanonicalVisualizationSource[],
   generatedAt: string,
   opts?: BuildSessionSnapshotOptions,
 ): VisualizationSession[] {

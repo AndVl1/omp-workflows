@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildSessionSnapshot } from "../src/visualize/snapshot.js";
-import { resolveDoWorkSource } from "../src/report/session-source.js";
+import { canonicalSourceFor } from "./fixtures/canonical-source.js";
 import {
   DEFAULT_BODY_CAP_BYTES,
   EMPTY_BODY_MARKER,
@@ -48,9 +48,7 @@ function write(path: string, content: string): void {
 }
 
 function build(cwd: string, input: CanonicalSessionInput, full = false) {
-  const resolved = resolveDoWorkSource(cwd, input.id);
-  if (!resolved) throw new Error(`session not resolved: ${input.id}`);
-  return buildSessionSnapshot(cwd, resolved, FIXED_GENERATED_AT, full ? { full: true } : {});
+  return buildSessionSnapshot(cwd, canonicalSourceFor(cwd, input), FIXED_GENERATED_AT, full ? { full: true } : {});
 }
 
 // ── 1. Redaction at every verbosity, redaction before caps (AC-3) ───────────

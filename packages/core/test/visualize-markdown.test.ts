@@ -34,12 +34,8 @@ import {
   sectionAnchorOf,
 } from "../src/visualize/markdown.js";
 import { buildSessionSnapshot } from "../src/visualize/snapshot.js";
-import {
-  listCtoSources,
-  resolveCtoSource,
-  resolveDoWorkSource,
-  type SessionSourceEntry,
-} from "../src/report/session-source.js";
+import { resolveCtoSource } from "../src/report/session-source.js";
+import { canonicalSourceFor } from "./fixtures/canonical-source.js";
 import {
   DEFAULT_RENDERER_IDENTITY,
   REGENERATE_HINT,
@@ -95,20 +91,13 @@ function materialize(cwd: string, input: CanonicalSessionInput, extraFiles: Reco
   for (const f of input.artifacts) write(join(cwd, f.relPath), f.content);
 }
 
-function entryOf(cwd: string, input: CanonicalSessionInput): SessionSourceEntry {
+function entryOf(cwd: string, input: CanonicalSessionInput) {
   if (input.kind === "cto") {
-    if (input.state.format === "markdown" && input.state.content.includes("# Summary")) {
-      const entry = listCtoSources(cwd).find((e) => e.id === input.id);
-      if (!entry) throw new Error(`terminal markdown run not discovered: ${input.id}`);
-      return entry;
-    }
-    const resolved = resolveCtoSource(cwd, input.id);
-    if (!resolved) throw new Error(`cto run not resolved: ${input.id}`);
-    return resolved;
+    const source = resolveCtoSource(cwd, input.id);
+    if (!source) throw new Error(`explicit CTO source unavailable: ${input.id}`);
+    return source;
   }
-  const resolved = resolveDoWorkSource(cwd, input.id);
-  if (!resolved) throw new Error(`do-work session not resolved: ${input.id}`);
-  return resolved;
+  return canonicalSourceFor(cwd, input);
 }
 
 function sessionOf(cwd: string, input: CanonicalSessionInput, full = false): VisualizationSession {
@@ -392,31 +381,6 @@ test("markdown: unlisted workflow gets the explicit safe default and generic fal
 
     const snapshot = snapshotFor([session], "all");
     assertPageHrefsResolve(session, md, snapshot);
-    assert.deepEqual(preflightLinks(snapshot).deadLinks, []);
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-// ── Golden: legacy root (stale + regenerate hint) ────────────────────────────
-
-test("markdown: legacy root session is stale with a visible regenerate hint", () => {
-  const cwd = tmpWorkspace();
-  try {
-    const input = caseInput("legacy-root");
-    materialize(cwd, input);
-    const session = sessionOf(cwd, input);
-    const md = renderSessionMarkdown(session);
-    assertFencesClosed(md);
-    assertOnlyAnchorTags(md);
-
-    assert.ok(md.includes('<a id="viz-legacy-root"></a>'), "legacy root keeps its stable pathKey anchor");
-    assert.ok(md.includes("# legacy feature worktree"));
-    assert.ok(md.includes("- **Staleness:** stale"));
-    assert.ok(md.includes("regenerate stale output"), "REGENERATE_HINT is visible");
-    assert.ok(md.includes("safe default; bodies disabled"), "legacy standard workflow → safe default");
-
-    const snapshot = snapshotFor([session], "all");
     assert.deepEqual(preflightLinks(snapshot).deadLinks, []);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
@@ -744,20 +708,15 @@ test("markdown: hub — selected scope is visibly partial, --all is complete", (
 });
 
 test("markdown: hub shows the stale regenerate hint per stale session", () => {
-  const cwd = tmpWorkspace();
-  try {
-    const legacyInput = caseInput("legacy-root");
-    materialize(cwd, legacyInput);
-    const legacy = sessionOf(cwd, legacyInput);
-    const snapshot = snapshotFor([legacy], "all");
-    const md = renderHubMarkdown(snapshot);
-    assert.ok(md.includes("· stale ·"));
-    assert.ok(md.includes("  - stale: run the on"), "stale hint line present");
-    assert.ok(md.includes("demand visualize command to regenerate stale output"), "stale regenerate hint on the hub");
-    assert.deepEqual(preflightLinks(snapshot).deadLinks, []);
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
+  const stale = buildExpectedSpecPreparationSession();
+  stale.provenance.sourceUpdatedAt = "2026-08-19T13:00:00.000Z";
+  stale.provenance.staleness = "stale";
+  const snapshot = snapshotFor([stale], "all");
+  const md = renderHubMarkdown(snapshot);
+  assert.ok(md.includes("· stale ·"));
+  assert.ok(md.includes("  - stale: run the on"), "stale hint line present");
+  assert.ok(md.includes("demand visualize command to regenerate stale output"), "stale regenerate hint on the hub");
+  assert.deepEqual(preflightLinks(snapshot).deadLinks, []);
 });
 
 // ── Link preflight ───────────────────────────────────────────────────────────

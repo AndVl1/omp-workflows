@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { createWorkflowSessionController, registerTeamWorkflow } from "../src/index.js";
+import { dispatchGate } from "../src/gates/dispatch.js";
 import type { RoleConfig, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
 
 const genericRoles: RoleConfig["roles"] = { worker: "worker" };
@@ -94,5 +95,39 @@ test("selected canonical run rejects malformed classification before dispatch", 
     assert.match(result?.reason ?? "", /malformed classification|workflow/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("explicit corrupt or missing canonical markers fail closed while no marker stays compatible", () => {
+  const markerFor = (run: string) => `<!-- omp-dispatch run=${run} stage=implementation kind=single cursor=epoch roles=worker -->`;
+
+  const corruptRoot = mkdtempSync(join(tmpdir(), "omp-gate-corrupt-marker-"));
+  try {
+    const runDir = join(corruptRoot, ".work-state", "runs", RUN_ID);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "state.json"), "{not json");
+    const blocked = dispatchGate({ toolName: "task", input: { task: markerFor(RUN_ID) } }, { cwd: corruptRoot });
+    assert.equal(blocked?.block, true, "an explicit corrupt canonical marker must fail closed");
+    assert.match(blocked?.reason ?? "", /workflow state path is invalid/);
+  } finally {
+    rmSync(corruptRoot, { recursive: true, force: true });
+  }
+
+  const missingRoot = mkdtempSync(join(tmpdir(), "omp-gate-missing-marker-"));
+  try {
+    const blocked = dispatchGate({ toolName: "task", input: { task: markerFor("22222222-2222-4222-8222-222222222222") } }, { cwd: missingRoot });
+    assert.equal(blocked?.block, true, "an explicit marker for a missing canonical run must fail closed");
+    assert.match(blocked?.reason ?? "", /workflow state is unavailable/);
+  } finally {
+    rmSync(missingRoot, { recursive: true, force: true });
+  }
+
+  const absentRoot = mkdtempSync(join(tmpdir(), "omp-gate-absent-marker-"));
+  try {
+    const allowed = dispatchGate({ toolName: "task", input: { task: "ordinary task" } }, { cwd: absentRoot });
+    assert.equal(allowed, undefined, "a task without a canonical marker keeps the compatibility behavior");
+  } finally {
+    rmSync(absentRoot, { recursive: true, force: true });
   }
 });

@@ -89,9 +89,9 @@ function resolveDispatchTarget(cwd: string, event: { input?: unknown }, controll
     }
   }
   try {
-    return resolveCanonicalRun(cwd, { kind: "team", runId: marker.run }, branch) ?? { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false };
+    return resolveCanonicalRun(cwd, { kind: "team", runId: marker.run }, branch) ?? null;
   } catch {
-    return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: true };
+    return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false, invalid: true };
   }
 }
 
