@@ -1050,6 +1050,12 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
     assert.equal(bashEcho?.block, true);
     const bashRemove = orchestratorWriteGate({ toolName: "bash", input: { command: "rm src/app.ts" } }, hostContext);
     assert.equal(bashRemove?.block, true);
+    const accessorCanonical = {} as Record<string, unknown>;
+    Object.defineProperty(accessorCanonical, "command", { get: () => `cat > ${canonicalStatePath}` });
+    assert.equal(orchestratorWriteGate({ toolName: "bash", input: accessorCanonical }, hostContext)?.block, true);
+    const malformedCanonical = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(malformedCanonical, "command", { value: `cat > ${canonicalStatePath}` });
+    assert.equal(orchestratorWriteGate({ toolName: "bash", input: malformedCanonical }, hostContext)?.block, true);
     const bashRead = orchestratorWriteGate(
       { toolName: "bash", input: { command: "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts" } },
       hostContext,
@@ -1107,6 +1113,8 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
       toolCall!({ toolName: "write", input }, ctx) as { block?: boolean; reason?: string } | undefined;
     const invokeBash = (command: string, ctx: unknown): { block?: boolean; reason?: string } | undefined =>
       toolCall!({ toolName: "bash", input: { command } }, ctx) as { block?: boolean; reason?: string } | undefined;
+    const invokeBashInput = (input: Record<string, unknown>, ctx: unknown): { block?: boolean; reason?: string } | undefined =>
+      toolCall!({ toolName: "bash", input }, ctx) as { block?: boolean; reason?: string } | undefined;
     const trustedRawContext = {
       sessionManager: { getCwd: () => root, getSessionId: () => sessionId },
     };
@@ -1182,6 +1190,91 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts", trustedRawContext), undefined);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD", trustedRawContext), undefined);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline", trustedRawContext), undefined);
+    assert.equal(invokeBash("git --no-pager -c core.fsmonitor=false status --short", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false rev-parse HEAD", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false status --porcelain=v2", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-textconv -- src/app.ts", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff HEAD", trustedRawContext)?.block, true);
+    assert.equal(
+      invokeBashInput(
+        { command: "git --no-pager -c core.fsmonitor=false diff --no-textconv -- src/app.ts", env: { GIT_OPTIONAL_LOCKS: "0" } },
+        trustedRawContext,
+      )?.block,
+      true,
+    );
+    assert.equal(
+      invokeBashInput(
+        { command: "git --no-pager -c core.fsmonitor=false show --no-ext-diff HEAD", env: { GIT_OPTIONAL_LOCKS: "0" } },
+        trustedRawContext,
+      )?.block,
+      true,
+    );
+    assert.equal(
+      invokeBashInput(
+        { command: "git --no-pager -c core.fsmonitor=false status --short --branch", env: { GIT_OPTIONAL_LOCKS: "0" } },
+        trustedRawContext,
+      ),
+      undefined,
+    );
+    assert.equal(
+      invokeBashInput(
+        { command: safeStatus, env: { GIT_OPTIONAL_LOCKS: "0" } },
+        trustedRawContext,
+      ),
+      undefined,
+    );
+    const inheritedEnv = Object.create({ GIT_OPTIONAL_LOCKS: "0" }) as Record<string, unknown>;
+    const inheritedExtraEnv = Object.create({ GIT_PAGER: "cat" }) as Record<string, unknown>;
+    Object.defineProperty(inheritedExtraEnv, "GIT_OPTIONAL_LOCKS", { value: "0", enumerable: true });
+    const symbolExtraEnv = { GIT_OPTIONAL_LOCKS: "0" } as Record<string, unknown>;
+    Object.defineProperty(symbolExtraEnv, Symbol("extra"), { value: "x" });
+    const hiddenExtraEnv = { GIT_OPTIONAL_LOCKS: "0" } as Record<string, unknown>;
+    Object.defineProperty(hiddenExtraEnv, "GIT_PAGER", { value: "cat" });
+    const accessorEnv = {};
+    Object.defineProperty(accessorEnv, "GIT_OPTIONAL_LOCKS", { get: () => "0" });
+    const invalidEnvs: unknown[] = [
+      { GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat" },
+      { GIT_OPTIONAL_LOCKS: "1" },
+      { GIT_OPTIONAL_LOCKS: 0 },
+      inheritedEnv,
+      inheritedExtraEnv,
+      symbolExtraEnv,
+      hiddenExtraEnv,
+      accessorEnv,
+      null,
+      ["0"],
+    ];
+    for (const env of invalidEnvs) {
+      assert.equal(
+        invokeBashInput({ command: "git --no-pager -c core.fsmonitor=false status --short", env }, trustedRawContext)?.block,
+        true,
+      );
+      assert.equal(
+        invokeBashInput({ command: safeStatus, env }, trustedRawContext)?.block,
+        true,
+      );
+    }
+    const accessorCommandInput = { command: safeStatus } as Record<string, unknown>;
+    Object.defineProperty(accessorCommandInput, "command", { get: () => safeStatus });
+    const accessorInputEnv = { command: "git --no-pager -c core.fsmonitor=false status --short" } as Record<string, unknown>;
+    Object.defineProperty(accessorInputEnv, "env", { get: () => ({ GIT_OPTIONAL_LOCKS: "0" }) });
+    for (const input of ["git --no-pager -c core.fsmonitor=false status --short", 1, true, 0, null, [], accessorCommandInput, accessorInputEnv] as unknown[]) {
+      assert.equal(invokeBashInput(input as Record<string, unknown>, trustedRawContext)?.block, true);
+    }
+    const structuredStatus = "git --no-pager -c core.fsmonitor=false status --short";
+    for (const command of [
+      `${safeStatus}; echo changed`,
+      `${safeStatus} $(echo changed)`,
+      `${safeStatus} > proof.txt`,
+      `${structuredStatus}; echo changed`,
+      `${structuredStatus} $(echo changed)`,
+      `${structuredStatus} > proof.txt`,
+    ]) {
+      assert.equal(
+        invokeBashInput({ command, env: { GIT_OPTIONAL_LOCKS: "0" } }, trustedRawContext)?.block,
+        true,
+      );
+    }
     assert.equal(invokeBash("chmod 644 src/app.ts", trustedRawContext)?.block, true);
     assert.equal(invokeBash("chmod 644 .work-state/other.json", trustedRawContext)?.block, true);
     assert.equal(invokeBash(`echo changed > ${artifactsDir}/mutation.json`, trustedRawContext)?.block, true);

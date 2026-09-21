@@ -63,6 +63,8 @@ export function orchestratorWriteGate(
   // exact route writes are exempt from project-write policy.
   if (isRegisteredLifecycleDeviceWrite(event)) return;
   const actor = trustedActorOf(ctx);
+  const bashSnapshot = event.toolName === "bash" ? bashProofInput(event.input) : undefined;
+  const bashCommand = event.toolName === "bash" && bashSnapshot?.valid ? bashSnapshot.command : "";
 
   // A proof-derived artifact scope is deliberately a positive allowlist:
   // only the exact sanitized read-only git prefix
@@ -70,14 +72,16 @@ export function orchestratorWriteGate(
   // through bash; diff/show additionally require --no-ext-diff and --no-textconv.
   const artifactsDir = trustedArtifactsDirOf(ctx, actor);
   if (event.toolName === "bash" && artifactsDir) {
-    const command = commandFromInput(event.input);
-    if (!isReadOnlyProofCommand(command)) {
+    if (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv)) {
       return { block: true, reason: "orchestrator policy: trusted host artifact proof permits only sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false; diff/show also require --no-ext-diff --no-textconv" };
     }
   }
 
+  if (event.toolName === "bash" && !bashSnapshot?.valid) {
+    return { block: true, reason: "orchestrator policy: malformed bash input" };
+  }
   if (event.toolName === "bash") {
-    const command = commandFromInput(event.input);
+    const command = bashCommand;
     const targets = bashMutationTargets(command);
     const canonical = targets.find((path) => isCanonicalStatePath(path, ctx.cwd));
     if (canonical || looksLikeWorkflowStateMutation(command)) {
@@ -152,12 +156,24 @@ function splitGitArgs(args: string[], options: ReadonlySet<string>): { before: s
 }
 
 /** Bounded read-only git grammar for trusted artifact-proof bash. */
-function isReadOnlyProofCommand(command: string): boolean {
+function isReadOnlyProofCommand(command: string, env: unknown, hasEnv: boolean): boolean {
   const words = simpleGitWords(command);
-  const prefix = ["GIT_OPTIONAL_LOCKS=0", "git", "--no-pager", "-c", "core.fsmonitor=false"];
-  if (!words || words.length < prefix.length + 1 || prefix.some((word, index) => words[index] !== word)) return false;
-  const subcommand = words[prefix.length]!;
-  const args = words.slice(prefix.length + 1);
+  const inlinePrefix = ["GIT_OPTIONAL_LOCKS=0", "git", "--no-pager", "-c", "core.fsmonitor=false"];
+  const structuredPrefix = ["git", "--no-pager", "-c", "core.fsmonitor=false"];
+  if (!words) return false;
+  if (hasEnv && !isExactSafeGitEnv(env)) return false;
+  const matches = (prefix: string[]): boolean =>
+    words.length >= prefix.length + 1 && prefix.every((word, index) => words[index] === word);
+  const inlineMatch = matches(inlinePrefix);
+  const structuredMatch = hasEnv && matches(structuredPrefix);
+  const prefixLength = inlineMatch
+    ? inlinePrefix.length
+    : structuredMatch
+      ? structuredPrefix.length
+      : undefined;
+  if (prefixLength === undefined) return false;
+  const subcommand = words[prefixLength]!;
+  const args = words.slice(prefixLength + 1);
   if (subcommand === "status") {
     const parsed = splitGitArgs(args, new Set(["-b", "-s", "--branch", "--no-renames", "--porcelain", "--short"]));
     return !!parsed && parsed.before.every((arg) => arg.startsWith("-")) && parsed.after.length === 0;
@@ -179,7 +195,6 @@ function isReadOnlyProofCommand(command: string): boolean {
   }
   return false;
 }
-
 export function actorOf(input: Record<string, unknown> | undefined): Actor | undefined {
   const raw = input?.__omp_actor ?? input?.actor;
   return raw === "orchestrator" || raw === "worker" || raw === "lead" ? raw : undefined;
@@ -189,6 +204,53 @@ function commandFromInput(input: ToolCallEvent["input"]): string {
   if (typeof input === "string") return input;
   if (!input) return "";
   return String(input.command ?? "");
+}
+type BashProofInput = {
+  valid: boolean;
+  command: string;
+  env?: unknown;
+  hasEnv: boolean;
+};
+
+function invalidBashProofInput(): BashProofInput {
+  return { valid: false, command: "", hasEnv: true };
+}
+
+function bashProofInput(input: ToolCallEvent["input"]): BashProofInput {
+  if (typeof input === "string") return { valid: true, command: input, hasEnv: false };
+  if (!input || typeof input !== "object" || Array.isArray(input)) return invalidBashProofInput();
+  try {
+    if (Object.getPrototypeOf(input) !== Object.prototype) return invalidBashProofInput();
+    const commandDescriptor = Object.getOwnPropertyDescriptor(input, "command");
+    if (!commandDescriptor || !("value" in commandDescriptor) || commandDescriptor.get !== undefined || commandDescriptor.set !== undefined) {
+      return invalidBashProofInput();
+    }
+    const command = commandDescriptor.value;
+    if (typeof command !== "string") return invalidBashProofInput();
+    const envDescriptor = Object.getOwnPropertyDescriptor(input, "env");
+    if (!envDescriptor) {
+      if ("env" in input) return invalidBashProofInput();
+      return { valid: true, command, hasEnv: false };
+    }
+    if (!("value" in envDescriptor) || envDescriptor.get !== undefined || envDescriptor.set !== undefined) return invalidBashProofInput();
+    const env = envDescriptor.value;
+    return { valid: true, command, env, hasEnv: true };
+  } catch {
+    return invalidBashProofInput();
+  }
+}
+function isExactSafeGitEnv(env: unknown): boolean {
+  try {
+    if (!env || typeof env !== "object" || Array.isArray(env) || Object.getPrototypeOf(env) !== Object.prototype) return false;
+    const keys = Reflect.ownKeys(env);
+    if (keys.length !== 1 || keys[0] !== "GIT_OPTIONAL_LOCKS") return false;
+    const descriptor = Object.getOwnPropertyDescriptor(env, "GIT_OPTIONAL_LOCKS");
+    if (!descriptor || !("value" in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) return false;
+    const value = descriptor.value;
+    return typeof value === "string" && value === "0";
+  } catch {
+    return false;
+  }
 }
 
 function pathsFromInput(input: ToolCallEvent["input"]): string[] {

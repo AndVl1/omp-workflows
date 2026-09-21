@@ -45,6 +45,13 @@ test("write_scope: worker writes outside the declared scope are blocked", () => 
 
     const allowed = workerWriteScopeGate({ toolName: "write", input: { path: "src/a.ts" } }, { cwd, actor: "worker", hasUI: false, writeScope: SCOPE });
     assert.equal(allowed, undefined, "worker write inside the scope is allowed");
+    const accessorCommand = {} as Record<string, unknown>;
+    Object.defineProperty(accessorCommand, "command", { get: () => "echo changed > lib/other.ts" });
+    const accessorOutside = workerWriteScopeGate(
+      { toolName: "bash", input: accessorCommand },
+      { cwd, actor: "worker", hasUI: false, writeScope: SCOPE },
+    );
+    assert.equal(accessorOutside?.block, true);
 
     const mountedTool = workerWriteScopeGate(
       { toolName: "write", input: { path: "xd://workflow_instructions" } },
