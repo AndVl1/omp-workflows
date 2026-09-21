@@ -58,6 +58,14 @@ function makePi() {
 		fireSessionStart(ctx: unknown): void {
 			for (const handler of hooks.get("session_start") ?? []) handler({}, ctx);
 		},
+		fireBeforeAgentStart(event: unknown, ctx: unknown): unknown {
+			let result: unknown;
+			for (const handler of hooks.get("before_agent_start") ?? []) {
+				const output = handler(event, ctx);
+				if (output !== undefined) result = output;
+			}
+			return result;
+		},
 	};
 }
 
@@ -100,9 +108,14 @@ test("zero workflow-engine registration when workspace markers are absent", () =
 
 	assert.deepEqual(host.labels, [], "no setLabel side effect");
 	assert.deepEqual(host.tools, [], "no tool registrations");
-	assert.equal(host.hooks.has("before_agent_start"), false, "engine gates not wired");
-	assert.equal(host.hooks.has("tool_call"), false, "engine gates not wired");
-	assert.equal(isRegisteredWorkflow("omp-feature") && false, false);
+	assert.equal(
+		host.fireBeforeAgentStart(
+			{ prompt: "untrusted workflow prompt", systemPrompt: ["base-system-prompt"] },
+			{ cwd: root, sessionManager: { getCwd: () => root, getSessionId: () => "unactivated-session" } },
+		),
+		undefined,
+		"unactivated sessions do not receive the workflow-managed turn contract",
+	);
 	for (const capability of ALL_CAPABILITIES) assertUnclaimed(root, capability);
 });
 
@@ -164,8 +177,14 @@ test("foreign claim on one capability blocks the whole bundle before any registr
 
 	assert.deepEqual(host.labels, [], "fail closed: no label");
 	assert.deepEqual(host.tools, [], "fail closed: no tools");
-	assert.equal(host.hooks.has("before_agent_start"), false, "engine gates stay unwired");
-	assert.equal(isRegisteredWorkflow("omp-feature") && false, false, "no engine/profile registration side effect");
+	assert.equal(
+		host.fireBeforeAgentStart(
+			{ prompt: "untrusted workflow prompt", systemPrompt: ["base-system-prompt"] },
+			{ cwd: root, sessionManager: { getCwd: () => root, getSessionId: () => "conflicted-session" } },
+		),
+		undefined,
+		"owner conflict leaves the workflow hook dormant without command authority",
+	);
 	assert.equal(workflowOwnerFor(root, "workflow_registration")?.owner.owner_id, "foreign-bundle");
 	assertUnclaimed(root, "workflow_tools");
 	assertUnclaimed(root, "config_writer");
