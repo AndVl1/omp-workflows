@@ -479,7 +479,7 @@ function resolveFullstackTrustedToolCallActor(
   cwd: string,
   runId: string | undefined,
 ): TrustedToolCallResolution | undefined {
-  if (!runId || !ctx || typeof ctx !== "object") return undefined;
+  if (!ctx || typeof ctx !== "object") return undefined;
   const captured = capturedHostSessionRef.current;
   const primary = primaryHostSessionRef.current;
   const controller = workflowSessionRef.current;
@@ -514,6 +514,8 @@ function resolveFullstackTrustedToolCallActor(
       || resolve(controllerContext.worktree) !== resolve(captured.cwd)
       || controller.selectedRunId() !== runId
     ) return undefined;
+    if (runId === undefined) return { kind: "authenticated-interactive-host-no-run" };
+    if (!runId) return undefined;
     const target = runTarget(captured.cwd, runId);
     const artifactsDir = target.artifactsDir;
     const expectedArtifactsDir = resolve(captured.cwd, ".work-state", "runs", runId, "artifacts");

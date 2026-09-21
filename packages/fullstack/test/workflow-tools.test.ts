@@ -1321,6 +1321,95 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
   }
 });
 
+test("fullstack: captured claim-free host with no selected run reaches ordinary tools but keeps safety gates", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-raw-tool-call-no-run-"));
+  const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+  const pi = {
+    zod: { z },
+    on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+      (handlers[name] ??= []).push(handler);
+    },
+    registerTool() {},
+    registerCommand() {},
+    setLabel() {},
+    sendUserMessage() {},
+  };
+  const emit = async (name: string, event: unknown, ctx: unknown): Promise<unknown[]> =>
+    Promise.all((handlers[name] ?? []).map(handler => handler(event, ctx)));
+  const invoke = async (
+    toolName: string,
+    input: Record<string, unknown>,
+    ctx: unknown,
+  ): Promise<{ block?: boolean; reason?: string } | undefined> => {
+    const results = await emit("tool_call", { toolName, input }, ctx);
+    return results.find(value => value && typeof value === "object" && (value as { block?: unknown }).block === true) as { block?: boolean; reason?: string } | undefined;
+  };
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    ompWorkflowsFullstack(pi as never);
+    const host = {
+      mode: "tui",
+      hasUI: true,
+      cwd: root,
+      session_id: "session-no-run",
+      sessionManager: { getCwd: () => root, getSessionId: () => "session-no-run" },
+    };
+    await emit("session_start", {}, host);
+
+    // With no selected run and no execution claim, the authenticated host
+    // reaches the ordinary tool gates instead of the blanket admission block.
+    assert.equal(await invoke("write", { path: "src/app.ts" }, {
+      sessionManager: host.sessionManager,
+    }), undefined);
+    assert.equal(await invoke("edit", { path: "src/app.ts" }, {
+      sessionManager: host.sessionManager,
+    }), undefined);
+    assert.equal(await invoke("bash", { command: "printf safe" }, {
+      sessionManager: host.sessionManager,
+    }), undefined);
+
+    // Normal safety behavior remains active after the no-run admission.
+    assert.equal((await invoke("write", { path: ".env" }, {
+      sessionManager: host.sessionManager,
+    }))?.block, true);
+    assert.equal((await invoke("bash", { command: "rm -rf /" }, {
+      sessionManager: host.sessionManager,
+    }))?.block, true);
+
+    // Foreign, copied-identity-mismatched, and headless contexts cannot use
+    // the captured host's no-run authority, even when they forge an actor.
+    const foreign = {
+      actor: "orchestrator",
+      sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" },
+    };
+    assert.equal((await invoke("write", { path: "src/app.ts" }, foreign))?.block, true);
+    assert.equal((await invoke("write", { path: "src/app.ts" }, {
+      actor: "orchestrator",
+      session_id: "mismatched-session",
+      sessionManager: host.sessionManager,
+    }))?.block, true);
+    await emit("session_start", {}, {
+      mode: "print",
+      hasUI: false,
+      cwd: root,
+      session_id: host.session_id,
+      sessionManager: host.sessionManager,
+    });
+    assert.equal((await invoke("write", { path: "src/app.ts" }, {
+      sessionManager: host.sessionManager,
+    }))?.block, true);
+  } finally {
+    await emit("session_stop", {}, {
+      mode: "tui",
+      hasUI: true,
+      cwd: root,
+      session_id: "session-no-run",
+      sessionManager: { getCwd: () => root, getSessionId: () => "session-no-run" },
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("fullstack: workflow_checkpoint_ask ingests the connected RPC client's select answer from the session profile", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-ask-rpc-"));
   const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();

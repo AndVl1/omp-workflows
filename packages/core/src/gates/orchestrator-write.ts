@@ -67,9 +67,16 @@ export function orchestratorWriteGate(
   const bashCommand = event.toolName === "bash" && bashSnapshot?.valid ? bashSnapshot.command : "";
 
   // A proof-derived artifact scope is deliberately a positive allowlist:
-  // only the exact sanitized read-only git prefix
-  // `GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false` may run
-  // through bash; diff/show additionally require --no-ext-diff and --no-textconv.
+  // read-only status/log/diff/show plus exactly `branch --show-current`
+  // may run through bash.
+  // Accepted command encodings are not mutually exclusive transports:
+  // inline `GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false ...`
+  // accepts env absent or the exact own one-key `{ GIT_OPTIONAL_LOCKS: "0" }`;
+  // non-inline `git --no-pager -c core.fsmonitor=false ...` requires that
+  // exact env. Wrong/extra/malformed env and omitted non-inline env remain
+  // blocked; diff/show additionally require --no-ext-diff and --no-textconv.
+  // Other branch modes, unsupported args, helpers, mutations, and injections
+  // remain blocked.
   const artifactsDir = trustedArtifactsDirOf(ctx, actor);
   if (event.toolName === "bash" && artifactsDir) {
     if (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv)) {

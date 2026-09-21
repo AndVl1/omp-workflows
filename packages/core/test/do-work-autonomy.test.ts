@@ -1339,6 +1339,170 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
   }
 });
 
+test("raw tool_call authenticated no-run host admission requires an empty canonical claim", () => {
+  const root = mkdtempSync(join(tmpdir(), "raw-tool-call-no-run-"));
+  try {
+    const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    const pi = {
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (handlers[name] ??= []).push(handler);
+      },
+    };
+    registerTeamWorkflow(pi as never, {
+      observability: false,
+      resolveCwd: () => root,
+      resolveTrustedToolCallActor: () => ({ kind: "authenticated-interactive-host-no-run" }),
+    });
+    const toolCall = handlers.tool_call?.[0];
+    assert.ok(toolCall, "configured raw tool hook is required");
+    const invoke = (toolName: string, input: Record<string, unknown>): { block?: boolean; reason?: string } | undefined =>
+      toolCall!({ toolName, toolCallId: `no-run-${toolName}-${randomUUID()}`, input }, {}) as { block?: boolean; reason?: string } | undefined;
+    const ordinaryCalls: Array<[string, Record<string, unknown>]> = [
+      ["write", { path: "src/app.ts", content: "ordinary" }],
+      ["edit", { path: "src/app.ts", oldText: "ordinary", newText: "ordinary" }],
+      ["bash", { command: "echo ordinary" }],
+    ];
+    for (const [toolName, input] of ordinaryCalls) {
+      assert.equal(invoke(toolName, input), undefined, `${toolName} should reach ordinary no-run gates without a control file`);
+    }
+
+    const controlPath = join(root, ".work-state", "run-control.json");
+    mkdirSync(join(root, ".work-state"), { recursive: true });
+    const writeControl = (claim: unknown): void => {
+      writeFileSync(controlPath, `${JSON.stringify({
+        schema: 2,
+        revision: 0,
+        runs: {},
+        selections: {},
+        execution_claim: claim,
+        prepare_receipts: {},
+        selection_snapshots: {},
+      })}\n`);
+    };
+    writeControl(null);
+    for (const [toolName, input] of ordinaryCalls) {
+      assert.equal(invoke(toolName, input), undefined, `${toolName} should pass with canonical execution_claim null`);
+    }
+
+    const persistedClaims: Array<[string, Record<string, unknown>]> = [
+      ["active", {
+        run_id: randomUUID(),
+        owner_kind: "workflow",
+        token: "foreign-active-token",
+        coordinator_session_id: "foreign-session",
+        coordinator_process_id: process.pid,
+        worker_ids: [],
+      }],
+      ["released", {
+        run_id: randomUUID(),
+        owner_kind: "workflow",
+        token: "foreign-released-token",
+        coordinator_session_id: "foreign-session",
+        coordinator_process_id: process.pid,
+        worker_ids: [],
+        released_at: new Date().toISOString(),
+      }],
+      ["other-owner", {
+        run_id: "foreign-cto-owner",
+        owner_kind: "cto",
+        token: "foreign-cto-token",
+        coordinator_session_id: "foreign-cto-session",
+        coordinator_process_id: process.pid,
+        worker_ids: [],
+      }],
+    ];
+    for (const [label, claim] of persistedClaims) {
+      writeControl(claim);
+      for (const [toolName, input] of ordinaryCalls) {
+        assert.equal(invoke(toolName, input)?.block, true, `${label} execution claim must block ${toolName}`);
+      }
+    }
+
+    writeFileSync(controlPath, "{corrupt canonical control\n");
+    assert.equal(invoke("bash", { command: "echo ordinary" })?.block, true, "corrupt canonical control must fail closed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("raw tool_call blocks authority-sensitive writes when session resolution throws", () => {
+  const root = mkdtempSync(join(tmpdir(), "raw-tool-call-resolution-failure-"));
+  try {
+    const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    const pi = {
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (handlers[name] ??= []).push(handler);
+      },
+    };
+    const throwingController = {
+      selectedRunId(): never {
+        throw new Error("selected run unavailable");
+      },
+    };
+    registerTeamWorkflow(pi as never, {
+      observability: false,
+      resolveCwd: () => root,
+      getSessionController: () => throwingController as never,
+      resolveTrustedToolCallActor: () => ({ kind: "authenticated-interactive-host-no-run" }),
+    });
+    const toolCall = handlers.tool_call?.[0];
+    assert.ok(toolCall, "configured raw tool hook is required");
+    const invoke = (toolName: string, input: Record<string, unknown>): { block?: boolean; reason?: string } | undefined =>
+      toolCall!({ toolName, toolCallId: `resolution-failure-${toolName}-${randomUUID()}`, input }, {}) as { block?: boolean; reason?: string } | undefined;
+    const ordinaryCalls: Array<[string, Record<string, unknown>]> = [
+      ["write", { path: "src/app.ts", content: "ordinary" }],
+      ["edit", { path: "src/app.ts", oldText: "ordinary", newText: "ordinary" }],
+      ["bash", { command: "echo ordinary" }],
+    ];
+    for (const [toolName, input] of ordinaryCalls) {
+      let result: { block?: boolean; reason?: string } | undefined;
+      assert.doesNotThrow(() => {
+        result = invoke(toolName, input);
+      }, `${toolName} must not throw when session resolution fails`);
+      assert.equal(result?.block, true, `${toolName} must fail closed when session resolution fails`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("raw tool_call no-run resolution is ignored for a selected run", () => {
+  const root = mkdtempSync(join(tmpdir(), "raw-tool-call-no-run-selected-"));
+  try {
+    const runId = writeWorkflowState(root, { policy: { strict_orchestrator: true } });
+    const artifactsDir = runTarget(root, runId).artifactsDir!;
+    const controller = selectedController(root);
+    const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    const pi = {
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (handlers[name] ??= []).push(handler);
+      },
+    };
+    registerTeamWorkflow(pi as never, {
+      observability: false,
+      resolveCwd: () => root,
+      getSessionController: () => controller,
+      resolveTrustedToolCallActor: () => ({ kind: "authenticated-interactive-host-no-run" }),
+    });
+    const toolCall = handlers.tool_call?.[0];
+    assert.ok(toolCall, "configured raw tool hook is required");
+    const invoke = (input: Record<string, unknown>): { block?: boolean; reason?: string } | undefined =>
+      toolCall!({ toolName: "write", toolCallId: `selected-no-run-${randomUUID()}`, input }, {}) as { block?: boolean; reason?: string } | undefined;
+
+    assert.equal(invoke({ path: "src/app.ts", content: "selected" })?.block, true, "selected source writes retain host admission denial");
+    assert.equal(
+      invoke({ path: join(artifactsDir, "discovery.json"), content: "{}" })?.block,
+      true,
+      "selected artifact writes retain proof-required denial",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("strict orchestrator policy permits git publication and PR control-plane commands", async () => {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-git-policy-"));
   try {

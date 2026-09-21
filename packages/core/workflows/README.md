@@ -246,22 +246,38 @@ Registry binding process-local. После перезапуска worker grants 
 
 ### Защищённый artifact-proof Bash
 
-Это единственное Bash-исключение в данном контракте: доверенный host artifact proof разрешает только bounded read-only Git inspection. Команда должна быть helper-free и начинаться ровно с:
+Это единственное Bash-исключение в данном контракте: доверенный host artifact proof разрешает только bounded read-only Git inspection. Поддерживаются две кодировки `command`; это не два взаимоисключающих транспорта:
 
-```bash
-GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false ...
-```
+1. Inline canonical encoding начинается с `GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false ...`. У такого `command` `env` может отсутствовать или быть ровно собственной plain одноключевой строковой map `{GIT_OPTIONAL_LOCKS: "0"}`:
 
-Например:
+   ```bash
+   GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false ...
+   ```
+
+2. Non-inline encoding начинается с `git --no-pager -c core.fsmonitor=false ...` и требует ровно той же map `env`:
+
+   ```json
+   {
+     "command": "git --no-pager -c core.fsmonitor=false branch --show-current",
+     "env": { "GIT_OPTIONAL_LOCKS": "0" }
+   }
+   ```
+
+Для non-inline encoding omitted `env` отклоняется; wrong/extra/malformed `env` отклоняется в обоих случаях.
+
+Allowlist содержит только read-only `status`, `log`, `diff`, `show` и ровно `branch --show-current`; `switch`, `checkout`, другие режимы `branch`, неподдержанные extra args, helper/wrapper, mutation и injection блокируются.
+
+Примеры inline form с отсутствующим `env`:
 
 ```bash
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false status --short
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline
+GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD
 ```
 
-Для `diff` и `show` обязательны оба флага `--no-ext-diff` и `--no-textconv`; bare `git`, helper/wrapper, mutation и несанкционированный Bash блокируются. Это правило относится только к protected artifact-proof context и не переписывает обычные terminal/code-reviewer инструкции.
+Для `diff` и `show` обязательны оба флага `--no-ext-diff` и `--no-textconv`. Это правило относится только к protected artifact-proof context и не переписывает обычные terminal/code-reviewer инструкции.
 
 ## Definition of Done (acceptance gate)
 

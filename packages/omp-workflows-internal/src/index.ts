@@ -257,14 +257,18 @@ function resolveInternalTrustedToolCallActor(
 	cwd: string,
 	runId: string | undefined,
 ): TrustedToolCallResolution | undefined {
-	if (!runId || !ctx || typeof ctx !== "object") return undefined;
+	if (!ctx || typeof ctx !== "object") return undefined;
 	const binding = sessionBindings.get(pi);
 	if (!binding?.interactive || !binding.sessionId || !binding.controller) return undefined;
 	const value = ctx as {
+		session_id?: unknown;
+		sessionId?: unknown;
 		mode?: unknown;
 		hasUI?: unknown;
 		sessionManager?: { getCwd?: () => unknown; getSessionId?: () => unknown };
 	};
+	if (typeof value.session_id === "string" && value.session_id !== binding.sessionId) return undefined;
+	if (typeof value.sessionId === "string" && value.sessionId !== binding.sessionId) return undefined;
 	const manager = value.sessionManager;
 	if (!manager || typeof manager.getCwd !== "function" || typeof manager.getSessionId !== "function") return undefined;
 	let managerCwd: unknown;
@@ -286,11 +290,13 @@ function resolveInternalTrustedToolCallActor(
 	if (value.hasUI !== undefined && (binding.mode === "rpc" ? value.hasUI !== false : value.hasUI !== true)) return undefined;
 	try {
 		const controllerContext = binding.controller.context();
+		const selectedRunId = binding.controller.selectedRunId();
 		if (
 			controllerContext.session_id !== binding.sessionId
 			|| resolve(controllerContext.worktree) !== resolve(binding.cwd)
-			|| binding.controller.selectedRunId() !== runId
+			|| selectedRunId !== runId
 		) return undefined;
+		if (runId === undefined) return { kind: "authenticated-interactive-host-no-run" };
 		const artifactsDir = runTarget(binding.cwd, runId).artifactsDir;
 		const expectedArtifactsDir = resolve(binding.cwd, ".work-state", "runs", runId, "artifacts");
 		return resolve(artifactsDir) === expectedArtifactsDir
@@ -300,15 +306,17 @@ function resolveInternalTrustedToolCallActor(
 		return undefined;
 	}
 }
-
-/** Raw tool-call ingress may only read the captured binding; it never lazily
- * creates or replaces a controller from a callback context. */
 function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
 	const binding = sessionBindings.get(pi);
 	if (!binding?.interactive || !binding.controller || !ctx || typeof ctx !== "object") return undefined;
-	const manager = (ctx as {
+	const value = ctx as {
+		session_id?: unknown;
+		sessionId?: unknown;
 		sessionManager?: { getCwd?: () => unknown; getSessionId?: () => unknown };
-	}).sessionManager;
+	};
+	if (typeof value.session_id === "string" && value.session_id !== binding.sessionId) return undefined;
+	if (typeof value.sessionId === "string" && value.sessionId !== binding.sessionId) return undefined;
+	const manager = value.sessionManager;
 	if (!manager || typeof manager.getCwd !== "function" || typeof manager.getSessionId !== "function") return undefined;
 	try {
 		const managerCwd = manager.getCwd();
@@ -329,6 +337,7 @@ function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSe
 		return undefined;
 	}
 }
+
 /** Entry points already wired for a given pi instance (idempotent per host). */
 const activatedEngines = new WeakSet<object>();
 

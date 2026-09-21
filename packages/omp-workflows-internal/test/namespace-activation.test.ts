@@ -7,7 +7,9 @@ import { test } from "node:test";
 
 import {
 	isRegisteredWorkflow,
+	readRunControl,
 	resetWorkflowOwners,
+	runTarget,
 	workflowOwnerFor,
 	type WorkflowCapability,
 } from "@andvl1/omp-workflows-core";
@@ -79,6 +81,9 @@ function makePi() {
 					errors.push(error instanceof Error ? error.message : String(error));
 				}
 			}
+		},
+		fireToolCall(event: unknown, ctx: unknown): unknown[] {
+			return (hooks.get("tool_call") ?? []).map((handler) => handler(event, ctx));
 		},
 	};
 }
@@ -282,8 +287,135 @@ test("privateOmpOwnerForMarkedWorkspace issues the frozen identity only inside t
 
 	const owner = privateOmpOwnerForMarkedWorkspace(marked);
 	assert.equal(owner.owner_id, OMP_INTERNAL_BUNDLE_ID);
+
 	assert.equal(owner.activation_marker, OMP_INTERNAL_ACTIVATION_MARKER);
 
 	assert.throws(() => privateOmpOwnerForMarkedWorkspace(plain), /activation_markers_missing/);
 	assertUnclaimed(plain, "workflow_registration");
+});
+test("captured host admits ordinary no-run writes while preserving session and selected-run boundaries", () => {
+	resetWorkflowOwners();
+	const root = markedRoot();
+	execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+	const host = makePi();
+	ompWorkflowsInternal(host.pi as never);
+
+	const hostContext = {
+		cwd: root,
+		mode: "tui",
+		hasUI: true,
+		session_id: "trusted-host-session",
+		sessionManager: { getCwd: () => root, getSessionId: () => "trusted-host-session" },
+	};
+	host.fireSessionStart(hostContext);
+	const rawHostContext = { sessionManager: hostContext.sessionManager };
+	const writeEvent = (path: string) => ({ toolName: "write", input: { path, content: "{}" } });
+	const hasBlock = (ctx: unknown, path: string): boolean =>
+		host.fireToolCall(writeEvent(path), ctx).some(
+			(result) => Boolean(result && typeof result === "object" && "block" in result && result.block === true),
+		);
+
+	assert.equal(hasBlock(rawHostContext, join(root, "src", "app.ts")), false, "claim-free captured host bypasses only the outer actor preblock");
+
+	const controlPath = join(root, ".work-state", "run-control.json");
+	mkdirSync(join(root, ".work-state"), { recursive: true });
+	const emptyControl = {
+		schema: 2,
+		revision: 0,
+		runs: {},
+		selections: {},
+		execution_claim: null,
+		prepare_receipts: {},
+		selection_snapshots: {},
+	};
+	writeFileSync(controlPath, JSON.stringify({
+		...emptyControl,
+		execution_claim: { run_id: "other-run", token: "foreign-token" },
+	}));
+	assert.equal(hasBlock(rawHostContext, join(root, "src", "claimed.ts")), true, "a non-null execution claim denies no-run admission");
+	writeFileSync(controlPath, "{ malformed run control");
+	assert.equal(hasBlock(rawHostContext, join(root, "src", "corrupt.ts")), true, "an unreadable canonical control denies no-run admission");
+	writeFileSync(controlPath, JSON.stringify(emptyControl));
+	assert.equal(readRunControl(root).execution_claim, null);
+	for (const mismatch of [
+		{ field: "session_id", context: { ...rawHostContext, session_id: "foreign-session" } },
+		{ field: "sessionId", context: { ...rawHostContext, sessionId: "foreign-session" } },
+	] as const) {
+		assert.equal(
+			hasBlock(mismatch.context, join(root, "src", `${mismatch.field}-no-run.ts`)),
+			true,
+			`copied captured manager with mismatched ${mismatch.field} cannot use no-run admission`,
+		);
+	}
+
+	const selectedRunId = "11111111-1111-4111-8111-111111111111";
+	const target = runTarget(root, selectedRunId);
+	mkdirSync(target.stateDir, { recursive: true });
+	mkdirSync(target.artifactsDir, { recursive: true });
+	writeFileSync(target.statePath, JSON.stringify({
+		schema: 2,
+		run_id: selectedRunId,
+		run_key: selectedRunId,
+		lifecycle_status: "active",
+		rework_generation: 0,
+		branch: "main",
+		title: "selected run",
+		task: "selected run",
+		classification: {
+			type: "FEATURE",
+			complexity: "QUICK",
+			confidence: "HIGH",
+			autonomous: false,
+			workflow: "lightweight",
+		},
+		workflow_override: false,
+		issue: null,
+		required_inputs: {},
+		required_input_receipts: {},
+		stage_cursor: "",
+		stages: [],
+		artifacts: {},
+		scope: {},
+		policy: { strict_orchestrator: true },
+		pause: { kind: "none", reason: "" },
+	}));
+	writeFileSync(controlPath, JSON.stringify({
+		...emptyControl,
+		selections: {
+			[hostContext.session_id]: {
+				run_id: selectedRunId,
+				branch: "main",
+				selected_at: "2026-09-21T00:00:00.000Z",
+				active: true,
+			},
+		},
+	}));
+	for (const mismatch of [
+		{ field: "session_id", context: { ...rawHostContext, session_id: "foreign-session" } },
+		{ field: "sessionId", context: { ...rawHostContext, sessionId: "foreign-session" } },
+	] as const) {
+		assert.equal(
+			hasBlock(mismatch.context, join(target.artifactsDir, `${mismatch.field}-proof.json`)),
+			true,
+			`copied captured manager with mismatched ${mismatch.field} cannot use selected controller/proof admission`,
+		);
+	}
+	assert.equal(hasBlock(rawHostContext, join(target.artifactsDir, "discovery.json")), false, "selected runs retain the artifact-proof write path");
+	assert.equal(hasBlock(rawHostContext, join(root, "src", "selected.ts")), true, "selected orchestrator writes remain artifact-scoped");
+
+	const foreignContext = {
+		sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" },
+	};
+	assert.equal(hasBlock(foreignContext, join(target.artifactsDir, "foreign.json")), true, "foreign session cannot borrow the captured host");
+	const mismatchedContext = {
+		sessionManager: { getCwd: () => plainRoot(), getSessionId: () => hostContext.session_id },
+	};
+	assert.equal(hasBlock(mismatchedContext, join(root, "src", "mismatched.ts")), true, "mismatched manager cwd remains fail-closed");
+
+	host.fireSessionStart({
+		...hostContext,
+		mode: "print",
+		hasUI: false,
+	});
+	assert.equal(hasBlock(rawHostContext, join(target.artifactsDir, "headless.json")), true, "headless transition revokes raw host admission");
 });

@@ -225,7 +225,8 @@ export type TrustedToolCallActor = "orchestrator" | "worker" | "lead";
 
 export type TrustedToolCallResolution =
   | { readonly actor: "orchestrator"; readonly artifactsDir: string }
-  | { readonly actor: "worker" | "lead" };
+  | { readonly actor: "worker" | "lead" }
+  | { readonly kind: "authenticated-interactive-host-no-run" };
 
 /**
  * Bundle-owned adapter seam for the current authenticated tool-call context.
@@ -739,17 +740,28 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     // authority (fullstack resolves sessionManager.getCwd() before any stale
     // copied context value); never substitute the process cwd or selection.
     const admissionCwd = opts.cwd ?? resolveCwd(ctx);
-    const sharedController = admissionCwd ? opts.getSessionController?.(ctx, admissionCwd) : undefined;
-    const selectedRunId = sharedController?.selectedRunId();
-    let nativeActor: NativeWorkerResolution | undefined;
+    let admissionResolutionFailed = false;
+    let sharedController: WorkflowSessionController | undefined;
+    let selectedRunId: string | undefined;
     if (admissionCwd) {
+      try {
+        const controller = opts.getSessionController?.(ctx, admissionCwd);
+        const resolvedRunId = controller?.selectedRunId();
+        sharedController = controller;
+        selectedRunId = resolvedRunId;
+      } catch {
+        admissionResolutionFailed = true;
+      }
+    }
+    let nativeActor: NativeWorkerResolution | undefined;
+    if (admissionCwd && !admissionResolutionFailed) {
       try {
         nativeActor = nativeWorkerAuthority.resolve(ctx, admissionCwd, selectedRunId);
       } catch {
         nativeActor = undefined;
       }
     }
-    const trustedRunId = selectedRunId ?? nativeActor?.runId;
+    const trustedRunId = admissionResolutionFailed ? undefined : selectedRunId ?? nativeActor?.runId;
     const gateContext = admissionCwd
       ? { ...c, cwd: admissionCwd, ...(trustedRunId ? { run_id: trustedRunId } : {}) }
       : undefined;
@@ -761,7 +773,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       ? c.actor
       : undefined;
     let adaptedActor: TrustedToolCallResolution | undefined;
-    if (admissionCwd && resolverConfigured) {
+    if (admissionCwd && resolverConfigured && !admissionResolutionFailed) {
       try {
         adaptedActor = opts.resolveTrustedToolCallActor!(ctx, admissionCwd, selectedRunId);
       } catch {
@@ -770,8 +782,11 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     }
     let trustedProof: TrustedOrchestratorWriteProof | undefined;
     if (
-      !nativeActor
-      && adaptedActor?.actor === "orchestrator"
+      !admissionResolutionFailed
+      && !nativeActor
+      && adaptedActor
+      && "actor" in adaptedActor
+      && adaptedActor.actor === "orchestrator"
       && typeof adaptedActor.artifactsDir === "string"
       && adaptedActor.artifactsDir.length > 0
       && admissionCwd
@@ -786,11 +801,31 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         trustedProof = undefined;
       }
     }
-    const adaptedTrustedActor = adaptedActor?.actor === "orchestrator"
-      ? (trustedProof ? adaptedActor.actor : undefined)
-      : adaptedActor?.actor;
-    const trustedActor = nativeActor?.actor
-      ?? (resolverConfigured ? adaptedTrustedActor : explicitActor);
+    const adaptedTrustedActor = adaptedActor && "actor" in adaptedActor
+      ? adaptedActor.actor === "orchestrator"
+        ? (trustedProof ? adaptedActor.actor : undefined)
+        : adaptedActor.actor
+      : undefined;
+    let authenticatedInteractiveHostNoRun = false;
+    if (
+      !admissionResolutionFailed
+      && resolverConfigured
+      && adaptedActor
+      && "kind" in adaptedActor
+      && adaptedActor.kind === "authenticated-interactive-host-no-run"
+      && selectedRunId === undefined
+      && trustedRunId === undefined
+      && admissionCwd
+    ) {
+      try {
+        authenticatedInteractiveHostNoRun = readRunControl(admissionCwd).execution_claim === null;
+      } catch {
+        authenticatedInteractiveHostNoRun = false;
+      }
+    }
+    const trustedActor = admissionResolutionFailed
+      ? undefined
+      : nativeActor?.actor ?? (resolverConfigured ? adaptedTrustedActor : explicitActor);
     const { actor: _runtimeActor, ...writeGateBase } = gateContext ?? {};
     const writeGateContext = gateContext
       ? {
@@ -805,13 +840,38 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       : undefined;
     let result: { block?: boolean; reason?: string } | undefined;
     const run = (candidate: { block?: boolean; reason?: string } | void) => { if (!result && candidate?.block) result = candidate; };
+    let lifecycleDeviceWrite = false;
+    if (event.toolName === "write") {
+      try {
+        lifecycleDeviceWrite = isRegisteredLifecycleDeviceWrite(
+          event as unknown as { toolName: string; input?: Record<string, unknown> | string },
+        );
+      } catch {
+        lifecycleDeviceWrite = false;
+      }
+    }
+    if (
+      admissionResolutionFailed
+      && (
+        event.toolName === "ask"
+        || event.toolName === "task"
+        || (
+          (event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")
+          && !lifecycleDeviceWrite
+        )
+      )
+    ) {
+      run({ block: true, reason: "workflow session admission resolution failed" });
+    }
     if (!admissionCwd && (event.toolName === "ask" || event.toolName === "task" || event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")) {
       run({ block: true, reason: "workflow cwd unavailable" });
     }
     if (
-      resolverConfigured
+      !result
+      && resolverConfigured
       && !trustedActor
-      && !isRegisteredLifecycleDeviceWrite(event as unknown as { toolName: string; input?: Record<string, unknown> | string })
+      && !authenticatedInteractiveHostNoRun
+      && !lifecycleDeviceWrite
       && (event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")
     ) {
       run({ block: true, reason: "trusted host actor unavailable" });
@@ -819,11 +879,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     if (nativeActor?.actor === "worker" && event.toolName === "task") {
       run({ block: true, reason: "native worker authority does not permit nested task delegation" });
     }
-    run(ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]));
+    const admissionResolutionBlocked = admissionResolutionFailed && !!result;
+    if (!admissionResolutionBlocked) run(ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]));
     // These gates read workspace state before they inspect the tool name. A
     // missing authoritative cwd therefore skips them rather than passing
     // undefined into path/state consumers. Cwd-independent guards still run.
-    if (gateContext) {
+    if (!admissionResolutionBlocked && gateContext) {
       run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], gateContext));
       run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], gateContext));
       run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], writeGateContext ?? gateContext!));
@@ -831,7 +892,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], gateContext));
       run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], { ...gateContext, controller: sharedController }));
     }
-    run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], (gateContext ?? c) as Parameters<typeof safetyGuard>[1]));
+    if (!admissionResolutionBlocked) run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], (gateContext ?? c) as Parameters<typeof safetyGuard>[1]));
     let eventRunId = event.toolName === "task" ? undefined : trustedRunId;
     let eventRunIdTrusted = event.toolName !== "task" && typeof trustedRunId === "string" && trustedRunId.length > 0;
     let nativeDispatchOrigins: DispatchOrigin[] | undefined;
