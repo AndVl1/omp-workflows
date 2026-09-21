@@ -30,9 +30,11 @@ import {
   FULLSTACK_BUNDLE_ID,
   fullstackOwnerForCwd,
   fullstackPreset,
+  getFullstackWorkflowSessionController,
+  isMainSessionContext,
   registerWorkflowTools,
   resolveSessionCwd,
-  isMainSessionContext,
+  default as ompWorkflowsFullstack,
 } from "../src/index.js";
 import { registerLectureAcquireTool } from "../src/tools/lecture-acquire.js";
 
@@ -1218,6 +1220,103 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     assert.equal((primaryAfterWorker.details as { ok?: boolean; error?: string }).ok, true, (primaryAfterWorker.details as { error?: string }).error);
   } finally {
     await fireSessionStop({ cwd: root, hasUI: true, mode: "tui" });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fullstack: raw tool_call derives artifact-only orchestrator authority from the captured host", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-raw-tool-call-actor-"));
+  const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+  const pi = {
+    on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+      (handlers[name] ??= []).push(handler);
+    },
+    registerCommand() {},
+    setLabel() {},
+    sendUserMessage() {},
+  };
+  const emit = async (name: string, event: unknown, ctx: unknown): Promise<unknown[]> =>
+    Promise.all((handlers[name] ?? []).map(handler => handler(event, ctx)));
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    const issued = writeCheckpointAskFixture(root);
+    const runId = issued.state.issued_for!.run_key;
+    const artifactsDir = runTarget(root, runId).artifactsDir!;
+    ompWorkflowsFullstack(pi as never);
+    const host = {
+      mode: "tui",
+      hasUI: true,
+      cwd: root,
+      session_id: "session-direct",
+      sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
+    };
+    await emit("session_start", {}, host);
+    getFullstackWorkflowSessionController(host, root)?.bind(runId);
+
+    const raw = {
+      sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
+    };
+    const invoke = async (input: Record<string, unknown>, ctx: unknown): Promise<{ block?: boolean; reason?: string } | undefined> => {
+      const results = await emit("tool_call", { toolName: "write", input }, ctx);
+      return results.find(value => value && typeof value === "object" && (value as { block?: unknown }).block === true) as { block?: boolean; reason?: string } | undefined;
+    };
+    const invokeBash = async (command: string, ctx: unknown): Promise<{ block?: boolean; reason?: string } | undefined> => {
+      const results = await emit("tool_call", { toolName: "bash", input: { command } }, ctx);
+      return results.find(value => value && typeof value === "object" && (value as { block?: unknown }).block === true) as { block?: boolean; reason?: string } | undefined;
+    };
+    assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, raw), undefined);
+    assert.equal((await invokeBash("git status --short", raw))?.block, true);
+    assert.equal(
+      (await invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false status --short", raw))?.block,
+      undefined,
+    );
+    assert.equal((await invokeBash("git diff -- src/app.ts", raw))?.block, true);
+    assert.equal(
+      (await invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts", raw))?.block,
+      undefined,
+    );
+    assert.equal((await invokeBash("git show --stat HEAD", raw))?.block, true);
+    assert.equal(
+      (await invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD", raw))?.block,
+      undefined,
+    );
+    assert.equal((await invokeBash("git log -1 --oneline", raw))?.block, true);
+    assert.equal(
+      (await invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline", raw))?.block,
+      undefined,
+    );
+    assert.equal((await invoke({ path: "src/app.ts", actor: "worker" }, raw))?.block, true);
+    assert.equal((await invoke({ path: ".work-state/other.json" }, raw))?.block, true);
+    assert.equal((await invokeBash("chmod 644 src/app.ts", raw))?.block, true);
+    assert.equal((await invokeBash("chmod 644 .work-state/other.json", raw))?.block, true);
+    assert.equal((await invokeBash(`echo changed > ${artifactsDir}/mutation.json`, raw))?.block, true);
+    assert.equal((await invokeBash("echo changed > src/app.ts", raw))?.block, true);
+    assert.equal((await invokeBash("echo changed > .work-state/other.json", raw))?.block, true);
+    assert.equal((await invokeBash(`mkdir -p ${artifactsDir}/new`, raw))?.block, true);
+
+    const worker = { ...raw, actor: "worker", hasUI: false };
+    assert.equal((await invoke({ path: "src/app.ts" }, worker))?.block, true, "configured resolver ignores input actor");
+
+    const foreign = {
+      sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" },
+    };
+    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, foreign))?.block, true);
+    assert.equal((await invoke({ path: "src/app.ts" }, foreign))?.block, true);
+    const foreignInteractive = {
+      mode: "tui",
+      hasUI: true,
+      cwd: root,
+      session_id: "foreign-session",
+      sessionManager: foreign.sessionManager,
+      actor: "orchestrator",
+    };
+    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, foreignInteractive))?.block, true);
+    assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, raw), undefined, "foreign raw context cannot replace the captured controller");
+
+    await emit("session_start", {}, { mode: "print", hasUI: false, cwd: root, session_id: "session-direct", sessionManager: host.sessionManager });
+    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.block, true, "headless transition cannot retain orchestrator authority");
+  } finally {
+    await emit("session_stop", {}, { mode: "tui", hasUI: true, cwd: root, session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } });
     rmSync(root, { recursive: true, force: true });
   }
 });

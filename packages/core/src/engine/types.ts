@@ -658,8 +658,10 @@ export interface StageDef {
   };
   /** Consilium parallel flag (always true for consilium in practice). */
   parallel?: boolean;
-  /** Artifact ids this stage reads from `.work-state/artifacts/<id>.json`. */
+  /** Required artifact ids this stage reads from `.work-state/artifacts/<id>.json`. */
   consumes?: string[];
+  /** Artifact ids this stage may read when present; absence is allowed. */
+  optional_consumes?: string[];
   /** Artifact ids this stage writes to `.work-state/artifacts/<id>.json`. */
   produces?: string | string[];
   /** Human checkpoint label. */

@@ -3,8 +3,31 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { getFullstackWorkflowSessionController } from "../src/index.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
+
+type SessionManagerFixture = {
+	getCwd: () => string;
+	getSessionId: () => string;
+	getSessionFile: () => string;
+	getHeader: () => { type: "session"; id: string; cwd: string; timestamp: string };
+};
+
+function sessionManagerFixture(cwd: string, sessionId: string): SessionManagerFixture {
+	const canonicalCwd = resolve(cwd);
+	return {
+		getCwd: () => canonicalCwd,
+		getSessionId: () => sessionId,
+		getSessionFile: () => join(canonicalCwd, ".omp", "sessions", `${sessionId}.jsonl`),
+		getHeader: () => ({
+			type: "session",
+			id: sessionId,
+			cwd: canonicalCwd,
+			timestamp: "2026-01-01T00:00:00.000Z",
+		}),
+	};
+}
 
 type Registered = {
 	description?: string;
@@ -23,23 +46,33 @@ function commandHarness(
 	prompts: string[];
 	notifications: string[];
 	sessionStarts: SessionStartHandler[];
+	sessionManager: SessionManagerFixture;
 } {
 	const commands = new Map<string, Registered>();
 	const prompts: string[] = [];
 	const notifications: string[] = [];
 	const sessionStarts: SessionStartHandler[] = [];
+	const sessionManager = sessionManagerFixture(sessionCwd, sessionId);
 	registerWorkflowCommands({
 		on(name: string, handler: SessionStartHandler) {
 			if (name !== "session_start") return;
 			sessionStarts.push(handler);
 			if (startSession) {
-				handler({}, {
-					cwd: sessionCwd,
-					session_id: sessionId,
-					mode: "tui",
+				const hostContext = {
+					cwd: sessionManager.getCwd(),
+					session_id: sessionManager.getSessionId(),
+					mode: "tui" as const,
 					hasUI: true,
-					sessionManager: { getSessionId: () => sessionId, getCwd: () => sessionCwd },
-				});
+					ui: {},
+					sessionManager,
+				};
+				handler({ type: "session_start" }, hostContext);
+				// Mirror the fullstack extension's trusted lifecycle capture before
+				// command contexts are delivered to handlers.
+				assert.ok(
+					getFullstackWorkflowSessionController(hostContext, sessionManager.getCwd()),
+					"session_start must capture a trusted workflow controller",
+				);
 			}
 		},
 		registerCommand(name: string, options: Registered) {
@@ -51,10 +84,15 @@ function commandHarness(
 			prompts.push(transformPrompt(prompt));
 		},
 	} as never);
-	return { commands, prompts, notifications, sessionStarts };
+	return { commands, prompts, notifications, sessionStarts, sessionManager };
 }
-
-function context(cwd: string, notifications: string[], sessionId = "session-direct", sessionCwd?: string): unknown {
+function context(
+	cwd: string,
+	notifications: string[],
+	sessionId = "session-direct",
+	sessionCwd?: string,
+	sessionManager: SessionManagerFixture = sessionManagerFixture(sessionCwd ?? cwd, sessionId),
+): unknown {
 	return {
 		cwd,
 		ui: {
@@ -62,12 +100,10 @@ function context(cwd: string, notifications: string[], sessionId = "session-dire
 				notifications.push(message);
 			},
 		},
-		sessionManager: {
-			getSessionId: () => sessionId,
-			getCwd: () => sessionCwd ?? cwd,
-		},
+		sessionManager,
 	};
 }
+
 
 test("fullstack: workflow commands register as authoritative extension commands", () => {
 	const { commands } = commandHarness();
@@ -114,8 +150,8 @@ test("fullstack: workflow commands use the session manager cwd after a context c
 	const stale = mkdtempSync(join(tmpdir(), "omp-command-stale-"));
 	try {
 		execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-		const { commands, prompts } = commandHarness(prompt => prompt, canonical, true, "session-drift");
-		await commands.get("do-work")?.handler("Canonical branch task", context(stale, [], "session-drift", canonical));
+		const { commands, prompts, sessionManager } = commandHarness(prompt => prompt, canonical, true, "session-drift");
+		await commands.get("do-work")?.handler("Canonical branch task", context(stale, [], "session-drift", canonical, sessionManager));
 		assert.equal(prompts.length, 1);
 		assert.match(prompts[0] ?? "", /Branch: `main`/);
 		assert.doesNotMatch(prompts[0] ?? "", /no git work tree/);

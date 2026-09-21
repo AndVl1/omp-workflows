@@ -28,6 +28,8 @@
  * to the external fullstack plugin) and `omp-model-roles` is never shadowed.
  */
 
+import { resolve } from "node:path";
+
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -43,10 +45,12 @@ import {
 	registerTeamWorkflow,
 	registerWorkflowCommands,
 	resolveActiveBranch,
+	runTarget,
 	writeRuntimeConfig,
 	workflowOwnerFor,
 	type RegisterOptions,
 	type TrustedExecutionContext,
+	type TrustedToolCallResolution,
 	type WorkflowCapability,
 	type WorkflowSessionController,
 	type WorkflowToolAdapter,
@@ -98,6 +102,7 @@ const NAMESPACED_DESCRIPTIONS = {
 interface InternalSessionBinding {
 	cwd: string;
 	interactive: boolean;
+	mode: "tui" | "rpc";
 	sessionId?: string;
 	controller?: WorkflowSessionController;
 }
@@ -183,17 +188,33 @@ function buildTrustedController(
  */
 function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 	const interactive = trustedInteractiveSession(ctx);
-	// Noninteractive and untrusted lifecycle events can come from a worker
-	// sharing this extension instance; they must not release or replace the
-	// trusted host controller.
-	if (!interactive) return;
+	const current = sessionBindings.get(pi);
+	const incomingSession = sessionIdFromContext(ctx);
+	const value = ctx as { mode?: unknown; hasUI?: unknown };
+	if (!interactive) {
+		// A same-session headless lifecycle boundary invalidates interactive
+		// authority but conservatively retains the controller/claim for later
+		// reconciliation. Foreign noninteractive events cannot mutate it.
+		if (
+			current
+			&& current.sessionId
+			&& incomingSession === current.sessionId
+			&& current.cwd === cwd
+		) {
+			sessionBindings.set(pi, { ...current, interactive: false });
+		}
+		return;
+	}
 	if (!releaseSessionBinding(pi, "host-session-replaced")) return;
 
-	const sessionId = sessionIdFromContext(ctx);
+	const mode = value.mode === "rpc" ? "rpc" : value.mode === "tui" ? "tui" : undefined;
+	if (!mode) return;
+	const sessionId = incomingSession;
 	const controller = sessionId ? buildTrustedController(cwd, sessionId) : undefined;
 	sessionBindings.set(pi, {
 		cwd,
 		interactive,
+		mode,
 		...(sessionId ? { sessionId } : {}),
 		...(controller ? { controller } : {}),
 	});
@@ -223,6 +244,90 @@ function sharedSessionController(pi: object, ctx: unknown, cwd: string): Workflo
 	binding.sessionId = requestedSession;
 	binding.controller = controller;
 	return controller;
+}
+
+/**
+ * Resolve the narrow orchestrator capability for raw tool calls from the
+ * already-captured host binding. The manager identity is re-read on every
+ * call; a raw context can neither create nor replace this controller.
+ */
+function resolveInternalTrustedToolCallActor(
+	pi: object,
+	ctx: unknown,
+	cwd: string,
+	runId: string | undefined,
+): TrustedToolCallResolution | undefined {
+	if (!runId || !ctx || typeof ctx !== "object") return undefined;
+	const binding = sessionBindings.get(pi);
+	if (!binding?.interactive || !binding.sessionId || !binding.controller) return undefined;
+	const value = ctx as {
+		mode?: unknown;
+		hasUI?: unknown;
+		sessionManager?: { getCwd?: () => unknown; getSessionId?: () => unknown };
+	};
+	const manager = value.sessionManager;
+	if (!manager || typeof manager.getCwd !== "function" || typeof manager.getSessionId !== "function") return undefined;
+	let managerCwd: unknown;
+	let managerSessionId: unknown;
+	try {
+		managerCwd = manager.getCwd();
+		managerSessionId = manager.getSessionId();
+	} catch {
+		return undefined;
+	}
+	if (
+		typeof managerCwd !== "string"
+		|| typeof managerSessionId !== "string"
+		|| managerSessionId !== binding.sessionId
+		|| resolve(managerCwd) !== resolve(binding.cwd)
+		|| resolve(cwd) !== resolve(binding.cwd)
+	) return undefined;
+	if (value.mode !== undefined && value.mode !== binding.mode) return undefined;
+	if (value.hasUI !== undefined && (binding.mode === "rpc" ? value.hasUI !== false : value.hasUI !== true)) return undefined;
+	try {
+		const controllerContext = binding.controller.context();
+		if (
+			controllerContext.session_id !== binding.sessionId
+			|| resolve(controllerContext.worktree) !== resolve(binding.cwd)
+			|| binding.controller.selectedRunId() !== runId
+		) return undefined;
+		const artifactsDir = runTarget(binding.cwd, runId).artifactsDir;
+		const expectedArtifactsDir = resolve(binding.cwd, ".work-state", "runs", runId, "artifacts");
+		return resolve(artifactsDir) === expectedArtifactsDir
+			? { actor: "orchestrator", artifactsDir }
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Raw tool-call ingress may only read the captured binding; it never lazily
+ * creates or replaces a controller from a callback context. */
+function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
+	const binding = sessionBindings.get(pi);
+	if (!binding?.interactive || !binding.controller || !ctx || typeof ctx !== "object") return undefined;
+	const manager = (ctx as {
+		sessionManager?: { getCwd?: () => unknown; getSessionId?: () => unknown };
+	}).sessionManager;
+	if (!manager || typeof manager.getCwd !== "function" || typeof manager.getSessionId !== "function") return undefined;
+	try {
+		const managerCwd = manager.getCwd();
+		const managerSessionId = manager.getSessionId();
+		if (
+			typeof managerCwd !== "string"
+			|| typeof managerSessionId !== "string"
+			|| managerSessionId !== binding.sessionId
+			|| resolve(managerCwd) !== resolve(binding.cwd)
+			|| resolve(cwd) !== resolve(binding.cwd)
+		) return undefined;
+		const controllerContext = binding.controller.context();
+		return controllerContext.session_id === binding.sessionId
+			&& resolve(controllerContext.worktree) === resolve(binding.cwd)
+			? binding.controller
+			: undefined;
+	} catch {
+		return undefined;
+	}
 }
 /** Entry points already wired for a given pi instance (idempotent per host). */
 const activatedEngines = new WeakSet<object>();
@@ -319,7 +424,9 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 		workflowProfiles: profiles,
 		resolveCwd: resolveSessionCwd,
 		owner: privateOmpOwnerForCwd,
-		getSessionController: (ctx, sessionCwd) => sharedSessionController(pi, ctx, sessionCwd),
+		resolveTrustedToolCallActor: (ctx, sessionCwd, runId) =>
+			resolveInternalTrustedToolCallActor(pi, ctx, sessionCwd, runId),
+		getSessionController: (ctx, sessionCwd) => rawSessionController(pi, ctx, sessionCwd),
 	};
 
 	// Seed-if-absent BEFORE the short-circuit and before ANY discovery
@@ -348,7 +455,6 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 	try {
 		registerTeamWorkflow(pi, registrationOpts);
 		const adapter: WorkflowToolAdapter = createWorkflowToolAdapter({
-			resolveCwd: resolveSessionCwd,
 			owner: privateOmpOwnerForCwd,
 			getSessionController: (ctx, sessionCwd) => sharedSessionController(pi, ctx, sessionCwd),
 			// Hand the fresh, provenance-checked mapping to core so workflow_begin

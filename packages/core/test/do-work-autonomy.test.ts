@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -34,6 +34,11 @@ import { buildDispatchMarker, dispatchTaskId, parseDispatchMarker, trustedDispat
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
 import { registerTeamWorkflow, registerWorkflowTools } from "../src/index.js";
 import { flushRecorder } from "../src/observability/hooks.js";
+import {
+  TRUSTED_ORCHESTRATOR_WRITE_PROOF,
+  createTrustedOrchestratorWriteProof,
+  orchestratorWriteGate,
+} from "../src/gates/orchestrator-write.js";
 
 import { runTarget } from "../src/engine/run-store.js";
 import type { TeamState, TrustedExecutionContext } from "../src/engine/types.js";
@@ -886,7 +891,10 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
     assert.equal(bashEcho?.block, true);
     const bashRemove = orchestratorWriteGate({ toolName: "bash", input: { command: "rm src/app.ts" } }, hostContext);
     assert.equal(bashRemove?.block, true);
-    const bashRead = orchestratorWriteGate({ toolName: "bash", input: { command: "git diff -- src/app.ts" } }, hostContext);
+    const bashRead = orchestratorWriteGate(
+      { toolName: "bash", input: { command: "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts" } },
+      hostContext,
+    );
     assert.equal(bashRead, undefined);
     const workerCanonicalBash = orchestratorWriteGate({ toolName: "bash", input: { command: `cat > ${canonicalStatePath}` } }, { ...hostContext, hasUI: false });
     assert.equal(workerCanonicalBash?.block, true);
@@ -896,6 +904,164 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
     assert.equal(redirectedSource?.block, true);
     const workerCanonicalInPlace = orchestratorWriteGate({ toolName: "bash", input: { command: `awk -i inplace '{print}' ${canonicalStatePath}` } }, { ...hostContext, hasUI: false });
     assert.equal(workerCanonicalInPlace?.block, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("registered raw tool_call derives a scoped orchestrator only from the trusted adapter", () => {
+  const root = mkdtempSync(join(tmpdir(), "raw-tool-call-actor-bridge-"));
+  try {
+    const runId = writeWorkflowState(root, { policy: { strict_orchestrator: true } });
+    const artifactsDir = runTarget(root, runId).artifactsDir!;
+    const sessionId = "trusted-main-session";
+    const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    const managerFor = (ctx: unknown): { getCwd: () => string; getSessionId: () => string } | undefined => {
+      if (!ctx || typeof ctx !== "object") return undefined;
+      const manager = (ctx as { sessionManager?: unknown }).sessionManager;
+      return manager && typeof manager === "object" ? manager as { getCwd: () => string; getSessionId: () => string } : undefined;
+    };
+    const pi = {
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (handlers[name] ??= []).push(handler);
+      },
+    };
+    registerTeamWorkflow(pi as never, {
+      observability: false,
+      resolveCwd: ctx => managerFor(ctx)?.getCwd(),
+      getSessionController: (_ctx, cwd) => cwd === root ? ({ selectedRunId: () => runId } as never) : undefined,
+      resolveTrustedToolCallActor: (ctx, cwd, selectedRunId) => {
+        const manager = managerFor(ctx);
+        if (
+          cwd === root
+          && selectedRunId === runId
+          && manager?.getCwd() === root
+          && manager.getSessionId() === sessionId
+        ) return { actor: "orchestrator", artifactsDir };
+        return undefined;
+      },
+    });
+    const toolCall = handlers.tool_call?.[0];
+    assert.ok(toolCall, "registered tool_call hook is required");
+    const invoke = (input: Record<string, unknown>, ctx: unknown): { block?: boolean; reason?: string } | undefined =>
+      toolCall!({ toolName: "write", input }, ctx) as { block?: boolean; reason?: string } | undefined;
+    const invokeBash = (command: string, ctx: unknown): { block?: boolean; reason?: string } | undefined =>
+      toolCall!({ toolName: "bash", input: { command } }, ctx) as { block?: boolean; reason?: string } | undefined;
+    const trustedRawContext = {
+      sessionManager: { getCwd: () => root, getSessionId: () => sessionId },
+    };
+
+    assert.equal(invoke({ path: join(artifactsDir, "discovery.json"), actor: "worker" }, trustedRawContext), undefined);
+    assert.equal(invoke({ path: "src/app.ts", actor: "worker" }, trustedRawContext)?.block, true);
+    assert.equal(invoke({ path: ".work-state/other.json", actor: "worker" }, trustedRawContext)?.block, true);
+    assert.equal(invoke({ path: `.work-state/runs/${runId}/state.json` }, trustedRawContext)?.block, true);
+    assert.equal(invoke({ path: join(artifactsDir, "..", "escape.json") }, trustedRawContext)?.block, true);
+
+    const missingParents = join(artifactsDir, "new", "nested", "discovery.json");
+    assert.equal(invoke({ path: missingParents }, trustedRawContext), undefined, "ordinary missing artifact parents remain valid");
+    const escapeTarget = join(root, "escape-target");
+    mkdirSync(escapeTarget);
+    symlinkSync(escapeTarget, join(artifactsDir, "escape-link"));
+    assert.equal(invoke({ path: join(artifactsDir, "escape-link", "discovery.json") }, trustedRawContext)?.block, true);
+    symlinkSync(join(escapeTarget, "missing.json"), join(artifactsDir, "dangling"));
+    assert.equal(invoke({ path: join(artifactsDir, "dangling") }, trustedRawContext)?.block, true);
+    const rootAlias = join(root, "artifacts-alias");
+    symlinkSync(artifactsDir, rootAlias);
+    const rootSymlinkContext = {
+      cwd: root,
+      run_id: runId,
+      actor: "orchestrator" as const,
+      [TRUSTED_ORCHESTRATOR_WRITE_PROOF]: createTrustedOrchestratorWriteProof(rootAlias),
+    };
+    assert.equal(
+      orchestratorWriteGate({ toolName: "write", input: { path: join(rootAlias, "discovery.json") } }, rootSymlinkContext)?.block,
+      true,
+      "a symlinked artifacts root is never a trusted write target",
+    );
+
+    execFileSync("git", ["init", "--quiet"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "native-proof@example.invalid"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["config", "user.name", "Native Proof"], { cwd: root, stdio: "ignore" });
+    writeFileSync(join(root, "tracked.txt"), "tracked\n");
+    writeFileSync(join(root, ".gitattributes"), "tracked.txt diff=sentinel\n");
+    const sentinelScript = (name: string, body: string): string => {
+      const script = join(root, `${name}.sh`);
+      writeFileSync(script, `#!/bin/sh\n${body}\n`);
+      chmodSync(script, 0o755);
+      return script;
+    };
+    const pagerSentinel = join(root, "pager-sentinel");
+    const fsmonitorSentinel = join(root, "fsmonitor-sentinel");
+    const externalDiffSentinel = join(root, "external-diff-sentinel");
+    const textconvSentinel = join(root, "textconv-sentinel");
+    const pager = sentinelScript("hostile-pager", `printf x > ${JSON.stringify(pagerSentinel)}\ncat`);
+    const fsmonitor = sentinelScript("hostile-fsmonitor", `printf x > ${JSON.stringify(fsmonitorSentinel)}`);
+    const externalDiff = sentinelScript("hostile-external-diff", `printf x > ${JSON.stringify(externalDiffSentinel)}`);
+    const textconv = sentinelScript("hostile-textconv", `printf x > ${JSON.stringify(textconvSentinel)}`);
+    execFileSync("git", ["add", "tracked.txt", ".gitattributes"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["commit", "--quiet", "-m", "hostile proof fixture"], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["config", "core.pager", pager], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["config", "core.fsmonitor", fsmonitor], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["config", "diff.external", externalDiff], { cwd: root, stdio: "ignore" });
+    execFileSync("git", ["config", "diff.sentinel.textconv", textconv], { cwd: root, stdio: "ignore" });
+
+    const safeStatus = "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false status --short";
+    const safeShow = "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD";
+    assert.equal(invokeBash("git status --short", trustedRawContext)?.block, true, "bare git proof commands stay blocked");
+    assert.equal(invokeBash(safeStatus, trustedRawContext), undefined);
+    assert.equal(invokeBash("git show --stat HEAD", trustedRawContext)?.block, true);
+    assert.equal(invokeBash(safeShow, trustedRawContext), undefined);
+    execFileSync("sh", ["-c", safeStatus], { cwd: root, stdio: "ignore" });
+    execFileSync("sh", ["-c", safeShow], { cwd: root, stdio: "ignore" });
+    assert.equal(existsSync(pagerSentinel), false, "sanitized show never invokes configured pager");
+    assert.equal(existsSync(fsmonitorSentinel), false, "sanitized status never invokes configured fsmonitor");
+    assert.equal(existsSync(externalDiffSentinel), false, "sanitized show never invokes configured external diff");
+    assert.equal(existsSync(textconvSentinel), false, "sanitized show never invokes configured textconv");
+
+    assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false status --short", trustedRawContext), undefined);
+    assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts", trustedRawContext), undefined);
+    assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD", trustedRawContext), undefined);
+    assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline", trustedRawContext), undefined);
+    assert.equal(invokeBash("chmod 644 src/app.ts", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("chmod 644 .work-state/other.json", trustedRawContext)?.block, true);
+    assert.equal(invokeBash(`echo changed > ${artifactsDir}/mutation.json`, trustedRawContext)?.block, true);
+    assert.equal(invokeBash("echo changed > src/app.ts", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("echo changed > .work-state/other.json", trustedRawContext)?.block, true);
+    assert.equal(invokeBash(`echo changed > .work-state/runs/${runId}/state.json`, trustedRawContext)?.block, true);
+    assert.equal(invokeBash(`mkdir -p ${artifactsDir}/new`, trustedRawContext)?.block, true);
+    assert.equal(invokeBash(`mkfifo ${artifactsDir}/fifo`, trustedRawContext)?.block, true);
+    assert.equal(invokeBash(`mknod ${artifactsDir}/node p`, trustedRawContext)?.block, true);
+    assert.equal(invokeBash("git status --short; echo changed", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("pwd", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("git diff --output=src/app.ts", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("git diff --output src/app.ts", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("git show --output=.work-state/other.json HEAD", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("git diff --ext-diff -- src/app.ts", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("git diff --textconv -- src/app.ts", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("git -c core.pager=cat diff -- src/app.ts", trustedRawContext)?.block, true);
+    assert.equal(invokeBash("git --no-pager show HEAD", trustedRawContext)?.block, true);
+
+    const explicitWorker = {
+      ...trustedRawContext,
+      actor: "worker",
+      hasUI: false,
+    };
+    assert.equal((invoke({ path: "src/app.ts" }, explicitWorker))?.block, true, "configured resolver ignores input actor");
+
+    const foreign = {
+      sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" },
+    };
+    assert.equal(invoke({ path: join(artifactsDir, "discovery.json") }, foreign)?.block, true);
+    assert.equal(invoke({ path: "src/app.ts" }, foreign)?.block, true);
+    const foreignExplicitOrchestrator = {
+      ...foreign,
+      actor: "orchestrator",
+      hasUI: true,
+    };
+    assert.equal(invoke({ path: join(artifactsDir, "discovery.json") }, foreignExplicitOrchestrator)?.block, true);
+    assert.equal(invoke({ path: ".work-state/other.json" }, foreignExplicitOrchestrator)?.block, true);
+    assert.equal(invoke({ path: join(artifactsDir, "discovery.json"), actor: "orchestrator" }, trustedRawContext)?.block, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1954,6 +2120,35 @@ test("workflow contract exposes the canonical run artifact directory", () => {
     assert.equal(prepared.artifactsDir, expectedArtifactsDir);
     assert.equal(contract.state.artifactsDir, expectedArtifactsDir);
     assert.equal(contract.state.path, prepared.statePath);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_instructions preserves typed recovery details from contract resolution", async () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-instructions-recovery-details-"));
+  try {
+    writeImplementationState(root);
+    const runId = activeRunId(root);
+    const target = runTarget(root, runId);
+    const state = JSON.parse(readFileSync(target.statePath!, "utf8")) as Record<string, unknown>;
+    state.required_inputs = {
+      implementation: [{ artifact_id: "missing", path: "missing.json" }],
+    };
+    writeFileSync(target.statePath!, JSON.stringify(state));
+    const instructions = registeredWorkflowTools(root).get("workflow_instructions");
+    assert.ok(instructions);
+    const response = await instructions.execute(
+      "workflow-instructions-recovery-details",
+      {},
+      undefined,
+      undefined,
+      { cwd: root, hasUI: true, session_id: trustedContext(root).session_id } as never,
+    );
+    const details = response.details as { code?: string; details?: { code?: string; error?: string } };
+    assert.equal(details.code, "WORKFLOW_RESOLUTION_FAILED");
+    assert.equal(details.details?.code, "RECOVERY_REQUIRED");
+    assert.match(details.details?.error ?? "", /recovery_required/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

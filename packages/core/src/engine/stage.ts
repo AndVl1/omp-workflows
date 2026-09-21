@@ -9,8 +9,9 @@
  *   - `bash`         -> deterministic shell step
  *   - `none`         -> skip
  *
- * The orchestrator hands every `task` call its `consumes` artifact content;
- * the agent gathers its own context outside this layer.
+ * The orchestrator hands every `task` call its required `consumes` content and
+ * any present `optional_consumes` content; the agent gathers its own context
+ * outside this layer.
  *
  * v0.7.0: stages that ship code (currently `implementation` and
  * `review_fixes`) go through the `validationGate` after the subagent
@@ -25,7 +26,8 @@ import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { readFileSync } from "node:fs";
-import { persistReturnedArtifacts, readArtifact, writeArtifact } from "./artifacts.js";
+import { persistReturnedArtifacts, readArtifact, readArtifactInput, writeArtifact } from "./artifacts.js";
+import { validateProducedArtifact } from "./artifact-contract.js";
 import { resolveConfig } from "./config.js";
 import { type ScopeFlags } from "./scope.js";
 import { evaluatePredicate } from "./predicate.js";
@@ -390,16 +392,20 @@ export async function runStage(
   }
 
   const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+  const optionalInputRead = readOptionalStageInputs(stage, ctx.state, ctx.artifactsDir);
+  if (!optionalInputRead.ok) {
+    return { stageId: stage.id, status: "failed", note: optionalInputRead.error, artifacts: produces };
+  }
   try {
     ctx.log(`stage ${stage.id}: ${stage.title}`);
     ctx.onStageStart?.(stage.id);
     switch (stage.type) {
       case "orchestrator":
-        return await runOrchestrator(stage, ctx, produces);
+        return await runOrchestrator(stage, ctx, produces, optionalInputRead.inputs);
       case "single":
-        return await runSingle(stage, ctx, produces);
+        return await runSingle(stage, ctx, produces, optionalInputRead.inputs);
       case "consilium":
-        return await runConsilium(stage, ctx, produces);
+        return await runConsilium(stage, ctx, produces, optionalInputRead.inputs);
       case "document":
         return await runProductPrdRender(stage, ctx, produces);
       case "bash":
@@ -418,13 +424,18 @@ export async function runStage(
   }
 }
 
-async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
+async function runOrchestrator(
+  stage: StageDef,
+  ctx: StageContext,
+  produces: string[],
+  optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
+): Promise<StageOutcome> {
   ctx.log(`  orchestrator: ${stage.produces?.toString() ?? "none"}`);
   if (ctx.orchestrate) {
     try {
       const result = await ctx.orchestrate({
         stage,
-        prompt: buildStagePrompt(stage, ctx, "orchestrator"),
+        prompt: buildStagePrompt(stage, ctx, "orchestrator", false, optionalInputContents),
         cwd: ctx.cwd,
         artifactsDir: ctx.artifactsDir,
         state: ctx.state,
@@ -450,15 +461,28 @@ export type RequiredStageInputRead =
   | { ok: true; inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> }
   | { ok: false; error: string };
 
+export type OptionalStageInputRead =
+  | { ok: true; inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }>; absent: string[] }
+  | { ok: false; error: string };
+
+export type StageInputRead =
+  | {
+    ok: true;
+    requiredInputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
+    optionalInputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
+    optionalAbsent: string[];
+  }
+  | { ok: false; error: string };
+
 /**
  * Read the canonical JSON inputs for a stage before any provider dispatch.
  * The manifest is persisted in TeamState when the durable callback is used;
  * this pure reader only resolves safe paths and verifies declared hashes.
  */
-export function readRequiredStageInputs(stage: StageDef, state: TeamState, artifactsDir: string): RequiredStageInputRead {
-  const declared = state.required_inputs?.[stage.id];
-  const baseManifest: Array<{ artifact_id: string; path: string; sha256?: string }> = declared && declared.length > 0
-    ? declared
+function readRequiredStageInputContents(stage: StageDef, state: TeamState, artifactsDir: string): RequiredStageInputRead {
+  const persisted = state.required_inputs?.[stage.id];
+  const baseManifest: Array<{ artifact_id: string; path: string; sha256?: string }> = persisted && persisted.length > 0
+    ? persisted
     : (stage.consumes ?? []).map((artifact_id) => ({ artifact_id, path: `${artifact_id}.json` }));
   const decisionManifest: Array<{ artifact_id: string; path: string; sha256?: string }> = (state.decisions ?? [])
     .filter((decision) => Boolean(decision.artifact_id))
@@ -489,6 +513,70 @@ export function readRequiredStageInputs(stage: StageDef, state: TeamState, artif
     inputs.push({ artifact_id: input.artifact_id, path: input.path, sha256, content });
   }
   return { ok: true, inputs };
+}
+
+/**
+ * Read required and optional stage inputs in one boundary call. Optional
+ * contents are returned to callers that render prompts/contracts; required
+ * callers can project only `requiredInputs` without changing receipts.
+ */
+export function readStageInputs(stage: StageDef, state: TeamState, artifactsDir: string): StageInputRead {
+  const required = readRequiredStageInputContents(stage, state, artifactsDir);
+  if (!required.ok) return required;
+  const optional = readOptionalStageInputs(stage, state, artifactsDir);
+  if (!optional.ok) return optional;
+  return {
+    ok: true,
+    requiredInputs: required.inputs,
+    optionalInputs: optional.inputs,
+    optionalAbsent: optional.absent,
+  };
+}
+
+/**
+ * Read only the required projection while also preflighting all declared
+ * optional inputs. Optional contents never enter the returned list or receipt.
+ */
+export function readRequiredStageInputs(stage: StageDef, state: TeamState, artifactsDir: string): RequiredStageInputRead {
+  const read = readStageInputs(stage, state, artifactsDir);
+  if (!read.ok) return read;
+  return { ok: true, inputs: read.requiredInputs };
+}
+
+/**
+ * Read optional stage inputs without collapsing a present invalid target into
+ * absence. Persisted required manifests take precedence over optional metadata.
+ */
+export function readOptionalStageInputs(stage: StageDef, state: TeamState, artifactsDir: string): OptionalStageInputRead {
+  const persisted = state.required_inputs?.[stage.id];
+  const persistedRequired = [
+    ...(Array.isArray(persisted) ? persisted.map((input) => input.artifact_id) : []),
+    ...(state.decisions ?? []).flatMap((decision) => decision.artifact_id ? [decision.artifact_id] : []),
+  ];
+  const requiredIds = new Set(persistedRequired);
+  const inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> = [];
+  const absent: string[] = [];
+  for (const id of stage.optional_consumes ?? []) {
+    if (requiredIds.has(id)) continue;
+    const read = readArtifactInput(artifactsDir, id);
+    if (read.status === "absent") {
+      absent.push(id);
+      continue;
+    }
+    if (read.status === "invalid") {
+      return { ok: false, error: `recovery_required: optional input ${id} is invalid: ${read.error}` };
+    }
+    const validated = validateProducedArtifact(id, read.value);
+    if (!validated.ok) {
+      return {
+        ok: false,
+        error: `recovery_required: optional input ${id} violates its artifact contract: ${validated.issues.map((issue) => `${issue.field}: ${issue.message}`).join("; ")}`,
+      };
+    }
+    const sha256 = createHash("sha256").update(read.content, "utf8").digest("hex");
+    inputs.push({ artifact_id: id, path: read.path, sha256, content: read.content });
+  }
+  return { ok: true, inputs, absent };
 }
 
 function persistTaskArtifacts(ctx: StageContext, result: TaskResult): { ids: string[]; error?: string } {
@@ -527,7 +615,12 @@ function hasCompletedDispatchForSlot(state: TeamState, stageId: string, slot: Di
   });
 }
 
-async function runSingle(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
+async function runSingle(
+  stage: StageDef,
+  ctx: StageContext,
+  produces: string[],
+  optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
+): Promise<StageOutcome> {
   const slot = resolveStageDispatchSlots(stage, ctx)[0];
   if (!slot) return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
   const agent = ctx.agent(slot.role);
@@ -537,7 +630,7 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
     ctx.log("  single: " + slot.slot + " already succeeded; reusing terminal dispatch");
     return validateProduced(stage, ctx, produces, "reused succeeded dispatch");
   }
-  const task = buildStagePrompt(stage, ctx, slot.slot);
+  const task = buildStagePrompt(stage, ctx, slot.slot, false, optionalInputContents);
   ctx.log(`  single: ${agent} (slot=${slot.slot}, role=${slot.role})`);
   const authorized = ctx.durable?.authorize(slot.slot, agent);
   if (authorized && !authorized.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${authorized.error}`, artifacts: produces };
@@ -634,7 +727,12 @@ function pairConsiliumResults(roster: DispatchSlot[], tasks: Array<{ name?: stri
   return { ok: true, paired: roster.map((slot) => ({ slot, result: bySlot.get(slot.slot)! })) };
 }
 
-async function runConsilium(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
+async function runConsilium(
+  stage: StageDef,
+  ctx: StageContext,
+  produces: string[],
+  optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
+): Promise<StageOutcome> {
   const resolvedRoster = resolveStageDispatchSlots(stage, ctx);
   const roster = resolvedRoster.filter((slot) => !hasCompletedDispatchForSlot(ctx.state, stage.id, slot));
   if (roster.length === 0) return validateProduced(stage, ctx, produces, "reused succeeded dispatches");
@@ -642,7 +740,7 @@ async function runConsilium(stage: StageDef, ctx: StageContext, produces: string
   ctx.log(`  consilium: ${roster.map((slot) => slot.slot).join(", ")}${multiSlot ? " (slot-scoped artifacts)" : ""}`);
   const inputRead = ctx.durable?.readInputs?.(stage.id);
   if (inputRead && !inputRead.ok) return { stageId: stage.id, status: "failed", note: inputRead.error, artifacts: produces };
-  const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot) }));
+  const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot, optionalInputContents) }));
   const authorized = ctx.durable ? roster.map((slot, i) => ctx.durable!.authorize(slot.slot, tasks[i]!.agent)) : [];
   const denied = authorized.find((a) => !a.ok);
   if (denied && !denied.ok) {
@@ -845,7 +943,13 @@ function validateProducedMultiSlot(
   return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
 }
 
-function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string, slotScoped = false): string {
+function buildStagePrompt(
+  stage: StageDef,
+  ctx: StageContext,
+  role: string,
+  slotScoped: boolean,
+  optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
+): string {
   const consumes = stage.consumes ?? [];
   const reads = consumes
     .map((id) => {
@@ -854,7 +958,15 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string, slot
     })
     .filter((x): x is string => x !== null);
 
+  const optionalReads = optionalInputContents.map((input) => `### Optional input: ${input.artifact_id}
+sha256: ${input.sha256}
+\`\`\`json
+${input.content}
+\`\`\``);
   const readsBlock = reads.length > 0 ? `\n\n## Reads from prior stages\n${reads.join("\n\n")}` : "";
+  const optionalReadsBlock = optionalReads.length > 0
+    ? `\n\n## Optional context (present inputs only; never satisfies required inputs)\n${optionalReads.join("\n\n")}`
+    : "";
   const rawProduces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
   const produces = slotScoped
     ? rawProduces.map((id) => `${id}-${sanitizeSlot(role)}.json`).join(", ")
@@ -896,7 +1008,7 @@ ${stage.prompt ?? "Follow the stage title and produce the declared artifact from
 ### Your job
 Execute this stage. Write your typed artifact to ${ctx.artifactsDir}/${slotScoped ? "<id>-<slot>.json" : "<id>.json"} matching the engine's schema (the engine reads only JSON, not prose).${slotScoped ? " This is a parallel consilium slot: write ONLY your own slot-scoped files (other slots write theirs). The engine deterministically synthesizes the shared artifacts at advance." : ""}
 
-Produces: ${produces}${readsBlock}
+Produces: ${produces}${readsBlock}${optionalReadsBlock}
 
 ### Rule
 ${roleHint}

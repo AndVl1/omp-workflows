@@ -5,7 +5,7 @@ import { loadProfile, profileHash as sharedProfileHash, resolveWorkflowProfilePa
 import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
 import { resolveActiveBranch, resolveCanonicalRun, withWorkspaceRead } from "./state.js";
-import { readRequiredStageInputs, resolveStageDispatchSlots } from "./stage.js";
+import { readStageInputs, resolveStageDispatchSlots } from "./stage.js";
 import { sanitizeSlot } from "./fan-in.js";
 import { artifactSchemaFor, type JsonSchemaDef } from "./artifact-contract.js";
 import {
@@ -534,11 +534,23 @@ export interface WorkflowStageContract {
   roles: Array<{ role: string; agent: string }>;
   parallel: boolean;
   consumes: string[];
+  /** Artifact ids read only when present; absence never blocks dispatch. */
+  optional_consumes: string[];
   /** Canonical evidence inputs that MUST be read before dependent dispatch. */
   required_inputs: Array<{ artifact_id: string; path: string; sha256?: string }>;
   /** Exact bytes read from required inputs; summaries cannot substitute for these. */
   required_input_contents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
-  input_read_receipt: { stage_id: string; capability_id: string; cursor_epoch: string; rework_generation: number; read_at: string; inputs: Array<{ artifact_id: string; path: string; sha256: string }> } | null;
+  /** Exact bytes and hashes read from present optional inputs; no receipt is issued. */
+  optional_input_contents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
+  /** Required-input read receipt bound to this stage/capability; optional inputs never appear here. */
+  input_read_receipt: {
+    stage_id: string;
+    capability_id: string;
+    cursor_epoch: string;
+    rework_generation: number;
+    read_at: string;
+    inputs: Array<{ artifact_id: string; path: string; sha256: string }>;
+  } | null;
   /** Artifact ids produced for each selected role/slot. */
   slot_artifacts: Record<string, string[]>;
   /** Persisted decisions restored from the selected run, never from chat text. */
@@ -624,6 +636,8 @@ export interface WorkflowContract {
     decisions: Array<{ id: string; summary: string; artifact_id?: string; at: string; evidence?: string }>;
     required_inputs: Array<{ artifact_id: string; path: string; sha256?: string }>;
     required_input_contents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
+    optional_consumes: string[];
+    optional_input_contents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
     input_read_receipt: { stage_id: string; capability_id: string; cursor_epoch: string; rework_generation: number; read_at: string; inputs: Array<{ artifact_id: string; path: string; sha256: string }> } | null;
     completion_intent: CompletionIntent;
     checkpoint_policy: CheckpointPolicy | null;
@@ -678,10 +692,25 @@ function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value) ?? "null").digest("hex");
 }
 
-function instructions(stage: StageDef, max: number): string {
+function instructions(
+  stage: StageDef,
+  max: number,
+  optionalContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }> = [],
+): string {
+  const optionalDeclaration = stage.optional_consumes && stage.optional_consumes.length > 0
+    ? `Optional inputs declared: ${stage.optional_consumes.join(", ")}. Missing optional inputs are absent and non-blocking.`
+    : undefined;
+  const optionalContext = optionalContents.length > 0
+    ? [
+      "Optional context (present inputs only; never satisfies required inputs):",
+      ...optionalContents.map((input) => `Optional input ${input.artifact_id} (${input.path}), sha256=${input.sha256}\n${input.content}`),
+    ].join("\n\n")
+    : undefined;
   const text = [
     stage.description,
     stage.prompt,
+    optionalDeclaration,
+    optionalContext,
     stage.checkpoint ? `Checkpoint: ${stage.checkpoint}` : undefined,
     stage.gate ? `Gate: ${stage.gate}` : undefined,
     stage.autonomous ? `Legacy autonomous rationale (migration input only): ${stage.autonomous}` : undefined,
@@ -799,12 +828,13 @@ function resolveWorkflowContractLocked(cwd: string, options: WorkflowContractOpt
   if (!stage) throw new WorkflowContractError("STAGE_MISSING", `stage cursor '${stageId ?? ""}' is not present in '${workflow}'`);
   const stageValidation = validateTypedControlPlane(stage);
   if (!stageValidation.ok) throw new WorkflowContractError("POLICY_INVALID", validationMessage(`workflow stage '${stage.id}'`, stageValidation));
-  const requiredInputsResult = state && resolved?.artifactsDir
-    ? readRequiredStageInputs(stage, state, resolved.artifactsDir)
-    : { ok: true as const, inputs: [] };
-  if (!requiredInputsResult.ok) throw new WorkflowContractError("RECOVERY_REQUIRED", requiredInputsResult.error);
-  const requiredInputContents = requiredInputsResult.inputs;
+  const stageInputsResult = state && resolved?.artifactsDir
+    ? readStageInputs(stage, state, resolved.artifactsDir)
+    : { ok: true as const, requiredInputs: [], optionalInputs: [], optionalAbsent: [] };
+  if (!stageInputsResult.ok) throw new WorkflowContractError("RECOVERY_REQUIRED", stageInputsResult.error);
+  const requiredInputContents = stageInputsResult.requiredInputs;
   const requiredInputManifest = requiredInputContents.map(({ artifact_id, path, sha256 }) => ({ artifact_id, path, sha256 }));
+  const optionalInputContents = stageInputsResult.optionalInputs;
 
 
   const config = resolveConfig(cwd);
@@ -1011,8 +1041,10 @@ function resolveWorkflowContractLocked(cwd: string, options: WorkflowContractOpt
     roles: roleAgents,
     parallel: stage.parallel ?? stage.type === "consilium",
     consumes: stage.consumes ?? [],
+    optional_consumes: stage.optional_consumes ?? [],
     required_inputs: requiredInputManifest,
     required_input_contents: requiredInputContents,
+    optional_input_contents: optionalInputContents,
     input_read_receipt: inputReadReceipt,
     decisions: (state?.decisions ?? []).map((decision) => ({
       ...decision,
@@ -1053,7 +1085,7 @@ function resolveWorkflowContractLocked(cwd: string, options: WorkflowContractOpt
       selection_id: roster_selection?.snapshot_id ?? null,
     },
     status,
-    instructions: instructions(stage, options.maxInstructions ?? 4000),
+    instructions: instructions(stage, options.maxInstructions ?? 4000, optionalInputContents),
     provenance: { source: "workflow", profilePath: path, profileHash: pHash, stageHash: hash(stage), control_plane },
   };
   const resolvedStatePath = resolved?.statePath ?? null;
@@ -1086,6 +1118,8 @@ function resolveWorkflowContractLocked(cwd: string, options: WorkflowContractOpt
       decisions: (state?.decisions ?? []).map((decision) => ({ ...decision })),
       required_inputs: requiredInputManifest,
       required_input_contents: requiredInputContents,
+      optional_consumes: stage.optional_consumes ?? [],
+      optional_input_contents: optionalInputContents,
       input_read_receipt: inputReadReceipt,
       workflow,
       profileHash: pHash,

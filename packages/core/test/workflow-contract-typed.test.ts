@@ -7,7 +7,8 @@ import {
   migrationCompletionIntent,
   validateTypedControlPlane,
 } from "../src/engine/workflow-contract.js";
-import type { CheckpointPolicy } from "../src/engine/types.js";
+import { registerWorkflowProfiles, validateProfileControlPlane } from "../src/engine/profile.js";
+import type { CheckpointPolicy, Profile } from "../src/engine/types.js";
 
 const identity = {
   run_id: "run-1",
@@ -164,6 +165,37 @@ test("unknown and malformed typed fields fail closed", () => {
   if (!rosterResult.ok) assert.ok(rosterResult.issues.some((issue) => issue.path === "$.roster_policy"));
   assert.equal(checkpointPolicyLegacyConflict(typedPolicy, true), null);
   assert.match(checkpointPolicyLegacyConflict({ ...typedPolicy, source: "migration" }, true) ?? "", /conflicts/);
+});
+
+test("stage input metadata validates safe ids, duplicates, overlap, and registration fail closed", () => {
+  const baseProfile: Profile = {
+    name: "optional-input-metadata",
+    title: "Optional input metadata",
+    description: "Profile validation fixture",
+    match: { type: ["FEATURE"] },
+    stages: [{ id: "stage", title: "Stage", type: "single", optional_consumes: ["product_spec"] }],
+  };
+  assert.deepEqual(validateProfileControlPlane(baseProfile), { ok: true });
+  assert.doesNotThrow(() => registerWorkflowProfiles([baseProfile]));
+
+  const invalidStages = [
+    { consumes: ["../unsafe"] },
+    { consumes: ["."] },
+    { optional_consumes: [".."] },
+    { optional_consumes: ["product_spec", "product_spec"] },
+    { consumes: ["review", "review"] },
+    { consumes: ["review"], optional_consumes: ["review"] },
+  ];
+  for (const [index, metadata] of invalidStages.entries()) {
+    const invalid = {
+      ...baseProfile,
+      name: `optional-input-invalid-${index}`,
+      stages: [{ ...baseProfile.stages[0], ...metadata }],
+    } as Profile;
+    const result = validateProfileControlPlane(invalid);
+    assert.equal(result.ok, false, `metadata case ${index} must be rejected`);
+    assert.throws(() => registerWorkflowProfiles([invalid]), /invalid workflow profile/);
+  }
 });
 
 test("completion intent and migration checkpoint policy remain orthogonal", () => {

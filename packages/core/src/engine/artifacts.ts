@@ -8,9 +8,9 @@
  * parses and matches the type name — but the schema is preserved for ref.
  */
 
-import { constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { lifecycleTransactionStatus } from "./lifecycle-journal.js";
 import { recordArtifactWritten } from "../observability/hooks.js";
 
@@ -24,8 +24,297 @@ function canonicalRunIdFromArtifactsDir(path: string): string | undefined {
 }
 
 function assertArtifactId(id: string): void {
-  if (!ARTIFACT_ID_RE.test(id) || id === "." || id === "..") {
+  if (!isSafeArtifactId(id)) {
     throw new Error(`unsafe artifact id: ${id}`);
+  }
+}
+
+/** The canonical artifact-id/safe-path-segment rule used by artifact I/O. */
+export function isSafeArtifactId(id: string): boolean {
+  return ARTIFACT_ID_RE.test(id) && id !== "." && id !== "..";
+}
+
+export type ArtifactInputRead =
+  | { status: "absent"; path: string }
+  | { status: "invalid"; path: string; error: string }
+  | { status: "present"; path: string; content: string; value: unknown };
+const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+const O_NONBLOCK = constants.O_NONBLOCK ?? 0;
+const O_DIRECTORY = constants.O_DIRECTORY ?? 0;
+
+function sameFileIdentity(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function pinnedDirectoryRejection(root: string, directoryFd: number, opened: Stats): string | null {
+  let currentFd: Stats;
+  try {
+    currentFd = fstatSync(directoryFd);
+  } catch (error) {
+    return `artifacts directory is unreadable: ${(error as Error).message}`;
+  }
+  if (!currentFd.isDirectory()) return "artifacts directory is not a directory";
+  if (!sameFileIdentity(currentFd, opened)) return "artifacts directory changed while it was being read";
+
+  let currentPath: Stats;
+  try {
+    currentPath = lstatSync(root);
+  } catch (error) {
+    return `artifacts directory changed while it was being read: ${(error as Error).message}`;
+  }
+  if (currentPath.isSymbolicLink()) return "artifacts directory is a symlink";
+  if (!currentPath.isDirectory()) return "artifacts directory is not a directory";
+  if (!sameFileIdentity(currentPath, opened)) return "artifacts directory changed while it was being read";
+  return null;
+}
+
+type OpenArtifactsDirectory =
+  | { status: "absent" }
+  | { status: "invalid"; error: string }
+  | { status: "ready"; canonicalRoot: string; fd: number; opened: Stats };
+
+function openArtifactsDirectory(lexicalRoot: string): OpenArtifactsDirectory {
+  let lexical: Stats;
+  try {
+    lexical = lstatSync(lexicalRoot);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      return { status: "invalid", error: `artifacts directory is unreadable: ${(error as Error).message}` };
+    }
+
+    let canonicalParent: string;
+    try {
+      canonicalParent = realpathSync(dirname(lexicalRoot));
+    } catch (parentError) {
+      return { status: "invalid", error: `artifacts directory parent is unreadable: ${(parentError as Error).message}` };
+    }
+    const canonicalRoot = join(canonicalParent, basename(lexicalRoot));
+    try {
+      lstatSync(canonicalRoot);
+      return { status: "invalid", error: "artifacts directory changed while it was being read" };
+    } catch (canonicalError) {
+      if ((canonicalError as NodeJS.ErrnoException).code !== "ENOENT") {
+        return { status: "invalid", error: `artifacts directory is unreadable: ${(canonicalError as Error).message}` };
+      }
+    }
+    try {
+      lstatSync(lexicalRoot);
+      return { status: "invalid", error: "artifacts directory changed while it was being read" };
+    } catch (recheckError) {
+      if ((recheckError as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" };
+      return { status: "invalid", error: `artifacts directory is unreadable: ${(recheckError as Error).message}` };
+    }
+  }
+
+  if (lexical.isSymbolicLink()) return { status: "invalid", error: "artifacts directory is a symlink" };
+  if (!lexical.isDirectory()) return { status: "invalid", error: "artifacts directory is not a directory" };
+
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = realpathSync(lexicalRoot);
+  } catch (error) {
+    return { status: "invalid", error: `artifacts directory is unreadable: ${(error as Error).message}` };
+  }
+  let canonical: Stats;
+  try {
+    canonical = lstatSync(canonicalRoot);
+  } catch (error) {
+    return { status: "invalid", error: `artifacts directory changed while it was being read: ${(error as Error).message}` };
+  }
+  if (canonical.isSymbolicLink()) return { status: "invalid", error: "artifacts directory is a symlink" };
+  if (!canonical.isDirectory()) return { status: "invalid", error: "artifacts directory is not a directory" };
+  if (!sameFileIdentity(lexical, canonical)) return { status: "invalid", error: "artifacts directory changed while it was being read" };
+
+  let directoryFd: number;
+  try {
+    directoryFd = openSync(canonicalRoot, constants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK);
+  } catch (error) {
+    return { status: "invalid", error: `artifacts directory is unreadable: ${(error as Error).message}` };
+  }
+  let opened: Stats;
+  try {
+    opened = fstatSync(directoryFd);
+  } catch (error) {
+    try {
+      closeSync(directoryFd);
+    } catch {
+      // Preserve the directory error; descriptor cleanup is best effort.
+    }
+    return { status: "invalid", error: `artifacts directory is unreadable: ${(error as Error).message}` };
+  }
+  if (!opened.isDirectory() || !sameFileIdentity(canonical, opened)) {
+    try {
+      closeSync(directoryFd);
+    } catch {
+      // Preserve the directory identity error; descriptor cleanup is best effort.
+    }
+    return {
+      status: "invalid",
+      error: opened.isDirectory() ? "artifacts directory changed while it was being read" : "artifacts directory is not a directory",
+    };
+  }
+  const pinned = pinnedDirectoryRejection(canonicalRoot, directoryFd, opened);
+  if (pinned) {
+    try {
+      closeSync(directoryFd);
+    } catch {
+      // Preserve the directory identity error; descriptor cleanup is best effort.
+    }
+    return { status: "invalid", error: pinned };
+  }
+  return { status: "ready", canonicalRoot, fd: directoryFd, opened };
+}
+
+function artifactContainmentRejection(root: string, path: string, realRoot: string, allowMissingTarget = false): string | null {
+  const parts = relative(root, path).split(sep).filter((part) => part !== "" && part !== ".");
+  let cursor = root;
+  for (const part of parts.slice(0, -1)) {
+    cursor = join(cursor, part);
+    try {
+      const parent = lstatSync(cursor);
+      if (parent.isSymbolicLink()) return "artifact path traverses a symlink";
+      if (!parent.isDirectory()) return "artifact path contains a non-directory component";
+    } catch {
+      return "artifact path changed while it was being read";
+    }
+  }
+  try {
+    const realPath = realpathSync(path);
+    if (!isWithinTree(realRoot, realPath)) return "artifact target escapes artifacts directory";
+  } catch (error) {
+    if (allowMissingTarget && (error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    return "artifact target changed while it was being read";
+  }
+  return null;
+}
+
+
+/**
+ * Read one declared input while preserving the distinction between a truly
+ * absent target and a present-but-invalid target.  Optional inputs use this
+ * boundary so a symlink, non-file, containment failure, permission error, or
+ * malformed JSON cannot be mistaken for absence.
+ */
+export function readArtifactInput(artifactsDir: string, id: string): ArtifactInputRead {
+  const relativePath = `${id}.json`;
+  if (!isSafeArtifactId(id)) return { status: "invalid", path: relativePath, error: `unsafe artifact id: ${id}` };
+  const lexicalRoot = resolve(artifactsDir);
+  const directory = openArtifactsDirectory(lexicalRoot);
+  if (directory.status === "absent") return { status: "absent", path: relativePath };
+  if (directory.status === "invalid") return { status: "invalid", path: relativePath, error: directory.error };
+
+  const root = directory.canonicalRoot;
+  const path = join(root, relativePath);
+  const directoryFd = directory.fd;
+  const openedDirectory = directory.opened;
+  const realRoot = root;
+  let fd: number | null = null;
+  try {
+    const preOpenDirectory = pinnedDirectoryRejection(root, directoryFd, openedDirectory);
+    if (preOpenDirectory) return { status: "invalid", path: relativePath, error: preOpenDirectory };
+    const preOpenContainment = artifactContainmentRejection(root, path, realRoot, true);
+    if (preOpenContainment) return { status: "invalid", path: relativePath, error: preOpenContainment };
+
+    try {
+      fd = openSync(path, constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        const beforeAbsence = pinnedDirectoryRejection(root, directoryFd, openedDirectory);
+        if (beforeAbsence) return { status: "invalid", path: relativePath, error: beforeAbsence };
+        const changed = artifactContainmentRejection(root, path, realRoot, true);
+        if (changed) return { status: "invalid", path: relativePath, error: changed };
+        try {
+          const current = lstatSync(path);
+          return {
+            status: "invalid",
+            path: relativePath,
+            error: current.isSymbolicLink() ? "artifact target is a symlink" : "artifact target changed while it was being read",
+          };
+        } catch (recheckError) {
+          if ((recheckError as NodeJS.ErrnoException).code !== "ENOENT") {
+            return { status: "invalid", path: relativePath, error: `artifact target is unreadable: ${(recheckError as Error).message}` };
+          }
+          const afterAbsence = pinnedDirectoryRejection(root, directoryFd, openedDirectory);
+          if (afterAbsence) return { status: "invalid", path: relativePath, error: afterAbsence };
+          return { status: "absent", path: relativePath };
+        }
+      }
+      return { status: "invalid", path: relativePath, error: `artifact target is unreadable: ${(error as Error).message}` };
+    }
+
+    let opened: Stats;
+    try {
+      opened = fstatSync(fd);
+    } catch (error) {
+      return { status: "invalid", path: relativePath, error: `artifact target is unreadable: ${(error as Error).message}` };
+    }
+    if (!opened.isFile()) return { status: "invalid", path: relativePath, error: "artifact target is not a regular file" };
+
+    let named: Stats;
+    try {
+      named = lstatSync(path);
+    } catch (error) {
+      return { status: "invalid", path: relativePath, error: `artifact target changed while it was being read: ${(error as Error).message}` };
+    }
+    if (named.isSymbolicLink()) return { status: "invalid", path: relativePath, error: "artifact target is a symlink" };
+    if (!sameFileIdentity(named, opened)) {
+      return { status: "invalid", path: relativePath, error: "artifact target changed while it was being read" };
+    }
+    const containment = artifactContainmentRejection(root, path, realRoot);
+    if (containment) return { status: "invalid", path: relativePath, error: containment };
+    const beforeReadDirectory = pinnedDirectoryRejection(root, directoryFd, openedDirectory);
+    if (beforeReadDirectory) return { status: "invalid", path: relativePath, error: beforeReadDirectory };
+
+    let content: string;
+    try {
+      content = readFileSync(fd, "utf8");
+    } catch (error) {
+      return { status: "invalid", path: relativePath, error: `artifact target is unreadable: ${(error as Error).message}` };
+    }
+    let after: Stats;
+    try {
+      after = fstatSync(fd);
+    } catch (error) {
+      return { status: "invalid", path: relativePath, error: `artifact target is unreadable: ${(error as Error).message}` };
+    }
+    if (!sameFileIdentity(after, opened) || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+      return { status: "invalid", path: relativePath, error: "artifact target changed while it was being read" };
+    }
+    try {
+      named = lstatSync(path);
+    } catch (error) {
+      return { status: "invalid", path: relativePath, error: `artifact target changed while it was being read: ${(error as Error).message}` };
+    }
+    if (named.isSymbolicLink() || !sameFileIdentity(named, opened)) {
+      return { status: "invalid", path: relativePath, error: "artifact target changed while it was being read" };
+    }
+    const postReadContainment = artifactContainmentRejection(root, path, realRoot);
+    if (postReadContainment) return { status: "invalid", path: relativePath, error: postReadContainment };
+
+    let value: unknown;
+    try {
+      value = JSON.parse(content) as unknown;
+    } catch (error) {
+      return { status: "invalid", path: relativePath, error: `artifact is not valid JSON: ${(error as Error).message}` };
+    }
+    const postParseDirectory = pinnedDirectoryRejection(root, directoryFd, openedDirectory);
+    if (postParseDirectory) return { status: "invalid", path: relativePath, error: postParseDirectory };
+    return { status: "present", path: relativePath, content, value };
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Preserve the read result; descriptor cleanup is best effort.
+      }
+    }
+    try {
+      closeSync(directoryFd);
+    } catch {
+      // Preserve the read result; descriptor cleanup is best effort.
+    }
   }
 }
 
@@ -302,7 +591,7 @@ export function writeArtifact<T = unknown>(artifactsDir: string, id: string, dat
     // Durable publication intent exists before rename, closing the crash gap.
     persistArtifactJournal(artifactJournal);
   }
-  const tempPath = join(artifactsDir, `.artifact.${randomUUID()}.tmp`);
+  const tempPath = join(dirname(path), `.artifact.${randomUUID()}.tmp`);
   try {
     writeFileSync(tempPath, body, "utf8");
     renameSync(tempPath, path);

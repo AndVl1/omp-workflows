@@ -8,15 +8,40 @@
  * fail closed for strict-state writes.
  */
 import { isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 interface ToolCallEvent {
   toolName: string;
   input?: Record<string, unknown> | string;
 }
-interface ToolCallContext { cwd: string; run_id?: string; hasUI?: boolean; actor?: Actor }
 
 type Actor = "orchestrator" | "worker" | "lead";
+
+/**
+ * Internal proof attached by the core host adapter after authenticating the
+ * current session. The unique symbol keeps model/tool input and ordinary
+ * runtime context fields from manufacturing the narrowed orchestrator scope.
+ */
+export const TRUSTED_ORCHESTRATOR_WRITE_PROOF = Symbol("trusted-orchestrator-write-proof");
+export interface TrustedOrchestratorWriteProof {
+  readonly [TRUSTED_ORCHESTRATOR_WRITE_PROOF]: true;
+  readonly artifactsDir: string;
+}
+
+export function createTrustedOrchestratorWriteProof(artifactsDir: string): TrustedOrchestratorWriteProof {
+  const root = resolve(artifactsDir);
+  return Object.freeze({
+    [TRUSTED_ORCHESTRATOR_WRITE_PROOF]: true as const,
+    artifactsDir: root,
+  });
+}
+
+interface ToolCallContext {
+  cwd: string;
+  run_id?: string;
+  hasUI?: boolean;
+  actor?: Actor;
+  [TRUSTED_ORCHESTRATOR_WRITE_PROOF]?: TrustedOrchestratorWriteProof;
+}
 
 export function orchestratorWriteGate(
   event: ToolCallEvent,
@@ -28,6 +53,18 @@ export function orchestratorWriteGate(
   // transport. That transport is not a project filesystem mutation.
   if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
   const actor = trustedActorOf(ctx);
+
+  // A proof-derived artifact scope is deliberately a positive allowlist:
+  // only the exact sanitized read-only git prefix
+  // `GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false` may run
+  // through bash; diff/show additionally require --no-ext-diff and --no-textconv.
+  const artifactsDir = trustedArtifactsDirOf(ctx, actor);
+  if (event.toolName === "bash" && artifactsDir) {
+    const command = commandFromInput(event.input);
+    if (!isReadOnlyProofCommand(command)) {
+      return { block: true, reason: "orchestrator policy: trusted host artifact proof permits only sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false; diff/show also require --no-ext-diff --no-textconv" };
+    }
+  }
 
   if (event.toolName === "bash") {
     const command = commandFromInput(event.input);
@@ -58,6 +95,13 @@ export function orchestratorWriteGate(
   if (actor !== "orchestrator" && actor !== "lead") {
     return { block: true, reason: "orchestrator policy: trusted actor identity is required for source writes" };
   }
+  if (artifactsDir) {
+    const invalid = paths.find((path) => !isArtifactPath(path, ctx.cwd, artifactsDir));
+    if (invalid) {
+      return { block: true, reason: `orchestrator policy: trusted host may write only under the selected artifacts directory; refused '${invalid}'` };
+    }
+    return;
+  }
   const invalid = paths.find((path) => !isWorkStatePath(path, ctx.cwd));
   if (invalid) {
     return { block: true, reason: `orchestrator policy: ${actor} may write only under .work-state; refused '${invalid}'` };
@@ -71,7 +115,61 @@ function trustedActorOf(ctx: ToolCallContext): Actor | undefined {
   return undefined;
 }
 
+function trustedArtifactsDirOf(ctx: ToolCallContext, actor: Actor | undefined): string | undefined {
+  if (actor !== "orchestrator") return undefined;
+  const proof = ctx[TRUSTED_ORCHESTRATOR_WRITE_PROOF];
+  return proof?.[TRUSTED_ORCHESTRATOR_WRITE_PROOF] === true ? proof.artifactsDir : undefined;
+}
+
+
 /** Diagnostic parser only. Values from tool input are never authorization. */
+function simpleGitWords(command: string): string[] | undefined {
+  const trimmed = command.trim();
+  if (!trimmed || /[\u0000-\u001f\u007f"'\\`;&|<>()$*?[\]{}!]/.test(trimmed)) return undefined;
+  const words = trimmed.split(/\s+/);
+  if (words.some((word) => !/^[A-Za-z0-9._/@:+~^=-]+$/.test(word))) return undefined;
+  return words;
+}
+
+function splitGitArgs(args: string[], options: ReadonlySet<string>): { before: string[]; after: string[] } | undefined {
+  const separator = args.indexOf("--");
+  const before = separator < 0 ? args : args.slice(0, separator);
+  const after = separator < 0 ? [] : args.slice(separator + 1);
+  if (before.some((arg) => arg.startsWith("-") && !options.has(arg))) return undefined;
+  if (before.some((arg) => !arg.startsWith("-") && !/^[A-Za-z0-9._/@:+~^-]+$/.test(arg))) return undefined;
+  if (after.some((arg) => !/^[A-Za-z0-9._/@:+~^-]+$/.test(arg))) return undefined;
+  return { before, after };
+}
+
+/** Bounded read-only git grammar for trusted artifact-proof bash. */
+function isReadOnlyProofCommand(command: string): boolean {
+  const words = simpleGitWords(command);
+  const prefix = ["GIT_OPTIONAL_LOCKS=0", "git", "--no-pager", "-c", "core.fsmonitor=false"];
+  if (!words || words.length < prefix.length + 1 || prefix.some((word, index) => words[index] !== word)) return false;
+  const subcommand = words[prefix.length]!;
+  const args = words.slice(prefix.length + 1);
+  if (subcommand === "status") {
+    const parsed = splitGitArgs(args, new Set(["-b", "-s", "--branch", "--no-renames", "--porcelain", "--short"]));
+    return !!parsed && parsed.before.every((arg) => arg.startsWith("-")) && parsed.after.length === 0;
+  }
+  if (subcommand === "diff") {
+    const parsed = splitGitArgs(args, new Set(["--stat", "--name-only", "--name-status", "--no-color", "--no-ext-diff", "--no-textconv"]));
+    if (!parsed || parsed.before.filter((arg) => !arg.startsWith("-")).length > 2) return false;
+    return parsed.before.includes("--no-ext-diff") && parsed.before.includes("--no-textconv");
+  }
+  if (subcommand === "show") {
+    const parsed = splitGitArgs(args, new Set(["--name-only", "--name-status", "--no-color", "--no-patch", "--oneline", "--stat", "--no-ext-diff", "--no-textconv"]));
+    if (!parsed || parsed.before.filter((arg) => !arg.startsWith("-")).length > 1) return false;
+    return parsed.before.includes("--no-ext-diff") && parsed.before.includes("--no-textconv");
+  }
+  if (subcommand === "log") {
+    const parsed = splitGitArgs(args, new Set(["-1", "--no-color", "--no-decorate", "--oneline", "--reverse"]));
+    if (!parsed || parsed.before.filter((arg) => !arg.startsWith("-")).length > 1) return false;
+    return true;
+  }
+  return false;
+}
+
 export function actorOf(input: Record<string, unknown> | undefined): Actor | undefined {
   const raw = input?.__omp_actor ?? input?.actor;
   return raw === "orchestrator" || raw === "worker" || raw === "lead" ? raw : undefined;
@@ -126,6 +224,58 @@ function isWorkStatePath(path: string, cwd: string): boolean {
   }
 }
 
+function isArtifactPath(path: string, cwd: string, artifactsDir: string): boolean {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+  const root = resolve(artifactsDir);
+  const lexical = relative(root, absolute);
+  if (lexical === "" || lexical.startsWith(`..${sep}`) || lexical === ".." || isAbsolute(lexical)) return false;
+  const projectRoot = resolve(cwd);
+  const rootFromProject = relative(projectRoot, root);
+  if (rootFromProject.startsWith(`..${sep}`) || rootFromProject === ".." || isAbsolute(rootFromProject)) return false;
+  try {
+    // The proof root itself must be a real directory. In particular, a
+    // symlinked artifacts directory is never an authenticated write target.
+    let rootCursor = projectRoot;
+    for (const segment of rootFromProject.split(sep).filter(Boolean)) {
+      rootCursor = join(rootCursor, segment);
+      const rootInfo = lstatSync(rootCursor);
+      if (rootInfo.isSymbolicLink()) return false;
+      if (!rootInfo.isDirectory()) return false;
+    }
+    const rootInfo = lstatSync(root);
+    if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) return false;
+    const realRoot = realpathSync(root);
+    const isInsideRoot = (candidate: string): boolean => {
+      const realRel = relative(realRoot, candidate);
+      return realRel !== "" && !realRel.startsWith(`..${sep}`) && realRel !== ".." && !isAbsolute(realRel);
+    };
+
+    let current = root;
+    for (const segment of lexical.split(sep).filter(Boolean)) {
+      current = join(current, segment);
+      let info;
+      try {
+        info = lstatSync(current);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+        return false;
+      }
+      if (info.isSymbolicLink()) {
+        let realLink: string;
+        try {
+          realLink = realpathSync(current);
+        } catch {
+          // This includes dangling final symlinks.
+          return false;
+        }
+        if (!isInsideRoot(realLink)) return false;
+      }
+    }
+    return isInsideRoot(realpathSync(absolute));
+  } catch {
+    return false;
+  }
+}
 function isCanonicalStatePath(path: string, cwd: string): boolean {
   const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
   const canonical = (rel: string): boolean =>
@@ -220,7 +370,7 @@ const SWITCH_FORCE_BRANCH_MUTATION = /(?:^|[;&|]\s*)git\s+switch\b[^;&|]*(?:^|\s
  * discard worktree contents remain blocked.
  */
 function looksLikeSourceMutation(command: string): boolean {
-  return /(?:\b(?:tee)\b|\b(?:cat|printf|echo)\b[^\n]*(?:>|>>|<<)|(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|rsync|patch|ed|sponge)\b|\b(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\b(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\bgit\s+(?:apply|restore|reset|clean|mv|rm|stash)\b|\bgit\s+show\b[^\n]*(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["'][^"']*[wax+][^"']*["'])/i.test(command)
+  return /(?:\b(?:tee)\b|\b(?:cat|printf|echo)\b[^\n]*(?:>|>>|<<)|(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:cp|mv|install|touch|rm|rmdir|mkfifo|mknod|truncate|dd|ln|rsync|patch|ed|sponge)\b|\b(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\b(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\bgit\s+(?:apply|restore|reset|clean|mv|rm|stash)\b|\bgit\s+show\b[^\n]*(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["'][^"']*[wax+][^"']*["'])/i.test(command)
     || CHECKOUT_PATH_MUTATION.test(command)
     || CHECKOUT_FORCE_MUTATION.test(command)
     || CHECKOUT_FORCE_BRANCH_MUTATION.test(command)

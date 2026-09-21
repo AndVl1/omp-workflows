@@ -82,8 +82,15 @@
         },
         "consumes": {
           "type": "array",
-          "items": { "type": "string" },
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "pattern": "^(?!\\.{1,2}$)[A-Za-z0-9._-]+$" },
           "description": "Artifact ids this stage reads from .work-state/artifacts/<id>.json before running. The interpreter loads them and threads relevant content into subagent prompts — replaces ad-hoc 'paste section'."
+        },
+        "optional_consumes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "pattern": "^(?!\\.{1,2}$)[A-Za-z0-9._-]+$" },
+          "description": "Artifact ids this stage reads when present from .work-state/artifacts/<id>.json. A truly absent optional artifact does not block the stage; present content is validated and exposed as optional context."
         },
         "produces": {
           "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }],

@@ -28,10 +28,12 @@ import {
   registerTeamWorkflow,
   readAgentMapping,
   resolveActiveBranch,
+  runTarget,
   type ModelRoleEntry,
   type RoleConfig,
   type ScopeRuntimeClassTable,
   type TrustedExecutionContext,
+  type TrustedToolCallResolution,
   type WorkflowOwnerIdentity,
   type WorkflowSessionController,
   type WorkflowToolAdapter,
@@ -467,6 +469,61 @@ function capturedHostControllerForTool(
   }
 }
 
+/**
+ * Resolve the narrow orchestrator capability for a raw `tool_call`. OMP
+ * 18.2.2 omits actor/hasUI on this event, so admission is based only on the
+ * already captured interactive host profile plus fresh manager identity.
+ */
+function resolveFullstackTrustedToolCallActor(
+  ctx: unknown,
+  cwd: string,
+  runId: string | undefined,
+): TrustedToolCallResolution | undefined {
+  if (!runId || !ctx || typeof ctx !== "object") return undefined;
+  const captured = capturedHostSessionRef.current;
+  const primary = primaryHostSessionRef.current;
+  const controller = workflowSessionRef.current;
+  if (
+    !workflowSessionCapturedAtHostStart.current
+    || !captured
+    || !primary
+    || primary.mode === "headless"
+    || !controller
+    || !sameHostSessionIdentity(primary, captured)
+  ) return undefined;
+
+  const authoritative = authoritativeHostSession(ctx);
+  if (
+    !authoritative
+    || !sameHostSessionIdentity(authoritative, captured)
+    || resolve(cwd) !== resolve(captured.cwd)
+  ) return undefined;
+
+  const value = ctx as { session_id?: unknown; sessionId?: unknown; mode?: unknown; hasUI?: unknown };
+  if (typeof value.session_id === "string" && value.session_id !== captured.sessionId) return undefined;
+  if (typeof value.sessionId === "string" && value.sessionId !== captured.sessionId) return undefined;
+  if (value.mode !== undefined && value.mode !== captured.mode) return undefined;
+  if (value.hasUI !== undefined) {
+    if (captured.mode === "rpc" ? value.hasUI !== false : value.hasUI !== true) return undefined;
+  }
+
+  try {
+    const controllerContext = controller.context();
+    if (
+      controllerContext.session_id !== captured.sessionId
+      || resolve(controllerContext.worktree) !== resolve(captured.cwd)
+      || controller.selectedRunId() !== runId
+    ) return undefined;
+    const target = runTarget(captured.cwd, runId);
+    const artifactsDir = target.artifactsDir;
+    const expectedArtifactsDir = resolve(captured.cwd, ".work-state", "runs", runId, "artifacts");
+    if (!artifactsDir || resolve(artifactsDir) !== expectedArtifactsDir) return undefined;
+    return { actor: "orchestrator", artifactsDir };
+  } catch {
+    return undefined;
+  }
+}
+
 function captureTrustedProfile(
   ctx: unknown,
   authoritative: { cwd: string; sessionId: string },
@@ -490,10 +547,10 @@ export function getFullstackWorkflowSessionController(ctx: unknown, cwd: string)
   const authoritative = authoritativeHostSession(ctx);
   if (!authoritative) return undefined;
   if (
-    !requestedSession ||
-    authoritative.sessionId !== requestedSession ||
-    resolve(authoritative.cwd) !== resolve(cwd) ||
-    !trustedHostSession(ctx)
+    !requestedSession
+    || authoritative.sessionId !== requestedSession
+    || resolve(authoritative.cwd) !== resolve(cwd)
+    || !trustedHostSession(ctx)
   ) return undefined;
   const controller = workflowSessionRef.current;
   if (controller) {
@@ -504,8 +561,21 @@ export function getFullstackWorkflowSessionController(ctx: unknown, cwd: string)
         captureTrustedProfile(ctx, authoritative);
         return controller;
       }
-      // A replacement is valid only after manager-proven identity and a
-      // successful release. ctx.cwd/tool arguments never select a worktree.
+      // A replacement is valid only after the primary profile itself proves
+      // that this manager identity owns the current interactive session.
+      // Unknown/foreign tool contexts must not release the retained host
+      // controller merely because they expose a different manager identity.
+      const primary = primaryHostSessionRef.current;
+      const value = ctx as { mode?: unknown; hasUI?: unknown };
+      const explicitInteractive = value.hasUI === true && (value.mode === "tui" || value.mode === "rpc");
+      if (
+        !explicitInteractive
+        && (
+          !primary
+          || primary.mode === "headless"
+          || !sameHostSessionIdentity(primary, authoritative)
+        )
+      ) return undefined;
       controller.release("host-session-replaced");
       workflowSessionRef.current = null;
       workflowSessionCapturedAtHostStart.current = false;
@@ -520,6 +590,47 @@ export function getFullstackWorkflowSessionController(ctx: unknown, cwd: string)
   captureTrustedProfile(ctx, authoritative);
   return created;
 }
+
+/**
+ * Raw `tool_call` contexts may be foreign or stale and must never replace the
+ * controller captured at session_start. Legitimate replacement happens only
+ * through bindWorkflowSession on the lifecycle ingress.
+ */
+function getFullstackRawWorkflowSessionController(
+  ctx: unknown,
+  cwd: string,
+): WorkflowSessionController | undefined {
+  const requestedSession = contextSessionId(ctx);
+  const authoritative = authoritativeHostSession(ctx);
+  const captured = capturedHostSessionRef.current;
+  const primary = primaryHostSessionRef.current;
+  const controller = workflowSessionRef.current;
+  if (
+    !requestedSession
+    || !authoritative
+    || !captured
+    || !primary
+    || primary.mode === "headless"
+    || !controller
+    || !sameHostSessionIdentity(primary, captured)
+    || !sameHostSessionIdentity(authoritative, captured)
+    || resolve(authoritative.cwd) !== resolve(cwd)
+    || requestedSession !== captured.sessionId
+  ) return undefined;
+  const value = ctx as { mode?: unknown; hasUI?: unknown };
+  if (value.mode !== undefined && value.mode !== captured.mode) return undefined;
+  if (value.hasUI !== undefined && (captured.mode === "rpc" ? value.hasUI !== false : value.hasUI !== true)) return undefined;
+  try {
+    const controllerContext = controller.context();
+    return controllerContext.session_id === captured.sessionId
+      && resolve(controllerContext.worktree) === resolve(captured.cwd)
+      ? controller
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 
 /** Adapter-only bridge for core's already profile-authenticated tool calls. */
 function getFullstackWorkflowToolSessionController(
@@ -581,7 +692,6 @@ export function fullstackOwnerForCwd(cwd: string): WorkflowOwnerIdentity {
       config_path: join(root, ".omp", "team.config.json"),
     },
   };
-
 }
 
 const fullstackWorkflowToolAdapter: WorkflowToolAdapter = createWorkflowToolAdapter({
@@ -607,11 +717,11 @@ export default function ompWorkflowsFullstack(pi: ExtensionAPI): void {
     roles: fullstackPreset.roles,
     scopeMap: fullstackPreset.scopeMap,
     flags: fullstackPreset.flags,
-    scopeRuntimeClasses: fullstackPreset.scopeRuntimeClasses,
+    getSessionController: getFullstackRawWorkflowSessionController,
     scopeUiClasses: fullstackPreset.scopeUiClasses,
     resolveCwd: resolveSessionCwd,
     owner: fullstackOwnerForCwd,
-    getSessionController: getFullstackWorkflowSessionController,
+    resolveTrustedToolCallActor: resolveFullstackTrustedToolCallActor,
   });
   registerWorkflowTools(pi);
   // URL-first lecture research acquisition — main-session only; core owns the

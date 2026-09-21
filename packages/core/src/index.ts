@@ -20,7 +20,13 @@
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { orchestratorWriteGate, workerWriteScopeGate } from "./gates/orchestrator-write.js";
+import {
+  orchestratorWriteGate,
+  workerWriteScopeGate,
+  createTrustedOrchestratorWriteProof,
+  TRUSTED_ORCHESTRATOR_WRITE_PROOF,
+  type TrustedOrchestratorWriteProof,
+} from "./gates/orchestrator-write.js";
 import { dispatchGate, parseDispatchMarker, trustedDispatchRequests, type DispatchMarker } from "./gates/dispatch.js";
 import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 import { classificationGate, classificationToolGate } from "./gates/classification.js";
@@ -35,16 +41,17 @@ import { authorizeDispatchTrusted, reconcileTrustedTaskResult, beginCapability, 
 import { loadProfile, registerWorkflowProfiles } from "./engine/profile.js";
 import { prepareWorkflowState, type ModelClassification, type WorkflowPrepareOptions } from "./engine/run.js";
 import { resolveActiveBranch } from "./engine/state.js";
+import { resolveWorkflowContract, WorkflowContractError } from "./engine/workflow-contract.js";
 import { findCurrentCheckpointDecision } from "./engine/checkpoints.js";
-import { resolveWorkflowContract } from "./engine/workflow-contract.js";
 import { LifecycleError } from "./engine/run-lifecycle.js";
 import { createWorkflowSessionController, type WorkflowSessionController } from "./engine/host-controller.js";
 import { createWorkflowReadSelector } from "./engine/read-selector.js";
 import { readDispatchOriginLocator, rememberDispatchOriginLocator } from "./dispatch-origin-locator.js";
-import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, readRunControl, readRunState, resolveRunSelection, listRuns, runStatePath, type DispatchOrigin } from "./engine/run-store.js";
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
+import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, readRunControl, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, type DispatchOrigin } from "./engine/run-store.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector } from "./engine/types.js";
 import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
+import { createNativeWorkerAuthority, type NativeWorkerResolution } from "./native-worker-authority.js";
 import type { ScopeRuntimeClassTable } from "./engine/scope.js";
 import type { DispatchAuth, RosterBeginSelection } from "./engine/durable.js";
 import type { AgentMappingState } from "./engine/agent-mapping.js";
@@ -209,8 +216,25 @@ export function workflowOwnerFor(projectRoot: string, capability: WorkflowCapabi
 /** Clear only the in-memory registry; intended for isolated host/test lifecycles. */
 export function resetWorkflowOwners(projectRoot?: string): void {
   if (projectRoot === undefined) workflowOwners.clear();
+
   else workflowOwners.delete(canonicalProjectRoot(projectRoot));
 }
+
+export type TrustedToolCallActor = "orchestrator" | "worker" | "lead";
+
+export type TrustedToolCallResolution =
+  | { readonly actor: "orchestrator"; readonly artifactsDir: string }
+  | { readonly actor: "worker" | "lead" };
+
+/**
+ * Bundle-owned adapter seam for the current authenticated tool-call context.
+ * The callback receives host context only; model/tool input is never passed.
+ */
+export type TrustedToolCallActorResolver = (
+  ctx: unknown,
+  cwd: string,
+  runId: string | undefined,
+) => TrustedToolCallResolution | undefined;
 
 export interface RegisterOptions {
   label?: string;
@@ -236,6 +260,8 @@ export interface RegisterOptions {
    * default — shipped workflows keep the single-writer model.
    */
   writeScope?: WorkerWriteScope;
+  /** Resolve the current authenticated host actor for raw tool-call hooks. */
+  resolveTrustedToolCallActor?: TrustedToolCallActorResolver;
   /** Shared session controller used by command/tool ingress and lifecycle gates. */
   getSessionController?: (ctx: unknown, cwd: string) => WorkflowSessionController | undefined;
 }
@@ -678,6 +704,8 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   if (opts.workflowProfiles?.length) registerWorkflowProfiles(opts.workflowProfiles);
 
   const resolveCwd = opts.resolveCwd ?? resolveCwdFromContext;
+  const nativeWorkerAuthority = createNativeWorkerAuthority(pi.events, { bundleLabel: label });
+  const resolverConfigured = typeof opts.resolveTrustedToolCallActor === "function";
   const bindSession = (ctx: unknown): void => {
     const cwd = opts.cwd ?? resolveCwd(ctx);
     if (!cwd) return;
@@ -686,46 +714,109 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     const runId = opts.getSessionController?.(ctx, cwd)?.selectedRunId();
     if (runId) restoreDispatchOrigins(cwd, runId);
   };
-  if (opts.cwd) bindSession({ cwd: opts.cwd });
-  else if ((opts.owner || opts.roles || opts.scopeMap || opts.flags || opts.rosterOverrides) && typeof pi.on === "function") {
-    pi.on("session_start", (_event: unknown, ctx: unknown) => bindSession(ctx));
-  }
-
-  // @ts-expect-error -- ExtensionAPI.on(string, handler) overload is enough at runtime; we type the handler explicitly.
-  pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string; session_id?: string; sessionId?: string };
-    const selectedController = c.cwd ? opts.getSessionController?.(ctx, c.cwd) : undefined;
-    const selectedRunId = selectedController?.selectedRunId();
-    const gateContext = { ...c, ...(selectedRunId ? { run_id: selectedRunId } : {}) };
-    const r1 = classificationGate(event as unknown as Parameters<typeof classificationGate>[0], gateContext);
-    if (r1?.block) return r1;
-    const r2 = monotonicGate(event, gateContext);
-    if (r2?.block) return r2;
+  pi.on("session_start", (_event, ctx: unknown) => {
+    nativeWorkerAuthority.observeSessionStart(ctx);
   });
-  pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
-    const c = ctx as { cwd: string };
-    const controller = c.cwd ? opts.getSessionController?.(ctx, c.cwd) : undefined;
-    const run_id = controller?.selectedRunId();
-    return dodBackstop(event as unknown as Parameters<typeof dodBackstop>[0], { ...c, ...(run_id ? { run_id } : {}) });
+  pi.on("session_stop", () => {
+    nativeWorkerAuthority.teardown();
+  });
+  pi.on("tool_execution_start", (event, ctx: unknown) => {
+    nativeWorkerAuthority.observeToolExecutionStart(event, ctx);
+  });
+  pi.on("tool_execution_end", (event, ctx: unknown) => {
+    nativeWorkerAuthority.observeToolExecutionEnd(event, ctx);
   });
   pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-    const c = ctx as { cwd?: string; hasUI?: boolean; actor?: "orchestrator" | "worker" | "lead"; session_id?: string; sessionId?: string };
+    const c = ctx as {
+      cwd?: string;
+      hasUI?: boolean;
+      actor?: TrustedToolCallActor;
+      session_id?: string;
+      sessionId?: string;
+    };
     // Resolve admission exactly once. The configured bundle resolver is the
     // authority (fullstack resolves sessionManager.getCwd() before any stale
     // copied context value); never substitute the process cwd or selection.
     const admissionCwd = opts.cwd ?? resolveCwd(ctx);
     const sharedController = admissionCwd ? opts.getSessionController?.(ctx, admissionCwd) : undefined;
     const selectedRunId = sharedController?.selectedRunId();
+    let nativeActor: NativeWorkerResolution | undefined;
+    if (admissionCwd) {
+      try {
+        nativeActor = nativeWorkerAuthority.resolve(ctx, admissionCwd, selectedRunId);
+      } catch {
+        nativeActor = undefined;
+      }
+    }
+    const trustedRunId = selectedRunId ?? nativeActor?.runId;
     const gateContext = admissionCwd
-      ? { ...c, cwd: admissionCwd, ...(selectedRunId ? { run_id: selectedRunId } : {}) }
+      ? { ...c, cwd: admissionCwd, ...(trustedRunId ? { run_id: trustedRunId } : {}) }
+      : undefined;
+
+    // A configured bundle resolver is the sole authority for raw tool calls.
+    // Model/tool actor fields and legacy hasUI are never credentials; the
+    // legacy actor path is retained only for bundles without a resolver.
+    const explicitActor = c.actor === "orchestrator" || c.actor === "worker" || c.actor === "lead"
+      ? c.actor
+      : undefined;
+    let adaptedActor: TrustedToolCallResolution | undefined;
+    if (admissionCwd && resolverConfigured) {
+      try {
+        adaptedActor = opts.resolveTrustedToolCallActor!(ctx, admissionCwd, selectedRunId);
+      } catch {
+        adaptedActor = undefined;
+      }
+    }
+    let trustedProof: TrustedOrchestratorWriteProof | undefined;
+    if (
+      !nativeActor
+      && adaptedActor?.actor === "orchestrator"
+      && typeof adaptedActor.artifactsDir === "string"
+      && adaptedActor.artifactsDir.length > 0
+      && admissionCwd
+      && selectedRunId
+    ) {
+      try {
+        const expectedArtifactsDir = runTarget(admissionCwd, selectedRunId).artifactsDir;
+        if (expectedArtifactsDir && resolve(expectedArtifactsDir) === resolve(adaptedActor.artifactsDir)) {
+          trustedProof = createTrustedOrchestratorWriteProof(expectedArtifactsDir);
+        }
+      } catch {
+        trustedProof = undefined;
+      }
+    }
+    const adaptedTrustedActor = adaptedActor?.actor === "orchestrator"
+      ? (trustedProof ? adaptedActor.actor : undefined)
+      : adaptedActor?.actor;
+    const trustedActor = nativeActor?.actor
+      ?? (resolverConfigured ? adaptedTrustedActor : explicitActor);
+    const { actor: _runtimeActor, ...writeGateBase } = gateContext ?? {};
+    const writeGateContext = gateContext
+      ? {
+        ...writeGateBase,
+        cwd: gateContext.cwd,
+        ...(trustedActor ? { actor: trustedActor } : {}),
+        ...(trustedProof ? { [TRUSTED_ORCHESTRATOR_WRITE_PROOF]: trustedProof } : {}),
+        // A configured resolver owns all raw-context authority; bare actor and
+        // hasUI fields never infer a worker after adapter failure.
+        ...(resolverConfigured && !trustedActor ? { hasUI: undefined } : {}),
+        }
       : undefined;
     let result: { block?: boolean; reason?: string } | undefined;
     const run = (candidate: { block?: boolean; reason?: string } | void) => { if (!result && candidate?.block) result = candidate; };
     if (!admissionCwd && (event.toolName === "ask" || event.toolName === "task" || event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")) {
       run({ block: true, reason: "workflow cwd unavailable" });
     }
-    // This guard has no workspace-state dependency and still applies without
-    // an authoritative cwd; protected tool classes above fail closed first.
+    if (
+      resolverConfigured
+      && !trustedActor
+      && (event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")
+    ) {
+      run({ block: true, reason: "trusted host actor unavailable" });
+    }
+    if (nativeActor?.actor === "worker" && event.toolName === "task") {
+      run({ block: true, reason: "native worker authority does not permit nested task delegation" });
+    }
     run(ctoNestingGuard(event as unknown as Parameters<typeof ctoNestingGuard>[0]));
     // These gates read workspace state before they inspect the tool name. A
     // missing authoritative cwd therefore skips them rather than passing
@@ -733,14 +824,15 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     if (gateContext) {
       run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], gateContext));
       run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], gateContext));
-      run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], gateContext));
-      run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...gateContext, writeScope: opts.writeScope }));
+      run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], writeGateContext ?? gateContext!));
+      run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...(writeGateContext ?? gateContext!), writeScope: opts.writeScope }));
       run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], gateContext));
       run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], { ...gateContext, controller: sharedController }));
     }
     run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], (gateContext ?? c) as Parameters<typeof safetyGuard>[1]));
-    let eventRunId = event.toolName === "task" ? undefined : selectedRunId;
-    let eventRunIdTrusted = event.toolName !== "task" && typeof selectedRunId === "string" && selectedRunId.length > 0;
+    let eventRunId = event.toolName === "task" ? undefined : trustedRunId;
+    let eventRunIdTrusted = event.toolName !== "task" && typeof trustedRunId === "string" && trustedRunId.length > 0;
+    let nativeDispatchOrigins: DispatchOrigin[] | undefined;
     if (!result && event.toolName === "task") {
       const authorization = gateContext
         ? trustedDispatchRequests(
@@ -753,7 +845,8 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       } else if (!admissionCwd) {
         run({ block: true, reason: "dispatch authorization failed: workflow cwd unavailable" });
       } else {
-        for (const request of authorization.requests) {
+        const origins: DispatchOrigin[] = [];
+        for (const [index, request] of authorization.requests.entries()) {
           if (request.run_id) {
             eventRunId = request.run_id;
             eventRunIdTrusted = true;
@@ -765,7 +858,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
           }
           const toolCallId = authorized.record?.tool_call_id ?? event.toolCallId;
           if (toolCallId && request.run_id && authorized.record) {
-            const origin = {
+            const origin: DispatchOrigin = {
               cwd: admissionCwd,
               run_id: request.run_id,
               dispatch_id: authorized.record.id,
@@ -778,10 +871,31 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
                 task_id: authorized.record.work_identity.task_id,
               } : {}),
             };
+            origins[index] = origin;
             rememberDispatchOrigin(toolCallId, origin);
             rememberDispatchOriginLocator(toolCallId, origin);
           }
         }
+        if (origins.length > 0) nativeDispatchOrigins = origins;
+      }
+    }
+    if (
+      !result
+      && admissionCwd
+      && event.toolName === "task"
+      && (trustedActor === "orchestrator" || trustedActor === "lead")
+    ) {
+      try {
+        nativeWorkerAuthority.admitTaskCall(
+          ctx,
+          event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
+          trustedActor,
+          eventRunId ?? trustedRunId,
+          nativeDispatchOrigins,
+        );
+      } catch {
+        // Native authority is fail-closed; a malformed host context never
+        // changes the already-allowed task decision or creates a grant.
       }
     }
     if (admissionCwd && opts.observability !== false) {
@@ -947,6 +1061,10 @@ function lifecycleCandidatesForBoundary(cwd: string, mode: "resume" | "rework" |
 }
 
 function lifecycleFailure(code: string, error: unknown, candidates?: readonly unknown[]): WorkflowToolResult {
+  if (error instanceof WorkflowContractError) {
+    const details = { code: error.code, error: error.message };
+    return toolResult({ ok: false, code, error: String(error), details });
+  }
   if (!(error instanceof LifecycleError)) return toolResult({ ok: false, code, error: String(error) });
   const boundaryError = error as LifecycleBoundaryError;
   const exactCandidates = boundaryError.candidates ?? candidates;
