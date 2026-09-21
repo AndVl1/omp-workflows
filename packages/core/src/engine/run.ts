@@ -276,9 +276,11 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
   const requestId = opts.request_id ?? randomUUID();
   const previousRunId = operation === "new" ? null : opts.run_id ?? null;
   if (operation !== "new" && !previousRunId) throw new LifecycleError("run_selection_required", `${operation} requires an explicit run_id before mutation`, { next_action: "resolve a run selector before calling workflow_prepare" });
+  let newClassification: Classification | undefined;
+  if (operation === "new") newClassification = resolveClassification(opts);
   const replayReceipt = readRunControl(opts.cwd).prepare_receipts[requestId];
   if (replayReceipt) {
-    const replayClassification = operation === "new" ? resolveClassification(opts) : undefined;
+    const replayClassification = operation === "new" ? newClassification : undefined;
     const replayAffectedStage = opts.affected_stage;
     const replayRequest = {
       mode: operation,
@@ -313,6 +315,20 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
       transition: replayReceipt,
     };
   }
+  let newProfile: Profile | undefined;
+  if (operation === "new") {
+    const requestedWorkflow = opts.classification?.workflow;
+    const selectedProfile = requestedWorkflow !== undefined
+      ? profiles.find((candidate) => candidate.name === requestedWorkflow)
+      : selectProfile(profiles, newClassification!);
+    if (!selectedProfile) {
+      if (requestedWorkflow !== undefined) {
+        throw new LifecycleError("run_state_invalid", `workflow profile '${requestedWorkflow}' is unavailable`);
+      }
+      throw new LifecycleError("run_state_invalid", `no profile matches classification ${JSON.stringify(newClassification)}`);
+    }
+    newProfile = selectedProfile;
+  }
 
   const recovered = recoverLegacyMigrations(opts.cwd);
   if (recovered.pending.length > 0) throw new LifecycleError("recovery_required", `legacy migration recovery is pending for ${recovered.pending.join(", ")}`, { next_action: "retry migration recovery before preparing a workflow" });
@@ -329,10 +345,8 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
   let transition: PrepareRequestReceipt;
   const requestedAffectedStage = opts.affected_stage;
   if (operation === "new") {
-    classification = resolveClassification(opts);
-    const selectedProfile = selectProfile(profiles, classification);
-    if (!selectedProfile) throw new LifecycleError("run_state_invalid", `no profile matches classification ${JSON.stringify(classification)}`);
-    profile = selectedProfile;
+    classification = newClassification!;
+    profile = newProfile!;
     flags = opts.files !== undefined ? resolveScope(opts.files, config) : resolveScope([], config);
     const runId = randomUUID();
     state = {

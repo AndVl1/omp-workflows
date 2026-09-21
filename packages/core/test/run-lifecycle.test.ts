@@ -35,11 +35,15 @@ import {
   finalizeCanonicalRun,
   discoverLegacySources,
   preflightLegacyMigration,
+  registerWorkflowProfiles,
+  resolveWorkflowContract,
 } from "../src/index.js";
 import { reworkCanonicalRunAtomically } from "../src/engine/run-store.js";
+import { profileHash } from "../src/engine/profile.js";
 import type {
   LifecycleRequest,
   PrepareRequestReceipt,
+  Profile,
   RunCandidate,
   TeamState,
   TrustedExecutionContext,
@@ -340,6 +344,81 @@ test("two new canonical runs on one branch remain independently listed and reada
   }
 });
 
+test("workflow_prepare rejects an unavailable explicit workflow before canonical mutation", () => {
+  const root = scratch("omp-lifecycle-unavailable-profile");
+  const missingWorkflow = `missing-profile-${randomUUID()}`;
+  try {
+    initGit(root);
+    const execution = context(root, "unavailable-profile");
+    const base = prepareOptions(root, "unavailable profile task", "unavailable-profile-request", execution);
+    const options = {
+      ...base,
+      classification: { ...base.classification, workflow: missingWorkflow },
+    };
+
+    assert.throws(
+      () => prepareWorkflowState(options),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_state_invalid",
+    );
+    assert.equal(existsSync(join(root, ".work-state")), false, "unavailable explicit workflow must not create canonical state");
+    assert.deepEqual(listRuns(root, { branch: BRANCH }), [], "unavailable explicit workflow must not publish a run or selection");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare with an omitted workflow preserves matrix selection", () => {
+  const root = scratch("omp-lifecycle-matrix-profile");
+  try {
+    initGit(root);
+    const execution = context(root, "matrix-profile");
+    const prepared = prepareWorkflowState(prepareOptions(root, "matrix profile task", "matrix-profile-request", execution));
+
+    assert.equal(prepared.profile.name, "bug-fix");
+    assert.equal(prepared.state.profile_hash, profileHash(prepared.profile));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow_prepare resolves a uniquely registered profile through the public contract", () => {
+  const root = scratch("omp-lifecycle-registered-profile");
+  const workflow = `registered-prepare-${randomUUID()}`;
+  const customProfile: Profile = {
+    name: workflow,
+    title: "Registered prepare profile",
+    description: "A uniquely registered profile for lifecycle preparation.",
+    match: { type: ["FEATURE"] },
+    stages: [{
+      id: "intake",
+      title: "Registered intake",
+      type: "orchestrator",
+      description: "Prepare the registered workflow.",
+      prompt: "Use the registered workflow contract.",
+    }],
+  };
+  try {
+    registerWorkflowProfiles([customProfile]);
+    initGit(root);
+    const execution = context(root, "registered-profile");
+    const base = prepareOptions(root, "registered profile task", "registered-profile-request", execution);
+    const prepared = prepareWorkflowState({
+      ...base,
+      classification: { ...base.classification, type: "FEATURE", workflow },
+    });
+    const expectedHash = profileHash(customProfile);
+    const contract = resolveWorkflowContract(root, { runId: prepared.state.run_id, branch: BRANCH });
+
+    assert.equal(prepared.profile.name, workflow);
+    assert.equal(prepared.state.profile_hash, expectedHash);
+    assert.equal(contract.workflow, workflow);
+    assert.equal(contract.profile.hash, expectedHash);
+    assert.equal(contract.stage.id, "intake");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("workflow_prepare creates independent new runs and exact replay returns the first receipt", () => {
   const root = scratch("omp-lifecycle-prepare");
   try {
@@ -375,6 +454,24 @@ test("workflow_prepare creates independent new runs and exact replay returns the
       (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict",
     );
     assert.equal(listRuns(root, { branch: BRANCH }).length, 2);
+    const beforeReplayControl = readRunControl(root);
+    const beforeReplayRunIds = listRuns(root, { branch: BRANCH }).map((candidate) => candidate.run_id);
+    const beforeReplayStates = beforeReplayRunIds.map((runId) => readRunState(root, runId));
+    const changedWorkflowOptions = prepareOptions(root, "first ingress task", "prepare-a", execution);
+    const replayWithUnavailableWorkflow = {
+      ...changedWorkflowOptions,
+      classification: {
+        ...changedWorkflowOptions.classification,
+        workflow: `missing-replay-profile-${randomUUID()}`,
+      },
+    };
+    assert.throws(
+      () => prepareWorkflowState(replayWithUnavailableWorkflow),
+      (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict",
+    );
+    assert.deepEqual(readRunControl(root), beforeReplayControl);
+    assert.deepEqual(listRuns(root, { branch: BRANCH }).map((candidate) => candidate.run_id), beforeReplayRunIds);
+    assert.deepEqual(beforeReplayRunIds.map((runId) => readRunState(root, runId)), beforeReplayStates);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
