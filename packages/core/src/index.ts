@@ -23,6 +23,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import {
   orchestratorWriteGate,
   workerWriteScopeGate,
+  isRegisteredLifecycleDeviceWrite,
   createTrustedOrchestratorWriteProof,
   TRUSTED_ORCHESTRATOR_WRITE_PROOF,
   type TrustedOrchestratorWriteProof,
@@ -810,6 +811,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     if (
       resolverConfigured
       && !trustedActor
+      && !isRegisteredLifecycleDeviceWrite(event as unknown as { toolName: string; input?: Record<string, unknown> | string })
       && (event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")
     ) {
       run({ block: true, reason: "trusted host actor unavailable" });

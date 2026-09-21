@@ -226,6 +226,43 @@ The prose phase descriptions in `commands/team.md` remain as a **STAGE REFERENCE
 the detailed prompt templates and review criteria live there. Profiles drive *which* stages
 run and *in what order*; the reference supplies the *how* for each stage type.
 
+### Необязательные входы и required-input receipt
+
+`consumes` остаётся обязательным входом: его отсутствие или ошибка блокирует зависимый dispatch. `optional_consumes` означает только «прочитать, если уже существует»:
+
+- действительно отсутствующий optional artifact не блокирует стадию, не создаёт `required_input` receipt и не может заменить обязательный input;
+- существующий target читается как exact bytes после проверки безопасного path под выбранным `artifactsDir` и JSON/schema artifact contract; `sha256` вычисляется для exact-byte optional context, без сравнения с ожидаемым persisted hash и без выдачи required-input receipt;
+- существующий, но invalid, dangling или unsafe target даёт `recovery_required` и блокирует dispatch — его нельзя выдать за отсутствие;
+- persisted `required_inputs` остаётся authority: объявление `optional_consumes` не ослабляет, не удовлетворяет и не переписывает этот обязательный manifest. `optional_input_contents` передаётся только как дополнительный контекст. Поэтому standalone `SPEC` остаётся валидным без optional `product_spec`.
+
+### Trusted native Task boundary
+
+Полномочие native `Task` worker выдаёт только host, а не текст задачи. Точная process-local binding строится по цепочке `authorized parent request → matching execution event → lifecycle sessionFile → real SessionManager + exact child header/session id + canonical cwd`. `matching tool_execution_start` подтверждает тот же запрос; `lifecycle.id` не является UUID child-session header. Перед каждым защищённым вызовом host повторно проверяет актуальность manager, `sessionFile`, header и `cwd`, а также canonical authority dispatch/run.
+Accepted TCB boundary: already-loaded extensions are trusted host code and are not sandboxed against their JS/process/FS capabilities; prompt/tool arguments and foreign sessions remain untrusted and cannot create this binding.
+
+Binding worker не разрешает вложенную делегацию: worker не вызывает `Task` для redelegation. `team-lead` может действовать только в уже выданном том же CTO `run`/`slice`; copied marker, `hasUI`, raw `actor`, prompt/arguments или чужая session сами по себе полномочий не создают. `write_scope`, если включён consumer-ом, только сужает уже разрешённый доступ и никогда его не расширяет.
+
+Registry binding process-local. После перезапуска worker grants не восстанавливаются; durable `pending`/`transport_reconnect` и captured result origin позволяют точно reconcile прежний dispatch, но не являются полномочием на запись source и не синтезируют новый `Task` поверх pending.
+
+### Защищённый artifact-proof Bash
+
+Это единственное Bash-исключение в данном контракте: доверенный host artifact proof разрешает только bounded read-only Git inspection. Команда должна быть helper-free и начинаться ровно с:
+
+```bash
+GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false ...
+```
+
+Например:
+
+```bash
+GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false status --short
+GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline
+GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts
+GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD
+```
+
+Для `diff` и `show` обязательны оба флага `--no-ext-diff` и `--no-textconv`; bare `git`, helper/wrapper, mutation и несанкционированный Bash блокируются. Это правило относится только к protected artifact-proof context и не переписывает обычные terminal/code-reviewer инструкции.
+
 ## Definition of Done (acceptance gate)
 
 Profiles with an implementation phase produce a `dod` artifact early (exploration / discovery /

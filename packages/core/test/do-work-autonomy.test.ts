@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -296,6 +296,162 @@ test("host admission resolves session-manager cwd for mounted read and workflow 
     assert.equal(contract.workflow, "debug-cycle");
     assert.equal(contract.stage?.id, "implementation");
     assert.deepEqual(contract.stage?.roles, [{ role: "developer-kotlin", agent: "developer-kotlin" }]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("lifecycle write routes are exact outer exemptions while handlers retain host authentication", async () => {
+  const root = mkdtempSync(join(tmpdir(), "lifecycle-device-route-auth-"));
+  try {
+    initGit(root, "main");
+    const trustedSessionId = "lifecycle-main-session";
+    const trusted = {
+      sessionManager: { getCwd: () => root, getSessionId: () => trustedSessionId },
+      mode: "tui",
+      hasUI: true,
+      session_id: trustedSessionId,
+    };
+    const trustedExecution = { ...trustedContext(root), session_id: trustedSessionId };
+    const controller = createWorkflowSessionController({ cwd: root, context: trustedExecution });
+    const sessionContext = (sessionId: string, mode: string, hasUI: boolean) => ({
+      sessionManager: { getCwd: () => root, getSessionId: () => sessionId },
+      mode,
+      hasUI,
+      session_id: sessionId,
+    });
+    const getController = (ctx: unknown, cwd: string) => {
+      if (cwd !== root || !ctx || typeof ctx !== "object") return undefined;
+      const value = ctx as {
+        mode?: unknown;
+        hasUI?: unknown;
+        sessionManager?: { getSessionId?: () => unknown };
+      };
+      let sessionId: unknown;
+      try {
+        sessionId = value.sessionManager?.getSessionId?.();
+      } catch {
+        return undefined;
+      }
+      return sessionId === trustedSessionId
+        && value.hasUI === true
+        && (value.mode === "tui" || value.mode === "rpc")
+        ? controller
+        : undefined;
+    };
+    const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    const tools = new Map<string, RegisteredWorkflowTool>();
+    const pi = {
+      zod: { z },
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (handlers[name] ??= []).push(handler);
+      },
+      registerTool(tool: RegisteredWorkflowTool) {
+        tools.set(tool.name, tool);
+      },
+    };
+    registerTeamWorkflow(pi as never, {
+      observability: false,
+      resolveCwd: ctx => {
+        if (!ctx || typeof ctx !== "object") return undefined;
+        try {
+          const cwd = (ctx as { sessionManager?: { getCwd?: () => unknown } }).sessionManager?.getCwd?.();
+          return typeof cwd === "string" ? cwd : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      getSessionController: getController,
+      resolveTrustedToolCallActor: () => undefined,
+    });
+    registerWorkflowTools(pi as never, {
+      resolveCwd: ctx => {
+        if (!ctx || typeof ctx !== "object") return undefined;
+        try {
+          const cwd = (ctx as { sessionManager?: { getCwd?: () => unknown } }).sessionManager?.getCwd?.();
+          return typeof cwd === "string" ? cwd : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      isMainSession: () => false,
+      getSessionController: getController,
+    });
+    for (const handler of handlers.session_start ?? []) handler({}, trusted);
+    const toolCall = handlers.tool_call?.[0];
+    assert.ok(toolCall, "configured raw tool hook is required");
+    const routeEvent = (path: string) => ({ toolName: "write", toolCallId: `route-${path}`, input: { path, content: "{}" } });
+    const lifecycleRoutes = [
+      "xd://workflow_prepare",
+      "xd://workflow_instructions",
+      "xd://workflow_begin",
+      "xd://workflow_status",
+      "xd://workflow_complete",
+      "xd://workflow_checkpoint",
+      "xd://workflow_checkpoint_ask",
+      "xd://workflow_advance",
+    ];
+    assert.equal(controller.selectedRunId(), undefined, "positive route must begin without a preselected run");
+    assert.equal(toolCall(routeEvent("xd://workflow_prepare"), trusted), undefined, "workflow_prepare outer write should reach its handler");
+    const prepare = tools.get("workflow_prepare");
+    assert.ok(prepare, "workflow_prepare handler is required");
+    const params = {
+      mode: "new",
+      task: "handler authentication",
+      branch: "main",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false },
+    };
+    const prepared = await prepare.execute("trusted-route", params, undefined, undefined, trusted as never);
+    const preparedDetails = prepared.details as { ok?: boolean; error?: string };
+    assert.equal(preparedDetails.ok, true, preparedDetails.error);
+    const selectedRunId = controller.selectedRunId();
+    assert.ok(selectedRunId, "trusted prepare must bind the new canonical run");
+    assert.equal(existsSync(runTarget(root, selectedRunId!).statePath), true, "trusted prepare must create canonical state");
+    const snapshotTree = (directory: string): string => {
+      const walk = (current: string, prefix: string): string[] => {
+        if (!existsSync(current)) return [];
+        return readdirSync(current, { withFileTypes: true })
+          .sort((left, right) => left.name.localeCompare(right.name))
+          .flatMap(entry => {
+            const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+            const path = join(current, entry.name);
+            return entry.isDirectory()
+              ? [`D:${relativePath}`, ...walk(path, relativePath)]
+              : [`F:${relativePath}:${readFileSync(path).toString("base64")}`];
+          });
+      };
+      return walk(directory, "").join("\n");
+    };
+    for (const path of lifecycleRoutes.slice(1)) {
+      assert.equal(toolCall(routeEvent(path), trusted), undefined, `exact lifecycle route should reach its handler: ${path}`);
+    }
+    const deniedRoutes: Array<[string, unknown]> = [
+      ["query", routeEvent("xd://workflow_prepare?mode=new")],
+      ["suffix", routeEvent("xd://workflow_prepare/")],
+      ["selector", routeEvent("xd://workflow_prepare#selector")],
+      ["traversal", routeEvent("xd://workflow_prepare/../workflow_begin")],
+      ["case", routeEvent("XD://workflow_prepare")],
+      ["unknown", routeEvent("xd://report_issue")],
+      ["ast_edit", routeEvent("xd://ast_edit")],
+      ["source", routeEvent("src/app.ts")],
+      [".work-state", routeEvent(".work-state/runs/current/state.json")],
+      ["mixed", { toolName: "write", input: { path: ["xd://workflow_prepare", "src/app.ts"], content: "{}" } }],
+      ["edit", { toolName: "edit", input: { path: "xd://workflow_prepare", content: "{}" } }],
+      ["bash", { toolName: "bash", input: { command: "echo route" } }],
+    ];
+    for (const [label, event] of deniedRoutes) {
+      assert.equal((toolCall(event, trusted) as { block?: boolean } | undefined)?.block, true, `${label} route must stay denied`);
+    }
+
+    const sentinel = join(root, "handler-sentinel");
+    writeFileSync(sentinel, "before");
+    const beforeRejectedHandlers = snapshotTree(join(root, ".work-state"));
+    const foreign = await prepare.execute("foreign-route", params, undefined, undefined, sessionContext("foreign-session", "tui", true) as never);
+    const headless = await prepare.execute("headless-route", params, undefined, undefined, sessionContext(trustedSessionId, "print", false) as never);
+    assert.equal((foreign.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
+    assert.equal((headless.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
+    assert.equal(snapshotTree(join(root, ".work-state")), beforeRejectedHandlers, "foreign/headless handlers must not mutate canonical state or run inventory");
+    assert.equal(readFileSync(sentinel, "utf8"), "before", "foreign/headless route handlers must not mutate state");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -880,11 +1036,14 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
       hostContext,
     );
     assert.equal(mountedWorkflowTool, undefined, "mounted xd tools are not project writes");
-    const mountedDiagnosticTool = orchestratorWriteGate(
-      { toolName: "write", input: { path: "xd://report_issue", content: "tool routing failed" } },
-      hostContext,
+    assert.equal(
+      orchestratorWriteGate(
+        { toolName: "write", input: { path: "xd://report_issue", content: "tool routing failed" } },
+        hostContext,
+      )?.block,
+      true,
+      "unregistered mounted diagnostics are not lifecycle write exemptions",
     );
-    assert.equal(mountedDiagnosticTool, undefined, "mounted diagnostics are not project writes");
     const worker = orchestratorWriteGate({ toolName: "write", input: { actor: "orchestrator", path: "src/app.ts" } }, { ...hostContext, hasUI: false });
     assert.equal(worker, undefined);
     const bashEcho = orchestratorWriteGate({ toolName: "bash", input: { command: "echo hacked > src/app.ts" } }, hostContext);

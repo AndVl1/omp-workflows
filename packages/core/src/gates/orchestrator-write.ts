@@ -13,6 +13,16 @@ interface ToolCallEvent {
   toolName: string;
   input?: Record<string, unknown> | string;
 }
+const REGISTERED_LIFECYCLE_DEVICE_ROUTES = new Set([
+  "xd://workflow_prepare",
+  "xd://workflow_instructions",
+  "xd://workflow_begin",
+  "xd://workflow_status",
+  "xd://workflow_complete",
+  "xd://workflow_checkpoint",
+  "xd://workflow_checkpoint_ask",
+  "xd://workflow_advance",
+]);
 
 type Actor = "orchestrator" | "worker" | "lead";
 
@@ -49,9 +59,9 @@ export function orchestratorWriteGate(
 ): { block?: boolean; reason?: string } | void {
   if (!hasStrictOrchestratorState(ctx.cwd, ctx.run_id)) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
-  // The host invokes mounted `xd://` devices through the generic write
-  // transport. That transport is not a project filesystem mutation.
-  if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
+  // Registered lifecycle devices use the generic write transport, but only
+  // exact route writes are exempt from project-write policy.
+  if (isRegisteredLifecycleDeviceWrite(event)) return;
   const actor = trustedActorOf(ctx);
 
   // A proof-derived artifact scope is deliberately a positive allowlist:
@@ -202,9 +212,10 @@ function pathsFromPatch(patch: string): string[] {
   return paths;
 }
 
-function isMountedToolRouteInput(input: ToolCallEvent["input"]): boolean {
-  const paths = pathsFromInput(input);
-  return paths.length > 0 && paths.every((path) => path.trim().toLowerCase().startsWith("xd://"));
+export function isRegisteredLifecycleDeviceWrite(event: ToolCallEvent): boolean {
+  if (event.toolName !== "write") return false;
+  const paths = pathsFromInput(event.input);
+  return paths.length > 0 && paths.every((path) => REGISTERED_LIFECYCLE_DEVICE_ROUTES.has(path));
 }
 
 function isWorkStatePath(path: string, cwd: string): boolean {
@@ -427,9 +438,9 @@ export function workerWriteScopeGate(
   ctx: ToolCallContext & { writeScope?: WorkerWriteScope },
 ): { block?: boolean; reason?: string } | void {
   const scope = ctx.writeScope;
+  if (isRegisteredLifecycleDeviceWrite(event)) return;
   if (!scope?.enabled) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
-  if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
   if (trustedActorOf(ctx) !== "worker") return;
   const paths = event.toolName === "bash" ? bashMutationTargets(commandFromInput(event.input)) : pathsFromInput(event.input);
   if (paths.length === 0) return;
