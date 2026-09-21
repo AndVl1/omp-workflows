@@ -178,6 +178,9 @@ function isReadOnlyProofCommand(command: string, env: unknown, hasEnv: boolean):
     const parsed = splitGitArgs(args, new Set(["-b", "-s", "--branch", "--no-renames", "--porcelain", "--short"]));
     return !!parsed && parsed.before.every((arg) => arg.startsWith("-")) && parsed.after.length === 0;
   }
+  if (subcommand === "branch") {
+    return args.length === 1 && args[0] === "--show-current";
+  }
   if (subcommand === "diff") {
     const parsed = splitGitArgs(args, new Set(["--stat", "--name-only", "--name-status", "--no-color", "--no-ext-diff", "--no-textconv"]));
     if (!parsed || parsed.before.filter((arg) => !arg.startsWith("-")).length > 2) return false;

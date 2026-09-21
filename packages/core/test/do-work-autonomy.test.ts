@@ -1190,6 +1190,26 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts", trustedRawContext), undefined);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD", trustedRawContext), undefined);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline", trustedRawContext), undefined);
+    assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current", trustedRawContext), undefined);
+    assert.equal(
+      invokeBashInput(
+        { command: "git --no-pager -c core.fsmonitor=false branch --show-current", env: { GIT_OPTIONAL_LOCKS: "0" } },
+        trustedRawContext,
+      ),
+      undefined,
+    );
+    for (const command of [
+      "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch -d main",
+      "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch -m main renamed",
+      "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --set-upstream-to=origin/main",
+      "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch main",
+      "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current extra",
+      "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current; echo changed",
+      "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current $(echo changed)",
+      "GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current > branch.txt",
+    ]) {
+      assert.equal(invokeBash(command, trustedRawContext)?.block, true);
+    }
     assert.equal(invokeBash("git --no-pager -c core.fsmonitor=false status --short", trustedRawContext)?.block, true);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false rev-parse HEAD", trustedRawContext)?.block, true);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false status --porcelain=v2", trustedRawContext)?.block, true);
