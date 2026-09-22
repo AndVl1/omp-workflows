@@ -6,9 +6,6 @@
  * (REJECT), empty validation_evidence (REJECT), not-ready artifact
  * (REJECT), non-validation-required stage (PASS by default).
  *
- * Also covers runSingle via the public `runStage` path with a stub
- * TaskCaller that writes the artifact under artifactsDir, asserting
- * the gate wires correctly.
  */
 
 import { test } from "node:test";

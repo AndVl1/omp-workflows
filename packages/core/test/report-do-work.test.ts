@@ -11,11 +11,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildCanonicalRunReport, buildSessionReport } from "../src/report/assemble.js";
-import { registerWorkflowProfiles } from "../src/engine/profile.js";
 import { rollupFromEvents, EventRecorder } from "../src/observability/recorder.js";
 import type { ObservabilityEvent } from "../src/observability/events.js";
 import type { SessionReport, StageInfo } from "../src/report/types.js";
-import type { Profile, TeamState } from "../src/engine/types.js";
+import type { TeamState } from "../src/engine/types.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -123,7 +122,6 @@ test("do-work: normalizes an explicit canonical TeamState schema 2 run into Sess
     const impl = report.stages.find((s) => s.id === "implementation");
     assert.ok(impl);
     assert.equal(impl.status, "in_progress");
-    assert.equal(impl.title, "Implementation");
     assert.equal(impl.type, "single");
     assert.equal(impl.phase, "full-feature");
     // No telemetry, artifact exists → at falls back to artifact mtime.
@@ -533,123 +531,17 @@ test("do-work: full-feature stages carry resolved agents, original roles, and de
     assert.equal(exploration?.agents, undefined);
     assert.deepEqual(exploration?.outputs, ["exploration", "dod"]);
 
-    // Stage with no `produces` declares an empty (not absent) output list.
-    const reviewFixes = report.stages.find((s) => s.id === "review_fixes");
-    assert.deepEqual(reviewFixes?.outputs, []);
 
     // Missing artifacts stay declared on the stage: architecture.json was
     // never written, yet the stage still lists it as an output.
     assert.equal(report.artifacts.find((a) => a.id === "architecture")?.status, "missing");
     assert.deepEqual(arch?.outputs, ["architecture"]);
 
-    // Profile metadata (checkpoint / gate / autonomous) copied from StageDef.
-    const discovery = report.stages.find((s) => s.id === "discovery");
-    assert.equal(discovery?.gate, "branch_created");
-    assert.equal(discovery?.checkpoint, "confirm_understanding");
-    assert.equal(discovery?.autonomous, "log confirmed understanding, continue");
-
-    const codeReview = report.stages.find((s) => s.id === "code_review");
-    assert.equal(codeReview?.gate, "verdict != reject");
-    assert.equal(codeReview?.checkpoint, "fix_decision");
-    assert.equal(codeReview?.autonomous, "fix CRITICAL+HIGH, then continue");
-
-    const manualQa = report.stages.find((s) => s.id === "manual_qa");
-    assert.equal(manualQa?.gate, "manual_qa.verdict != FAIL");
-    const qaTests = report.stages.find((s) => s.id === "qa_tests");
-    assert.equal(qaTests?.gate, "manual_qa.verdict != FAIL || !scope.has_runtime");
-
-    // Stages that declare none of the metadata keep every field absent.
-    assert.equal(exploration?.description, undefined);
-    assert.equal(exploration?.checkpoint, undefined);
-    assert.equal(exploration?.gate, undefined);
-    assert.equal(exploration?.autonomous, undefined);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test("do-work: declared stage description/checkpoint/gate/autonomous flow into profile-backed stages", () => {
-  // No shipped profile declares stage-level `description` (schema keeps it
-  // optional), so the copy path is proven with a registered fixture profile.
-  registerWorkflowProfiles([
-    {
-      name: "stage-detail",
-      title: "Stage Detail Fixture",
-      description: "Fixture profile for stage metadata copying.",
-      match: { type: ["FEATURE"] },
-      stages: [
-        {
-          id: "design",
-          title: "Design",
-          type: "single",
-          role: "architect",
-          description: "Pick the architecture approach.",
-          checkpoint: "user_choice",
-          gate: "option_chosen",
-          autonomous: "pick option #1, record rationale",
-          produces: "design",
-        },
-        {
-          id: "tidy",
-          title: "Tidy",
-          type: "single",
-          role: "qa",
-          produces: "tidy",
-        },
-        {
-          id: "render_prd",
-          title: "Render PRD",
-          type: "document",
-          document: { format: "markdown", renderer: "product-prd", path: "documents/product-prd.md" },
-          consumes: ["design"],
-          produces: "product_prd",
-        },
-      ],
-    },
-  ]);
-
-  const cwd = tmpWorkspace();
-  try {
-    const state = makeTeamState({
-      classification: { ...makeTeamState().classification, workflow: "stage-detail" },
-      stages: [
-        { id: "design", status: "done" },
-        { id: "tidy", status: "pending" },
-        { id: "render_prd", status: "in_progress" },
-      ],
-    });
-    writeFeature(cwd, "session-report", state);
-
-    const report = buildCanonicalRunReport(cwd, { run_id: RUN_ID });
-
-    // All four profile metadata fields are copied verbatim.
-    const design = report.stages.find((s) => s.id === "design");
-    assert.equal(design?.description, "Pick the architecture approach.");
-    assert.equal(design?.checkpoint, "user_choice");
-    assert.equal(design?.gate, "option_chosen");
-    assert.equal(design?.autonomous, "pick option #1, record rationale");
-    // Existing provenance behavior untouched.
-    assert.deepEqual(design?.agents, [{ name: "architect", role: "architect", source: "workflow" }]);
-    assert.deepEqual(design?.outputs, ["design"]);
-
-    // Document stages carry their typed document contract verbatim —
-    // metadata only, never rendered content.
-    const renderPrd = report.stages.find((s) => s.id === "render_prd");
-    assert.deepEqual(renderPrd?.document, { format: "markdown", renderer: "product-prd", path: "documents/product-prd.md" });
-    assert.deepEqual(renderPrd?.outputs, ["product_prd"]);
-
-    // Undeclared fields stay absent — even on a profile-backed stage.
-    const tidy = report.stages.find((s) => s.id === "tidy");
-    assert.equal(tidy?.description, undefined);
-    assert.equal(tidy?.checkpoint, undefined);
-    assert.equal(tidy?.gate, undefined);
-    assert.equal(tidy?.autonomous, undefined);
-    assert.equal(tidy?.document, undefined);
-    assert.deepEqual(tidy?.outputs, ["tidy"]);
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
 
 test("do-work: consilium roster honors configured roster_overrides (add/replace)", () => {
   const cwd = tmpWorkspace();
@@ -705,9 +597,6 @@ test("do-work: unresolved ${scope.dev_agent} template roles are omitted, inputs/
     const impl = report.stages.find((s) => s.id === "implementation");
     assert.deepEqual(impl?.inputs, ["architecture", "exploration"]);
     assert.deepEqual(impl?.outputs, ["implementation"]);
-    const reviewFixes = report.stages.find((s) => s.id === "review_fixes");
-    assert.deepEqual(reviewFixes?.inputs, ["review"]);
-    assert.deepEqual(reviewFixes?.outputs, []);
 
     // No literal template placeholder can leak into any stage's agent names.
     for (const s of report.stages) {

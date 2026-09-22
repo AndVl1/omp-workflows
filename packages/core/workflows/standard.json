@@ -107,7 +107,8 @@
       "consumes": ["review"],
       "checkpoint": "fix_selection",
       "autonomous": "fix CRITICAL+HIGH, defer the rest",
-      "skip_if": "review.findings == []"
+      "skip_if": "review.findings == []",
+      "produces": "review_fixes"
     },
     {
       "id": "manual_qa",
