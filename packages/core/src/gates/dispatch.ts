@@ -222,10 +222,15 @@ export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx:
     const role = marker.slot_id ?? marker.role ?? (typeof item.role === "string" ? item.role : "");
     const roster = expectedRoster.find((entry) => entry.role === role);
     const expectedTask = dispatchTaskId(capability.capability_id, issued.run_key, issued.branch, issued.workflow, issued.stage_cursor, role);
+    if (marker.task_id !== undefined && marker.task_id !== expectedTask) {
+      return {
+        block: true,
+        reason: "dispatch gate: task identity mismatch; use the complete current workflow_begin dispatch marker verbatim",
+      };
+    }
     if (
       marker.capability_id !== undefined && marker.capability_id !== capability.capability_id
       || marker.slot_id !== undefined && marker.slot_id !== role
-      || marker.task_id !== undefined && marker.task_id !== expectedTask
       || !roster
       || seenRoles.has(role)
       || agent !== roster.agent
