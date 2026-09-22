@@ -2502,6 +2502,18 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
     nextStage = candidate;
     break;
   }
+  // A no-next-stage advance is terminal only when the resulting stage image
+  // is entirely terminal. Reject before capability rotation or state/control
+  // publication so an inconsistent last cursor cannot be committed as an
+  // active run with a completed capability.
+  const projectedFinalStages = state.stages.map((stage) => {
+    if (stage.id === state.stage_cursor) return { ...stage, status: "done" as const };
+    if (skippedStageIds.includes(stage.id)) return { ...stage, status: "skipped" as const };
+    return stage;
+  });
+  if (!nextStage && !projectedFinalStages.every((stage) => stage.status === "done" || stage.status === "skipped")) {
+    return rejectTransition("cannot complete workflow while stages remain nonterminal", state);
+  }
   // The cursor epoch rotates ONLY when a next stage is armed: a terminal
   // advance keeps the completed capability's epoch so the strict
   // state<->capability binding stays coherent (rotating without a next
@@ -2580,8 +2592,19 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
   const selectionStays = Boolean(priorSelection && nextStage && priorSelection.stage_id === nextStage.id);
   const { roster_selection: _carriedSelection, ...carriedState } = state;
   const identityStage = nextStage?.id ?? state.stage_cursor;
+  const nextStages = state.stages.map((s) => {
+    if (s.id === state.stage_cursor) return { ...s, status: "done" as const };
+    if (skippedStageIds.includes(s.id)) return { ...s, status: "skipped" as const };
+    if (armedStage && s.id === armedStage.id) return { ...s, status: "in_progress" as const };
+    return s;
+  });
+  // The run becomes terminal only when this successful advance leaves no
+  // runnable stage AND every persisted stage is terminal. Keep the explicit
+  // lifecycle marker absent for legacy-compatible nonterminal states.
+  const terminal = !nextStage && nextStages.every((stage) => stage.status === "done" || stage.status === "skipped");
   const next: TeamState = {
     ...carriedState,
+    ...(terminal ? { lifecycle_status: "complete" as const } : {}),
     ...policyProjectionFor(nextDeclaration.declaration, nextStage?.id ?? "", cap.issued_for.profile_hash),
     stage_cursor: nextStage?.id ?? state.stage_cursor,
     cursor_epoch: epoch,
@@ -2590,12 +2613,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
     // pending — nothing can dispatch against it until workflow_begin arms
     // the selected capability. Consecutive skip_if stages are marked
     // terminal `skipped` in the same update; they are never armed.
-    stages: state.stages.map((s) => {
-      if (s.id === state.stage_cursor) return { ...s, status: "done" as const };
-      if (skippedStageIds.includes(s.id)) return { ...s, status: "skipped" as const };
-      if (armedStage && s.id === armedStage.id) return { ...s, status: "in_progress" as const };
-      return s;
-    }),
+    stages: nextStages,
     join_summary: joinSummary,
     ...(selectionStays && priorSelection ? { roster_selection: priorSelection } : {}),
     dispatch_capability: nextCap,
@@ -2603,7 +2621,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
     // lifecycle: the prior stage's pause/pending/completion mirrors are
     // cleared below, so a resolved checkpoint or provider wait can never
     // report the NEXT stage as paused or pending.
-    pause: nextStage ? { kind: "none", reason: "" } : { kind: "done", reason: "" },
+    pause: nextStage ? { kind: "none", reason: "" } : terminal ? { kind: "done", reason: "" } : { kind: "none", reason: "" },
   };
   // Deliberate mirror resets of the cursor move — all by key deletion, never
   // own undefined:

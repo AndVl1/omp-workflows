@@ -67,8 +67,18 @@ import { normalizePersistedState, setStageStatus, setStateTransactionTestHooks, 
 import { readArtifact, writeArtifact } from "../src/engine/artifacts.js";
 import { flushRecorder } from "../src/observability/hooks.js";
 import { resolveWorkflowContract as rawResolveWorkflowContract } from "../src/engine/workflow-contract.js";
-import { runTarget } from "../src/engine/run-store.js";
-import type { CheckpointAnswerProof, CheckpointPolicy, Profile, TeamState } from "../src/engine/types.js";
+import {
+  candidateForState,
+  persistCanonicalRun,
+  readRunControl,
+  readRunState,
+  resumeCanonicalRun,
+  runTarget,
+  terminalControlPublication,
+  updateRunControl,
+} from "../src/engine/run-store.js";
+import { lifecyclePayloadHash, LifecycleError } from "../src/engine/run-lifecycle.js";
+import type { CheckpointAnswerProof, CheckpointPolicy, LifecycleRequest, PrepareRequestReceipt, Profile, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
 function initGit(root: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
 }
@@ -310,6 +320,20 @@ function stalePolicyProfile(): Profile {
     ],
   };
 }
+/** Two terminal orchestrator stages for final cursor publication regressions. */
+function terminalAdvanceProfile(): Profile {
+  return {
+    name: "final-terminal-advance",
+    title: "Final terminal advance",
+    description: "terminal summary publication",
+    match: { type: ["OPS"] },
+    stages: [
+      { id: "prior", title: "Prior", type: "orchestrator" },
+      { id: "summary", title: "Summary", type: "orchestrator" },
+    ],
+  };
+}
+
 
 interface SeedOptions {
   profile: Profile;
@@ -378,6 +402,7 @@ function seedState(root: string, opts: SeedOptions): void {
   if (opts.capability && (!("dispatch_token_hash" in opts.capability) || !("advance_token_hash" in opts.capability))) {
     const statePath = statePathOf(root, "final");
     mkdirSync(dirname(statePath), { recursive: true });
+
     mkdirSync(join(runPath(root), "artifacts"), { recursive: true });
     writeFileSync(statePath, JSON.stringify(state) + "\n");
     writeStateMd(runPath(root), state);
@@ -391,6 +416,67 @@ function noneCapability(profile: Profile, stageId: string): IssuedCapability {
     run_key: RUN_ID, branch: "main", workflow: profile.name, profile_hash: profileHash(profile),
     stage_cursor: stageId, kind: "none", expected_roster: [],
   });
+}
+function terminalAdvanceContext(root: string, sessionId = "terminal-advance"): TrustedExecutionContext {
+  return {
+    session_id: sessionId,
+    caller: "host",
+    process_id: process.pid,
+    worktree: root,
+    branch: "main",
+    authority: "coordinator",
+  };
+}
+
+function terminalAdvanceState(profile: Profile, capability: IssuedCapability): TeamState {
+  return {
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
+    lifecycle_status: "active",
+    rework_generation: 0,
+    branch: "main",
+    title: "terminal advance",
+    classification: {
+      type: "OPS",
+      complexity: "MEDIUM",
+      confidence: "HIGH",
+      autonomous: false,
+      workflow: profile.name,
+    },
+    task: "terminal advance",
+    workflow_override: false,
+    issue: null,
+    required_inputs: {},
+    required_input_receipts: {},
+
+    artifacts: {},
+    pause: { kind: "none", reason: "" },
+    policy: { strict_orchestrator: true },
+    profile_hash: profileHash(profile),
+    scope: scopeFlags(),
+    stage_cursor: "summary",
+    stages: [
+      { id: "prior", status: "done" },
+      { id: "summary", status: "in_progress" },
+    ],
+    cursor_epoch: capability.state.issued_for!.cursor_epoch,
+    dispatch_capability: capability.state,
+    updated_at: new Date().toISOString(),
+  };
+}
+function persistTerminalAdvanceFixture(root: string, sessionId = "terminal-advance"): {
+  profile: Profile;
+  issued: IssuedCapability;
+  context: TrustedExecutionContext;
+} {
+  initGit(root);
+  const profile = terminalAdvanceProfile();
+  registerWorkflowProfiles([profile]);
+  const issued = noneCapability(profile, "summary");
+  const context = terminalAdvanceContext(root, sessionId);
+  persistCanonicalRun(root, terminalAdvanceState(profile, issued), { context });
+  return { profile, issued, context };
 }
 
 function singleCapability(profile: Profile, stageId: string, role: string): IssuedCapability {
@@ -1442,6 +1528,196 @@ test("final: after a provider wait and a resolved checkpoint the next stage repo
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// HIGH: final advance publishes canonical completion and terminal controls
+// ---------------------------------------------------------------------------
+
+test("final: summary advance commits lifecycle completion before terminal control publication", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-terminal-advance-"));
+  try {
+    const { issued, context } = persistTerminalAdvanceFixture(root);
+    const advanced = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "summary complete" });
+    assert.equal(advanced.ok, true, advanced.ok ? "summary advanced" : advanced.error);
+    if (!advanced.ok) return;
+
+    const persisted = readRunState(root, RUN_ID, "main");
+    assert.ok(persisted);
+    assert.equal(persisted.lifecycle_status, "complete");
+    assert.deepEqual(persisted.pause, { kind: "done", reason: "" });
+    assert.deepEqual(persisted.stages.map((stage) => stage.status), ["done", "done"]);
+    assert.equal(persisted.dispatch_capability?.status, "complete");
+
+    const control = readRunControl(root);
+    assert.deepEqual(control.runs[RUN_ID], candidateForState(persisted));
+    assert.equal(control.runs[RUN_ID]?.status, "complete");
+    assert.equal(control.execution_claim, null);
+    assert.equal(control.selections[context.session_id]?.active, false);
+
+    const resumeContext = terminalAdvanceContext(root, "terminal-resumer");
+    const request: LifecycleRequest = {
+      mode: "resume",
+      request_id: "terminal-resume-after-advance",
+      execution: resumeContext,
+      run_id: RUN_ID,
+      branch: "main",
+    };
+    const receipt: PrepareRequestReceipt = {
+      request_id: request.request_id,
+      payload_hash: lifecyclePayloadHash(request),
+      operation: "resume",
+      previous_run_id: RUN_ID,
+      previous_title: "terminal advance",
+      previous_status: "complete",
+      selected_run_id: RUN_ID,
+      selected_title: "terminal advance",
+      selected_status: "complete",
+      committed_at: new Date().toISOString(),
+      continuation: { stage: "summary", status: "complete" },
+    };
+    assert.throws(
+      () => resumeCanonicalRun(root, RUN_ID, resumeContext, { request, receipt }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_terminal",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("final: rejected summary advance leaves canonical state and terminal controls unchanged", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-terminal-reject-"));
+  try {
+    const { issued } = persistTerminalAdvanceFixture(root);
+    const beforeState = readRunState(root, RUN_ID, "main");
+    const beforeControl = readRunControl(root);
+    const rejected = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "   " });
+    assert.equal(rejected.ok, false);
+    assert.deepEqual(readRunState(root, RUN_ID, "main"), beforeState);
+    assert.deepEqual(readRunControl(root), beforeControl);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("final: last-cursor advance rejects when an earlier stage remains nonterminal", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-terminal-nonterminal-"));
+  try {
+    const { issued } = persistTerminalAdvanceFixture(root);
+    const changed = updateStateAtomically(root, (snapshot) => ({
+      op: "commit",
+      state: {
+        ...snapshot.state!,
+        stages: snapshot.state!.stages.map((stage) => stage.id === "prior" ? { ...stage, status: "pending" as const } : stage),
+      },
+    }), { target: runTarget(root, RUN_ID), branch: "main" });
+    assert.equal(changed.ok, true);
+    const beforeState = readRunState(root, RUN_ID, "main");
+    const beforeControl = readRunControl(root);
+    const rejected = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "summary complete" });
+    assert.equal(rejected.ok, false);
+    assert.deepEqual(readRunState(root, RUN_ID, "main"), beforeState);
+    assert.deepEqual(readRunControl(root), beforeControl);
+    assert.equal(beforeState?.lifecycle_status, "active");
+    assert.equal(beforeState?.pause.kind, "none");
+    assert.equal(beforeControl.selections["terminal-advance"]?.active, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("final: an outstanding worker blocks terminal completion, claim release, and selection demotion", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-terminal-worker-"));
+  try {
+    const { issued, context } = persistTerminalAdvanceFixture(root);
+    updateRunControl(root, (control) => {
+      const claim = control.execution_claim;
+      if (!claim) throw new Error("terminal fixture claim missing");
+      return {
+        commit: true,
+        value: undefined,
+        control: { ...control, execution_claim: { ...claim, worker_ids: ["worker-pending"] } },
+      };
+    });
+    const beforeState = readRunState(root, RUN_ID, "main");
+    const beforeControl = readRunControl(root);
+    const rejected = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "summary complete" });
+    assert.equal(rejected.ok, false);
+    assert.deepEqual(readRunState(root, RUN_ID, "main"), beforeState);
+    const afterControl = readRunControl(root);
+    assert.deepEqual(afterControl, beforeControl);
+    assert.equal(afterControl.runs[RUN_ID]?.status, "active");
+    assert.deepEqual(afterControl.execution_claim?.worker_ids, ["worker-pending"]);
+    assert.equal(afterControl.selections[context.session_id]?.active, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("final: outstanding dispatches deny terminal publication with an owned or null control claim", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-terminal-dispatch-"));
+  try {
+    initGit(root);
+    const profile = terminalAdvanceProfile();
+    registerWorkflowProfiles([profile]);
+    const issued = createCapability({
+      run_key: RUN_ID,
+      branch: "main",
+      workflow: profile.name,
+      profile_hash: profileHash(profile),
+      stage_cursor: "summary",
+      kind: "single",
+      expected_roster: [{ role: "dev", agent: "dev" }],
+    });
+    const context = terminalAdvanceContext(root);
+    persistCanonicalRun(root, terminalAdvanceState(profile, issued), { context });
+    const authorized = authorizeDispatch(root, {
+      ...advanceAuthOf(issued),
+      token: issued.dispatch_token,
+      role: "dev",
+      agent: "dev",
+    });
+    assert.equal(authorized.ok, true, authorized.ok ? "dispatch authorized" : authorized.error);
+    if (!authorized.ok) return;
+
+    const beforeState = readRunState(root, RUN_ID, "main");
+    assert.ok(beforeState);
+    if (!beforeState) return;
+    const terminalState: TeamState = {
+      ...beforeState,
+      lifecycle_status: "complete",
+      pause: { kind: "done", reason: "" },
+      stages: beforeState.stages.map((stage) => ({ ...stage, status: "done" as const })),
+      ...(beforeState.dispatch_capability
+        ? { dispatch_capability: { ...beforeState.dispatch_capability, status: "complete" as const, dispatches: [] } }
+        : {}),
+    };
+    const beforeOwnedControl = readRunControl(root);
+    assert.throws(
+      () => terminalControlPublication(root, beforeState, terminalState),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.deepEqual(readRunState(root, RUN_ID, "main"), beforeState);
+    assert.deepEqual(readRunControl(root), beforeOwnedControl);
+    assert.equal(beforeOwnedControl.selections[context.session_id]?.active, true);
+
+    updateRunControl(root, (control) => ({
+      commit: true,
+      value: undefined,
+      control: { ...control, execution_claim: null },
+    }));
+    const beforeNullClaimControl = readRunControl(root);
+    assert.equal(beforeNullClaimControl.execution_claim, null);
+    assert.throws(
+      () => terminalControlPublication(root, beforeState, terminalState),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.deepEqual(readRunState(root, RUN_ID, "main"), beforeState);
+    assert.deepEqual(readRunControl(root), beforeNullClaimControl);
+    assert.equal(beforeNullClaimControl.selections[context.session_id]?.active, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 
 // ---------------------------------------------------------------------------
 // PR review: raw snapshot, commit point, journal generation and observability

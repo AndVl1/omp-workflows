@@ -424,6 +424,36 @@ export function createSelectionSnapshot(cwd: string, options: { branch?: string;
 export function resolveRunSelection(input: RunSelectionInput): RunSelectionResult {
   return selectRunCandidate(input);
 }
+/**
+ * Terminal publication uses the state image already read under the canonical
+ * transaction lock. Legacy canonical states may omit state_revision; that
+ * omission is safe to tolerate here because commitState will stamp the next
+ * revision before publication. Ledger shape and quiescence remain fail-closed.
+ */
+function terminalOutstandingDispatches(previous: TeamState, runId: string, ownerKind: "workflow" | "cto"): boolean | null {
+  if (ownerKind === "cto") return false;
+  if (
+    previous.schema !== 2
+    || previous.run_id !== runId
+    || previous.run_key !== runId
+    || typeof previous.branch !== "string"
+    || !previous.branch
+    || !Array.isArray(previous.stages)
+    || typeof previous.stage_cursor !== "string"
+    || typeof previous.updated_at !== "string"
+  ) return null;
+  if (previous.pause?.kind === "background_wait") return true;
+  if (previous.pending && ["authorized", "running", "pending"].includes(previous.pending.status)) return true;
+  if (previous.dispatch_capability === undefined) return false;
+  const capability = validateDispatchCapabilityValue(previous.dispatch_capability);
+  if (!capability.ok) return null;
+  const dispatches = previous.dispatch_capability.dispatches;
+  if (!Array.isArray(dispatches)) return null;
+  return dispatches.some((dispatch) =>
+    !dispatch.completion && ["authorized", "running", "pending", "transport_reconnect"].includes(dispatch.status ?? ""),
+  );
+}
+
 function hasOutstandingDispatches(cwd: string, runId: string, ownerKind: "workflow" | "cto" = "workflow"): boolean | null {
   // CTO ids are a separate slug namespace and have no ordinary run state.
   if (ownerKind === "cto") return false;
@@ -959,16 +989,30 @@ export function snapshotCanonicalRun(cwd: string, runId: string, label = "rework
 
 /** Build the control sidecar publication for a terminal state transition. */
 export function terminalControlPublication(cwd: string, previous: TeamState | null, next: TeamState): StatePublication | undefined {
-  if (!previous || next.pause.kind !== "done" || !next.run_id) return undefined;
+  if (!previous || !next.run_id) return undefined;
+  // Derive terminality from the candidate that will be indexed by the
+  // control plane. Explicit lifecycle status remains authoritative while
+  // legacy states continue to derive completion from pause.kind.
+  const candidate = candidateForState(next);
+  if (candidate.status !== "complete") return undefined;
   const controlBefore = controlContent(cwd);
   const control = readControlRaw(cwd);
   const claim = control.execution_claim;
   if (claim && claim.run_id !== next.run_id) throw new LifecycleError("run_busy", `worktree execution is owned by run ${claim.run_id}`, { run_id: claim.run_id });
+  const outstanding = terminalOutstandingDispatches(previous, next.run_id, claim?.owner_kind ?? "workflow");
+  if (outstanding === null) {
+    throw new LifecycleError("recovery_required", "cannot publish terminal control while canonical worker state is unreadable", { run_id: next.run_id, next_action: "repair or reconcile the canonical run before terminal publication" });
+  }
+  if (outstanding || (claim?.worker_ids.length ?? 0) > 0) {
+    throw new LifecycleError("run_busy", "terminal publication requires all dispatch workers to be reconciled", { run_id: next.run_id });
+  }
   const nextControl: RunControl = {
     ...control,
     revision: control.revision + 1,
     execution_claim: claim ? null : control.execution_claim,
-    runs: { ...control.runs, [next.run_id]: candidateForState(next) },
+    runs: { ...control.runs, [next.run_id]: candidate },
+    // The state/control lifecycle journal commits this demotion together with
+    // state.json; a failed state commit therefore leaves selection intact.
     selections: Object.fromEntries(Object.entries(control.selections).map(([sessionId, selection]) => [sessionId, selection.run_id === next.run_id ? { ...selection, active: false } : selection])),
   };
   return {

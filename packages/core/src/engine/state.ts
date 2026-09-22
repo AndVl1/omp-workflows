@@ -811,6 +811,8 @@ export interface StatePublication {
   before: Record<string, string | null>;
   after: Record<string, string | null>;
 }
+type StatePublicationFactory = (stamped: TeamState) => StatePublication | undefined;
+
 
 function commitState(
   cwd: string,
@@ -818,12 +820,16 @@ function commitState(
   state: TeamState,
   stateRevision: number,
   publication?: StatePublication,
+  publicationFactory?: StatePublicationFactory,
 ): CommittedState {
   const { stateDir, statePath, artifactsDir } = prepared;
   const rejectionIssues: string[] = [];
   const normalized = normalizePersistedState(state, rejectionIssues);
   if (!normalized) throw new Error(`workflow state contains malformed or conflicting typed control-plane fields: ${rejectionIssues.join("; ") || "unrecognized shape"}`);
   const stamped: TeamState = { ...normalized, state_revision: stateRevision, updated_at: new Date().toISOString() };
+  // Publication factories run only after normalization and the single
+  // canonical timestamp stamp, but before any mirror/state/journal write.
+  const committedPublication = publication ?? publicationFactory?.(stamped);
 
   const stateContent = JSON.stringify(stamped, null, 2) + "\n";
   const stateMdPath = join(stateDir, STATE_MD);
@@ -839,13 +845,13 @@ function commitState(
     stateMdPublished = true;
     // Authoritative commit point. When a lifecycle publication is supplied,
     // state.json and its control sidecar share one durable journal marker.
-    if (publication) {
+    if (committedPublication) {
       markArtifactJournalCommit(statePath, stateContent);
       const transaction = beginLifecycleTransaction({
         cwd,
-        operation: publication.operation,
-        before: { [statePath]: readRegularFileNoFollow(statePath), ...publication.before },
-        after: { [statePath]: stateContent, ...publication.after },
+        operation: committedPublication.operation,
+        before: { [statePath]: readRegularFileNoFollow(statePath), ...committedPublication.before },
+        after: { [statePath]: stateContent, ...committedPublication.after },
       });
       markArtifactJournalLifecycle(transaction.transaction_id);
       commitLifecycleTransaction(cwd, transaction.transaction_id);
@@ -1481,8 +1487,14 @@ export function updateStateAtomically<T>(
 
     let committed: CommittedState;
     try {
-      const publication = mutation.publication ?? opts.publication?.(snapshot, mutation.state, target);
-      committed = commitState(cwd, prepared, mutation.state, revision + 1, publication);
+      // A prebuilt mutation publication remains authoritative. The optional
+      // public callback is deferred into commitState so it receives the exact
+      // normalized/stamped state that will be serialized and returned.
+      const publicationCallback = mutation.publication === undefined ? opts.publication : undefined;
+      const publicationFactory = publicationCallback
+        ? (stamped: TeamState) => publicationCallback(snapshot, stamped, target)
+        : undefined;
+      committed = commitState(cwd, prepared, mutation.state, revision + 1, mutation.publication, publicationFactory);
     } catch (error) {
       return { ok: false, code: "state_invalid", error: `workflow state commit failed: ${(error as Error).message}` };
     }
