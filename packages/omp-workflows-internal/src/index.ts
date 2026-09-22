@@ -138,16 +138,120 @@ function trustedInteractiveSession(ctx: unknown): boolean {
 	return host.hasUI === true && (host.mode === "tui" || host.mode === "rpc");
 }
 
-/**
- * Release and forget the current controller before a host-session binding is
- * replaced or stopped. A failed release is retained as a conservative busy
- * binding; it is never silently converted into an unowned session.
- */
-function releaseSessionBinding(pi: object, receipt: string): boolean {
-	const prior = sessionBindings.get(pi);
+interface SessionIdentity {
+	cwd?: string;
+	sessionId?: string;
+	managerBacked?: boolean;
+}
+
+function sessionIdentityFromValue(value: unknown): SessionIdentity | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const objectValue = value as {
+		cwd?: unknown;
+		session_id?: unknown;
+		sessionId?: unknown;
+		sessionManager?: unknown;
+	};
+	const explicitCwd = typeof objectValue.cwd === "string" && objectValue.cwd.length > 0
+		? objectValue.cwd
+		: undefined;
+	const explicitSessionId = objectValue.session_id ?? objectValue.sessionId;
+	if (
+		(objectValue.session_id !== undefined && typeof objectValue.session_id !== "string")
+		|| (objectValue.sessionId !== undefined && typeof objectValue.sessionId !== "string")
+		|| (
+			typeof objectValue.session_id === "string"
+			&& typeof objectValue.sessionId === "string"
+			&& objectValue.session_id !== objectValue.sessionId
+		)
+	) return undefined;
+	const sessionId = typeof explicitSessionId === "string" && explicitSessionId.length > 0
+		? explicitSessionId
+		: undefined;
+	const manager = objectValue.sessionManager;
+	if (manager !== undefined) {
+		if (!manager || typeof manager !== "object") return undefined;
+		const sessionManager = manager as {
+			getCwd?: () => unknown;
+			getSessionId?: () => unknown;
+		};
+		if (typeof sessionManager.getCwd !== "function" || typeof sessionManager.getSessionId !== "function") return undefined;
+		let managerCwd: unknown;
+		let managerSessionId: unknown;
+		try {
+			managerCwd = sessionManager.getCwd();
+			managerSessionId = sessionManager.getSessionId();
+		} catch {
+			return undefined;
+		}
+		if (typeof managerCwd !== "string" || managerCwd.length === 0 || typeof managerSessionId !== "string" || managerSessionId.length === 0) {
+			return undefined;
+		}
+		if (explicitCwd && resolve(explicitCwd) !== resolve(managerCwd)) return undefined;
+		if (sessionId && sessionId !== managerSessionId) return undefined;
+		return { cwd: managerCwd, sessionId: managerSessionId, managerBacked: true };
+	}
+	if (!explicitCwd && !sessionId) return {};
+	return {
+		...(explicitCwd ? { cwd: explicitCwd } : {}),
+		...(sessionId ? { sessionId } : {}),
+		managerBacked: false,
+	};
+}
+
+function lifecycleSessionIdentity(event: unknown, ctx: unknown): SessionIdentity | undefined {
+	const eventIdentity = sessionIdentityFromValue(event);
+	const contextIdentity = sessionIdentityFromValue(ctx);
+	if (
+		(event && typeof event === "object" && eventIdentity === undefined)
+		|| (ctx && typeof ctx === "object" && contextIdentity === undefined)
+	) return undefined;
+	const cwd = eventIdentity?.cwd ?? contextIdentity?.cwd;
+	const sessionId = eventIdentity?.sessionId ?? contextIdentity?.sessionId;
+	if (
+		!cwd
+		|| !sessionId
+		|| (eventIdentity?.cwd && resolve(eventIdentity.cwd) !== resolve(cwd))
+		|| (contextIdentity?.cwd && resolve(contextIdentity.cwd) !== resolve(cwd))
+		|| (eventIdentity?.sessionId && eventIdentity.sessionId !== sessionId)
+		|| (contextIdentity?.sessionId && contextIdentity.sessionId !== sessionId)
+	) return undefined;
+	return {
+		cwd,
+		sessionId,
+		managerBacked: eventIdentity?.managerBacked === true || contextIdentity?.managerBacked === true,
+	};
+}
+
+function sameBindingIdentity(binding: InternalSessionBinding, identity: SessionIdentity | undefined): boolean {
+	return Boolean(
+		binding.sessionId
+		&& identity?.sessionId
+		&& binding.sessionId === identity.sessionId
+		&& identity.cwd
+		&& resolve(binding.cwd) === resolve(identity.cwd),
+	);
+}
+
+function trustedInteractiveLifecycle(
+	binding: InternalSessionBinding,
+	event: unknown,
+	ctx: unknown,
+): boolean {
+	if (!trustedInteractiveSession(ctx)) return false;
+	for (const value of [event, ctx]) {
+		if (!value || typeof value !== "object") continue;
+		const actor = (value as { actor?: unknown }).actor;
+		if (actor === "worker" || actor === "lead") return false;
+	}
+	const mode = (ctx as { mode?: unknown }).mode;
+	if (mode !== binding.mode) return false;
+	return sameBindingIdentity(binding, lifecycleSessionIdentity(event, ctx));
+}
+
+function releaseController(binding: InternalSessionBinding, receipt: string): boolean {
 	try {
-		prior?.controller?.release(receipt);
-		sessionBindings.delete(pi);
+		binding.controller?.release(receipt);
 		return true;
 	} catch {
 		console.warn(`[${COMMAND_NAME}]`, JSON.stringify({
@@ -157,6 +261,41 @@ function releaseSessionBinding(pi: object, receipt: string): boolean {
 		}));
 		return false;
 	}
+}
+
+/**
+ * Release and forget the current controller before a host-session binding is
+ * replaced. A failed release is retained as a conservative busy binding; it
+ * is never silently converted into an unowned session.
+ */
+function releaseSessionBinding(pi: object, receipt: string): boolean {
+	const prior = sessionBindings.get(pi);
+	if (!prior || !releaseController(prior, receipt)) return !prior;
+	sessionBindings.delete(pi);
+	return true;
+}
+
+/**
+ * Release the exact trusted interactive binding while retaining its profile,
+ * controller and selected-run view. Core's canonical release semantics clear
+ * only the private execution claim and pending command reservation.
+ */
+function settleSessionBinding(pi: object, event: unknown, ctx: unknown): boolean {
+	const binding = sessionBindings.get(pi);
+	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
+	return releaseController(binding, "host-session-stop");
+}
+
+/**
+ * Release and forget only the exact trusted interactive binding. Foreign,
+ * worker and headless lifecycle events cannot tear down another host session.
+ */
+function teardownSessionBinding(pi: object, event: unknown, ctx: unknown, receipt: string): boolean {
+	const binding = sessionBindings.get(pi);
+	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
+	if (!releaseController(binding, receipt)) return false;
+	sessionBindings.delete(pi);
+	return true;
 }
 
 function buildTrustedController(
@@ -181,35 +320,57 @@ function buildTrustedController(
 
 /**
  * Capture the host session before any lifecycle callback can suspend. A
- * replacement releases the old coordinator before the new binding is stored;
- * pending workers remain reserved by core's release semantics. Hosts that do
- * not expose a session ID remain unbound until a later trusted ingress
- * supplies one.
+ * verified replacement releases the old coordinator before the new binding
+ * is stored; pending workers remain reserved by core's release semantics.
+ * Same-identity headless starts revoke interactive authority but retain the
+ * binding so a later trusted interactive ingress can replace it safely.
  */
 function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 	const interactive = trustedInteractiveSession(ctx);
 	const current = sessionBindings.get(pi);
-	const incomingSession = sessionIdFromContext(ctx);
-	const value = ctx as { mode?: unknown; hasUI?: unknown };
+	const value = ctx as { mode?: unknown; hasUI?: unknown; actor?: unknown };
+	const incomingIdentity = sessionIdentityFromValue(ctx);
+	if (value.actor === "worker" || value.actor === "lead") return;
 	if (!interactive) {
-		// A same-session headless lifecycle boundary invalidates interactive
-		// authority but conservatively retains the controller/claim for later
-		// reconciliation. Foreign noninteractive events cannot mutate it.
 		if (
 			current
-			&& current.sessionId
-			&& incomingSession === current.sessionId
-			&& current.cwd === cwd
+			&& current.interactive
+			&& incomingIdentity?.managerBacked === true
+			&& sameBindingIdentity(current, incomingIdentity)
+			&& incomingIdentity.cwd
+			&& resolve(incomingIdentity.cwd) === resolve(cwd)
 		) {
-			sessionBindings.set(pi, { ...current, interactive: false });
+			// A same-identity headless ingress revokes the private claim before
+			// retaining a marker that cannot resolve a controller. If release
+			// itself fails, retain the controller only as a conservative busy
+			// marker; interactive authority remains disabled and the next
+			// verified ingress can retry the release.
+			const released = releaseController(current, "host-session-headless");
+			sessionBindings.set(pi, {
+				...current,
+				interactive: false,
+				...(released ? { controller: undefined } : {}),
+			});
 		}
 		return;
 	}
-	if (!releaseSessionBinding(pi, "host-session-replaced")) return;
-
 	const mode = value.mode === "rpc" ? "rpc" : value.mode === "tui" ? "tui" : undefined;
 	if (!mode) return;
-	const sessionId = incomingSession;
+	if (current) {
+		const sameIdentity = sameBindingIdentity(current, incomingIdentity)
+			&& incomingIdentity?.cwd
+			&& resolve(incomingIdentity.cwd) === resolve(cwd);
+		if (sameIdentity && current.interactive && current.mode === mode) return;
+		// A replacement is accepted only from a complete trusted manager
+		// identity. Unknown identity cannot release a retained controller.
+		if (
+			incomingIdentity?.managerBacked !== true
+			|| !incomingIdentity.sessionId
+			|| !incomingIdentity.cwd
+		) return;
+		if (!releaseSessionBinding(pi, "host-session-replaced")) return;
+	}
+	const sessionId = incomingIdentity?.managerBacked === true ? incomingIdentity.sessionId : undefined;
 	const controller = sessionId ? buildTrustedController(cwd, sessionId) : undefined;
 	sessionBindings.set(pi, {
 		cwd,
@@ -219,6 +380,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 		...(controller ? { controller } : {}),
 	});
 }
+
 
 /**
  * Return the captured controller only for its originating workspace/session.
@@ -235,13 +397,18 @@ function sharedSessionController(pi: object, ctx: unknown, cwd: string): Workflo
 		const actor = hostContext.actor;
 		if (actor === "worker" || actor === "lead") return undefined;
 	}
-	const requestedSession = sessionIdFromContext(ctx);
-	if (requestedSession && binding.sessionId && requestedSession !== binding.sessionId) return undefined;
+	const identity = sessionIdentityFromValue(ctx);
+	if (
+		identity?.managerBacked !== true
+		|| !identity.cwd
+		|| !identity.sessionId
+		|| resolve(identity.cwd) !== resolve(binding.cwd)
+	) return undefined;
+	if (binding.sessionId && identity.sessionId !== binding.sessionId) return undefined;
 	if (binding.controller) return binding.controller;
-	if (!requestedSession) return undefined;
-	const controller = buildTrustedController(cwd, requestedSession);
+	const controller = buildTrustedController(cwd, identity.sessionId);
 	if (!controller) return undefined;
-	binding.sessionId = requestedSession;
+	binding.sessionId = identity.sessionId;
 	binding.controller = controller;
 	return controller;
 }
@@ -291,10 +458,12 @@ function resolveInternalTrustedToolCallActor(
 	try {
 		const controllerContext = binding.controller.context();
 		const selectedRunId = binding.controller.selectedRunId();
+		const activeClaimRunId = binding.controller.activeClaimRunId();
 		if (
 			controllerContext.session_id !== binding.sessionId
 			|| resolve(controllerContext.worktree) !== resolve(binding.cwd)
 			|| selectedRunId !== runId
+			|| activeClaimRunId !== runId
 		) return undefined;
 		if (runId === undefined) return { kind: "authenticated-interactive-host-no-run" };
 		const artifactsDir = runTarget(binding.cwd, runId).artifactsDir;
@@ -623,13 +792,13 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 		getSessionController: (ctx, cwd) => sharedSessionController(pi, ctx, cwd),
 	});
 
-	pi.on("session_start", (_event: unknown, ctx: unknown) => {
+	pi.on("session_start", (event: unknown, ctx: unknown) => {
 		const cwd = resolveSessionCwd(ctx);
 		if (!cwd || !detectWorkspaceMarkers(cwd).ok) {
-			// Only a trusted interactive lifecycle event can end the host binding
-			// here; untrusted/noninteractive events preserve it even without cwd.
+			// Only the exact trusted interactive lifecycle identity can end
+			// the host binding; foreign and headless starts preserve it.
 			if (trustedInteractiveSession(ctx)) {
-				releaseSessionBinding(pi, "host-session-unavailable");
+				teardownSessionBinding(pi, event, ctx, "host-session-unavailable");
 			}
 			return;
 		}
@@ -670,7 +839,10 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 			});
 		}
 	});
-	pi.on("session_stop", () => {
-		releaseSessionBinding(pi, "host-session-stop");
+	pi.on("session_stop", (event: unknown, ctx: unknown) => {
+		settleSessionBinding(pi, event, ctx);
+	});
+	pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
+		teardownSessionBinding(pi, event, ctx, "host-session-shutdown");
 	});
 }

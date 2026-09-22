@@ -1244,17 +1244,15 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
       zod: { z: zod },
       registerTool: (tool: { name: string; execute: never }) => registered.push(tool as never),
     };
-    const controller = createWorkflowSessionController({
-      cwd: root,
-      context: {
-        session_id: "repeated-tool-session",
-        caller: "host",
-        process_id: process.pid,
-        worktree: root,
-        branch: "feat/tool-hook",
-        authority: "coordinator",
-      },
-    });
+    const controllerContext = {
+      session_id: "repeated-tool-session",
+      caller: "host" as const,
+      process_id: process.pid,
+      worktree: root,
+      branch: "feat/tool-hook",
+      authority: "coordinator" as const,
+    };
+    const controller = createWorkflowSessionController({ cwd: root, context: controllerContext });
     const otherController = createWorkflowSessionController({
       cwd: otherRoot,
       context: {
@@ -1266,8 +1264,12 @@ test("wave-004: workflow tools invoke beforeBegin per transition with the exact 
         authority: "coordinator",
       },
     });
-    otherController.bind(RUN_ID);
-    controller.bind(RUN_ID);
+    const otherPrepared = otherController.prepare({ mode: "resume", run_id: RUN_ID });
+    assert.equal(otherPrepared.state.run_id, RUN_ID);
+    assert.equal(otherController.activeClaimRunId(), RUN_ID);
+    const prepared = controller.prepare({ mode: "resume", run_id: RUN_ID });
+    assert.equal(prepared.state.run_id, RUN_ID);
+    assert.equal(controller.activeClaimRunId(), RUN_ID);
     registerWorkflowTools(pi as unknown as Parameters<typeof registerWorkflowTools>[0], {
       isMainSession: () => true,
       resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,

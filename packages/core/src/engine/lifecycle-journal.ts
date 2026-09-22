@@ -294,6 +294,21 @@ export function recoverLifecycleTransactions(cwd: string): LifecycleTransactionR
   return records;
 }
 
+/** Verify that no lifecycle transaction still requires recovery, without mutating it. */
+export function assertNoUnresolvedLifecycleTransactions(cwd: string): void {
+  const root = transactionRoot(cwd);
+  if (!existsSync(root)) return;
+  for (const transactionId of readdirSync(root)) {
+    if (!SAFE_SEGMENT.test(transactionId)) {
+      throw new LifecycleRecoveryError(`invalid lifecycle transaction directory '${transactionId}'`, transactionId);
+    }
+    const record = parseRecord(cwd, transactionId);
+    if (record.status === "prepared" || record.status === "committing") {
+      throw new LifecycleRecoveryError(`lifecycle transaction '${transactionId}' requires recovery`, transactionId);
+    }
+  }
+}
+
 export function lifecycleTransactionStatus(cwd: string, transactionId: string): LifecycleTransactionRecord | null {
   const path = recordPath(cwd, transactionId);
   if (!existsSync(path)) return null;

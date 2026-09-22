@@ -141,8 +141,10 @@ export type NativeWorkerAuthority = {
   ): void;
   resolve(ctx: unknown, cwd: string, selectedRunId?: string): NativeWorkerResolution | undefined;
   observeSessionStart(ctx: unknown): void;
+  observeSessionShutdown(ctx: unknown): void;
   teardown(): void;
 };
+
 
 
 function registrySlot(): RegistrySlot {
@@ -278,6 +280,13 @@ function sameParentSnapshot(left: SessionSnapshot, right: SessionSnapshot): bool
     && left.sessionId === right.sessionId
     && left.sessionFile === right.sessionFile
     && left.cwd === right.cwd;
+}
+
+function sameBindingSnapshot(binding: Binding, snapshot: SessionSnapshot): boolean {
+  return binding.manager === snapshot.manager
+    && binding.sessionId === snapshot.sessionId
+    && binding.sessionFile === snapshot.sessionFile
+    && binding.cwd === snapshot.cwd;
 }
 
 function snapshotMatchesContext(snapshot: SessionSnapshot, ctx: unknown, cwd: string): boolean {
@@ -714,12 +723,37 @@ export function createNativeWorkerAuthority(
       if (!current) return;
       const value = ctx as { mode?: unknown; hasUI?: unknown };
       const headless = value.mode === "print" || value.mode === "json" || (value.mode !== "tui" && value.mode !== "rpc" && value.hasUI === false);
+      const replacedOrHeadless = (parent: SessionSnapshot): boolean =>
+        parent.manager === current.manager
+        && (parent.sessionId !== current.sessionId
+          || parent.sessionFile !== current.sessionFile
+          || parent.cwd !== current.cwd
+          || headless);
       for (const grant of [...registry.grants.values()]) {
-        if (
-          grant.owner === owner
-          && grant.parent.manager === current.manager
-          && (grant.parent.sessionId !== current.sessionId || grant.parent.cwd !== current.cwd || headless)
-        ) revokeGrant(registry, grant);
+        if (grant.owner === owner && replacedOrHeadless(grant.parent)) revokeGrant(registry, grant);
+      }
+      for (const candidate of [...registry.candidates.values()]) {
+        if (candidate.owner === owner && replacedOrHeadless(candidate.parent)) removeCandidate(registry, candidate);
+      }
+    },
+
+    observeSessionShutdown(ctx) {
+      const current = getRegistry(false);
+      if (!current) return;
+      const snapshot = readSnapshot(ctx);
+      if (!snapshot) return;
+      const state = current.owners.get(owner);
+      if (!state) return;
+      for (const candidate of [...state.candidates]) {
+        if (sameParentSnapshot(candidate.parent, snapshot)) removeCandidate(current, candidate);
+      }
+      for (const grant of [...state.grants]) {
+        if (sameParentSnapshot(grant.parent, snapshot)) revokeGrant(current, grant);
+      }
+      for (const binding of [...state.bindings]) {
+        if (!sameBindingSnapshot(binding, snapshot)) continue;
+        if (current.grants.get(binding.grant.slotKey) === binding.grant) revokeGrant(current, binding.grant);
+        else removeBinding(current, binding);
       }
     },
 

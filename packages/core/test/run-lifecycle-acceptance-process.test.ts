@@ -83,6 +83,13 @@ function initGit(root: string): void {
 function context(root: string, sessionId: string, processId = process.pid): TrustedExecutionContext {
   return { session_id: sessionId, caller: "host", process_id: processId, worktree: root, branch: BRANCH, authority: "coordinator" };
 }
+function preparedController(root: string, execution: TrustedExecutionContext, runId: string) {
+  const controller = createWorkflowSessionController({ cwd: root, context: execution });
+  const prepared = controller.prepare({ mode: "resume", run_id: runId });
+  assert.equal(prepared.state.run_id, runId);
+  assert.equal(controller.activeClaimRunId(), runId);
+  return controller;
+}
 function identity(runId: string): WorkIdentity {
   return {
     run_id: runId, wave_id: "wave-1", slice_id: "slice-1", session_id: "worker-session", workflow: "lightweight",
@@ -386,14 +393,13 @@ test("process acceptance: cold native result replay mutates the origin run once"
     const artifacts = join(root, ".work-state", "runs", runId, "artifacts");
     mkdirSync(artifacts, { recursive: true });
     writeFileSync(join(artifacts, "discovery.json"), JSON.stringify({ goal: "native result" }));
+    const controller = preparedController(root, owner, runId);
     const begun = beginCapability(root, undefined, { runId });
     assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
-    assert.ok(begun.ok && begun.handoff);
     const stage = loadProfile("lightweight")!.stages.find((candidate) => candidate.id === "implementation");
     assert.ok(stage);
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
-    const controller = createWorkflowSessionController({ cwd: root, context: owner });
     const bus = fakePi();
     registerTeamWorkflow(bus.pi as never, { cwd: root, observability: false, getSessionController: () => controller });
     const hookResults = await bus.emit("tool_call", { toolName: "task", toolCallId: "cold-tool", input }, { cwd: root, hasUI: false, session_id: owner.session_id });
@@ -455,6 +461,7 @@ test("process acceptance: fresh-session late native result uses exact durable lo
     const artifacts = join(root, ".work-state", "runs", runId, "artifacts");
     mkdirSync(artifacts, { recursive: true });
     writeFileSync(join(artifacts, "discovery.json"), JSON.stringify({ goal: "fresh session result" }));
+    const ownerController = preparedController(root, owner, runId);
     const begun = beginCapability(root, undefined, { runId });
     assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
     assert.ok(begun.ok && begun.handoff);
@@ -462,7 +469,6 @@ test("process acceptance: fresh-session late native result uses exact durable lo
     assert.ok(stage);
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
-    const ownerController = createWorkflowSessionController({ cwd: root, context: owner });
     const ownerBus = fakePi();
     registerTeamWorkflow(ownerBus.pi as never, { cwd: root, observability: false, getSessionController: () => ownerController });
     const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "fresh-session-tool", input }, { cwd: root, hasUI: false, session_id: owner.session_id });
@@ -518,6 +524,7 @@ test("process acceptance: fresh restart uses the persisted origin workspace", as
     const artifacts = join(rootA, ".work-state", "runs", runId, "artifacts");
     mkdirSync(artifacts, { recursive: true });
     writeFileSync(join(artifacts, "discovery.json"), JSON.stringify({ goal: "cross-worktree fresh result" }));
+    const ownerController = preparedController(rootA, owner, runId);
     const begun = beginCapability(rootA, undefined, { runId });
     assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
     assert.ok(begun.ok && begun.handoff);
@@ -525,7 +532,6 @@ test("process acceptance: fresh restart uses the persisted origin workspace", as
     assert.ok(stage);
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
-    const ownerController = createWorkflowSessionController({ cwd: rootA, context: owner });
     const ownerBus = fakePi();
     registerTeamWorkflow(ownerBus.pi as never, { cwd: rootA, observability: false, getSessionController: () => ownerController });
     const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "cross-worktree-tool", input }, { cwd: rootA, hasUI: false, session_id: owner.session_id });
@@ -581,6 +587,7 @@ test("process acceptance: ambiguous durable locator candidates reject without mu
     const artifacts = join(rootA, ".work-state", "runs", runId, "artifacts");
     mkdirSync(artifacts, { recursive: true });
     writeFileSync(join(artifacts, "discovery.json"), JSON.stringify({ goal: "ambiguous locator" }));
+    const ownerController = preparedController(rootA, owner, runId);
     const begun = beginCapability(rootA, undefined, { runId });
     assert.equal(begun.ok, true, begun.ok ? "" : begun.error);
     assert.ok(begun.ok && begun.handoff);
@@ -588,7 +595,6 @@ test("process acceptance: ambiguous durable locator candidates reject without mu
     assert.ok(stage);
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
-    const ownerController = createWorkflowSessionController({ cwd: rootA, context: owner });
     const ownerBus = fakePi();
     registerTeamWorkflow(ownerBus.pi as never, { cwd: rootA, observability: false, getSessionController: () => ownerController });
     const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "ambiguous-origin-tool", input }, { cwd: rootA, hasUI: false, session_id: owner.session_id });
@@ -669,6 +675,132 @@ test("workflow tools ignore a foreign session_stop without dropping the trusted 
     assert.equal(record(replay.details).ok, true, JSON.stringify(replay.details));
     assert.deepEqual(readRunControl(root).execution_claim, claimBefore);
     await bus.emit("session_stop", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
+    assert.equal(readRunControl(root).execution_claim, null, "idle stop releases coordinator claim");
+    const afterStop = await bus.tools.get("workflow_status")!.execute("same-session-after-stop", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.equal(record(afterStop.details).ok, true, "retained host session keeps read access after idle stop");
+    await bus.emit("session_shutdown", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
+    const afterShutdown = await bus.tools.get("workflow_status")!.execute("same-session-after-shutdown", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.equal(record(afterShutdown.details).code, "WORKFLOW_CONTEXT_REJECTED", "shutdown clears only the exact host identity");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("process acceptance: active claim proof drops on idle release, takeover, and corruption", () => {
+  const root = scratch("rl-active-claim-proof");
+  try {
+    initGit(root); publishMapping(root);
+    const owner = context(root, "claim-proof-owner");
+    const controller = createWorkflowSessionController({ cwd: root, context: owner });
+    assert.equal(controller.activeClaimRunId(), undefined);
+    const prepared = controller.prepare({ mode: "new", task: "claim proof", classification: CLASSIFICATION });
+    const runId = prepared.state.run_id!;
+    assert.equal(controller.activeClaimRunId(), runId);
+    const pending = beginLifecycleTransaction({ cwd: root, operation: "claim", before: {}, after: {} });
+    const pendingJournal = join(root, ".work-state", "lifecycle-transactions", pending.transaction_id, "transaction.json");
+    assert.equal(controller.activeClaimRunId(), undefined, "pending lifecycle journals fail the ownership proof closed");
+    assert.equal(existsSync(pendingJournal), true, "activeClaimRunId must not repair or publish a pending journal");
+    rmSync(join(root, ".work-state", "lifecycle-transactions", pending.transaction_id), { recursive: true, force: true });
+    assert.equal(controller.activeClaimRunId(), runId);
+    const claim = readRunControl(root).execution_claim;
+    assert.ok(claim);
+    controller.release("idle-proof");
+    assert.equal(controller.selectedRunId(), runId, "idle release retains the selected run");
+    assert.equal(controller.activeClaimRunId(), undefined);
+
+    const takeover = context(root, "claim-proof-takeover");
+    const replacement = acquireExecutionClaim(root, { run_id: runId, context: takeover });
+    const replacementController = createWorkflowSessionController({ cwd: root, context: takeover });
+    replacementController.bind(runId, replacement.claim.token);
+    assert.equal(replacementController.activeClaimRunId(), runId);
+    assert.equal(controller.activeClaimRunId(), undefined, "the old token/session cannot prove the replacement claim");
+
+    const controlPath = join(root, ".work-state", "run-control.json");
+    writeFileSync(controlPath, JSON.stringify({
+      ...readRunControl(root),
+      execution_claim: { ...replacement.claim, token: 42 },
+    }) + "\n");
+    assert.equal(replacementController.activeClaimRunId(), undefined, "corrupt canonical claims fail closed");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workflow shutdown revokes local authority even when canonical release is unreadable", async () => {
+  const root = scratch("rl-shutdown-release-failure");
+  try {
+    initGit(root); publishMapping(root);
+    const owner = context(root, "shutdown-release-failure");
+    const controller = createWorkflowSessionController({ cwd: root, context: owner });
+    const bus = fakePi();
+    registerWorkflowTools(bus.pi as never, { cwd: root, getSessionController: () => controller });
+    await bus.emit("session_start", {}, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const prepared = controller.prepare({ mode: "new", task: "shutdown release failure", classification: CLASSIFICATION });
+    const claimBefore = readRunControl(root).execution_claim;
+    assert.ok(claimBefore);
+    const controlPath = join(root, ".work-state", "run-control.json");
+    writeFileSync(join(root, ".work-state", "runs", prepared.state.run_id!, "state.json"), "{}\n");
+    await bus.emit("session_stop", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
+    assert.deepEqual(
+      record(JSON.parse(readFileSync(controlPath, "utf8"))).execution_claim,
+      claimBefore,
+      "failed idle release preserves canonical ownership",
+    );
+    await bus.emit("session_shutdown", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
+    assert.deepEqual(
+      record(JSON.parse(readFileSync(controlPath, "utf8"))).execution_claim,
+      claimBefore,
+      "failed shutdown release preserves canonical ownership",
+    );
+    const afterShutdown = await bus.tools.get("workflow_status")!.execute("release-failure-after-shutdown", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.equal(record(afterShutdown.details).code, "WORKFLOW_CONTEXT_REJECTED");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("process acceptance: selected but unclaimed host cannot manufacture orchestrator writes", async () => {
+  const root = scratch("rl-selected-unclaimed-actor");
+  try {
+    initGit(root); publishMapping(root);
+    const owner = context(root, "selected-unclaimed-host");
+    const controller = createWorkflowSessionController({ cwd: root, context: owner });
+    const prepared = controller.prepare({ mode: "new", task: "selected but idle", classification: CLASSIFICATION });
+    const bus = fakePi();
+    registerTeamWorkflow(bus.pi as never, {
+      cwd: root,
+      getSessionController: () => controller,
+      resolveTrustedToolCallActor: () => ({ actor: "orchestrator", artifactsDir: runTarget(root, prepared.state.run_id!).artifactsDir }),
+    });
+    registerWorkflowTools(bus.pi as never, { cwd: root, getSessionController: () => controller });
+    await bus.emit("session_start", {}, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    controller.release("selected-unclaimed");
+    assert.equal(controller.selectedRunId(), prepared.state.run_id);
+    assert.equal(controller.activeClaimRunId(), undefined);
+    const statePath = join(root, ".work-state", "runs", prepared.state.run_id!, "state.json");
+    const persistedState = readFileSync(statePath, "utf8");
+    unlinkSync(statePath);
+    assert.throws(() => controller.selectedRunId(), (error: unknown) => {
+      assert.equal(record(error).code, "recovery_required");
+      return true;
+    });
+    const missingResults = await bus.emit(
+      "tool_call",
+      { toolName: "write", toolCallId: "selected-missing-write", input: { path: join(root, "missing.txt"), content: "unsafe" } },
+      { cwd: root, session_id: owner.session_id, actor: "orchestrator" },
+    );
+    assert.ok(missingResults.some(value => value && typeof value === "object" && "block" in value && value.block === true), JSON.stringify(missingResults));
+    assert.equal(existsSync(statePath), false, "raw authority reads must not repair a missing selected run");
+    writeFileSync(statePath, persistedState);
+    assert.equal(controller.selectedRunId(), prepared.state.run_id);
+    const results = await bus.emit(
+      "tool_call",
+      { toolName: "write", toolCallId: "selected-unclaimed-write", input: { path: join(root, "source.txt"), content: "unsafe" } },
+      { cwd: root, session_id: owner.session_id, actor: "orchestrator" },
+    );
+    assert.ok(results.some(value => value && typeof value === "object" && "block" in value && value.block === true), JSON.stringify(results));
+    const begin = bus.tools.get("workflow_begin")!;
+    const deniedBegin = await begin.execute("selected-unclaimed-begin", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.equal(record(deniedBegin.details).code, "WORKFLOW_CONTEXT_REJECTED");
+    const rebind = await bus.tools.get("workflow_prepare")!.execute("selected-unclaimed-rebind", { mode: "resume", run_id: prepared.state.run_id }, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.equal(record(rebind.details).ok, true, JSON.stringify(rebind.details));
+    assert.equal(controller.activeClaimRunId(), prepared.state.run_id);
+    const allowedBegin = await begin.execute("selected-unclaimed-begin-rebound", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.notEqual(record(allowedBegin.details).code, "WORKFLOW_CONTEXT_REJECTED");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -302,6 +302,47 @@ function authoritativeHostSession(ctx: unknown): { cwd: string; sessionId: strin
   }
 }
 
+type LifecycleIdentityPart = {
+  cwd?: string;
+  sessionId?: string;
+  sessionManager?: object;
+};
+
+function lifecycleIdentityPart(value: unknown): LifecycleIdentityPart {
+  if (!value || typeof value !== "object") return {};
+  const objectValue = value as { sessionManager?: unknown };
+  const cwd = resolveSessionCwd(value);
+  const sessionId = contextSessionId(value);
+  const sessionManager = objectValue.sessionManager;
+  return {
+    ...(cwd ? { cwd } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(sessionManager && typeof sessionManager === "object" ? { sessionManager } : {}),
+  };
+}
+function lifecycleIdentity(event: unknown, ctx: unknown): { cwd: string; sessionId: string } | undefined {
+  const eventIdentity = lifecycleIdentityPart(event);
+  const contextIdentity = lifecycleIdentityPart(ctx);
+  if (eventIdentity.sessionId && contextIdentity.sessionId && eventIdentity.sessionId !== contextIdentity.sessionId) return undefined;
+  if (eventIdentity.cwd && contextIdentity.cwd) {
+    try {
+      if (resolve(eventIdentity.cwd) !== resolve(contextIdentity.cwd)) return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (eventIdentity.sessionManager && contextIdentity.sessionManager && eventIdentity.sessionManager !== contextIdentity.sessionManager) return undefined;
+  const cwd = eventIdentity.cwd ?? contextIdentity.cwd;
+  const sessionId = eventIdentity.sessionId ?? contextIdentity.sessionId;
+  return cwd && sessionId ? { cwd, sessionId } : undefined;
+}
+
+function exactLifecycleContext(event: unknown, ctx: unknown): boolean {
+  const identity = lifecycleIdentity(event, ctx);
+  const authoritative = authoritativeHostSession(ctx);
+  return Boolean(identity && authoritative && sameHostSessionIdentity(identity, authoritative));
+}
+
 function sameHostSessionIdentity(
   left: { cwd: string; sessionId: string },
   right: { cwd: string; sessionId: string },
@@ -314,22 +355,60 @@ function sameHostSessionIdentity(
 }
 
 /**
- * Track only the primary host session. A noninteractive start for that same
- * manager identity denies the stale interactive fallback without releasing
- * its controller; foreign worker/lead starts are ignored.
+ * A same-identity headless session_start is an explicit fail-closed
+ * boundary. It may revoke the retained interactive binding, but a foreign
+ * or unverifiable headless start must never mutate another host session.
  */
-function observePrimaryHostSession(ctx: unknown): void {
-  const authoritative = authoritativeHostSession(ctx);
+function invalidateHeadlessHostSession(authoritative: { cwd: string; sessionId: string }): void {
   const current = primaryHostSessionRef.current;
-  if (!authoritative || !current || !sameHostSessionIdentity(current, authoritative)) return;
-  const value = ctx as { mode?: unknown; hasUI?: unknown };
-  const mode = value.mode;
-  if (value.hasUI === true && (mode === "tui" || mode === "rpc")) {
-    primaryHostSessionRef.current = { ...authoritative, mode };
+  if (!current || current.mode === "headless" || !sameHostSessionIdentity(current, authoritative)) return;
+
+  const captured = capturedHostSessionRef.current;
+  const controller = workflowSessionRef.current;
+  if (!captured || !controller || !sameHostSessionIdentity(captured, authoritative)) {
+    workflowSessionRef.current = null;
+    workflowSessionCapturedAtHostStart.current = false;
+    capturedHostSessionRef.current = null;
+    primaryHostSessionRef.current = { ...authoritative, mode: "headless" };
     return;
   }
-  if (value.hasUI === false && (mode === undefined || mode === "json" || mode === "print")) {
+  try {
+    const controllerContext = controller.context();
+    if (
+      controllerContext.session_id !== authoritative.sessionId
+      || resolve(controllerContext.worktree) !== resolve(authoritative.cwd)
+    ) return;
+    controller.release("host-session-unavailable");
+    workflowSessionRef.current = null;
+    workflowSessionCapturedAtHostStart.current = false;
+    capturedHostSessionRef.current = null;
     primaryHostSessionRef.current = { ...authoritative, mode: "headless" };
+  } catch {
+    // Preserve the controller and claim on failed release. The headless
+    // marker still prevents stale interactive authority until reconciliation.
+    primaryHostSessionRef.current = { ...authoritative, mode: "headless" };
+  }
+}
+
+function observePrimaryHostSession(ctx: unknown): void {
+  const authoritative = authoritativeHostSession(ctx);
+  if (!authoritative) return;
+  const current = primaryHostSessionRef.current;
+  const value = ctx as { mode?: unknown; hasUI?: unknown };
+  const headless = value.hasUI === false && (value.mode === undefined || value.mode === "json" || value.mode === "print");
+  if (current && sameHostSessionIdentity(current, authoritative)) {
+    if (headless) {
+      invalidateHeadlessHostSession(authoritative);
+      return;
+    }
+    if (value.hasUI === true && (value.mode === "tui" || value.mode === "rpc")) {
+      primaryHostSessionRef.current = { ...authoritative, mode: value.mode };
+    }
+    return;
+  }
+  if (current) return;
+  if (value.hasUI === true && (value.mode === "tui" || value.mode === "rpc")) {
+    primaryHostSessionRef.current = { ...authoritative, mode: value.mode };
   }
 }
 
@@ -405,12 +484,33 @@ function bindWorkflowSession(ctx: unknown): void {
   capturedHostSessionRef.current = workflowSessionRef.current
     ? captureHostSession(ctx, authoritative) ?? null
     : null;
+  // bindWorkflowSession is registered before the core adapter's profile
+  // observer. Capture the primary profile here so the very first raw
+  // tool_call after session_start has trusted admission.
+  const captured = capturedHostSessionRef.current;
+  if (workflowSessionRef.current && captured) primaryHostSessionRef.current = captured;
 }
-function releaseWorkflowSession(ctx: unknown): void {
+function releaseWorkflowSession(event: unknown, ctx: unknown, teardown: boolean): void {
+  const stopped = lifecycleIdentity(event, ctx);
   const authoritative = authoritativeHostSession(ctx);
-  if (!authoritative || !trustedHostSession(ctx)) return;
+  if (
+    !stopped
+    || !authoritative
+    || !trustedHostSession(ctx)
+    || !sameHostSessionIdentity(stopped, authoritative)
+  ) return;
   const controller = workflowSessionRef.current;
-  if (!controller) return;
+  if (!controller) {
+    if (teardown) {
+      const captured = capturedHostSessionRef.current;
+      if (!captured || sameHostSessionIdentity(captured, authoritative)) {
+        workflowSessionCapturedAtHostStart.current = false;
+        capturedHostSessionRef.current = null;
+        clearPrimaryHostSession(ctx);
+      }
+    }
+    return;
+  }
   try {
     const controllerContext = controller.context();
     if (
@@ -418,6 +518,7 @@ function releaseWorkflowSession(ctx: unknown): void {
       resolve(controllerContext.worktree) !== resolve(authoritative.cwd)
     ) return;
     controller.release("host-session-stop");
+    if (!teardown) return;
     workflowSessionRef.current = null;
     workflowSessionCapturedAtHostStart.current = false;
     capturedHostSessionRef.current = null;
@@ -498,7 +599,6 @@ function resolveFullstackTrustedToolCallActor(
     || !sameHostSessionIdentity(authoritative, captured)
     || resolve(cwd) !== resolve(captured.cwd)
   ) return undefined;
-
   const value = ctx as { session_id?: unknown; sessionId?: unknown; mode?: unknown; hasUI?: unknown };
   if (typeof value.session_id === "string" && value.session_id !== captured.sessionId) return undefined;
   if (typeof value.sessionId === "string" && value.sessionId !== captured.sessionId) return undefined;
@@ -512,10 +612,11 @@ function resolveFullstackTrustedToolCallActor(
     if (
       controllerContext.session_id !== captured.sessionId
       || resolve(controllerContext.worktree) !== resolve(captured.cwd)
-      || controller.selectedRunId() !== runId
     ) return undefined;
+    const selectedRunId = controller.selectedRunId();
+    if (selectedRunId !== runId) return undefined;
     if (runId === undefined) return { kind: "authenticated-interactive-host-no-run" };
-    if (!runId) return undefined;
+    if (!runId || controller.activeClaimRunId() !== runId) return undefined;
     const target = runTarget(captured.cwd, runId);
     const artifactsDir = target.artifactsDir;
     const expectedArtifactsDir = resolve(captured.cwd, ".work-state", "runs", runId, "artifacts");
@@ -525,72 +626,43 @@ function resolveFullstackTrustedToolCallActor(
     return undefined;
   }
 }
-
-function captureTrustedProfile(
-  ctx: unknown,
-  authoritative: { cwd: string; sessionId: string },
-): void {
-  const captured = captureHostSession(ctx, authoritative);
-  if (captured) {
-    capturedHostSessionRef.current = captured;
-    workflowSessionCapturedAtHostStart.current = true;
-    primaryHostSessionRef.current = captured;
-  }
-}
-
 /**
- * Shared accessor passed to commands, tools, and core hooks. It creates a
- * controller only when a trusted host session supplies a real session ID and
- * sessionManager-authoritative worktree, and never replaces an existing
- * controller without a proven host-session transition.
+ * Shared accessor passed to commands, tools, and core hooks. The lifecycle
+ * ingress is the only authority allowed to create, replace, or capture the
+ * controller; this accessor only returns an already-captured exact binding.
  */
 export function getFullstackWorkflowSessionController(ctx: unknown, cwd: string): WorkflowSessionController | undefined {
   const requestedSession = contextSessionId(ctx);
   const authoritative = authoritativeHostSession(ctx);
-  if (!authoritative) return undefined;
-  if (
-    !requestedSession
-    || authoritative.sessionId !== requestedSession
-    || resolve(authoritative.cwd) !== resolve(cwd)
-    || !trustedHostSession(ctx)
-  ) return undefined;
+  const captured = capturedHostSessionRef.current;
+  const primary = primaryHostSessionRef.current;
   const controller = workflowSessionRef.current;
-  if (controller) {
-    try {
-      const controllerContext = controller.context();
-      const sameWorktree = resolve(controllerContext.worktree) === resolve(authoritative.cwd);
-      if (sameWorktree && controllerContext.session_id === authoritative.sessionId) {
-        captureTrustedProfile(ctx, authoritative);
-        return controller;
-      }
-      // A replacement is valid only after the primary profile itself proves
-      // that this manager identity owns the current interactive session.
-      // Unknown/foreign tool contexts must not release the retained host
-      // controller merely because they expose a different manager identity.
-      const primary = primaryHostSessionRef.current;
-      const value = ctx as { mode?: unknown; hasUI?: unknown };
-      const explicitInteractive = value.hasUI === true && (value.mode === "tui" || value.mode === "rpc");
-      if (
-        !explicitInteractive
-        && (
-          !primary
-          || primary.mode === "headless"
-          || !sameHostSessionIdentity(primary, authoritative)
-        )
-      ) return undefined;
-      controller.release("host-session-replaced");
-      workflowSessionRef.current = null;
-      workflowSessionCapturedAtHostStart.current = false;
-      capturedHostSessionRef.current = null;
-    } catch {
-      // Preserve the current owner when replacement release fails.
-      return undefined;
-    }
+  if (
+    !workflowSessionCapturedAtHostStart.current
+    || !requestedSession
+    || !authoritative
+    || !captured
+    || !primary
+    || primary.mode === "headless"
+    || !controller
+    || !sameHostSessionIdentity(primary, captured)
+    || !sameHostSessionIdentity(authoritative, captured)
+    || resolve(authoritative.cwd) !== resolve(cwd)
+    || requestedSession !== captured.sessionId
+  ) return undefined;
+  const value = ctx && typeof ctx === "object" ? ctx as { mode?: unknown; hasUI?: unknown } : {};
+  if (value.mode !== undefined && value.mode !== captured.mode) return undefined;
+  if (value.hasUI === false) return undefined;
+  if (value.hasUI !== undefined && value.hasUI !== true) return undefined;
+  try {
+    const controllerContext = controller.context();
+    return controllerContext.session_id === captured.sessionId
+      && resolve(controllerContext.worktree) === resolve(captured.cwd)
+      ? controller
+      : undefined;
+  } catch {
+    return undefined;
   }
-  const created = createWorkflowSession(authoritative.cwd, authoritative.sessionId);
-  workflowSessionRef.current = created ?? null;
-  captureTrustedProfile(ctx, authoritative);
-  return created;
 }
 
 /**
@@ -645,16 +717,20 @@ function getFullstackWorkflowToolSessionController(
 
 function registerWorkflowSessionProfile(pi: ExtensionAPI): void {
   if (typeof (pi as { on?: unknown }).on !== "function") return;
-  pi.on("session_start", (_event: unknown, ctx: unknown) => observePrimaryHostSession(ctx));
-  pi.on("session_stop", (_event: unknown, ctx: unknown) => clearPrimaryHostSession(ctx));
-  pi.on("session_shutdown", (_event: unknown, ctx: unknown) => clearPrimaryHostSession(ctx));
+  pi.on("session_start", (event: unknown, ctx: unknown) => {
+    if (!exactLifecycleContext(event, ctx)) return;
+    observePrimaryHostSession(ctx);
+  });
 }
 
 function registerWorkflowSessionController(pi: ExtensionAPI): void {
   if (typeof (pi as { on?: unknown }).on !== "function") return;
-  pi.on("session_start", (_event: unknown, ctx: unknown) => bindWorkflowSession(ctx));
-  pi.on("session_stop", (_event: unknown, ctx: unknown) => releaseWorkflowSession(ctx));
-  pi.on("session_shutdown", (_event: unknown, ctx: unknown) => releaseWorkflowSession(ctx));
+  pi.on("session_start", (event: unknown, ctx: unknown) => {
+    if (!exactLifecycleContext(event, ctx)) return;
+    bindWorkflowSession(ctx);
+  });
+  pi.on("session_stop", (event: unknown, ctx: unknown) => releaseWorkflowSession(event, ctx, false));
+  pi.on("session_shutdown", (event: unknown, ctx: unknown) => releaseWorkflowSession(event, ctx, true));
 }
 
 /**

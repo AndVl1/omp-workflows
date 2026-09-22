@@ -8,6 +8,7 @@ import {
   updateStateAtomically,
   withWorkspaceTransaction,
   withWorkspaceRead,
+  withWorkspaceReadNoRecovery,
   type CanonicalRunTarget,
   type StatePublication,
 } from "./state.js";
@@ -172,6 +173,10 @@ export function readRunControl(cwd: string): RunControl {
   return withWorkspaceRead(cwd, () => readControlRaw(cwd), () => defaultControl());
 }
 
+export function readRunControlNoRecovery(cwd: string): RunControl {
+  return withWorkspaceReadNoRecovery(cwd, () => readControlRaw(cwd), () => defaultControl());
+}
+
 export function updateRunControl<T>(cwd: string, mutate: RunControlMutation<T>): T {
   return withWorkspaceTransaction(cwd, () => {
     const before = controlContent(cwd);
@@ -183,6 +188,13 @@ export function updateRunControl<T>(cwd: string, mutate: RunControlMutation<T>):
     }
     return result.value;
   });
+}
+
+export function readRunStateNoRecovery(cwd: string, runId: string, currentBranch?: string): TeamState | null {
+  return withWorkspaceReadNoRecovery(cwd, () => {
+    const resolved = resolveCanonicalRun(cwd, { kind: "team", runId }, currentBranch);
+    return resolved?.state ?? null;
+  }, () => null);
 }
 
 export function runTarget(cwd: string, runId: string): CanonicalRunTarget {

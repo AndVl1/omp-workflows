@@ -127,6 +127,47 @@ test("native worker bridge denies a foreign fork while the legitimate active gra
   }
 });
 
+test("native worker authority keeps pending candidates and active grants across an idle gap", () => {
+  const f = fixture();
+  try {
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const childAuthority = createNativeWorkerAuthority(bus);
+    const pendingChild = childSession(f.root, f.parentFile, "idle-pending-child");
+    const activeChild = childSession(f.root, f.parentFile, "idle-active-child");
+    const pendingInput = { agent: "developer-go", task: "pending idle work" };
+    parent.admitTaskCall(f.parentContext, { toolName: "task", toolCallId: "idle-pending", input: pendingInput }, "orchestrator", RUN_ID);
+    assert.equal(childAuthority.resolve(pendingChild.context, f.root), undefined);
+
+    startGrant(
+      bus,
+      parent,
+      f.parentContext,
+      { agent: "developer-go", task: "active idle work" },
+      "idle-active",
+      activeChild.file,
+      "developer-go",
+    );
+    assert.deepEqual(childAuthority.resolve(activeChild.context, f.root), { actor: "worker", runId: RUN_ID });
+
+    // Ordinary idle has no authority teardown. The pending candidate must
+    // still be promotable, and the active grant must remain usable.
+    parent.observeToolExecutionStart({ toolName: "task", toolCallId: "idle-pending", args: structuredClone(pendingInput) }, f.parentContext);
+    bus.emit("task:subagent:lifecycle", {
+      id: "idle-pending-lifecycle",
+      agent: "developer-go",
+      status: "started",
+      sessionFile: pendingChild.file,
+      parentToolCallId: "idle-pending",
+      index: 0,
+    });
+    assert.deepEqual(childAuthority.resolve(pendingChild.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(activeChild.context, f.root), { actor: "worker", runId: RUN_ID });
+  } finally {
+    f.close();
+  }
+});
+
 test("native worker bridge accepts SDK headers without optional parentSession", () => {
   const f = fixture();
   try {
@@ -220,6 +261,99 @@ test("native authority teardown is owner-isolated and the same factory can be re
   }
 });
 
+test("native authority session shutdown revokes only the exact owner's parent records", () => {
+  const f = fixture();
+  try {
+    const bus = new TestBus();
+    const parentA = createNativeWorkerAuthority(bus);
+    const parentB = createNativeWorkerAuthority(bus);
+    const childAuthority = createNativeWorkerAuthority(bus);
+    const childA = childSession(f.root, f.parentFile, "shutdown-parent-a");
+    const pendingA = childSession(f.root, f.parentFile, "shutdown-pending-a");
+    const childB = childSession(f.root, f.parentFile, "shutdown-parent-b");
+    startGrant(bus, parentA, f.parentContext, { agent: "developer-go", task: "parent shutdown grant" }, "shutdown-parent-call", childA.file, "developer-go");
+    const pendingInput = { agent: "developer-go", task: "pending shutdown work" };
+    parentA.admitTaskCall(f.parentContext, { toolName: "task", toolCallId: "shutdown-pending-call", input: pendingInput }, "orchestrator", RUN_ID);
+    startGrant(bus, parentB, f.parentContext, { agent: "developer-go", task: "sibling shutdown grant" }, "shutdown-sibling-call", childB.file, "developer-go");
+    assert.deepEqual(childAuthority.resolve(childA.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+
+    parentA.observeSessionShutdown(f.parentContext);
+    assert.equal(childAuthority.resolve(childA.context, f.root), undefined);
+    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+
+    // The pending candidate was scoped to parentA and cannot be promoted
+    // after parentA's exact shutdown.
+    parentA.observeToolExecutionStart({ toolName: "task", toolCallId: "shutdown-pending-call", args: structuredClone(pendingInput) }, f.parentContext);
+    bus.emit("task:subagent:lifecycle", {
+      id: "shutdown-pending-lifecycle",
+      agent: "developer-go",
+      status: "started",
+      sessionFile: pendingA.file,
+      parentToolCallId: "shutdown-pending-call",
+      index: 0,
+    });
+    assert.equal(childAuthority.resolve(pendingA.context, f.root), undefined);
+    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+  } finally {
+    f.close();
+  }
+});
+
+test("native authority ignores foreign, headless, and missing shutdown snapshots", () => {
+  const f = fixture();
+  try {
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const childAuthority = createNativeWorkerAuthority(bus);
+    const child = childSession(f.root, f.parentFile, "shutdown-legitimate-child");
+    const foreign = childSession(f.root, f.parentFile, "shutdown-foreign-child");
+    const headless = childSession(f.root, f.parentFile, "shutdown-headless-child");
+    foreign.context.mode = "tui";
+    foreign.context.hasUI = true;
+    startGrant(bus, parent, f.parentContext, { agent: "developer-go", task: "survive foreign shutdown" }, "shutdown-foreign-call", child.file, "developer-go");
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+
+    parent.observeSessionShutdown(foreign.context);
+    parent.observeSessionShutdown(headless.context);
+    parent.observeSessionShutdown(undefined);
+    parent.observeSessionShutdown({});
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+  } finally {
+    f.close();
+  }
+});
+
+test("native authority child shutdown revokes its bound grant before a manager replacement can rebind", () => {
+  const f = fixture();
+  try {
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const siblingParent = createNativeWorkerAuthority(bus);
+    const childAuthority = createNativeWorkerAuthority(bus);
+    const child = childSession(f.root, f.parentFile, "shutdown-bound-child");
+    const sibling = childSession(f.root, f.parentFile, "shutdown-bound-sibling");
+    startGrant(bus, parent, f.parentContext, { agent: "developer-go", task: "bound shutdown grant" }, "shutdown-bound-call", child.file, "developer-go");
+    startGrant(bus, siblingParent, f.parentContext, { agent: "developer-go", task: "sibling grant" }, "shutdown-bound-sibling-call", sibling.file, "developer-go");
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(sibling.context, f.root), { actor: "worker", runId: RUN_ID });
+
+    childAuthority.observeSessionShutdown(child.context);
+    const replacementHeader = { ...child.header };
+    const replacementManager = {
+      getCwd: () => f.root,
+      getSessionId: () => replacementHeader.id,
+      getSessionFile: () => child.file,
+      getHeader: () => replacementHeader,
+    };
+    const replacementContext = { sessionManager: replacementManager, mode: "print", hasUI: false };
+    assert.equal(childAuthority.resolve(replacementContext, f.root), undefined);
+    assert.deepEqual(childAuthority.resolve(sibling.context, f.root), { actor: "worker", runId: RUN_ID });
+  } finally {
+    f.close();
+  }
+});
+
 test("native worker bridge requires structural execution arguments, not only a matching tool id", () => {
   const f = fixture();
   try {
@@ -288,6 +422,72 @@ test("failed execution end before lifecycle start revokes the pending candidate"
       index: 0,
     });
     assert.equal(childAuthority.resolve(child.context, f.root), undefined);
+  } finally {
+    f.close();
+  }
+});
+
+test("native authority lifecycle completed, failed, and aborted statuses revoke grants", () => {
+  const f = fixture();
+  try {
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const childAuthority = createNativeWorkerAuthority(bus);
+    const cases = [
+      { suffix: "lifecycle-completed", callId: "lifecycle-completed-call", status: "completed" },
+      { suffix: "lifecycle-failed", callId: "lifecycle-failed-call", status: "failed" },
+      { suffix: "lifecycle-aborted", callId: "lifecycle-aborted-call", status: "aborted" },
+    ] as const;
+    const children = cases.map(({ suffix, callId }) => {
+      const child = childSession(f.root, f.parentFile, suffix);
+      startGrant(bus, parent, f.parentContext, { agent: "developer-go", task: suffix }, callId, child.file, "developer-go");
+      assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+      return child;
+    });
+
+    cases.forEach(({ callId, status }, index) => {
+      const child = children[index]!;
+      bus.emit("task:subagent:lifecycle", {
+        id: `${callId}-lifecycle-0`,
+        agent: "developer-go",
+        status,
+        sessionFile: child.file,
+        parentToolCallId: callId,
+        index: 0,
+      });
+      assert.equal(childAuthority.resolve(child.context, f.root), undefined);
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test("native authority preserves headless session-start invalidation", () => {
+  const f = fixture();
+  try {
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const childAuthority = createNativeWorkerAuthority(bus);
+    const child = childSession(f.root, f.parentFile, "headless-start-child");
+    const pendingChild = childSession(f.root, f.parentFile, "headless-start-pending-child");
+    const pendingInput = { agent: "developer-go", task: "delayed headless work" };
+    startGrant(bus, parent, f.parentContext, { agent: "developer-go", task: "headless invalidation" }, "headless-start-call", child.file, "developer-go");
+    parent.admitTaskCall(f.parentContext, { toolName: "task", toolCallId: "headless-start-pending-call", input: pendingInput }, "orchestrator", RUN_ID);
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+
+    parent.observeSessionStart({ sessionManager: f.parentManager, mode: "print", hasUI: false });
+    assert.equal(childAuthority.resolve(child.context, f.root), undefined);
+
+    parent.observeToolExecutionStart({ toolName: "task", toolCallId: "headless-start-pending-call", args: structuredClone(pendingInput) }, f.parentContext);
+    bus.emit("task:subagent:lifecycle", {
+      id: "headless-start-pending-lifecycle",
+      agent: "developer-go",
+      status: "started",
+      sessionFile: pendingChild.file,
+      parentToolCallId: "headless-start-pending-call",
+      index: 0,
+    });
+    assert.equal(childAuthority.resolve(pendingChild.context, f.root), undefined);
   } finally {
     f.close();
   }

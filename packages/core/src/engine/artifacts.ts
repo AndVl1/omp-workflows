@@ -438,6 +438,16 @@ export function recoverArtifactJournals(cwd: string): void {
   }
 }
 
+/** Verify that no artifact journal is waiting for recovery, without mutating it. */
+export function assertNoPendingArtifactJournals(cwd: string): void {
+  const root = join(resolve(cwd, ".work-state"), "artifact-transactions");
+  if (!existsSync(root)) return;
+  const entries = readdirSync(root);
+  if (entries.length > 0) {
+    throw new Error(`artifact journal recovery required: ${entries[0]}`);
+  }
+}
+
 let artifactJournal: ArtifactJournal | null = null;
 
 function readGenerationNoFollow(path: string): FileGeneration | null {

@@ -65,6 +65,15 @@ function normalized(value: string): string {
   return value.trim().toLocaleLowerCase().replace(/\s+/g, " ");
 }
 
+/**
+ * Natural lifecycle language is intentionally a command-shaped grammar. The
+ * verb must lead the request (optionally after a registered command name), and
+ * ordinary nouns such as "button" or an isolated bug report do not select an
+ * existing run. A rework verb is accepted only with a result/workflow noun or
+ * an explicit prior-run reference.
+ */
+const LIFECYCLE_INTENT_PATTERN = new RegExp(String.raw`^(?:\/(?:do-work|team)\s+)?((?:resume|continue|reconnect|attach)\s+(?:where\s+(?:we|i)\s+left\s+off|(?:(?:the|this|that)\s+)?(?:previous|prior|last|existing|unfinished|incomplete)\s+(?:work|task|feature|run|workflow|implementation|project)|(?:work|working)\s+on)|pick\s+up\s+where\s+(?:we|i)\s+left\s+off|(?:продолж(?:и|ить|ай|ать)|возобнов(?:и|ить|ай|ать))\s+\S+|вернись\s+к\s+(?:(?:этой|предыдущей|прошлой|текущей)\s+)?(?:фич\p{L}*|работ\p{L}*|задач\p{L}*|проект\p{L}*|запуск\p{L}*)|дальше\s+по\s+(?:этой\s+)?(?:фич\p{L}*|работ\p{L}*|задач\p{L}*|проект\p{L}*))|^(?:\/(?:do-work|team)\s+)?((?:rework|revise|amend)\s+(?:(?:(?:the|this|that)\s+)?(?:previous|prior|last|existing|earlier)\s+(?:work|task|feature|run|workflow|project|result|output|implementation)|(?:(?:the|this|that)\s+)?(?:result|output|implementation)|(?:result|output|implementation|work|task|feature|run|workflow|project)\s+(?:from|of|for)\s+(?:(?:the|this|that)\s+)?(?:previous|prior|last|existing|earlier))|(?:correct|fix|improve|repair|update)\s+(?:(?:the|this|that)\s+)?(?:previous|prior|last|existing|earlier)(?:\s+[\p{L}\p{N}_-]+){0,3}\s+(?:result|output|implementation|work|task|feature|run|workflow|project|bug|issue|defect|error)|(?:reopen|re-open)\s+(?:(?:the|this|that)\s+)?(?:previous|prior|last|existing|unfinished|incomplete)\s+(?:run|workflow|task|feature|work|implementation)|(?:доработ(?:ай|ать|и)|исправ(?:ь|ить|и)|поправ(?:ь|ить|и)|переоткрой|пересмотр(?:и|еть))\s+(?:(?:(?:эт(?:от|у|ого)|предыдущ(?:ий|ую|его)|прошл(?:ый|ую|ого)|существующ(?:ий|ую|его))\s+)(?:результат\p{L}*|вывод\p{L}*|реализац\p{L}*|работ\p{L}*|задач\p{L}*|фич\p{L}*|запуск\p{L}*|проект\p{L}*|баг\p{L}*|ошибк\p{L}*|дефект\p{L}*)|(?:результат\p{L}*|вывод\p{L}*|реализац\p{L}*)|(?:результат\p{L}*|вывод\p{L}*|реализац\p{L}*|работ\p{L}*|задач\p{L}*|фич\p{L}*|запуск\p{L}*|проект\p{L}*)\s+(?:предыдущ\p{L}*|прошл\p{L}*)))`, "iu");
+
 /** Pure intent classification. Presence of history is intentionally ignored. */
 export function resolveLifecycleIntent(input: {
   text?: string;
@@ -74,10 +83,11 @@ export function resolveLifecycleIntent(input: {
 }): LifecycleIntent {
   if (input.mode) return { mode: input.mode, source: "explicit", ...(input.selector ? { selector: input.selector } : {}), ...(input.feedback ? { feedback: input.feedback } : {}) };
   const text = normalized(input.text ?? "");
-  if (/\b(resume|continue|reconnect|attach)\b|продолж|возобнов|вернись|дальше/.test(text)) {
+  const match = LIFECYCLE_INTENT_PATTERN.exec(text);
+  if (match?.[1]) {
     return { mode: "resume", source: "natural_language", ...(input.selector ? { selector: input.selector } : {}) };
   }
-  if (/\b(rework|revise|fix|correct|amend)\b|доработ|исправ|переоткрой|поправ/.test(text)) {
+  if (match?.[2]) {
     return { mode: "rework", source: "natural_language", ...(input.selector ? { selector: input.selector } : {}), ...(input.feedback || text ? { feedback: input.feedback ?? input.text } : {}) };
   }
   return { mode: "new", source: "default" };

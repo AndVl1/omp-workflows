@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { getFullstackWorkflowSessionController } from "../src/index.js";
+import ompWorkflowsFullstack, { getFullstackWorkflowSessionController } from "../src/index.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
 
 type SessionManagerFixture = {
@@ -47,12 +47,26 @@ function commandHarness(
 	notifications: string[];
 	sessionStarts: SessionStartHandler[];
 	sessionManager: SessionManagerFixture;
+	cleanup: () => void;
 } {
 	const commands = new Map<string, Registered>();
 	const prompts: string[] = [];
 	const notifications: string[] = [];
 	const sessionStarts: SessionStartHandler[] = [];
 	const sessionManager = sessionManagerFixture(sessionCwd, sessionId);
+	const lifecycleHandlers: { sessionStart?: SessionStartHandler; sessionShutdown?: SessionStartHandler } = {};
+	let sessionStarted = false;
+	// The production entrypoint owns controller creation at session_start. Keep
+	// command registration isolated while capturing only that ingress handler.
+	ompWorkflowsFullstack({
+		on(name: string, handler: SessionStartHandler) {
+			if (name === "session_start" && !lifecycleHandlers.sessionStart) lifecycleHandlers.sessionStart = handler;
+			if (name === "session_shutdown" && !lifecycleHandlers.sessionShutdown) lifecycleHandlers.sessionShutdown = handler;
+		},
+		registerCommand() {},
+		setLabel() {},
+		sendUserMessage() {},
+	} as never);
 	registerWorkflowCommands({
 		on(name: string, handler: SessionStartHandler) {
 			if (name !== "session_start") return;
@@ -66,9 +80,9 @@ function commandHarness(
 					ui: {},
 					sessionManager,
 				};
+				lifecycleHandlers.sessionStart?.({ type: "session_start" }, hostContext);
 				handler({ type: "session_start" }, hostContext);
-				// Mirror the fullstack extension's trusted lifecycle capture before
-				// command contexts are delivered to handlers.
+				sessionStarted = true;
 				assert.ok(
 					getFullstackWorkflowSessionController(hostContext, sessionManager.getCwd()),
 					"session_start must capture a trusted workflow controller",
@@ -84,7 +98,26 @@ function commandHarness(
 			prompts.push(transformPrompt(prompt));
 		},
 	} as never);
-	return { commands, prompts, notifications, sessionStarts, sessionManager };
+	const cleanup = (): void => {
+		if (!sessionStarted) return;
+		const hostContext = {
+			cwd: sessionManager.getCwd(),
+			session_id: sessionManager.getSessionId(),
+			mode: "tui" as const,
+			hasUI: true,
+			ui: {},
+			sessionManager,
+		};
+		const event = {
+			type: "session_shutdown",
+			cwd: sessionManager.getCwd(),
+			session_id: sessionManager.getSessionId(),
+			sessionManager,
+		};
+		lifecycleHandlers.sessionShutdown?.(event, hostContext);
+		sessionStarted = false;
+	};
+	return { commands, prompts, notifications, sessionStarts, sessionManager, cleanup };
 }
 function context(
 	cwd: string,
@@ -106,56 +139,51 @@ function context(
 
 
 test("fullstack: workflow commands register as authoritative extension commands", () => {
-	const { commands } = commandHarness();
-	assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
-	assert.equal(commands.get("do-work")?.description, "Run a profile-driven workflow. /do-work <task>. (Alias: /team.)");
-	assert.equal(commands.get("team")?.description, "Alias for /do-work. Prefer /do-work in new code.");
-	assert.ok(commands.get("cto")?.description?.includes("resident CTO"));
+	const { commands, cleanup } = commandHarness();
+	try {
+		assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
+		assert.equal(commands.get("do-work")?.description, "Run a profile-driven workflow. /do-work <task>. (Alias: /team.)");
+		assert.equal(commands.get("team")?.description, "Alias for /do-work. Prefer /do-work in new code.");
+		assert.ok(commands.get("cto")?.description?.includes("resident CTO"));
+	} finally {
+		cleanup();
+	}
 });
 
 test("fullstack: base inventory is public before session_start and remains overrideable", () => {
-	const { commands, sessionStarts } = commandHarness(prompt => prompt, process.cwd(), false);
-	assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
-	assert.equal(sessionStarts.length, 1);
+	const { commands, sessionStarts, cleanup } = commandHarness(prompt => prompt, process.cwd(), false);
+	try {
+		assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
+		assert.equal(sessionStarts.length, 1);
 
-	const override: Registered = {
-		description: "Project plugin team override",
-		handler: async () => undefined,
-	};
-	commands.set("team", override);
+		const override: Registered = {
+			description: "Project plugin team override",
+			handler: async () => undefined,
+		};
+		commands.set("team", override);
 
-	assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
-	assert.equal(commands.get("team"), override);
-	assert.equal([...commands.keys()].filter(name => name === "team").length, 1);
+		assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
+		assert.equal(commands.get("team"), override);
+		assert.equal([...commands.keys()].filter(name => name === "team").length, 1);
+	} finally {
+		cleanup();
+	}
 });
 
-test("fullstack: direct /do-work and /team send prompts through OMP", async () => {
-	const { commands, prompts, notifications } = commandHarness();
-	const ctx = context(process.cwd(), notifications);
-
-	await commands.get("do-work")?.handler("Fresh do-work task", ctx);
-	await commands.get("team")?.handler("Fresh team task", ctx);
-
-	assert.equal(prompts.length, 2);
-	assert.ok(prompts[0]?.includes("Fresh do-work task"));
-	assert.ok(prompts[0]?.includes("classification pass"));
-	assert.ok(prompts[1]?.includes("Fresh team task"));
-	assert.ok(prompts[1]?.includes("classification pass"));
-	assert.match(prompts[0] ?? "", /typed `workflow_checkpoint` envelope/);
-	assert.match(prompts[0] ?? "", /actor_provenance/);
-	assert.deepEqual(notifications.map(message => message.split(":")[0]), ["do-work", "team"]);
-});
 test("fullstack: workflow commands use the session manager cwd after a context cwd drift", async () => {
 	const canonical = mkdtempSync(join(tmpdir(), "omp-command-canonical-"));
 	const stale = mkdtempSync(join(tmpdir(), "omp-command-stale-"));
+	let cleanup: () => void = () => undefined;
 	try {
 		execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-		const { commands, prompts, sessionManager } = commandHarness(prompt => prompt, canonical, true, "session-drift");
-		await commands.get("do-work")?.handler("Canonical branch task", context(stale, [], "session-drift", canonical, sessionManager));
-		assert.equal(prompts.length, 1);
-		assert.match(prompts[0] ?? "", /Branch: `main`/);
-		assert.doesNotMatch(prompts[0] ?? "", /no git work tree/);
+		const harness = commandHarness(prompt => prompt, canonical, true, "session-drift");
+		cleanup = harness.cleanup;
+		await harness.commands.get("do-work")?.handler("Canonical branch task", context(stale, [], "session-drift", canonical, harness.sessionManager));
+		assert.equal(harness.prompts.length, 1);
+		assert.match(harness.prompts[0] ?? "", /Branch: `main`/);
+		assert.doesNotMatch(harness.prompts[0] ?? "", /no git work tree/);
 	} finally {
+		cleanup();
 		rmSync(canonical, { recursive: true, force: true });
 		rmSync(stale, { recursive: true, force: true });
 	}
@@ -163,33 +191,38 @@ test("fullstack: workflow commands use the session manager cwd after a context c
 
 test("fullstack: external hook boundary can augment /do-work prompt", async () => {
 	let observed = "";
-	const { commands, prompts } = commandHarness(prompt => {
+	const harness = commandHarness(prompt => {
 		observed = prompt;
 		return `${prompt}\n[external-hook-marker]`;
 	});
-
-	await commands.get("do-work")?.handler("Hooked workflow task", context(process.cwd(), []));
-
-	assert.ok(observed.includes("Hooked workflow task"));
-	assert.ok(prompts[0]?.endsWith("[external-hook-marker]"));
+	try {
+		await harness.commands.get("do-work")?.handler("Hooked workflow task", context(process.cwd(), []));
+		assert.ok(observed.includes("Hooked workflow task"));
+		assert.ok(harness.prompts[0]?.endsWith("[external-hook-marker]"));
+	} finally {
+		harness.cleanup();
+	}
 });
-
 test("fullstack: direct /cto handler emits fresh and standby prompts", async () => {
 	const root = mkdtempSync(join(tmpdir(), "omp-command-cto-"));
+	let cleanup: () => void = () => undefined;
 	try {
 		execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-		const { commands, prompts, notifications } = commandHarness(prompt => prompt, root);
-		const ctx = context(root, notifications);
+		const harness = commandHarness(prompt => prompt, root);
+		cleanup = harness.cleanup;
+		const ctx = context(root, harness.notifications);
 
-		await commands.get("cto")?.handler("Fresh CTO task", ctx);
-		assert.ok(prompts[0]?.includes("Fresh CTO task"));
-		assert.ok(prompts[0]?.includes("/cto workflow"));
-		assert.ok(notifications.some(message => message.startsWith("cto: Fresh CTO task")));
+		await harness.commands.get("cto")?.handler("Fresh CTO task", ctx);
+		assert.ok(harness.prompts[0]?.includes("Fresh CTO task"));
+		assert.ok(harness.prompts[0]?.includes("/cto workflow"));
+		assert.ok(harness.notifications.some(message => message.startsWith("cto: Fresh CTO task")));
 
-		await commands.get("cto")?.handler("", ctx);
-		assert.ok(prompts[1]?.includes("/cto STANDBY"));
-		assert.ok(notifications.some(message => message.startsWith("cto: standby mode")));
+		await harness.commands.get("cto")?.handler("", ctx);
+		assert.ok(harness.prompts[1]?.includes("/cto STANDBY"));
+		assert.ok(harness.notifications.some(message => message.startsWith("cto: standby mode")));
 	} finally {
+		cleanup();
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+

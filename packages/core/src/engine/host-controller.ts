@@ -1,6 +1,8 @@
 import {
   readRunControl,
+  readRunControlNoRecovery,
   readRunState,
+  readRunStateNoRecovery,
   restoreDispatchOrigins,
   selectSession,
   deactivateSessionSelection,
@@ -56,6 +58,12 @@ export interface WorkflowSessionController {
   readSelector(): WorkflowReadSelector;
   /** Current run explicitly bound by this session, if any; never performs CLI selection. */
   selectedRunId(): string | undefined;
+  /**
+   * Return the run whose canonical execution claim is still owned by this
+   * controller, or undefined when the binding is idle, replaced, released,
+   * or unreadable. This is a read-only proof and never repairs state.
+   */
+  activeClaimRunId(): string | undefined;
   /** Issue a one-shot opaque binding for an explicit user lifecycle command. */
   issueCommandIntent(mode: WorkflowCommandIntentMode, run_id?: string): WorkflowCommandIntent;
   /** Validate and reserve the issued binding before workflow_prepare mutates state. */
@@ -67,6 +75,29 @@ export interface WorkflowSessionController {
   prepare(request: WorkflowControllerPrepareRequest): PreparedWorkflowState;
   bind(runId: string, token?: string): void;
   release(receipt?: string): void;
+}
+
+function exactActiveClaim(
+  claim: unknown,
+  expectedOwnerKind: "workflow" | "cto",
+  runId: string,
+  token: string,
+  context: TrustedExecutionContext,
+): boolean {
+  if (!claim || typeof claim !== "object" || Array.isArray(claim)) return false;
+  const value = claim as Record<string, unknown>;
+  return value.owner_kind === expectedOwnerKind
+    && value.run_id === runId
+    && value.token === token
+    && typeof value.token === "string"
+    && value.token.length > 0
+    && value.coordinator_session_id === context.session_id
+    && value.coordinator_process_id === context.process_id
+    && value.released_at === null
+    && typeof value.ownership_epoch === "string"
+    && value.ownership_epoch.length > 0
+    && Array.isArray(value.worker_ids)
+    && value.worker_ids.every((workerId) => typeof workerId === "string" && workerId.length > 0);
 }
 
 function selectionRunId(
@@ -82,6 +113,7 @@ function selectionRunId(
 
 export function createWorkflowSessionController(options: WorkflowSessionControllerOptions): WorkflowSessionController {
   const cwd = options.cwd;
+  const expectedOwnerKind = options.owner_kind ?? "workflow";
   const trusted = structuredClone(options.context);
   assertTrustedExecutionContext(trusted);
   if (trusted.worktree !== cwd) {
@@ -92,6 +124,16 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
   let boundToken: string | undefined;
   let commandIntent: WorkflowCommandIntent | undefined;
   let consumedCommandIntentId: string | undefined;
+
+  function activeClaimRunId(): string | undefined {
+    if (!boundRunId || !boundToken) return undefined;
+    try {
+      const claim = readRunControlNoRecovery(cwd).execution_claim;
+      return exactActiveClaim(claim, expectedOwnerKind, boundRunId, boundToken, trusted) ? boundRunId : undefined;
+    } catch {
+      return undefined;
+    }
+  }
 
   function bindClaim(runId: string, token?: string): void {
     boundRunId = runId;
@@ -188,8 +230,11 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
     readSelector: () => selector,
     selectedRunId: () => {
       if (boundRunId) {
-        const state = readRunState(cwd, boundRunId);
-        if (!state || state.lifecycle_status === "complete" || state.pause?.kind === "done") {
+        const state = readRunStateNoRecovery(cwd, boundRunId);
+        if (!state) {
+          throw new LifecycleError("recovery_required", `bound workflow run '${boundRunId}' is missing or unreadable; recover lifecycle state before mutating`);
+        }
+        if (state.lifecycle_status === "complete" || state.pause?.kind === "done") {
           boundRunId = undefined;
           boundToken = undefined;
           try { deactivateSessionSelection(cwd, trusted.session_id); } catch { /* preserve history; fail closed */ }
@@ -197,15 +242,19 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
         }
         return boundRunId;
       }
-      const selection = readRunControl(cwd).selections[trusted.session_id];
+      const selection = readRunControlNoRecovery(cwd).selections[trusted.session_id];
       if (!selection?.active) return undefined;
-      const state = readRunState(cwd, selection.run_id);
-      if (!state || state.lifecycle_status === "complete" || state.pause?.kind === "done") {
+      const state = readRunStateNoRecovery(cwd, selection.run_id);
+      if (!state) {
+        throw new LifecycleError("recovery_required", `selected workflow run '${selection.run_id}' is missing or unreadable; recover lifecycle state before mutating`);
+      }
+      if (state.lifecycle_status === "complete" || state.pause?.kind === "done") {
         try { deactivateSessionSelection(cwd, trusted.session_id); } catch { /* preserve history; fail closed */ }
         return undefined;
       }
       return selection.run_id;
     },
+    activeClaimRunId,
     issueCommandIntent,
     consumeCommandIntent,
     commitCommandIntent,

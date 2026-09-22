@@ -34,14 +34,22 @@ interface RecordedCommand {
 
 type SessionStartHandler = (event: unknown, ctx: unknown) => unknown;
 
-function makePi() {
+function permissiveZod(): { z: unknown } {
+	const schema = new Proxy({}, { get: () => () => schema });
+	const z = new Proxy({}, { get: () => () => schema });
+	return { z };
+}
+
+function makePi(options: { tools?: boolean } = {}) {
 	const commands = new Map<string, RecordedCommand>();
 	const hooks = new Map<string, SessionStartHandler[]>();
 	const labels: string[] = [];
 	const tools: string[] = [];
+	const toolHandlers = new Map<string, unknown>();
 	const sent: string[] = [];
 	const errors: string[] = [];
 	const pi = {
+		...(options.tools ? { zod: permissiveZod() } : {}),
 		registerCommand(name: string, options: { description?: string; handler: RecordedCommand["handler"] }) {
 			commands.set(name, { name, ...options });
 		},
@@ -53,8 +61,9 @@ function makePi() {
 		setLabel(label: string) {
 			labels.push(label);
 		},
-		registerTool(tool: { name: string }) {
+		registerTool(tool: { name: string; execute?: unknown }) {
 			tools.push(tool.name);
+			if (tool.execute !== undefined) toolHandlers.set(tool.name, tool.execute);
 		},
 		sendUserMessage(content: string) {
 			sent.push(content);
@@ -66,6 +75,7 @@ function makePi() {
 		hooks,
 		labels,
 		tools,
+		toolHandlers,
 		sent,
 		errors,
 		/**
@@ -293,11 +303,11 @@ test("privateOmpOwnerForMarkedWorkspace issues the frozen identity only inside t
 	assert.throws(() => privateOmpOwnerForMarkedWorkspace(plain), /activation_markers_missing/);
 	assertUnclaimed(plain, "workflow_registration");
 });
-test("captured host admits ordinary no-run writes while preserving session and selected-run boundaries", () => {
+test("captured host admits ordinary no-run writes while preserving session and selected-run boundaries", async () => {
 	resetWorkflowOwners();
 	const root = markedRoot();
 	execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-	const host = makePi();
+	const host = makePi({ tools: true });
 	ompWorkflowsInternal(host.pi as never);
 
 	const hostContext = {
@@ -306,12 +316,19 @@ test("captured host admits ordinary no-run writes while preserving session and s
 		hasUI: true,
 		session_id: "trusted-host-session",
 		sessionManager: { getCwd: () => root, getSessionId: () => "trusted-host-session" },
+		ui: { notify() {} },
 	};
+	host.fireSessionStart(hostContext);
+	// The production host publishes the core session_start handlers before
+	// dispatching the lifecycle event. The harness activation above publishes
+	// them during that dispatch, so replay the same authoritative ingress once
+	// to exercise the complete registered workflow_prepare path.
 	host.fireSessionStart(hostContext);
 	const rawHostContext = { sessionManager: hostContext.sessionManager };
 	const writeEvent = (path: string) => ({ toolName: "write", input: { path, content: "{}" } });
+	const hookResults = (ctx: unknown, path: string): unknown[] => host.fireToolCall(writeEvent(path), ctx);
 	const hasBlock = (ctx: unknown, path: string): boolean =>
-		host.fireToolCall(writeEvent(path), ctx).some(
+		hookResults(ctx, path).some(
 			(result) => Boolean(result && typeof result === "object" && "block" in result && result.block === true),
 		);
 
@@ -348,48 +365,35 @@ test("captured host admits ordinary no-run writes while preserving session and s
 		);
 	}
 
-	const selectedRunId = "11111111-1111-4111-8111-111111111111";
-	const target = runTarget(root, selectedRunId);
-	mkdirSync(target.stateDir, { recursive: true });
-	mkdirSync(target.artifactsDir, { recursive: true });
-	writeFileSync(target.statePath, JSON.stringify({
-		schema: 2,
-		run_id: selectedRunId,
-		run_key: selectedRunId,
-		lifecycle_status: "active",
-		rework_generation: 0,
-		branch: "main",
-		title: "selected run",
-		task: "selected run",
-		classification: {
-			type: "FEATURE",
-			complexity: "QUICK",
-			confidence: "HIGH",
-			autonomous: false,
-			workflow: "lightweight",
-		},
-		workflow_override: false,
-		issue: null,
-		required_inputs: {},
-		required_input_receipts: {},
-		stage_cursor: "",
-		stages: [],
-		artifacts: {},
-		scope: {},
-		policy: { strict_orchestrator: true },
-		pause: { kind: "none", reason: "" },
-	}));
-	writeFileSync(controlPath, JSON.stringify({
-		...emptyControl,
-		selections: {
-			[hostContext.session_id]: {
-				run_id: selectedRunId,
-				branch: "main",
-				selected_at: "2026-09-21T00:00:00.000Z",
-				active: true,
+	const executePrepare = host.toolHandlers.get("workflow_prepare") as
+		| ((id: string, params: unknown, signal: unknown, update: unknown, ctx: unknown) => Promise<unknown>)
+		| undefined;
+	assert.equal(typeof executePrepare, "function", "workflow_prepare must be registered for selected-run authority");
+	const prepared = await executePrepare!(
+		"namespace-captured-host-prepare",
+		{
+			mode: "new",
+			task: "selected host run",
+			classification: {
+				type: "FEATURE" as const,
+				complexity: "QUICK" as const,
+				confidence: "HIGH" as const,
+				autonomous: false,
+				workflow: "lightweight",
 			},
 		},
-	}));
+		undefined,
+		undefined,
+		hostContext,
+	);
+	const preparedDetails = (prepared as { details?: { ok?: boolean; artifacts_dir?: string; state?: { run_id?: string } } }).details;
+	assert.equal(preparedDetails?.ok, true, JSON.stringify(prepared));
+	const selectedRunId = preparedDetails?.state?.run_id;
+	assert.equal(typeof selectedRunId, "string", JSON.stringify(prepared));
+	assert.equal(readRunControl(root).execution_claim?.run_id, selectedRunId);
+	assert.equal(typeof preparedDetails?.artifacts_dir, "string", JSON.stringify(prepared));
+	mkdirSync(preparedDetails?.artifacts_dir as string, { recursive: true });
+	const target = runTarget(root, selectedRunId as string);
 	for (const mismatch of [
 		{ field: "session_id", context: { ...rawHostContext, session_id: "foreign-session" } },
 		{ field: "sessionId", context: { ...rawHostContext, sessionId: "foreign-session" } },
@@ -400,7 +404,26 @@ test("captured host admits ordinary no-run writes while preserving session and s
 			`copied captured manager with mismatched ${mismatch.field} cannot use selected controller/proof admission`,
 		);
 	}
-	assert.equal(hasBlock(rawHostContext, join(target.artifactsDir, "discovery.json")), false, "selected runs retain the artifact-proof write path");
+	const selectedArtifactHookResults = hookResults(rawHostContext, join(target.artifactsDir, "discovery.json"));
+	const selectedClaim = readRunControl(root).execution_claim;
+	assert.equal(
+		selectedArtifactHookResults.some(
+			(result) => Boolean(result && typeof result === "object" && "block" in result && result.block === true),
+		),
+		false,
+		JSON.stringify({
+			prepareRunId: selectedRunId,
+			prepareSessionId: hostContext.session_id,
+			claim: selectedClaim
+				? {
+					runId: selectedClaim.run_id,
+					sessionId: selectedClaim.coordinator_session_id,
+					hasToken: typeof selectedClaim.token === "string" && selectedClaim.token.length > 0,
+				}
+				: null,
+			hookResults: selectedArtifactHookResults,
+		}),
+	);
 	assert.equal(hasBlock(rawHostContext, join(root, "src", "selected.ts")), true, "selected orchestrator writes remain artifact-scoped");
 
 	const foreignContext = {

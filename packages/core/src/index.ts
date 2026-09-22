@@ -49,7 +49,7 @@ import { createWorkflowSessionController, type WorkflowSessionController } from 
 import { createWorkflowReadSelector } from "./engine/read-selector.js";
 import { readDispatchOriginLocator, rememberDispatchOriginLocator } from "./dispatch-origin-locator.js";
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
-import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, readRunControl, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, type DispatchOrigin } from "./engine/run-store.js";
+import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, readRunControl, readRunControlNoRecovery, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, type DispatchOrigin } from "./engine/run-store.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector } from "./engine/types.js";
 import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
 import { createNativeWorkerAuthority, type NativeWorkerResolution } from "./native-worker-authority.js";
@@ -708,6 +708,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   const resolveCwd = opts.resolveCwd ?? resolveCwdFromContext;
   const nativeWorkerAuthority = createNativeWorkerAuthority(pi.events, { bundleLabel: label });
   const resolverConfigured = typeof opts.resolveTrustedToolCallActor === "function";
+  const controllerConfigured = typeof opts.getSessionController === "function";
   const bindSession = (ctx: unknown): void => {
     const cwd = opts.cwd ?? resolveCwd(ctx);
     if (!cwd) return;
@@ -719,8 +720,10 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   pi.on("session_start", (_event, ctx: unknown) => {
     nativeWorkerAuthority.observeSessionStart(ctx);
   });
-  pi.on("session_stop", () => {
-    nativeWorkerAuthority.teardown();
+  // Idle session_stop must retain native worker grants. Only the host's
+  // parent-scoped shutdown proof may revoke this owner's bindings.
+  pi.on("session_shutdown", (_event: unknown, ctx: unknown) => {
+    nativeWorkerAuthority.observeSessionShutdown(ctx);
   });
   pi.on("tool_execution_start", (event, ctx: unknown) => {
     nativeWorkerAuthority.observeToolExecutionStart(event, ctx);
@@ -743,12 +746,15 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     let admissionResolutionFailed = false;
     let sharedController: WorkflowSessionController | undefined;
     let selectedRunId: string | undefined;
+    let activeClaimRunId: string | undefined;
     if (admissionCwd) {
       try {
         const controller = opts.getSessionController?.(ctx, admissionCwd);
         const resolvedRunId = controller?.selectedRunId();
+        const resolvedActiveClaimRunId = controller?.activeClaimRunId();
         sharedController = controller;
         selectedRunId = resolvedRunId;
+        activeClaimRunId = resolvedActiveClaimRunId;
       } catch {
         admissionResolutionFailed = true;
       }
@@ -765,10 +771,10 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     const gateContext = admissionCwd
       ? { ...c, cwd: admissionCwd, ...(trustedRunId ? { run_id: trustedRunId } : {}) }
       : undefined;
-
-    // A configured bundle resolver is the sole authority for raw tool calls.
-    // Model/tool actor fields and legacy hasUI are never credentials; the
-    // legacy actor path is retained only for bundles without a resolver.
+    // A configured bundle resolver/controller is the sole authority for raw
+    // tool calls. Model/tool actor fields and legacy hasUI are never
+    // credentials; the legacy actor path is retained only without either
+    // trusted contract.
     const explicitActor = c.actor === "orchestrator" || c.actor === "worker" || c.actor === "lead"
       ? c.actor
       : undefined;
@@ -783,6 +789,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     let trustedProof: TrustedOrchestratorWriteProof | undefined;
     if (
       !admissionResolutionFailed
+      && controllerConfigured
       && !nativeActor
       && adaptedActor
       && "actor" in adaptedActor
@@ -791,6 +798,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       && adaptedActor.artifactsDir.length > 0
       && admissionCwd
       && selectedRunId
+      && activeClaimRunId === selectedRunId
     ) {
       try {
         const expectedArtifactsDir = runTarget(admissionCwd, selectedRunId).artifactsDir;
@@ -818,14 +826,15 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       && admissionCwd
     ) {
       try {
-        authenticatedInteractiveHostNoRun = readRunControl(admissionCwd).execution_claim === null;
+        authenticatedInteractiveHostNoRun = readRunControlNoRecovery(admissionCwd).execution_claim === null;
       } catch {
         authenticatedInteractiveHostNoRun = false;
       }
     }
+    const actorAuthorityConfigured = resolverConfigured || controllerConfigured;
     const trustedActor = admissionResolutionFailed
       ? undefined
-      : nativeActor?.actor ?? (resolverConfigured ? adaptedTrustedActor : explicitActor);
+      : nativeActor?.actor ?? (actorAuthorityConfigured ? adaptedTrustedActor : explicitActor);
     const { actor: _runtimeActor, ...writeGateBase } = gateContext ?? {};
     const writeGateContext = gateContext
       ? {
@@ -833,9 +842,9 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         cwd: gateContext.cwd,
         ...(trustedActor ? { actor: trustedActor } : {}),
         ...(trustedProof ? { [TRUSTED_ORCHESTRATOR_WRITE_PROOF]: trustedProof } : {}),
-        // A configured resolver owns all raw-context authority; bare actor and
-        // hasUI fields never infer a worker after adapter failure.
-        ...(resolverConfigured && !trustedActor ? { hasUI: undefined } : {}),
+        // A configured resolver/controller owns all raw-context authority;
+        // bare actor and hasUI fields never infer a worker after failure.
+        ...(actorAuthorityConfigured && !trustedActor ? { hasUI: undefined } : {}),
         }
       : undefined;
     let result: { block?: boolean; reason?: string } | undefined;
@@ -868,11 +877,24 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     }
     if (
       !result
-      && resolverConfigured
+      && actorAuthorityConfigured
       && !trustedActor
       && !authenticatedInteractiveHostNoRun
       && !lifecycleDeviceWrite
       && (event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")
+    ) {
+      run({ block: true, reason: "trusted host actor unavailable" });
+    }
+    if (
+      !result
+      && event.toolName === "task"
+      && actorAuthorityConfigured
+      && !nativeActor
+      && !trustedActor
+      && (
+        !sharedController
+        || (selectedRunId !== undefined && activeClaimRunId !== selectedRunId)
+      )
     ) {
       run({ block: true, reason: "trusted host actor unavailable" });
     }
@@ -1090,13 +1112,7 @@ interface HostAskSurface {
 /**
  * Authoritative host session identity captured from the session_start event
  * context. The installed host emits session_start only after the extension
- * runner is initialized with the runtime mode (`ExtensionMode` = "tui" |
- * "rpc" | "json" | "print") and the mode's UI context, so this profile is
- * the authoritative host mode: interactive TUI sessions report mode "tui"
- * with a live dialog UI, `--mode rpc`/`--mode rpc-ui` sessions report mode
- * "rpc" with the connected RPC client's UI (live select bridge, no
- * askDialog), while print/json runs and Task subagent sessions report mode
- * "print" with no UI.
+ * runner is initialized with the runtime mode and UI context.
  */
 interface HostSessionProfile {
   mode: string;
@@ -1104,7 +1120,43 @@ interface HostSessionProfile {
   ui: unknown;
   session_id?: string;
   cwd?: string;
+  session_manager?: object;
 }
+
+type HostSessionIdentity = {
+  session_id?: string;
+  cwd?: string;
+  session_manager?: object;
+};
+
+function hostSessionIdentityFromContext(ctx: unknown): HostSessionIdentity {
+  if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return {};
+  const value = ctx as { sessionManager?: unknown };
+  return {
+    ...(sessionIdFromContext(ctx) ? { session_id: sessionIdFromContext(ctx) } : {}),
+    ...(resolveCwdFromContext(ctx) ? { cwd: resolveCwdFromContext(ctx) } : {}),
+    ...(value.sessionManager && typeof value.sessionManager === "object" ? { session_manager: value.sessionManager } : {}),
+  };
+}
+
+function sameHostSessionIdentity(left: HostSessionIdentity, right: HostSessionIdentity): boolean {
+  if (left.session_manager && left.session_manager !== right.session_manager) return false;
+  if (left.session_id && left.session_id !== right.session_id) return false;
+  if (left.cwd && !right.cwd) return false;
+  if (left.cwd && right.cwd) {
+    try {
+      if (resolve(left.cwd) !== resolve(right.cwd)) return false;
+    } catch {
+      return false;
+    }
+  }
+  return Boolean(
+    (left.session_manager && right.session_manager)
+    || (left.session_id && right.session_id)
+    || (left.cwd && right.cwd),
+  );
+}
+
 
 type WorkflowToolResult = { content: [{ type: "text"; text: string }]; details: unknown };
 type LifecycleBoundaryError = LifecycleError & { candidates?: readonly unknown[]; snapshot?: unknown };
@@ -1211,31 +1263,88 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   // final values.
   let hostSession: HostSessionProfile | null = null;
   let sessionController: WorkflowSessionController | null = null;
+  let lifecycleRevoked = false;
   if (typeof (pi as { on?: unknown }).on === "function") {
     pi.on("session_start", (_event: unknown, ctx: unknown) => {
-      const c = ctx as { mode?: unknown; hasUI?: unknown; ui?: unknown; cwd?: unknown; session_id?: unknown; sessionId?: unknown } | undefined;
+      const c = ctx as { mode?: unknown; hasUI?: unknown; ui?: unknown } | undefined;
       const incomingMode = typeof c?.mode === "string" ? c.mode : "print";
       const incomingHasUI = c?.hasUI === true;
       const incomingTrusted = incomingHasUI && (incomingMode === "tui" || incomingMode === "rpc");
-      const currentTrusted = hostSession !== null
-        && hostSession.hasUI
-        && (hostSession.mode === "tui" || hostSession.mode === "rpc");
-      // Task workers and print sessions can emit lifecycle starts through the
-      // same extension runner. They must not replace an already-bound host
-      // session; a trusted interactive start still has the host's historical
-      // replacement semantics.
-      if (currentTrusted && !incomingTrusted) return;
-      const cwd = typeof c?.cwd === "string" ? c.cwd : options.cwd;
-      const sessionId = typeof c?.session_id === "string" ? c.session_id : typeof c?.sessionId === "string" ? c.sessionId : undefined;
+      const incomingIdentity = hostSessionIdentityFromContext(ctx);
+      const cwd = options.cwd ?? incomingIdentity.cwd;
+      const sessionId = incomingIdentity.session_id;
+      const controllerContext = (() => {
+        try { return sessionController?.context(); } catch { return undefined; }
+      })();
+      const currentIdentity: HostSessionIdentity = {
+        ...(hostSession?.session_id ? { session_id: hostSession.session_id } : controllerContext?.session_id ? { session_id: controllerContext.session_id } : {}),
+        ...(hostSession?.cwd ? { cwd: hostSession.cwd } : controllerContext?.worktree ? { cwd: controllerContext.worktree } : {}),
+        ...(hostSession?.session_manager ? { session_manager: hostSession.session_manager } : {}),
+      };
+      const sameIdentity = hostSession !== null && sameHostSessionIdentity(currentIdentity, incomingIdentity);
+      let incomingController: WorkflowSessionController | null = null;
+      if (cwd) {
+        try {
+          incomingController = options.getSessionController?.(ctx, cwd) ?? null;
+          if (incomingController) {
+            const incomingControllerContext = incomingController.context();
+            if (
+              (incomingIdentity.session_id && incomingControllerContext.session_id !== incomingIdentity.session_id)
+              || (incomingIdentity.cwd && resolve(incomingControllerContext.worktree) !== resolve(incomingIdentity.cwd))
+            ) incomingController = null;
+          }
+        } catch {
+          incomingController = null;
+        }
+      }
+      let requireFreshController = lifecycleRevoked;
+      // A headless worker/print start may share the extension runner with the
+      // interactive host. It is ignored when foreign, but a same-identity
+      // headless transition revokes the retained interactive claim.
+      if (hostSession && !sameIdentity) {
+        if (!incomingTrusted) return;
+        if (options.getSessionController && !incomingController) return;
+        requireFreshController = true;
+        try {
+          sessionController?.release("host-session-replaced");
+        } catch {
+          // Canonical ownership remains untouched; local authority is still
+          // revoked below so a failed release cannot authorize this process.
+        }
+        sessionController = null;
+        hostSession = null;
+        lifecycleRevoked = true;
+      }
+      if (hostSession && sameIdentity && !incomingTrusted) {
+        requireFreshController = true;
+        try {
+          sessionController?.release("host-session-unavailable");
+        } catch {
+          // Canonical ownership remains untouched; local authority is still
+          // revoked below.
+        }
+        sessionController = null;
+        lifecycleRevoked = true;
+        hostSession = {
+          mode: incomingMode,
+          hasUI: incomingHasUI,
+          ui: c?.ui,
+          ...(sessionId ? { session_id: sessionId } : {}),
+          ...(cwd ? { cwd } : {}),
+          ...(incomingIdentity.session_manager ? { session_manager: incomingIdentity.session_manager } : {}),
+        };
+        return;
+      }
       hostSession = {
         mode: incomingMode,
         hasUI: incomingHasUI,
         ui: c?.ui,
         ...(sessionId ? { session_id: sessionId } : {}),
         ...(cwd ? { cwd } : {}),
+        ...(incomingIdentity.session_manager ? { session_manager: incomingIdentity.session_manager } : {}),
       };
-      sessionController = cwd ? options.getSessionController?.(ctx, cwd) ?? null : null;
-      if (!sessionController && !options.getSessionController && sessionId && cwd && hostSession.hasUI && (hostSession.mode === "tui" || hostSession.mode === "rpc")) {
+      sessionController = incomingController ?? (sameIdentity ? sessionController : null);
+      if (!sessionController && !options.getSessionController && sessionId && cwd && incomingTrusted) {
         try {
           const branch = resolveActiveBranch(cwd);
           const context: TrustedExecutionContext = { session_id: sessionId, caller: "host", process_id: process.pid, worktree: cwd, branch, authority: "coordinator" };
@@ -1244,21 +1353,60 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
           sessionController = null;
         }
       }
+      if (incomingTrusted && requireFreshController && sessionController) {
+        try {
+          if (sessionController.activeClaimRunId() !== undefined) {
+            sessionController = null;
+            lifecycleRevoked = true;
+            hostSession = { ...hostSession, mode: incomingMode, hasUI: false, ui: undefined };
+            return;
+          }
+        } catch {
+          sessionController = null;
+          lifecycleRevoked = true;
+          hostSession = { ...hostSession, mode: incomingMode, hasUI: false, ui: undefined };
+          return;
+        }
+      }
+      if (incomingTrusted) lifecycleRevoked = false;
     });
-    pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
+    const lifecycleIdentity = (event: unknown, ctx: unknown): HostSessionIdentity => ({
+      ...(sessionIdFromContext(event) ? { session_id: sessionIdFromContext(event) } : sessionIdFromContext(ctx) ? { session_id: sessionIdFromContext(ctx) } : {}),
+      ...(resolveCwdFromContext(ctx) ? { cwd: resolveCwdFromContext(ctx) } : resolveCwdFromContext(event) ? { cwd: resolveCwdFromContext(event) } : {}),
+      ...(hostSessionIdentityFromContext(ctx).session_manager ? { session_manager: hostSessionIdentityFromContext(ctx).session_manager } : hostSessionIdentityFromContext(event).session_manager ? { session_manager: hostSessionIdentityFromContext(event).session_manager } : {}),
+    });
+    const controllerIdentity = (): HostSessionIdentity => {
       const controllerContext = (() => {
         try { return sessionController?.context(); } catch { return undefined; }
       })();
-      const expectedSessionId = hostSession?.session_id ?? controllerContext?.session_id;
-      const stoppedSessionId = sessionIdFromContext(event) ?? sessionIdFromContext(ctx);
-      // OMP may route a worker/foreign stop through the same extension runner.
-      // An explicit identity is authoritative; an absent identity remains
-      // accepted for older direct harnesses that supplied no event context.
-      if (stoppedSessionId && (!expectedSessionId || stoppedSessionId !== expectedSessionId)) return;
-      const expectedCwd = hostSession?.cwd ?? controllerContext?.worktree;
-      const stoppedCwd = resolveCwdFromContext(ctx);
-      if (stoppedCwd && (!expectedCwd || resolve(stoppedCwd) !== resolve(expectedCwd))) return;
-      try { sessionController?.release("host-session-stop"); } finally { sessionController = null; hostSession = null; }
+      return {
+        ...(hostSession?.session_id ? { session_id: hostSession.session_id } : controllerContext?.session_id ? { session_id: controllerContext.session_id } : {}),
+        ...(hostSession?.cwd ? { cwd: hostSession.cwd } : controllerContext?.worktree ? { cwd: controllerContext.worktree } : {}),
+        ...(hostSession?.session_manager ? { session_manager: hostSession.session_manager } : {}),
+      };
+    };
+    pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
+      const stopped = lifecycleIdentity(event, ctx);
+      if (!stopped.session_id || !stopped.cwd || !sameHostSessionIdentity(controllerIdentity(), stopped)) return;
+      try {
+        sessionController?.release("host-session-stop");
+      } catch {
+        // Preserve identity and selection when canonical ownership is
+        // unreadable or has changed; never hide a live conflict.
+      }
+    });
+    pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
+      const stopped = lifecycleIdentity(event, ctx);
+      if (!stopped.session_id || !stopped.cwd || !sameHostSessionIdentity(controllerIdentity(), stopped)) return;
+      lifecycleRevoked = true;
+      try {
+        sessionController?.release("host-session-shutdown");
+      } catch {
+        // Canonical ownership remains untouched; local authority is revoked.
+      } finally {
+        sessionController = null;
+        hostSession = null;
+      }
     });
   }
   /**
@@ -1270,9 +1418,12 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   const trustedInteractiveProfile = (): HostSessionProfile | null =>
     hostSession !== null && hostSession.hasUI && (hostSession.mode === "tui" || hostSession.mode === "rpc") ? hostSession : null;
   const contextError = (ctx: unknown): WorkflowToolResult | null => {
+    if (lifecycleRevoked) {
+      return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "workflow host lifecycle identity was revoked; wait for a new trusted session_start" });
+    }
     // Session ownership: the captured host profile is authoritative. The
-    // per-call context cannot make this call — a plain-rpc main session and
-    // a Task subagent report identical tool contexts (hasUI=false, no ui).
+    // per-call context cannot make this call — a plain-rpc main session and a
+    // Task subagent report identical tool contexts (hasUI=false, no ui).
     // The bundle callback (or the legacy per-call heuristic) decides only
     // when no session_start profile was captured.
     const ownsTools = hostSession !== null
@@ -1314,6 +1465,23 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     const branch = resolveActiveBranch(cwd);
     sessionController = createWorkflowSessionController({ cwd, context: { session_id: sessionId, caller: "host", process_id: process.pid, worktree: cwd, branch, authority: "coordinator" } });
     return sessionController;
+  };
+  const requireActiveClaimForMutation = (controller: WorkflowSessionController, expectedRunId?: string): WorkflowToolResult | null => {
+    try {
+      const selectedRunId = controller.selectedRunId();
+      if (!selectedRunId) {
+        if (!expectedRunId) return null;
+      } else if ((!expectedRunId || selectedRunId === expectedRunId) && controller.activeClaimRunId() === selectedRunId) {
+        return null;
+      }
+    } catch {
+      // A canonical read error is not evidence of authority.
+    }
+    return toolResult({
+      ok: false,
+      code: "WORKFLOW_CONTEXT_REJECTED",
+      error: "a workflow run is selected but this session does not hold its active execution claim; call workflow_prepare to rebind",
+    });
   };
   const classificationParameters = z.object({
     type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"]),
@@ -1447,9 +1615,13 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         // workflow_begin fails closed; it never silently selects the
         // persisted mapping.
         const controller = controllerFor(ctx, cwd);
+        const claimDenied = requireActiveClaimForMutation(controller);
+        if (claimDenied) return claimDenied;
         const runId = controller.selectedRunId();
         if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
         const handoff = await options.beforeBegin?.(cwd);
+        const claimAfterHandoff = requireActiveClaimForMutation(controller, runId);
+        if (claimAfterHandoff) return claimAfterHandoff;
         const trustedMapping = handoff === undefined ? undefined : handoff as unknown as AgentMappingState;
         const transition = beginCapability(cwd, input.selection, { ...(trustedMapping !== undefined ? { trustedMapping } : {}), runId });
         if (!transition.ok) return toolResult({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? workflowStateSummary(cwd, options.mappingSummary, runId) : undefined });
@@ -1533,6 +1705,8 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       const input = params as DispatchAuth & { dispatch_id: string; evidence: string; artifact_ids?: string[]; outcome: "succeeded" | "failed" | "cancelled" };
       try {
         const controller = controllerFor(ctx, cwd);
+        const claimDenied = requireActiveClaimForMutation(controller);
+        if (claimDenied) return claimDenied;
         const runId = controller.selectedRunId();
         if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
         const transition = completeDispatch(cwd, { ...input, completed_by: "workflow_complete" }, { runId });
@@ -1594,8 +1768,13 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       };
       try {
         const controller = controllerFor(ctx, cwd);
-        const runId = input.run_id ?? controller.selectedRunId();
-        if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
+        const claimDenied = requireActiveClaimForMutation(controller);
+        if (claimDenied) return claimDenied;
+        const selectedRunId = controller.selectedRunId();
+        const runId = input.run_id ?? selectedRunId;
+        if (input.run_id && input.run_id !== selectedRunId) {
+          return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "checkpoint run_id must match the selected run held by this session's active execution claim" });
+        }
         const transition = recordCheckpointDecision(cwd, { ...input, run_id: runId });
         return transition.ok
           ? toolResult({ ok: true, transition: "checkpoint", checkpoint: input.checkpoint, state: workflowStateSummary(cwd, options.mappingSummary, runId) })
@@ -1644,7 +1823,12 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         run_id?: string;
       };
       const controller = controllerFor(ctx, cwd);
+      const claimDenied = requireActiveClaimForMutation(controller);
+      if (claimDenied) return claimDenied;
       const selectedRunId = input.run_id ?? controller.selectedRunId();
+      if (input.run_id && input.run_id !== controller.selectedRunId()) {
+        return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "checkpoint run_id must match the selected run held by this session's active execution claim" });
+      }
       if (!selectedRunId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
       const scopedInput = { ...input, run_id: selectedRunId };
       const abortedResult = () => toolResult({
@@ -1792,6 +1976,8 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         // ledger write), so a canceled call can never reach the ledger past
         // this point.
         if (signal?.aborted) return abortedResult();
+        const claimBeforeCommit = requireActiveClaimForMutation(controller, selectedRunId);
+        if (claimBeforeCommit) return claimBeforeCommit;
         // One engine-owned durable commit: commitCheckpointAnswer re-runs the
         // full state<->capability<->profile<->policy validation against the
         // freshly persisted state inside a cross-process lock+CAS
@@ -1886,9 +2072,13 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         // undefined keeps the persisted mapping; runtime null or a value
         // failing the engine's structural gate fails the advance closed.
         const controller = controllerFor(ctx, cwd);
+        const claimDenied = requireActiveClaimForMutation(controller);
+        if (claimDenied) return claimDenied;
         const runId = controller.selectedRunId();
         if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
         const handoff = await options.beforeBegin?.(cwd);
+        const claimAfterHandoff = requireActiveClaimForMutation(controller, runId);
+        if (claimAfterHandoff) return claimAfterHandoff;
         const trustedMapping = handoff === undefined ? undefined : handoff as unknown as AgentMappingState;
         const transition = advanceCursor(cwd, input, { ...(trustedMapping !== undefined ? { trustedMapping } : {}), runId });
         return transition.ok

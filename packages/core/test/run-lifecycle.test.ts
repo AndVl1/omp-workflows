@@ -15,10 +15,11 @@ import {
   readRunControl,
   readRunState,
   resolveRunSelection,
+  resolveLifecycleIntent,
   selectRunCandidate,
   resumeCanonicalRun,
-  acquireExecutionClaim,
   handoverExecutionClaim,
+  acquireExecutionClaim,
   releaseExecutionClaim,
   beginLifecycleTransaction,
   recoverLifecycleTransactions,
@@ -185,6 +186,26 @@ function prepareOptions(root: string, task: string, requestId: string, execution
     execution,
   };
 }
+
+test("lifecycle intent is anchored, history-independent, and explicit-mode first", () => {
+  assert.deepEqual(resolveLifecycleIntent({ text: "/do-work продолжи фичу" }), {
+    mode: "resume",
+    source: "natural_language",
+  });
+  assert.deepEqual(resolveLifecycleIntent({ text: "resume the previous feature" }), {
+    mode: "resume",
+    source: "natural_language",
+  });
+  assert.equal(resolveLifecycleIntent({ text: "Add a Continue button" }).source, "default");
+  assert.equal(resolveLifecycleIntent({ text: "Fix login bug" }).source, "default");
+  assert.equal(resolveLifecycleIntent({ text: "fix the previous login result" }).mode, "rework");
+  assert.equal(resolveLifecycleIntent({ text: "rework previous result" }).mode, "rework");
+  assert.equal(resolveLifecycleIntent({ text: "revise project" }).source, "default");
+  assert.equal(resolveLifecycleIntent({ text: "доработай задачу" }).source, "default");
+  assert.equal(resolveLifecycleIntent({ text: "доработай предыдущую реализацию" }).mode, "rework");
+  assert.equal(resolveLifecycleIntent({ text: "продолжи фичу", mode: "new" }).source, "explicit");
+  assert.equal(resolveLifecycleIntent({ text: "продолжи фичу", mode: "new" }).mode, "new");
+});
 
 test("explicit terminal resume is run_terminal and never falls back", () => {
   const terminal = candidate("11111111-1111-4111-8111-111111111111", "Finished export", "complete");

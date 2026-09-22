@@ -48,7 +48,7 @@ function loadTeamConfig(cwd: string): WorkTeamConfig {
   };
 }
 const RESUME_FROM_DISK_STEPS = [
-  "**Prepare** — call `workflow_prepare` once with the PHASE-0 classification, exact canonical branch, changed files, and issue metadata. On a matching branch, continue the existing run; preserve its task, classification, stage history, artifact IDs, and capability/dispatch identities instead of creating or resetting state.",
+  "**Prepare** — for resume/rework, resolve the existing run before mutation and call `workflow_prepare` with the exact typed selector when available, plus feedback/affected stage when applicable, and the captured canonical branch; do not reclassify or create a new state. Preserve the selected run's task, classification, stage history, artifact IDs, and capability/dispatch identities instead of resetting state.",
   "**Read instructions and compose selection** — after preparation succeeds, call `workflow_instructions` BEFORE `workflow_begin` and read the current stage contract (`stage.instructions`, `roles`, `consumes`, `produces`, `artifact_schemas`, `checkpoint`/`gate`, `provenance`, and `state.artifactsDir`). When the stage declares a `roster_policy`, its role list is an ALLOWED POOL, not a fixed one-agent-per-role recipe: compose the dispatch yourself as 1..N semantic occurrences (`role` plus optional `facet`/`focus`/`reason`) drawn only from `allowed_roles`, within `min_workers`/`max_workers` and per-role `multiplicity`. Repeat a role for parallel facets (for example distinct architecture options) and keep the composition situational — task size, risk triggers, and confidence decide whether one agent suffices. NEVER pass concrete agent ids: agent resolution belongs to the live registered mapping, and a missing, disabled, or mismatched registration fails closed.",
   "**Resolve and validate begin** — call `workflow_begin` (passing the semantic selection for roster stages), then validate the returned current stage, cursor epoch, frozen `roster_selection`, and workflow against the persisted state. Reject stale, missing, or mismatched selection; never guess a stage from prompt text or a filesystem path. The selection freezes at first issuance: re-issuing the identical semantic selection is idempotent, and a changed selection for an active capability is rejected — continue with the frozen composition or finish the stage first.",
   "**Freeze snapshot/capability** — treat the `workflow_begin` handoff as the immutable run snapshot (run key, profile hash, capability identity, cursor, epoch, and dispatch markers), and re-read `workflow_instructions` so the returned contract — not disk or memory — is the only workflow instruction source; do not reconstruct schemas or profile data from disk.",
@@ -83,8 +83,43 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
       "Do not discard or overwrite completed artifacts unless the reopened stage produces a replacement artifact.",
     ].join("\n");
   }
+  const continuationMode = envelope.mode === "resume" || envelope.mode === "rework";
+  const lifecycleSelection = continuationMode
+    ? [
+      "### Lifecycle selection (before new-task PHASE-0)",
+      `Resolve the ${envelope.mode} target before any new-task classification; preserve the selected run's canonical task, classification, cursor, artifacts, and dispatch identities.`,
+      envelope.mode === "resume"
+        ? envelope.run_id
+          ? "Use the supplied run selector in the first `workflow_prepare` call; do not reinterpret it from task wording."
+          : "For resume without a selector (for example generic `продолжи фичу`), call the existing `workflow_prepare` directly with `{ mode: \"resume\" }`; classification is optional at this lifecycle boundary."
+        : "For rework without a selector, call `workflow_prepare` with `{ mode: \"rework\", feedback: <user feedback> }`; classification is optional at this lifecycle boundary.",
+      "If the request names a specific prior run, include a typed `selector.title` in that first call; when the user selects a displayed item, include its typed `selector.list_item` snapshot/index/run_id in the first call. Never prepare against a retained/current selection and parse a named target afterward.",
+      "Consume the typed `candidates` and `next_action` from a selection result. If selection is required, ask one ordinary same-turn question (not a `required_human` checkpoint or `workflow_checkpoint_ask`), then retry `workflow_prepare` with the selected typed title or list item.",
+    ]
+    : [
+      "### Lifecycle selection",
+      "No lifecycle mode was frozen at ingress. Treat an ordinary task as a new workflow; do not use the presence of history to change that decision. Only strong, explicit continuation wording may select resume or rework.",
+    ];
+  const lifecyclePreparation = continuationMode
+    ? [
+      "Call `workflow_prepare` for the selected resume/rework lifecycle before any new-task PHASE-0 classification. Preserve the canonical state and omit classification unless the tool contract explicitly requires it; never create a replacement run for a continuation.",
+      "`workflow_prepare` is the ONLY supported state initialization/update path: do not call `write`, `edit`, `bash`, or any filesystem API to create or modify `.work-state` files. It revalidates the captured branch and typed selector atomically.",
+      "If `workflow_prepare` fails, stop and record the structured typed error — never guess a state path or repair canonical state by hand.",
+    ]
+    : [
+      buildClassificationPhaseZero({ label: "leading directive", value: envelope.autonomyHint }),
+      "",
+      buildWorkflowMatrix(),
+      "",
+      "After PHASE-0 classification, call `workflow_prepare` with the task, the captured canonical branch, the classification object, changed file paths, and issue metadata.",
+      "`workflow_prepare` is the ONLY supported state initialization/update path: do not call `write`, `edit`, `bash`, or any filesystem API to create or modify `.work-state` files. It persists the classification, resolved workflow, task, branch, stages, scope, and durable capability atomically.",
+      "If `workflow_prepare` fails, stop and record the structured error — never guess a state path or repair canonical state by hand. The P5 gate reads `classification.autonomous` as the authority.",
+      "If confidence is LOW, ask a focused clarification question before preparing an expansive workflow (unless `autonomous` is true; then document a conservative default).",
+    ];
   return [
-    "/do-work classification pass — understand the task before selecting a workflow.",
+    "/do-work lifecycle routing pass — resolve continuation selection before any new-task PHASE-0 classification.",
+    "",
+    ...lifecycleSelection,
     "",
     "### Task",
     envelope.task || "(task supplied by the selected run)",
@@ -102,15 +137,9 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "",
     continuation,
     "",
-    buildClassificationPhaseZero({ label: "leading directive", value: envelope.autonomyHint }),
+    ...lifecyclePreparation,
     "",
-    buildWorkflowMatrix(),
-    "",
-    "After PHASE-0 classification, call `workflow_prepare` with the task, the exact canonical branch, the classification object, changed file paths, and issue metadata. For a continuation, pass the existing feedback and affected stage instead of creating a new state.",
-    "`workflow_prepare` is the ONLY supported state initialization/update path: do not call `write`, `edit`, `bash`, or any filesystem API to create or modify `.work-state` files. It persists the classification, resolved workflow, task, branch, stages, scope, and durable capability atomically.",
-    "If `workflow_prepare` fails, stop and record the structured error — never guess a state path or repair canonical state by hand. The P5 gate reads `classification.autonomous` as the authority.",
-    "If confidence is LOW, ask a focused clarification question before preparing an expansive workflow (unless `autonomous` is true; then document a conservative default).",
-    "Continue executing in THIS TURN: do not stop after printing CLASSIFICATION or preparing state; immediately enter the eight-step contract.",
+    "Continue executing in THIS TURN: do not stop after lifecycle selection or preparation; immediately enter the eight-step contract.",
     "",
     "### Eight-step resume-from-disk contract (mandatory for every continuation)",
     ...RESUME_FROM_DISK_STEPS.map((step, index) => `${index + 1}. ${step}`),
@@ -148,7 +177,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     "You are the workflow orchestrator, not an implementation agent. Your allowed work is limited to reading application code, invoking engine-owned workflow control tools, writing declared typed artifacts under the exact `state.artifactsDir` returned by `workflow_instructions`, and deterministic auxiliary operations required to inspect or coordinate the run. No feature/legacy artifact path or fallback is authorized.",
     "NEVER use `write` or `edit` on application source, tests, configuration, lockfiles, documentation, or canonical workflow state. NEVER patch a subagent's code, validation, or artifact to make a stage pass.",
     "Every implementation, review-fix, or source-changing operation MUST be delegated through the profile's `single`/`consilium` stage. If a subagent fails, returns incomplete evidence, or produces incorrect work, re-spawn the same role with a corrected task; do not fix it yourself.",
-    "Branch selection/creation is a host/user ingress precondition: before `/do-work` invocation, the user/outer host MUST select or create the intended branch and capture its canonical name in this envelope. Before `workflow_prepare`, the orchestrator MUST verify the read-only current branch against that captured/intended value; if it is wrong, detached, missing, or not intended, stop before prepare and tell the user/outer host to select it and reinvoke. Later strict stages may only re-check the current branch read-only against the persisted prepared binding; any divergence fails closed. NEVER switch, checkout, create, pull, reuse stale branch metadata, or rebind an active run.",
+    "Registered command ingress captures the authoritative canonical branch for both new and continuation requests. Use that captured value in atomic `workflow_prepare`, which revalidates branch and any retained quiescent selection under its mutation lock; do not add a separate shell/Git dependency before this call. After preparation, and again at strict stages, preserve the existing bounded read-only branch checks against the persisted binding; any divergence fails closed. NEVER switch, checkout, create, pull, reuse stale branch metadata, or rebind an active run.",
     "Selected-run artifact proof permits only bounded sanitized read-only Git inspection: inline `GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false ...` (with no env or the exact one-key env) or non-inline `git --no-pager -c core.fsmonitor=false ...` with exact env `{ GIT_OPTIONAL_LOCKS: \"0\" }`; allow only bounded `status`, `log`, `diff`, `show`, and exactly `branch --show-current`, with `diff`/`show` requiring `--no-ext-diff --no-textconv`. Reject wrong/extra env, omitted env on the non-inline form, unsupported args, helpers/wrappers, mutations, and injection.",
     "Version-control synchronization, integration, mutation, and publication are not discovery-orchestrator authority: `fetch`/`pull`, branch setup, `add`/`commit`/`push`, merge/rebase/cherry-pick, and PR commands belong only to an explicitly declared actor/stage contract.",
     "After every delegated call or parallel batch: stop and reconcile the result through `workflow_status` and the engine-owned completion/advance tools. Every delegated task payload must state that `workflow_*` control tools are main-session-only, must not mutate canonical `.work-state` with `bash`, and must use `write` for its declared artifact before returning. Require every declared artifact and gate/validation evidence, then dispatch the next stage only if the state transition is valid. A subagent return is not permission to improvise, skip stages, or self-complete.",

@@ -8,9 +8,10 @@ import {
 	parseEnvelope as parseCtoEnvelope,
 } from "./cto.js";
 import { buildDoWorkPrompt, parseWorkEnvelope, type ParsedWorkEnvelope } from "./do-work.js";
-import { parseWorkflowCommand } from "./envelope.js";
+import { parseWorkflowCommand, type WorkflowCommandMode } from "./envelope.js";
 import { createSelectionSnapshot } from "../engine/run-store.js";
 import { resolveActiveBranch } from "../engine/state.js";
+import { resolveLifecycleIntent } from "../engine/run-lifecycle.js";
 import type { WorkflowSessionController } from "../engine/host-controller.js";
 import type { TrustedExecutionContext } from "../engine/types.js";
 import {
@@ -85,6 +86,8 @@ type CommandProvenanceRecord = SessionIdentity & {
 
 type CommandInvocation = {
 	commandIntentId?: string;
+	/** Natural-language mode is a routing hint, never an explicit command token. */
+	inferredMode?: Exclude<WorkflowCommandMode, "list">;
 	/** Removes this invocation's record and, if owned, its exact intent. */
 	cleanup?: () => void;
 	/** Arms the same ingress record after the exact prompt has been built. */
@@ -311,6 +314,7 @@ type CommandPromptBuilder = (
 	ctx: ExtensionCommandContext,
 	cwd: string | undefined,
 	commandIntentId?: string,
+	inferredMode?: Exclude<WorkflowCommandMode, "list">,
 ) => string;
 type BeforeCommandExecute = (
 	args: string,
@@ -344,7 +348,7 @@ function registerPromptCommand(
 			const invocation = beforeExecute?.(normalizedArgs, cwd, ctx);
 			let prompt: string;
 			try {
-				prompt = buildPrompt(normalizedArgs, ctx, cwd, invocation?.commandIntentId);
+				prompt = buildPrompt(normalizedArgs, ctx, cwd, invocation?.commandIntentId, invocation?.inferredMode);
 			} catch (error) {
 				try {
 					invocation?.cleanup?.();
@@ -374,7 +378,6 @@ function preflightWorkflowCommand(args: string): string | undefined {
 	if (command.ok) return undefined;
 	return `ERROR [${command.code}]: ${command.error}`;
 }
-
 function buildDoWorkCommandPrompt(
 	args: string,
 	ctx: ExtensionCommandContext,
@@ -383,6 +386,7 @@ function buildDoWorkCommandPrompt(
 	promptBuilder: (envelope: ParsedWorkEnvelope, cwd: string) => string,
 	cwd: string | undefined,
 	commandIntentId?: string,
+	inferredMode?: Exclude<WorkflowCommandMode, "list">,
 ): string {
 	const displayName = variant === "do-work" ? display.doWork : display.team;
 	if (!args) {
@@ -414,14 +418,17 @@ function buildDoWorkCommandPrompt(
 		return snapshot.candidates.map((candidate, index) => String(index + 1) + ". " + candidate.title + " — " + candidate.branch + " — " + candidate.status + " — " + candidate.stage + " (snapshot_id=" + snapshot.snapshot_id + "; index=" + index + "; run_id=" + candidate.run_id + ")").join("\n");
 	}
 	const parsed = parseWorkEnvelope(command.task, cwd);
+	const inferred = !command.explicit_mode ? resolveLifecycleIntent({ text: parsed.task }) : undefined;
+	const naturalMode = inferred?.source === "natural_language" ? inferred.mode : undefined;
+	const resolvedMode = command.mode ?? inferredMode ?? naturalMode;
 	if (command.mode === "new" && !parsed.task) return "ERROR: empty task after stripping prefix.";
 	const envelope: ParsedWorkEnvelope = {
 		...parsed,
-		mode: command.mode,
+		...(resolvedMode ? { mode: resolvedMode } : {}),
 		...(command.run_id ? { run_id: command.run_id } : {}),
 		...(commandIntentId ? { command_intent_id: commandIntentId } : {}),
 	};
-	ctx.ui.notify(`${displayName}: ${envelope.task || command.mode} (workflow pending)`, "info");
+	ctx.ui.notify(`${displayName}: ${envelope.task || envelope.mode || "workflow"} (workflow pending)`, "info");
 	return promptBuilder(envelope, cwd);
 }
 
@@ -490,6 +497,11 @@ function prepareCommandInvocation(
 		if (!previousHadIntent) binding.controller.clearCommandIntent();
 		return undefined;
 	}
+	const parsedTask = command.explicit_mode ? undefined : parseWorkEnvelope(command.task, cwd!).task;
+	const lifecycleIntent = command.explicit_mode
+		? undefined
+		: resolveLifecycleIntent({ text: parsedTask ?? command.task });
+	const inferredMode = lifecycleIntent?.source === "natural_language" ? lifecycleIntent.mode : undefined;
 	let commandIntentId: string | undefined;
 	let intent: CommandIntentOwnership | undefined;
 	if (command.explicit_mode && command.mode) {
@@ -510,14 +522,15 @@ function prepareCommandInvocation(
 	provenance.set(provenanceBindingKey, record);
 	return {
 		commandIntentId,
+		...(inferredMode ? { inferredMode } : {}),
 		arm: (prompt: string) => armCommandProvenance(provenance, record, cwd, ctx, prompt),
 		cleanup: () => {
 			if (provenance.get(provenanceBindingKey) === record) provenance.delete(provenanceBindingKey);
 			cleanupIntent(record);
 		},
 	};
-}
 
+}
 function readBeforeAgentStartEvent(event: unknown): { prompt: string; systemPrompt: string[] } | undefined {
 	if (!event || typeof event !== "object") return undefined;
 	const value = event as Record<string, unknown>;
@@ -603,7 +616,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			pi,
 			names.doWork,
 			options.doWorkDescription ?? doWorkDescription(names.doWork, names.team),
-			(args, ctx, cwd, commandIntentId) => buildDoWorkCommandPrompt(args, ctx, "do-work", names, promptBuilder, cwd, commandIntentId),
+			(args, ctx, cwd, commandIntentId, inferredMode) => buildDoWorkCommandPrompt(args, ctx, "do-work", names, promptBuilder, cwd, commandIntentId, inferredMode),
 			resolveEffectiveCwd,
 			(args, cwd, ctx) => {
 				claimForCommand?.(cwd);
@@ -616,7 +629,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			pi,
 			names.team,
 			options.teamDescription ?? teamDescription(names.doWork),
-			(args, ctx, cwd, commandIntentId) => buildDoWorkCommandPrompt(args, ctx, "team", names, promptBuilder, cwd, commandIntentId),
+			(args, ctx, cwd, commandIntentId, inferredMode) => buildDoWorkCommandPrompt(args, ctx, "team", names, promptBuilder, cwd, commandIntentId, inferredMode),
 			resolveEffectiveCwd,
 			(args, cwd, ctx) => {
 				claimForCommand?.(cwd);

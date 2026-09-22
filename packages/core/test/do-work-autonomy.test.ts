@@ -119,6 +119,15 @@ function selectedController(root: string, branch = "main") {
   controller.bind(activeRunId(root));
   return controller;
 }
+function preparedController(root: string, branch = "main", sessionId = trustedContext(root, branch).session_id) {
+  const runId = activeRunId(root);
+  const execution = { ...trustedContext(root, branch), session_id: sessionId };
+  const controller = createWorkflowSessionController({ cwd: root, context: execution });
+  const prepared = controller.prepare({ mode: "resume", run_id: runId });
+  assert.equal(prepared.state.run_id, runId);
+  assert.equal(controller.activeClaimRunId(), runId);
+  return controller;
+}
 
 function classificationGateFor(root: string, event: { agent?: string; role?: string } = { agent: "developer" }) {
   return classificationGate(event, { cwd: root, run_id: activeRunId(root) });
@@ -1077,7 +1086,18 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
 test("registered raw tool_call derives a scoped orchestrator only from the trusted adapter", () => {
   const root = mkdtempSync(join(tmpdir(), "raw-tool-call-actor-bridge-"));
   try {
-    const runId = writeWorkflowState(root, { policy: { strict_orchestrator: true } });
+    initGit(root, "main");
+    const profile = loadProfile("lightweight");
+    assert.ok(profile);
+    const runId = writeWorkflowState(root, {
+      policy: { strict_orchestrator: true },
+      profile_hash: profileHash(profile),
+      stage_cursor: "implementation",
+      stages: profile.stages.map((stage) => ({
+        id: stage.id,
+        status: stage.id === "implementation" ? "in_progress" : "pending",
+      })),
+    });
     const artifactsDir = runTarget(root, runId).artifactsDir!;
     const sessionId = "trusted-main-session";
     const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
@@ -1092,10 +1112,16 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
         (handlers[name] ??= []).push(handler);
       },
     };
+    const controller = preparedController(root, "main", sessionId);
     registerTeamWorkflow(pi as never, {
       observability: false,
       resolveCwd: ctx => managerFor(ctx)?.getCwd(),
-      getSessionController: (_ctx, cwd) => cwd === root ? ({ selectedRunId: () => runId } as never) : undefined,
+      getSessionController: (ctx, cwd) => {
+        const manager = managerFor(ctx);
+        return cwd === root && manager?.getCwd() === root && manager.getSessionId() === sessionId
+          ? controller
+          : undefined;
+      },
       resolveTrustedToolCallActor: (ctx, cwd, selectedRunId) => {
         const manager = managerFor(ctx);
         if (
@@ -2036,6 +2062,7 @@ test("native task hook leaves spawned and scheduled results pending", () => {
     });
     publishMapping(root, { "developer-kotlin": "developer-kotlin" });
     writeRequiredArtifact(root, "discovery", { task: "async capability test", branch });
+    const controller = preparedController(root, branch);
     const begun = beginCapability(root, undefined, { runId });
     assert.equal(begun.ok, true);
     if (!begun.ok || !begun.handoff) return;
@@ -2043,7 +2070,6 @@ test("native task hook leaves spawned and scheduled results pending", () => {
     assert.ok(stage);
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["developer-kotlin"], "developer-kotlin", begun.handoff.cursor_epoch);
     const taskInput = { agent: "developer-kotlin", role: "developer-kotlin", task: marker };
-    const controller = selectedController(root, branch);
     const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
     registerTeamWorkflow({
       setLabel() {},
@@ -2166,6 +2192,7 @@ test("native task result reconciles its immutable origin after the manager moves
       });
       publishMapping(root, { "developer-kotlin": "developer-kotlin" });
       writeRequiredArtifact(root, "discovery", { task, branch });
+      const controller = preparedController(root, branch);
       const begun = beginCapability(root, undefined, { runId });
       assert.equal(begun.ok, true);
       const stage = profile.stages.find((candidate) => candidate.id === "implementation");
@@ -2192,7 +2219,7 @@ test("native task result reconciles its immutable origin after the manager moves
         runId,
         handoff: begun.handoff,
         taskId,
-        controller: selectedController(root, branch),
+        controller,
         sessionId: trustedContext(root, branch).session_id,
         taskInput: { agent: "developer-kotlin", role: "developer-kotlin", task: marker },
       };
@@ -2348,11 +2375,10 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
     });
     publishMapping(root, { "code-reviewer": "code-reviewer", qa: "qa", "developer-kotlin": "developer-kotlin" });
     writeRequiredArtifact(root, "discovery", { task: "batch capability test", branch });
+    const controller = preparedController(root, branch);
     const begun = beginCapability(root, undefined, { runId });
-    assert.equal(begun.ok, true);
     if (!begun.ok || !begun.handoff) return;
     const markerFor = (role: string) => begun.handoff!.dispatch_markers.find((entry) => entry.role === role)?.marker ?? "";
-    const controller = selectedController(root, branch);
     const taskInput = {
       tasks: [
         { role: "qa", agent: "qa", task: markerFor("qa") },

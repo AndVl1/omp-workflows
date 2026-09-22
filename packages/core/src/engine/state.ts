@@ -14,6 +14,7 @@ import { recordStageTransition } from "../observability/hooks.js";
 import {
   beginArtifactJournal,
   recoverArtifactJournals,
+  assertNoPendingArtifactJournals,
   markArtifactJournalCommit,
   markArtifactJournalLifecycle,
   artifactJournalHasCommitBoundary,
@@ -22,7 +23,7 @@ import {
   publishAfterStateCommit,
   rollbackArtifactJournal,
 } from "./artifacts.js";
-import { beginLifecycleTransaction, commitLifecycleTransaction, recoverLifecycleTransactions } from "./lifecycle-journal.js";
+import { assertNoUnresolvedLifecycleTransactions, beginLifecycleTransaction, commitLifecycleTransaction, recoverLifecycleTransactions } from "./lifecycle-journal.js";
 import { activeWave, readCtoState } from "../cto/state.js";
 import {
   loadProfile,
@@ -1195,10 +1196,11 @@ function releaseStateLock(wsDir: string, token: string): void {
  * while that lock is held, so a malformed or torn lifecycle record fails
  * closed before any reader or writer can inspect authority.
  */
-export function withWorkspaceTransaction<T>(
+function withLockedWorkspace<T>(
   cwd: string,
   action: () => T,
-  opts: { lockTimeoutMs?: number; createIfMissing?: boolean } = {},
+  opts: { lockTimeoutMs?: number; createIfMissing?: boolean },
+  recover: boolean,
 ): T {
   const wsDir = resolve(cwd, WORK_STATE_DIR);
   if (!existsSync(wsDir)) {
@@ -1207,6 +1209,10 @@ export function withWorkspaceTransaction<T>(
   }
   const nestedDepth = workspaceLockDepth.get(wsDir) ?? 0;
   if (nestedDepth > 0) {
+    if (!recover) {
+      assertNoUnresolvedLifecycleTransactions(cwd);
+      assertNoPendingArtifactJournals(cwd);
+    }
     workspaceLockDepth.set(wsDir, nestedDepth + 1);
     try { return action(); } finally { workspaceLockDepth.set(wsDir, nestedDepth); }
   }
@@ -1214,8 +1220,13 @@ export function withWorkspaceTransaction<T>(
   if ("error" in lock) throw new Error(lock.error);
   workspaceLockDepth.set(wsDir, 1);
   try {
-    recoverLifecycleTransactions(cwd);
-    recoverArtifactJournals(cwd);
+    if (recover) {
+      recoverLifecycleTransactions(cwd);
+      recoverArtifactJournals(cwd);
+    } else {
+      assertNoUnresolvedLifecycleTransactions(cwd);
+      assertNoPendingArtifactJournals(cwd);
+    }
     return action();
   } finally {
     workspaceLockDepth.delete(wsDir);
@@ -1223,14 +1234,32 @@ export function withWorkspaceTransaction<T>(
   }
 }
 
+/**
+ * Shared workspace transaction seam for lifecycle control and state changes.
+ * Every caller uses the same lock as updateStateAtomically; recovery runs
+ * while that lock is held, so a malformed or torn lifecycle record fails
+ * closed before any reader or writer can inspect authority.
+ */
+export function withWorkspaceTransaction<T>(
+  cwd: string,
+  action: () => T,
+  opts: { lockTimeoutMs?: number; createIfMissing?: boolean } = {},
+): T {
+  return withLockedWorkspace(cwd, action, opts, true);
+}
+
+/** Read under the shared workspace lock without recovering or publishing journal state. */
+export function withWorkspaceReadNoRecovery<T>(cwd: string, action: () => T, absent: () => T, opts: { lockTimeoutMs?: number } = {}): T {
+  const wsDir = resolve(cwd, WORK_STATE_DIR);
+  if (!existsSync(wsDir)) return absent();
+  return withLockedWorkspace(cwd, action, { ...opts, createIfMissing: false }, false);
+}
+
 /** Read under the shared workspace lock when it exists, without creating a workspace for empty roots. */
 export function withWorkspaceRead<T>(cwd: string, action: () => T, absent: () => T, opts: { lockTimeoutMs?: number } = {}): T {
   const wsDir = resolve(cwd, WORK_STATE_DIR);
-  // If no workspace exists, linearize at this absence check: never run an
-  // arbitrary reader after releasing the check, because a concurrent writer
-  // could publish a partially visible authority tree.
   if (!existsSync(wsDir)) return absent();
-  return withWorkspaceTransaction(cwd, action, { ...opts, createIfMissing: false });
+  return withLockedWorkspace(cwd, action, { ...opts, createIfMissing: false }, true);
 }
 
 interface RawStateSnapshot {

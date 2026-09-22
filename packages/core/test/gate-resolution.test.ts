@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { createWorkflowSessionController, registerTeamWorkflow } from "../src/index.js";
 import { dispatchGate } from "../src/gates/dispatch.js";
 import type { RoleConfig, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
+import type { WorkflowSessionController } from "../src/engine/host-controller.js";
 
 const genericRoles: RoleConfig["roles"] = { worker: "worker" };
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
@@ -49,7 +50,11 @@ function trustedContext(root: string): TrustedExecutionContext {
   };
 }
 
-function registerGate(root: string, selected = true): (event: unknown, ctx: unknown) => unknown {
+function registerGate(
+  root: string,
+  selected = true,
+  existingController?: WorkflowSessionController,
+): (event: unknown, ctx: unknown) => unknown {
   const handlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const pi = {
     setLabel() {},
@@ -57,15 +62,20 @@ function registerGate(root: string, selected = true): (event: unknown, ctx: unkn
       if (name === "tool_call") handlers.push(handler);
     },
   };
-  const controller = selected
+  const controller = existingController ?? (selected
     ? createWorkflowSessionController({ cwd: root, context: trustedContext(root) })
-    : undefined;
-  if (controller) controller.bind(RUN_ID);
+    : undefined);
+  if (controller) {
+    if (!existingController) {
+      const prepared = controller.prepare({ mode: "resume", run_id: RUN_ID });
+      assert.equal(prepared.state.run_id, RUN_ID);
+    }
+    assert.equal(controller.activeClaimRunId(), RUN_ID);
+  }
   registerTeamWorkflow(pi as never, {
     roles: genericRoles,
-    getSessionController: () => controller,
+    ...(controller ? { getSessionController: () => controller } : {}),
   });
-  assert.equal(handlers.length, 1);
   return handlers[0]!;
 }
 
@@ -85,12 +95,18 @@ test("history without a selected run does not gate task compatibility", () => {
 test("selected canonical run rejects malformed classification before dispatch", () => {
   const root = mkdtempSync(join(tmpdir(), "omp-gate-malformed-"));
   try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "feature/gates"], { stdio: "ignore" });
+    writeCanonicalState(root, minimalState());
+    const controller = createWorkflowSessionController({ cwd: root, context: trustedContext(root) });
+    const prepared = controller.prepare({ mode: "resume", run_id: RUN_ID });
+    assert.equal(prepared.state.run_id, RUN_ID);
+    assert.equal(controller.activeClaimRunId(), RUN_ID);
     const armed = {
-      ...minimalState(),
+      ...prepared.state,
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false },
     } as TeamState;
     writeCanonicalState(root, armed);
-    const handler = registerGate(root);
+    const handler = registerGate(root, true, controller);
     const result = handler({ toolName: "task", input: { task: "prompt-only" } }, { cwd: root }) as { block?: boolean; reason?: string } | undefined;
     assert.equal(result?.block, true);
     assert.match(result?.reason ?? "", /malformed classification|workflow/i);

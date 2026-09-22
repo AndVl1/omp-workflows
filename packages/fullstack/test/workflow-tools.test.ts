@@ -8,7 +8,6 @@ import { join } from "node:path";
 import { z } from "zod";
 import {
   dispatchGate,
-  beginCapability,
   authorizeDispatch,
   completeDispatch,
   buildAgentMapping,
@@ -25,12 +24,13 @@ import {
   writeAgentMapping,
   prepareWorkflowState,
   runTarget,
+  registerWorkflowTools as registerCoreWorkflowTools,
+  type IssuedCapability,
 } from "@andvl1/omp-workflows-core";
 import {
   FULLSTACK_BUNDLE_ID,
   fullstackOwnerForCwd,
   fullstackPreset,
-  getFullstackWorkflowSessionController,
   isMainSessionContext,
   registerWorkflowTools,
   resolveSessionCwd,
@@ -54,65 +54,6 @@ type RegisteredTool = {
   parameters: unknown;
   execute: (...args: never[]) => Promise<{ content: [{ type: "text"; text: string }]; details: unknown }>;
 };
-function writeBeginFixture(root: string, branch: string): void {
-  mkdirSync(join(root, ".work-state"), { recursive: true });
-  writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
-    schema: 1,
-    branch,
-    run_key: branch,
-    classification: {
-      type: "FEATURE",
-      complexity: "QUICK",
-      confidence: "HIGH",
-      autonomous: false,
-      workflow: "lightweight",
-    },
-    task: "cwd binding regression",
-    stage_cursor: "discovery",
-    stages: [{ id: "discovery", status: "in_progress" }],
-    artifacts: {},
-    scope: {
-      scope: [],
-      has_security: false,
-      has_infra: false,
-      has_ui: false,
-      has_runtime: false,
-      dev_agent: "developer-kotlin",
-    },
-    policy: { strict_orchestrator: true },
-    pause: { kind: "none", reason: "" },
-  }) + "\n");
-}
-
-function writeConsiliumBeginFixture(root: string): void {
-  mkdirSync(join(root, ".work-state"), { recursive: true });
-  writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
-    schema: 1,
-    branch: "main",
-    run_key: "main",
-    classification: {
-      type: "SPEC",
-      complexity: "COMPLEX",
-      confidence: "HIGH",
-      autonomous: true,
-      workflow: "spec-preparation",
-    },
-    task: "consilium marker regression",
-    stage_cursor: "intake_repo_map",
-    stages: [{ id: "intake_repo_map", status: "in_progress" }],
-    artifacts: {},
-    scope: {
-      scope: [],
-      has_security: false,
-      has_infra: false,
-      has_ui: false,
-      has_runtime: false,
-      dev_agent: null,
-    },
-    policy: { strict_orchestrator: true },
-    pause: { kind: "none", reason: "" },
-  }) + "\n");
-}
 
 const trustedIntakeRoles = { analyst: "analyst", "tech-researcher": "tech-researcher" } as const;
 
@@ -136,24 +77,40 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     publishMapping(root);
-    const prepared = prepareWorkflowState({
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    const hostContext = {
       cwd: root,
-      branch: "main",
-      task: "consilium marker regression",
-      autonomous: true,
-      classification: { type: "SPEC", complexity: "COMPLEX", confidence: "HIGH", autonomous: true, workflow: "spec-preparation" },
-      mode: "new",
-      execution: {
-        session_id: "session-direct",
-        caller: "host",
-        process_id: process.pid,
-        worktree: root,
+      hasUI: true,
+      mode: "tui",
+      session_id: "session-direct",
+      sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
+    };
+    const prepare = tools.get("workflow_prepare")!;
+    const preparedResponse = await prepare.execute(
+      "marker-fixture-prepare",
+      {
+        mode: "new",
+        task: "consilium marker regression",
         branch: "main",
-        authority: "coordinator",
+        classification: { type: "SPEC", complexity: "COMPLEX", confidence: "HIGH", autonomous: true, workflow: "spec-preparation" },
       },
-    });
-    mkdirSync(prepared.artifactsDir, { recursive: true });
-    writeFileSync(join(prepared.artifactsDir, "product_spec.json"), JSON.stringify({
+      undefined,
+      undefined,
+      hostContext as never,
+    );
+    const preparedDetails = preparedResponse.details as {
+      ok?: boolean;
+      error?: string;
+      state?: { run_id?: string };
+      artifacts_dir?: string;
+    };
+    assert.equal(preparedDetails.ok, true, preparedDetails.error);
+    const preparedRunId = preparedDetails.state?.run_id;
+    if (!preparedRunId) throw new Error("marker fixture preparation did not select a canonical run");
+    const artifactsDir = preparedDetails.artifacts_dir ?? runTarget(root, preparedRunId).artifactsDir;
+    if (!artifactsDir) throw new Error("marker fixture artifacts directory is unavailable");
+    mkdirSync(artifactsDir, { recursive: true });
+    writeFileSync(join(artifactsDir, "product_spec.json"), JSON.stringify({
       recommendation: "proceed",
       value_proposition: "make the specification handoff traceable",
       opportunity: "the workflow needs durable product context",
@@ -170,13 +127,7 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
     }) + "\n");
 
     const begin = tools.get("workflow_begin")!;
-    const response = await begin.execute(
-      "test",
-      {},
-      undefined,
-      undefined,
-      { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never,
-    );
+    const response = await begin.execute("marker-fixture-begin", {}, undefined, undefined, hostContext as never);
     const details = response.details as {
       ok?: boolean;
       error?: string;
@@ -277,8 +228,8 @@ test("fullstack: workflow_status exposes completion artifact bindings", async ()
   const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    const issued = writeCheckpointAskFixture(root);
     await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    const issued = await writeCheckpointAskFixture(root, tools);
     const binding = issued.state.issued_for!;
     const rosterEntry = issued.state.expected_roster?.[0];
     const auth = {
@@ -533,36 +484,34 @@ test("fullstack: workflow_begin follows the canonical session cwd, not a stale c
   let fireSessionStop: ((ctx: Record<string, unknown>) => Promise<void>) | undefined;
   try {
     execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    prepareWorkflowState({
-      cwd: canonical,
-      branch: "main",
-      task: "canonical begin regression",
-      autonomous: false,
-      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
-      mode: "new",
-      execution: {
-        session_id: "session-direct",
-        caller: "host",
-        process_id: process.pid,
-        worktree: canonical,
-        branch: "main",
-        authority: "coordinator",
-      },
-    });
     const toolsAndLifecycle = registerToolsWithSessionSink();
     fireSessionStop = toolsAndLifecycle.fireSessionStop;
     await toolsAndLifecycle.fireSessionStart({ mode: "tui", hasUI: true, cwd: canonical, ui: {} });
+    const prepare = toolsAndLifecycle.tools.get("workflow_prepare")!;
+    const prepared = await prepare.execute(
+      "canonical-fixture-prepare",
+      {
+        mode: "new",
+        task: "canonical begin regression",
+        branch: "main",
+        classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      },
+      undefined,
+      undefined,
+      { cwd: stale, sessionManager: { getCwd: () => canonical, getSessionId: () => "session-direct" }, mode: "tui", session_id: "session-direct", hasUI: true } as never,
+    );
+    const preparedDetails = prepared.details as { ok?: boolean; error?: string };
+    assert.equal(preparedDetails.ok, true, preparedDetails.error);
     const begin = toolsAndLifecycle.tools.get("workflow_begin")!;
     const response = await begin.execute(
-      "test",
+      "canonical-fixture-begin",
       {},
       undefined,
       undefined,
       { cwd: stale, sessionManager: { getCwd: () => canonical, getSessionId: () => "session-direct" }, mode: "tui", session_id: "session-direct", hasUI: true } as never,
     );
-    const details = response.details;
-    if (!details || typeof details !== "object" || !("ok" in details)) throw new Error("workflow_begin response has no ok field");
-    assert.equal(details.ok, true);
+    const details = response.details as { ok?: boolean; error?: string };
+    assert.equal(details.ok, true, details.error);
   } finally {
     await fireSessionStop?.({ cwd: canonical, mode: "tui", hasUI: true });
     rmSync(canonical, { recursive: true, force: true });
@@ -684,9 +633,14 @@ test("fullstack: F7 core lifecycle exports remain public", () => {
   }
 });
 
-function writeCheckpointAskFixture(root: string): IssuedCapability {
-  // prepareWorkflowState resolves scope from the caller's registered preset;
-  // without this canonical config, src/main/App.kt cannot select a dev agent.
+async function writeCheckpointAskFixture(
+  root: string,
+  tools: Map<string, RegisteredTool>,
+  context?: Record<string, unknown>,
+): Promise<IssuedCapability> {
+  // workflow_prepare resolves scope from the caller's registered preset; keep
+  // the fixture configuration explicit, but establish the run and claim only
+  // through the registered host lifecycle tools below.
   writeConfig(
     join(root, ".omp", "team.config.json"),
     {
@@ -698,60 +652,89 @@ function writeCheckpointAskFixture(root: string): IssuedCapability {
     },
     { cwd: root },
   );
-  const execution = {
-    session_id: "session-direct",
-    caller: "host" as const,
-    process_id: process.pid,
-    worktree: root,
-    branch: "main",
-    authority: "coordinator" as const,
-  };
-  const prepared = prepareWorkflowState({
+  const hostContext = context ?? {
     cwd: root,
-    branch: "main",
-    task: "checkpoint ask ingest",
-    autonomous: false,
-    classification: {
-      type: "FEATURE",
-      complexity: "QUICK",
-      confidence: "HIGH",
-      autonomous: false,
-      workflow: "lightweight",
+    hasUI: true,
+    mode: "tui",
+    session_id: "session-direct",
+    sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
+  };
+  const prepare = tools.get("workflow_prepare");
+  const begin = tools.get("workflow_begin");
+  if (!prepare || !begin) throw new Error("workflow lifecycle tools are not registered");
+  const preparedResponse = await prepare.execute(
+    "checkpoint-fixture-prepare",
+    {
+      mode: "new",
+      task: "checkpoint ask ingest",
+      branch: "main",
+      classification: {
+        type: "FEATURE",
+        complexity: "QUICK",
+        confidence: "HIGH",
+        autonomous: false,
+        workflow: "lightweight",
+      },
+      files: ["src/main/App.kt"],
     },
-    mode: "new",
-    execution,
-    files: ["src/main/App.kt"],
-  });
-  const runId = prepared.state.run_id!;
-  const state = JSON.parse(readFileSync(prepared.statePath!, "utf8")) as {
+    undefined,
+    undefined,
+    hostContext as never,
+  );
+  const preparedDetails = preparedResponse.details as {
+    ok?: boolean;
+    error?: string;
+    state?: { run_id?: string };
+  };
+  if (!preparedDetails.ok || !preparedDetails.state?.run_id) {
+    throw new Error(preparedDetails.error ?? "workflow_prepare did not select a canonical run");
+  }
+  const runId = preparedDetails.state.run_id;
+  const statePath = runTarget(root, runId).statePath;
+  const artifactsDir = runTarget(root, runId).artifactsDir;
+  if (!statePath || !artifactsDir) throw new Error("canonical checkpoint fixture paths are unavailable");
+  const state = JSON.parse(readFileSync(statePath, "utf8")) as {
     stages?: Array<{ id: string; status: string }>;
     artifacts?: Record<string, string>;
     [key: string]: unknown;
   };
-  // Arm the implementation stage through the same durable begin transition
-  // used by the host. Its declared discovery input is a canonical prerequisite
-  // rather than an unbound hand-written capability.
+  // Arm the implementation stage through the canonical state selected by
+  // workflow_prepare. The active execution claim remains the controller's
+  // exact binding while the fixture supplies the declared discovery input.
   state.artifacts = { ...(state.artifacts ?? {}), discovery: "discovery.json" };
   state.stage_cursor = "implementation";
   state.stages = (state.stages ?? []).map((stage) => ({
     ...stage,
     status: stage.id === "discovery" ? "done" : stage.id === "implementation" ? "in_progress" : "pending",
   }));
-  writeFileSync(prepared.statePath!, `${JSON.stringify(state)}\n`);
-  mkdirSync(prepared.artifactsDir, { recursive: true });
-  writeFileSync(join(prepared.artifactsDir, "discovery.json"), JSON.stringify({
+  writeFileSync(statePath, `${JSON.stringify(state)}\n`);
+  mkdirSync(artifactsDir, { recursive: true });
+  writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({
     task: "checkpoint ask ingest",
     branch: "main",
   }) + "\n");
-  const begun = beginCapability(root, undefined, { runId });
-  if (!begun.ok || !begun.handoff || !begun.state.dispatch_capability) {
-    throw new Error(begun.ok ? "begin did not return a capability handoff" : begun.error);
+  const begunResponse = await begin.execute("checkpoint-fixture-begin", {}, undefined, undefined, hostContext as never);
+  const begunDetails = begunResponse.details as {
+    ok?: boolean;
+    error?: string;
+    handoff?: {
+      capability_id: string;
+      dispatch_token: string;
+      advance_token: string;
+    };
+  };
+  if (!begunDetails.ok || !begunDetails.handoff) {
+    throw new Error(begunDetails.error ?? "workflow_begin did not return a capability handoff");
   }
+  const persisted = JSON.parse(readFileSync(statePath, "utf8")) as {
+    dispatch_capability?: IssuedCapability["state"];
+  };
+  if (!persisted.dispatch_capability) throw new Error("workflow_begin did not persist a dispatch capability");
   return {
-    capability_id: begun.handoff.capability_id,
-    dispatch_token: begun.handoff.dispatch_token,
-    advance_token: begun.handoff.advance_token,
-    state: begun.state.dispatch_capability,
+    capability_id: begunDetails.handoff.capability_id,
+    dispatch_token: begunDetails.handoff.dispatch_token,
+    advance_token: begunDetails.handoff.advance_token,
+    state: persisted.dispatch_capability,
   };
 }
 
@@ -816,8 +799,8 @@ test("fullstack: workflow_checkpoint_ask ingests the terminal answer and its pro
   const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    const issued = writeCheckpointAskFixture(root);
     await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    const issued = await writeCheckpointAskFixture(root, tools);
     const ask = tools.get("workflow_checkpoint_ask")!;
     const calls: FakeAskDialogQuestion[][] = [];
     const response = await ask.execute("test", {
@@ -889,8 +872,8 @@ test("fullstack: workflow_checkpoint rejects a decision that diverges from the r
   const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    const issued = writeCheckpointAskFixture(root);
     await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    const issued = await writeCheckpointAskFixture(root, tools);
     const ask = tools.get("workflow_checkpoint_ask")!;
     const askResponse = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, askDialogContext(root, askToolSelection(["proceed"]), []) as never);
     const askDetails = askResponse.details as { ok?: boolean; error?: string; actor_provenance?: unknown };
@@ -931,8 +914,8 @@ test("fullstack: workflow_checkpoint_ask records nothing on decline, timeout, cu
   const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    const issued = writeCheckpointAskFixture(root);
     await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    const issued = await writeCheckpointAskFixture(root, tools);
     const ask = tools.get("workflow_checkpoint_ask")!;
     const declines: Array<[string, FakeAskDialogResult]> = [
       ["declined", undefined],
@@ -960,8 +943,8 @@ test("fullstack: workflow_checkpoint_ask fails closed without UI, for unauthenti
   const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    const issued = writeCheckpointAskFixture(root);
     await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    const issued = await writeCheckpointAskFixture(root, tools);
     const ask = tools.get("workflow_checkpoint_ask")!;
     const calls: FakeAskDialogQuestion[][] = [];
 
@@ -1044,14 +1027,46 @@ function assertWorkflowMutationUnchanged(before: WorkflowMutationSnapshot, after
   assert.deepEqual(after.claim, before.claim, label + ": execution claim changed");
 }
 
+function assertHeadlessRelease(before: WorkflowMutationSnapshot, after: WorkflowMutationSnapshot, label: string): void {
+  assert.equal(after.runCount, before.runCount, label + ": run count changed");
+  assert.equal(after.stateRaw, before.stateRaw, label + ": state bytes changed");
+  const beforeControl = JSON.parse(before.controlRaw) as Record<string, unknown>;
+  const afterControl = JSON.parse(after.controlRaw) as Record<string, unknown>;
+  const { revision: beforeRevision, execution_claim: beforeClaim, ...beforeRest } = beforeControl;
+  const { revision: afterRevision, execution_claim: afterClaim, ...afterRest } = afterControl;
+  assert.equal(typeof beforeRevision, "number", label + ": baseline revision missing");
+  assert.equal(afterRevision, (beforeRevision as number) + 1, label + ": unexpected control revision");
+  assert.ok(beforeClaim, label + ": no active claim to release");
+  assert.equal(afterClaim, null, label + ": headless transition retained execution claim");
+  assert.deepEqual(afterRest, beforeRest, label + ": unexpected control mutation");
+}
+
 function registerToolsWithSessionSink(): {
   tools: Map<string, RegisteredTool>;
   fireSessionStart: (ctx: Record<string, unknown>) => Promise<void>;
   fireSessionStop: (ctx: Record<string, unknown>) => Promise<void>;
+  fireSessionShutdown: (ctx: Record<string, unknown>) => Promise<void>;
 } {
   const tools = new Map<string, RegisteredTool>();
   const sessionStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const sessionStops: Array<(event: unknown, ctx: unknown) => unknown> = [];
+  const lifecycle: {
+    sessionStart?: (event: unknown, ctx: unknown) => unknown;
+    sessionStop?: (event: unknown, ctx: unknown) => unknown;
+    sessionShutdown?: (event: unknown, ctx: unknown) => unknown;
+  } = {};
+  // Mirror the production entrypoint's lifecycle ingress without registering
+  // its unrelated commands/tools into this focused harness.
+  ompWorkflowsFullstack({
+    on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+      if (event === "session_start" && !lifecycle.sessionStart) lifecycle.sessionStart = handler;
+      if (event === "session_stop" && !lifecycle.sessionStop) lifecycle.sessionStop = handler;
+      if (event === "session_shutdown" && !lifecycle.sessionShutdown) lifecycle.sessionShutdown = handler;
+    },
+    registerCommand() {},
+    setLabel() {},
+    sendUserMessage() {},
+  } as never);
   registerWorkflowTools({
     zod: { z },
     registerTool(tool: RegisteredTool) {
@@ -1062,21 +1077,29 @@ function registerToolsWithSessionSink(): {
       if (event === "session_stop") sessionStops.push(handler);
     },
   } as never);
+  const hostContext = (ctx: Record<string, unknown>): Record<string, unknown> => ({
+    ...ctx,
+    session_id: ctx.session_id ?? "session-direct",
+    sessionManager: {
+      getSessionId: () => ctx.session_id ?? "session-direct",
+      getCwd: () => ctx.cwd,
+    },
+  });
   return {
     tools,
     fireSessionStart: async (ctx) => {
-      const hostContext = {
-        ...ctx,
-        session_id: ctx.session_id ?? "session-direct",
-        sessionManager: {
-          getSessionId: () => ctx.session_id ?? "session-direct",
-          getCwd: () => ctx.cwd,
-        },
-      };
-      await Promise.all(sessionStarts.map(handler => handler({}, hostContext)));
+      const normalized = hostContext(ctx);
+      await lifecycle.sessionStart?.({}, normalized);
+      await Promise.all(sessionStarts.map(handler => handler({}, normalized)));
     },
     fireSessionStop: async (ctx) => {
-      await Promise.all(sessionStops.map(handler => handler({}, ctx)));
+      const normalized = hostContext(ctx);
+      await lifecycle.sessionStop?.({}, normalized);
+      await Promise.all(sessionStops.map(handler => handler({}, normalized)));
+    },
+    fireSessionShutdown: async (ctx) => {
+      const normalized = hostContext(ctx);
+      await lifecycle.sessionShutdown?.({}, normalized);
     },
   };
 }
@@ -1138,21 +1161,21 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     assert.equal((rpc.details as { code?: string }).code, undefined);
     assert.equal((rpc.details as { ok?: boolean; error?: string }).ok, true, (rpc.details as { error?: string }).error);
 
-    // rpc-ui: the same profile, but the host also wires the tool context.
-    const rpcUi = await status.execute("test-rpc-ui", {}, undefined, undefined, {
-      cwd: root,
-      hasUI: true,
-      mode: "rpc",
-      session_id: "session-direct",
-      sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
-      ui: { select: async () => undefined },
-    } as never);
-    assert.equal((rpcUi.details as { ok?: boolean; error?: string }).ok, true, (rpcUi.details as { error?: string }).error);
     const mutationBeforeHeadless = workflowMutationSnapshot(root, hostRunId);
-
+    let mutationAfterHeadless = mutationBeforeHeadless;
     // json and print (headless single-shot) sessions never own the tools.
+    // The first same-identity headless start legitimately settles/revokes
+    // the interactive execution claim; subsequent headless calls must not
+    // mutate anything beyond that lifecycle release.
     for (const mode of ["json", "print"]) {
       await fireSessionStart({ mode, hasUI: false, cwd: root, ui: {} });
+      const afterHeadlessStart = workflowMutationSnapshot(root, hostRunId);
+      if (mode === "json") {
+        assertHeadlessRelease(mutationAfterHeadless, afterHeadlessStart, mode);
+      } else {
+        assertWorkflowMutationUnchanged(mutationAfterHeadless, afterHeadlessStart, mode);
+      }
+      mutationAfterHeadless = afterHeadlessStart;
       const deniedPrepare = await prepare.execute("headless-" + mode, {
         mode: "new",
         task: "headless " + mode + " must not mutate workflow state",
@@ -1161,7 +1184,7 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
       }, undefined, undefined, { cwd: root, hasUI: false } as never);
       const deniedPrepareDetails = deniedPrepare.details as { code?: string; error?: string };
       assert.equal(deniedPrepareDetails.code, "WORKFLOW_CONTEXT_REJECTED", mode + ": " + deniedPrepareDetails.error);
-      assertWorkflowMutationUnchanged(mutationBeforeHeadless, workflowMutationSnapshot(root, hostRunId), mode);
+      assertWorkflowMutationUnchanged(mutationAfterHeadless, workflowMutationSnapshot(root, hostRunId), mode + " prepare");
       const headless = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
       assert.equal((headless.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED", mode);
     }
@@ -1172,8 +1195,9 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     const worker = await status.execute("worker", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
     assert.equal((worker.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
 
-    // A later trusted primary start re-enables the mode-less RPC fallback;
-    // the deny profile must not release or replace the shared controller.
+    // A later trusted primary start re-enables the mode-less RPC fallback
+    // after the explicit headless claim revocation; workflow_prepare must
+    // establish the exact active claim again before mutation.
     await fireSessionStart({ mode: "rpc", hasUI: true, cwd: root, ui: { select: async () => undefined } });
     const reenabled = await status.execute("test-reenabled", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
     assert.equal((reenabled.details as { ok?: boolean; error?: string }).ok, true, (reenabled.details as { error?: string }).error);
@@ -1227,9 +1251,14 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
 test("fullstack: raw tool_call derives artifact-only orchestrator authority from the captured host", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-raw-tool-call-actor-"));
   const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+  const tools = new Map<string, RegisteredTool>();
   const pi = {
+    zod: { z },
     on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
       (handlers[name] ??= []).push(handler);
+    },
+    registerTool(tool: RegisteredTool) {
+      tools.set(tool.name, tool);
     },
     registerCommand() {},
     setLabel() {},
@@ -1239,9 +1268,6 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     Promise.all((handlers[name] ?? []).map(handler => handler(event, ctx)));
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    const issued = writeCheckpointAskFixture(root);
-    const runId = issued.state.issued_for!.run_key;
-    const artifactsDir = runTarget(root, runId).artifactsDir!;
     ompWorkflowsFullstack(pi as never);
     const host = {
       mode: "tui",
@@ -1251,8 +1277,14 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
     };
     await emit("session_start", {}, host);
-    getFullstackWorkflowSessionController(host, root)?.bind(runId);
-
+    const issued = await writeCheckpointAskFixture(root, tools, host);
+    const runId = issued.state.issued_for!.run_key;
+    const artifactsDir = runTarget(root, runId).artifactsDir!;
+    // Idle stop releases the controller's exact claim while retaining the
+    // selected run. The next raw call must remain denied until the registered
+    // workflow_prepare resume rebinds that claim.
+    await emit("session_stop", {}, host);
+    await emit("session_start", {}, host);
     const raw = {
       sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
     };
@@ -1264,6 +1296,17 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       const results = await emit("tool_call", { toolName: "bash", input: { command } }, ctx);
       return results.find(value => value && typeof value === "object" && (value as { block?: unknown }).block === true) as { block?: boolean; reason?: string } | undefined;
     };
+    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason, "trusted host actor unavailable");
+    const prepare = tools.get("workflow_prepare");
+    if (!prepare) throw new Error("workflow_prepare was not registered");
+    const prepared = await prepare.execute("raw-first-prepare", {
+      mode: "resume",
+      run_id: runId,
+      branch: "main",
+    }, undefined, undefined, host as never);
+    const preparedDetails = prepared.details as { ok?: boolean; error?: string; state?: { run_id?: string } };
+    assert.equal(preparedDetails.ok, true, preparedDetails.error);
+    assert.equal(preparedDetails.state?.run_id, runId);
     assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, raw), undefined);
     assert.equal((await invokeBash("git status --short", raw))?.block, true);
     assert.equal(
@@ -1293,10 +1336,6 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     assert.equal((await invokeBash("echo changed > src/app.ts", raw))?.block, true);
     assert.equal((await invokeBash("echo changed > .work-state/other.json", raw))?.block, true);
     assert.equal((await invokeBash(`mkdir -p ${artifactsDir}/new`, raw))?.block, true);
-
-    const worker = { ...raw, actor: "worker", hasUI: false };
-    assert.equal((await invoke({ path: "src/app.ts" }, worker))?.block, true, "configured resolver ignores input actor");
-
     const foreign = {
       sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" },
     };
@@ -1312,11 +1351,71 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     };
     assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, foreignInteractive))?.block, true);
     assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, raw), undefined, "foreign raw context cannot replace the captured controller");
+    // A conflicting event identity must not use the owner ctx as a bypass.
+    const foreignEvent = { cwd: root, session_id: "foreign-session" };
+    await emit("session_stop", foreignEvent, host);
+    await emit("session_shutdown", foreignEvent, host);
+    assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, raw), undefined);
 
+    // Foreign lifecycle events cannot release the retained host claim.
+    await emit("session_stop", {}, foreignInteractive);
+    await emit("session_shutdown", {}, foreignInteractive);
+    assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, raw), undefined);
+
+    // An exact idle stop releases the claim but retains the authenticated
+    // controller/selection; a retained selection without a claim is not the
+    // no-run branch and therefore receives no raw orchestrator actor.
+    await emit("session_stop", {}, host);
+    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason, "trusted host actor unavailable");
+    const resumed = await prepare.execute("raw-idle-resume", {
+      mode: "resume",
+      run_id: runId,
+      branch: "main",
+    }, undefined, undefined, host as never);
+    const resumedDetails = resumed.details as { ok?: boolean; error?: string; state?: { run_id?: string } };
+    assert.equal(resumedDetails.ok, true, resumedDetails.error);
+    assert.equal(resumedDetails.state?.run_id, runId);
+    assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, raw), undefined, "atomic prepare rebinds raw orchestrator authority");
+
+    // A verified host replacement revokes the old identity's raw authority,
+    // then gains its own authority only through the registered prepare tool.
+    const replacement = {
+      mode: "tui",
+      hasUI: true,
+      cwd: root,
+      session_id: "replacement-session",
+      sessionManager: { getCwd: () => root, getSessionId: () => "replacement-session" },
+    };
+    await emit("session_start", {}, replacement);
+    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.block, true);
+    const replacementPrepared = await prepare.execute("raw-replacement-prepare", {
+      mode: "resume",
+      run_id: runId,
+      branch: "main",
+    }, undefined, undefined, replacement as never);
+    const replacementDetails = replacementPrepared.details as { ok?: boolean; error?: string; state?: { run_id?: string } };
+    assert.equal(replacementDetails.ok, true, replacementDetails.error);
+    assert.equal(replacementDetails.state?.run_id, runId);
+    const replacementRaw = { sessionManager: replacement.sessionManager };
+    assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw), undefined);
+    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.block, true);
+    await emit("session_shutdown", {}, replacement);
+    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.block, true);
+
+    // The same-identity headless start is an explicit invalidation boundary.
+    await emit("session_start", {}, host);
+    const reboundPrepared = await prepare.execute("raw-rebind-after-shutdown", {
+      mode: "resume",
+      run_id: runId,
+      branch: "main",
+    }, undefined, undefined, host as never);
+    const reboundDetails = reboundPrepared.details as { ok?: boolean; error?: string; state?: { run_id?: string } };
+    assert.equal(reboundDetails.ok, true, reboundDetails.error);
+    assert.equal(reboundDetails.state?.run_id, runId);
     await emit("session_start", {}, { mode: "print", hasUI: false, cwd: root, session_id: "session-direct", sessionManager: host.sessionManager });
     assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.block, true, "headless transition cannot retain orchestrator authority");
   } finally {
-    await emit("session_stop", {}, { mode: "tui", hasUI: true, cwd: root, session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } });
+    await emit("session_shutdown", {}, { mode: "tui", hasUI: true, cwd: root, session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } });
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1415,7 +1514,13 @@ test("fullstack: workflow_checkpoint_ask ingests the connected RPC client's sele
   const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    const issued = writeCheckpointAskFixture(root);
+    const rpcToolContext = {
+      cwd: root,
+      hasUI: false,
+      mode: "rpc",
+      session_id: "session-direct",
+      sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" },
+    };
     const ask = tools.get("workflow_checkpoint_ask")!;
     const calls: Array<{ title: string; options: string[] }> = [];
     // Plain-rpc session: the profile carries the live select bridge; the
@@ -1431,6 +1536,7 @@ test("fullstack: workflow_checkpoint_ask ingests the connected RPC client's sele
         },
       },
     });
+    const issued = await writeCheckpointAskFixture(root, tools, rpcToolContext);
     const response = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, { cwd: root, hasUI: false } as never);
     const details = response.details as { ok?: boolean; error?: string; decision?: string; loop_iteration?: number; channel?: string; actor_provenance?: { kind?: string } };
     assert.equal(details.ok, true, details.error);
@@ -1448,13 +1554,12 @@ test("fullstack: workflow_checkpoint_ask ingests the connected RPC client's sele
 
 test("fullstack: workflow_checkpoint_ask fails closed in json/print headless sessions while the no-profile fallback keeps the legacy heuristic", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-ask-headless-"));
-  let fallbackStop: ((ctx: Record<string, unknown>) => Promise<void>) | undefined;
   const { tools, fireSessionStart, fireSessionStop } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    const issued = writeCheckpointAskFixture(root);
+    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    const issued = await writeCheckpointAskFixture(root, tools);
     const ask = tools.get("workflow_checkpoint_ask")!;
-    const status = tools.get("workflow_status")!;
 
     for (const mode of ["json", "print"]) {
       await fireSessionStart({ mode, hasUI: false, cwd: root, ui: {} });
@@ -1465,15 +1570,25 @@ test("fullstack: workflow_checkpoint_ask fails closed in json/print headless ses
     // No captured profile (older hosts, direct tool harnesses): the legacy
     // per-call heuristic decides — interactive contexts pass, worker
     // contexts are rejected.
-    const fallback = registerToolsWithSessionSink();
-    fallbackStop = fallback.fireSessionStop;
-    const mainCtx = await fallback.tools.get("workflow_status")!.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never);
+    const fallbackTools = new Map<string, RegisteredTool>();
+    registerCoreWorkflowTools({
+      zod: { z },
+      registerTool(tool: RegisteredTool) {
+        fallbackTools.set(tool.name, tool);
+      },
+    } as never);
+    const mainCtx = await fallbackTools.get("workflow_status")!.execute(
+      "test",
+      {},
+      undefined,
+      undefined,
+      { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: { getCwd: () => root, getSessionId: () => "session-direct" } } as never,
+    );
     assert.equal((mainCtx.details as { ok?: boolean }).ok, true);
-    const workerCtx = await fallback.tools.get("workflow_status")!.execute("worker", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
+    const workerCtx = await fallbackTools.get("workflow_status")!.execute("worker", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
     assert.equal((workerCtx.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
   } finally {
     await fireSessionStop({ cwd: root, hasUI: true, mode: "tui" });
-    await fallbackStop?.({ cwd: root, hasUI: true, mode: "tui" });
     rmSync(root, { recursive: true, force: true });
   }
 });

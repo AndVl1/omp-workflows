@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { buildDoWorkPrompt } from "../src/commands/do-work.js";
 import { registerWorkflowCommands } from "../src/commands/register.js";
 import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 import { LifecycleError } from "../src/engine/run-lifecycle.js";
@@ -107,6 +108,76 @@ test("command intent is opaque, two-phase, exact, one-shot, and release-cleared"
     const released = controller.issueCommandIntent("new");
     controller.release("test-release");
     lifecycleConflict(() => controller.consumeCommandIntent({ command_intent_id: released.intent_id, mode: "new" }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("registered ingress infers only natural lifecycle modes and never mints their token", async () => {
+  const root = mkdtempSync(join(tmpdir(), "command-intent-natural-"));
+  try {
+    const sessionId = "natural-command-session";
+    const controller = createWorkflowSessionController({ cwd: root, context: trustedContext(root, sessionId) });
+    const harness = commandHarness();
+    const context = {
+      cwd: root,
+      sessionManager: { getCwd: () => root, getSessionId: () => sessionId },
+      ui: { notify() {} },
+    };
+    const envelopes: Array<{ mode?: string; command_intent_id?: string; task: string }> = [];
+    let autonomyHint = false;
+    registerWorkflowCommands(harness.pi as never, {
+      resolveCwd: () => root,
+      getSessionController: () => controller,
+      buildDoWorkPrompt: envelope => {
+        autonomyHint = envelope.autonomyHint;
+        envelopes.push({ mode: envelope.mode, command_intent_id: envelope.command_intent_id, task: envelope.task });
+        return envelope.task;
+      },
+    });
+    const handler = harness.commands.get("do-work")!.handler;
+
+    await handler("продолжи фичу", context);
+    assert.deepEqual(envelopes.at(-1), { mode: "resume", command_intent_id: undefined, task: "продолжи фичу" });
+    await handler("[AUTONOMOUS] продолжи фичу", context);
+    assert.deepEqual(envelopes.at(-1), { mode: "resume", command_intent_id: undefined, task: "продолжи фичу" });
+    assert.equal(autonomyHint, true);
+    await handler("действуй автономно: продолжи фичу", context);
+    assert.deepEqual(envelopes.at(-1), { mode: "resume", command_intent_id: undefined, task: "продолжи фичу" });
+    assert.equal(autonomyHint, true);
+    await handler("Add a Continue button", context);
+    assert.deepEqual(envelopes.at(-1), { mode: undefined, command_intent_id: undefined, task: "Add a Continue button" });
+    await handler("Fix login bug", context);
+    assert.deepEqual(envelopes.at(-1), { mode: undefined, command_intent_id: undefined, task: "Fix login bug" });
+    await handler("--new continue", context);
+    const explicit = envelopes.at(-1)!;
+    assert.equal(explicit.mode, "new");
+    assert.match(explicit.command_intent_id ?? "", /^[0-9a-f-]{36}$/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resume prompt selects lifecycle before classification and keeps selection same-turn", () => {
+  const root = mkdtempSync(join(tmpdir(), "command-intent-prompt-"));
+  try {
+    const prompt = buildDoWorkPrompt({
+      task: "продолжи фичу",
+      mode: "resume",
+      autonomyHint: false,
+      issue: null,
+      branch: null,
+    }, root);
+    assert.ok(prompt.indexOf("### Lifecycle selection") < prompt.indexOf("### Task"));
+    assert.match(prompt, /workflow_prepare.*\{ mode: "resume" \}/);
+    assert.match(prompt, /typed `candidates` and `next_action`/);
+    assert.match(prompt, /ordinary same-turn question/);
+    assert.match(prompt, /required_human.*workflow_checkpoint_ask/);
+    assert.match(prompt, /selector\.list_item/);
+    assert.match(prompt, /Registered command ingress captures the authoritative canonical branch/);
+    assert.match(prompt, /do not add a separate shell\/Git dependency before this call/);
+    assert.doesNotMatch(prompt, /Before `workflow_prepare`, the orchestrator MUST verify/);
+    assert.doesNotMatch(prompt, /workflow-view|UUID/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

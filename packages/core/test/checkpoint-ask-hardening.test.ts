@@ -41,13 +41,15 @@ import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { createCapability, recordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
 import { checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
 import { resolveCanonicalRun } from "../src/engine/state.js";
-import { persistCanonicalRun, runTarget } from "../src/engine/run-store.js";
-import { createWorkflowSessionController } from "../src/engine/host-controller.js";
+import { persistCanonicalRun, readRunControl, runTarget } from "../src/engine/run-store.js";
+import { createWorkflowSessionController, type WorkflowSessionController } from "../src/engine/host-controller.js";
 import { registerWorkflowTools } from "../src/index.js";
 import type { TeamState, TrustedExecutionContext } from "../src/engine/types.js";
 
 const RUN_ID = "11111111-1111-4111-8111-111111111111";
 const SESSION_ID = "ask-hardening-session";
+
+const fixtureControllers = new Map<string, WorkflowSessionController>();
 
 type AskParams = Record<string, unknown>;
 type AskResponse = { details: AskParams };
@@ -73,6 +75,7 @@ function registerTools(root: string): Map<string, { name: string; execute: never
     authority: "coordinator",
   };
   const controller = createWorkflowSessionController({ cwd: root, context });
+  fixtureControllers.set(root, controller);
   registerWorkflowTools({
     zod: { z: zod },
     registerTool: (tool: { name: string; execute: never }) => {
@@ -149,6 +152,16 @@ function writeAskFixture(root: string): IssuedCapability {
     updated_at: new Date().toISOString(),
   };
   persistCanonicalRun(root, state, { context: trustedContext(root) });
+  const controller = fixtureControllers.get(root);
+  assert.ok(controller, "fixture controller must be registered before seeding the canonical run");
+  const claim = readRunControl(root).execution_claim;
+  assert.ok(claim, "canonical fixture persistence must create an execution claim");
+  assert.equal(claim.run_id, RUN_ID, "the canonical claim must bind the fixture run");
+  assert.equal(claim.coordinator_session_id, SESSION_ID, "the canonical claim must bind the fixture session");
+  assert.equal(typeof claim.token, "string");
+  controller.bind(RUN_ID, claim.token);
+  assert.equal(controller.selectedRunId(), RUN_ID, "the fixture controller must select the canonical run");
+  assert.equal(controller.activeClaimRunId(), RUN_ID, "the fixture controller must own the canonical claim");
   return issued;
 }
 
@@ -347,6 +360,7 @@ function withFixture(name: string, run: (root: string, ask: AskExecute, tools: M
       const tools = registerTools(root);
       await run(root, askExecute(tools), tools);
     } finally {
+      fixtureControllers.delete(root);
       rmSync(root, { recursive: true, force: true });
     }
   });
