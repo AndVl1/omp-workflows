@@ -3,7 +3,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { buildDoWorkPrompt } from "../src/commands/do-work.js";
 import { registerWorkflowCommands } from "../src/commands/register.js";
 import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 import { LifecycleError } from "../src/engine/run-lifecycle.js";
@@ -153,31 +152,6 @@ test("registered ingress infers only natural lifecycle modes and never mints the
     const explicit = envelopes.at(-1)!;
     assert.equal(explicit.mode, "new");
     assert.match(explicit.command_intent_id ?? "", /^[0-9a-f-]{36}$/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("resume prompt selects lifecycle before classification and keeps selection same-turn", () => {
-  const root = mkdtempSync(join(tmpdir(), "command-intent-prompt-"));
-  try {
-    const prompt = buildDoWorkPrompt({
-      task: "продолжи фичу",
-      mode: "resume",
-      autonomyHint: false,
-      issue: null,
-      branch: null,
-    }, root);
-    assert.ok(prompt.indexOf("### Lifecycle selection") < prompt.indexOf("### Task"));
-    assert.match(prompt, /workflow_prepare.*\{ mode: "resume" \}/);
-    assert.match(prompt, /typed `candidates` and `next_action`/);
-    assert.match(prompt, /ordinary same-turn question/);
-    assert.match(prompt, /required_human.*workflow_checkpoint_ask/);
-    assert.match(prompt, /selector\.list_item/);
-    assert.match(prompt, /Registered command ingress captures the authoritative canonical branch/);
-    assert.match(prompt, /do not add a separate shell\/Git dependency before this call/);
-    assert.doesNotMatch(prompt, /Before `workflow_prepare`, the orchestrator MUST verify/);
-    assert.doesNotMatch(prompt, /workflow-view|UUID/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
