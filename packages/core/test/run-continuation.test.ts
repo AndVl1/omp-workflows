@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,6 +12,8 @@ import { listRuns, readRunControl, runTarget, updateCanonicalRun } from "../src/
 import { discoverLegacySources } from "../src/engine/run-migration.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { resolveConfig } from "../src/engine/config.js";
+import { beginCapability as rawBeginCapability } from "../src/engine/durable.js";
+import { resolveWorkflowContract, WorkflowContractError } from "../src/engine/workflow-contract.js";
 import { registerWorkflowProfiles } from "../src/engine/profile.js";
 import type { Profile, TaskType, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
 import type { TaskCaller, TaskResult } from "../src/engine/stage.js";
@@ -438,6 +441,148 @@ test("run rework snapshots the previous result and reruns only the affected stag
     assert.equal(manifest.run_id, seeded.runId);
     assert.ok(manifest.artifact_sha256?.["upstream.json"], "revision manifest preserves upstream evidence");
     assert.ok(manifest.artifact_sha256?.["reopened.json"], "revision manifest preserves the old affected result");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("QA rework invalidates only downstream DoD evidence and rebinds a fresh summary receipt", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-run-rework-qa-dod-"));
+  try {
+    initGit(root);
+    const workflow = "qa-rework-evidence";
+    const qaProfile: Profile = {
+      name: workflow,
+      title: "QA rework evidence",
+      description: "QA shared DoD re-entry regression",
+      match: { type: ["FEATURE"] },
+      stages: [
+        { id: "implementation", title: "Implementation", type: "orchestrator", produces: "implementation" },
+        { id: "review", title: "Review", type: "orchestrator", produces: "review" },
+        { id: "qa_tests", title: "QA", type: "orchestrator", consumes: ["implementation", "review", "dod"], produces: "qa_tests" },
+        { id: "summary", title: "Summary", type: "orchestrator", consumes: ["implementation", "review", "dod"], produces: "summary" },
+      ],
+    };
+    registerWorkflowProfiles([qaProfile]);
+    const execution = trustedContext(root, BRANCH, "qa-rework-session");
+    const created = prepareWorkflowState({
+      task: "QA rework evidence",
+      cwd: root,
+      branch: BRANCH,
+      autonomous: false,
+      classification: { ...CLASSIFICATION, workflow },
+      files: [],
+      issue: null,
+      mode: "new",
+      request_id: "qa-rework-new",
+      execution,
+    });
+    const runId = created.state.run_id!;
+    const target = runTarget(root, runId);
+    const artifactsDir = target.artifactsDir!;
+    mkdirSync(artifactsDir, { recursive: true });
+    const implementation = JSON.stringify({ source: "implementation-v1" });
+    const review = JSON.stringify({ source: "review-v1" });
+    const dod = JSON.stringify({
+      items: [{
+        id: "criterion-1",
+        criterion: "Shared DoD evidence is current",
+        verify_method: "QA mutation",
+        status: "pending",
+        evidence: "",
+      }],
+    });
+    const implementationHash = createHash("sha256").update(implementation, "utf8").digest("hex");
+    const reviewHash = createHash("sha256").update(review, "utf8").digest("hex");
+    const dodHash = createHash("sha256").update(dod, "utf8").digest("hex");
+    writeFileSync(join(artifactsDir, "implementation.json"), implementation);
+    writeFileSync(join(artifactsDir, "review.json"), review);
+    writeFileSync(join(artifactsDir, "dod.json"), dod);
+    const implementationInput = { artifact_id: "implementation", path: "implementation.json", sha256: implementationHash };
+    const reviewInput = { artifact_id: "review", path: "review.json", sha256: reviewHash };
+    const dodInput = { artifact_id: "dod", path: "dod.json", sha256: dodHash };
+    const summaryInputs = [implementationInput, reviewInput, dodInput];
+    updateCanonicalRun(root, runId, (state) => ({
+      ...state,
+      stage_cursor: "summary",
+      stages: qaProfile.stages.map((stage) => ({ id: stage.id, status: "done" as const })),
+      lifecycle_status: "complete",
+      pause: { kind: "done", reason: "" },
+      artifacts: {
+        implementation: "artifacts/implementation.json",
+        review: "artifacts/review.json",
+        dod: "artifacts/dod.json",
+        qa_tests: "artifacts/qa_tests.json",
+        summary: "artifacts/summary.json",
+      },
+      required_inputs: {
+        implementation: [implementationInput],
+        review: [reviewInput],
+        qa_tests: summaryInputs,
+        summary: summaryInputs,
+      },
+      required_input_receipts: {
+        summary: {
+          stage_id: "summary",
+          capability_id: "old-capability",
+          cursor_epoch: "old-epoch",
+          rework_generation: 0,
+          read_at: "2026-09-20T00:00:00.000Z",
+          inputs: summaryInputs,
+        },
+      },
+    }));
+
+    const reopened = prepareWorkflowState({
+      task: "ignored for explicit rework",
+      cwd: root,
+      branch: BRANCH,
+      autonomous: true,
+      classification: { type: "BUG_FIX", complexity: "COMPLEX", confidence: "LOW", autonomous: true, workflow: "debug-cycle" },
+      mode: "rework",
+      run_id: runId,
+      request_id: "qa-rework",
+      feedback: "QA must refresh shared DoD evidence",
+      affected_stage: "qa_tests",
+      execution,
+    });
+    assert.equal(reopened.state.rework_generation, 1);
+
+    const refreshedDod = JSON.stringify({
+      items: [{
+        id: "criterion-1",
+        criterion: "Shared DoD evidence is current",
+        verify_method: "QA mutation",
+        status: "met",
+        evidence: "QA refreshed the criterion",
+      }],
+    });
+    const refreshedDodHash = createHash("sha256").update(refreshedDod, "utf8").digest("hex");
+    writeFileSync(join(artifactsDir, "dod.json"), refreshedDod);
+    updateCanonicalRun(root, runId, (state) => ({
+      ...state,
+      stage_cursor: "summary",
+      stages: qaProfile.stages.map((stage) => ({ id: stage.id, status: stage.id === "summary" ? "pending" as const : "done" as const })),
+    }));
+
+    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ source: "implementation-tampered" }));
+    assert.throws(
+      () => resolveWorkflowContract(root, { runId, branch: BRANCH }),
+      (error: unknown) => error instanceof WorkflowContractError && error.code === "RECOVERY_REQUIRED",
+      "mutating a preserved implementation input remains fail-closed",
+    );
+    writeFileSync(join(artifactsDir, "implementation.json"), implementation);
+
+    const instructions = resolveWorkflowContract(root, { runId, branch: BRANCH });
+    assert.equal(instructions.stage.id, "summary");
+    assert.equal(instructions.stage.required_input_contents.find((input) => input.artifact_id === "dod")?.sha256, refreshedDodHash);
+    const began = rawBeginCapability(root, undefined, { runId });
+    assert.equal(began.ok, true, began.ok ? "summary begin reads the refreshed DoD" : began.error);
+    if (!began.ok) return;
+    const afterBeginInstructions = resolveWorkflowContract(root, { runId, branch: BRANCH });
+    assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "dod")?.sha256, refreshedDodHash);
+    assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "implementation")?.sha256, implementationHash);
+    assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "review")?.sha256, reviewHash);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

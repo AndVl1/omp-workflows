@@ -610,6 +610,15 @@ interface QaDoDSnapshot {
   reason?: string;
 }
 
+interface QaDoDOwnership {
+  currentSlot: string;
+  ownerSlot: string;
+  writable: boolean;
+  orchestrator: boolean;
+  orchestratorOwner: boolean;
+  standaloneOrchestrator: boolean;
+}
+
 
 const QA_DOD_ITEM_CONTRACT = [
   "Root value is an object with an `items` array.",
@@ -633,7 +642,7 @@ function readQaDoDSnapshot(ctx: StageContext): QaDoDSnapshot {
   return { path, raw: input.content };
 }
 
-function renderQaDoDContract(snapshot: QaDoDSnapshot): string {
+function renderQaDoDContract(snapshot: QaDoDSnapshot, ownership: QaDoDOwnership): string {
   const current = snapshot.raw === null
     ? `DoD content is unavailable. Reason: ${snapshot.reason ?? "unknown read failure"}. Do not fabricate criteria or close items.`
     : [
@@ -643,16 +652,34 @@ function renderQaDoDContract(snapshot: QaDoDSnapshot): string {
       "```",
       snapshot.reason ? `Typed-item validation note: ${snapshot.reason}` : "The current JSON satisfies validateTypedDoD.",
     ].join("\n");
+  const ownershipRule = ownership.orchestrator
+    ? ownership.orchestratorOwner
+      ? ownership.standaloneOrchestrator
+        ? "Shared DoD ownership: this standalone QA orchestrator is the owner; designate exactly one child in stable child order as the sole writer. Keep every other child read-only/evidence-only; do not transfer ownership based on completion, resume, or timing."
+        : `Shared DoD ownership: orchestration slot '${ownership.currentSlot}' is the first resolved QA slot and owns coordination. Designate exactly one child in stable child order as the sole writer; keep every other child read-only/evidence-only. Do not transfer ownership based on completion, resume, or timing.`
+      : `Shared DoD ownership: slot '${ownership.ownerSlot}' is the sole writer. This orchestration slot ('${ownership.currentSlot}') is a non-owner and MUST designate NO writer; it and all its children are strictly read-only/evidence-only. Do not transfer ownership based on completion, resume, or timing.`
+    : ownership.writable
+      ? `Shared DoD ownership: slot '${ownership.currentSlot}' is the sole writer (the first resolved QA slot '${ownership.ownerSlot}'). You may edit the sidecar, but close only with your own actual criterion-specific evidence, explicitly report every remaining pending item, and never wait for, rerun, or replace a peer.`
+      : `Shared DoD ownership: slot '${ownership.ownerSlot}' is the sole writer. This slot ('${ownership.currentSlot}') is strictly read-only: do not edit or write dod.json, do not wait for or rerun peers, and return observed evidence plus proposed criterion updates only. Ownership never transfers when the first slot is already completed or on resume.`;
+  const writeRule = ownership.orchestrator
+    ? ownership.orchestratorOwner
+      ? "Do not edit dod.json directly; designate exactly one child writer in stable child order and keep every other child read-only."
+      : "Do not edit dod.json directly; this non-owner orchestration slot must designate no child writer, and it plus all children remain read-only."
+    : ownership.writable
+      ? "Write and verify the declared qa_tests artifact and the shared DoD sidecar when available."
+      : "Do not write the shared DoD sidecar; return evidence and proposed updates to the designated writer.";
   return [
     "## Shared DoD sidecar contract (qa_tests)",
     `Canonical expected shared sidecar path: ${snapshot.path}`,
     "The DoD is shared mutable authored state, not a declared QA output or required-input receipt, and MUST NOT be added to workflow_complete artifact_ids.",
     "### Source-backed typed DoD item contract",
     QA_DOD_ITEM_CONTRACT,
+    ownershipRule,
     current,
     "Inspect every pending item against actual QA evidence and that item's criterion and verify_method. Move pending→met only with nonblank criterion-specific evidence. If evidence is insufficient, keep the item pending; never blanket-mark items met.",
     "Never delete or rewrite unrelated criteria, verification methods, fields, metadata, or contributions or regress a met item. Preserve an empty items array exactly when it is empty; append a QA-owned item only when genuinely needed and only with a newly chosen non-empty id.",
-    "Write and verify the declared qa_tests artifact and the shared DoD sidecar when available. Return a closure summary with dod_updated, closed item IDs plus evidence references, and pending item IDs. Pending is valid; the later dod_complete gate remains authoritative.",
+    writeRule,
+    "Return a closure summary with dod_updated, closed item IDs plus evidence references, and pending item IDs. Pending is valid; the later dod_complete gate remains authoritative.",
   ].join("\n");
 }
 
@@ -675,7 +702,8 @@ async function runSingle(
   produces: string[],
   optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
 ): Promise<StageOutcome> {
-  const slot = resolveStageDispatchSlots(stage, ctx)[0];
+  const resolvedSlots = resolveStageDispatchSlots(stage, ctx);
+  const slot = resolvedSlots[0];
   if (!slot) return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
   const agent = ctx.agent(slot.role);
   const inputRead = ctx.durable?.readInputs?.(stage.id);
@@ -684,7 +712,7 @@ async function runSingle(
     ctx.log("  single: " + slot.slot + " already succeeded; reusing terminal dispatch");
     return validateProduced(stage, ctx, produces, "reused succeeded dispatch");
   }
-  const task = buildStagePrompt(stage, ctx, slot.slot, false, optionalInputContents);
+  const task = buildStagePrompt(stage, ctx, slot.slot, false, optionalInputContents, resolvedSlots);
   ctx.log(`  single: ${agent} (slot=${slot.slot}, role=${slot.role})`);
   const authorized = ctx.durable?.authorize(slot.slot, agent);
   if (authorized && !authorized.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${authorized.error}`, artifacts: produces };
@@ -784,8 +812,7 @@ async function runConsilium(
   const multiSlot = roster.length > 1;
   ctx.log(`  consilium: ${roster.map((slot) => slot.slot).join(", ")}${multiSlot ? " (slot-scoped artifacts)" : ""}`);
   const inputRead = ctx.durable?.readInputs?.(stage.id);
-  if (inputRead && !inputRead.ok) return { stageId: stage.id, status: "failed", note: inputRead.error, artifacts: produces };
-  const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot, optionalInputContents) }));
+  const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot, optionalInputContents, resolvedRoster) }));
   const authorized = ctx.durable ? roster.map((slot, i) => ctx.durable!.authorize(slot.slot, tasks[i]!.agent)) : [];
   const denied = authorized.find((a) => !a.ok);
   if (denied && !denied.ok) {
@@ -994,6 +1021,7 @@ function buildStagePrompt(
   role: string,
   slotScoped: boolean,
   optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
+  resolvedSlotRoster?: DispatchSlot[],
 ): string {
   const consumes = stage.consumes ?? [];
   const reads = consumes
@@ -1016,13 +1044,29 @@ ${input.content}
   const produces = slotScoped
     ? rawProduces.map((id) => `${id}-${sanitizeSlot(role)}.json`).join(", ")
     : rawProduces.join(", ") || "(none)";
-  const roleHint = isOrchestratorRole(role)
+  const resolvedSlots = resolvedSlotRoster ?? (stage.type === "single" || stage.type === "consilium"
+    ? resolveStageDispatchSlots(stage, ctx)
+    : []);
+  const currentDispatchSlot = resolvedSlots.find((slot) => slot.slot === role);
+  const semanticRole = currentDispatchSlot?.role ?? role;
+  const orchestratorRole = isOrchestratorRole(semanticRole);
+  const roleHint = orchestratorRole
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
   let qaDoDContract = "";
   if (stage.id === "qa_tests") {
+    const ownerSlot = resolvedSlots[0]?.slot ?? role;
+    const standaloneOrchestrator = orchestratorRole && resolvedSlots.length === 0;
+    const ownership: QaDoDOwnership = {
+      currentSlot: role,
+      ownerSlot,
+      writable: !orchestratorRole && role === ownerSlot,
+      orchestrator: orchestratorRole,
+      orchestratorOwner: orchestratorRole && (standaloneOrchestrator || role === ownerSlot),
+      standaloneOrchestrator,
+    };
     const snapshot = readQaDoDSnapshot(ctx);
-    qaDoDContract = `\n\n${renderQaDoDContract(snapshot)}`;
+    qaDoDContract = `\n\n${renderQaDoDContract(snapshot, ownership)}`;
   }
   const capability = ctx.state.dispatch_capability;
   const markerCapabilityId = capability?.capability_id;
@@ -1030,7 +1074,7 @@ ${input.content}
     ? dispatchTaskId(markerCapabilityId, capability.issued_for?.run_key ?? ctx.state.run_key ?? ctx.state.branch, capability.issued_for?.branch ?? ctx.state.branch, capability.issued_for?.workflow ?? ctx.state.classification.workflow, stage.id, role)
     : undefined;
   const dispatchMarker = stage.type === "single" || stage.type === "consilium"
-    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolveStageDispatchSlots(stage, ctx).map((slot) => slot.slot), role, ctx.state.cursor_epoch ?? stage.id, markerCapabilityId, role, markerTaskId)
+    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolvedSlots.map((slot) => slot.slot), role, ctx.state.cursor_epoch ?? stage.id, markerCapabilityId, role, markerTaskId)
     : "";
   const durableBinding = dispatchMarker
     ? `run_key=${ctx.state.run_key ?? ctx.state.branch} branch=${ctx.state.branch} workflow=${ctx.state.classification.workflow} profile_hash=${ctx.state.profile_hash ?? ""} stage_cursor=${stage.id} cursor_epoch=${ctx.state.cursor_epoch ?? ""}`

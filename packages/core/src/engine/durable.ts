@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
-import { normalizePersistedState, resolveCanonicalRun, isSafeStateSegment, resolveActiveBranch, updateStateAtomically, type ResolvedState, type StateMutation, type StateUpdateResult, type StateSnapshot } from "./state.js";
+import { normalizePersistedState, resolveCanonicalRun, isSafeStateSegment, resolveActiveBranch, updateStateAtomically, invalidateQaSharedDodEvidence, type ResolvedState, type StateMutation, type StateUpdateResult, type StateSnapshot } from "./state.js";
 import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole, type ResolvedConfig } from "./config.js";
 import { validateAgentMappingState, type AgentMappingDiagnostic, type AgentMappingState } from "./agent-mapping.js";
 import { resolveScope, type ScopeFlags } from "./scope.js";
@@ -2750,9 +2750,10 @@ function reenterLoop(
   // `roster_selections` history retains it for audit.
   const priorLoopSelection = state.roster_selection?.stage_id === backToStage.id ? state.roster_selection : undefined;
   const { roster_selection: _carriedLoopSelection, ...carriedLoopState } = state;
+  const loopStateWithInvalidatedEvidence = invalidateQaSharedDodEvidence(carriedLoopState, profile.stages, backToStage.id);
   const loopBackIndex = profile.stages.findIndex((stage) => stage.id === backToStage.id);
   const regeneratedArtifacts = new Set(loopBackIndex < 0 ? [] : profile.stages.slice(loopBackIndex).flatMap((stage) => stageProduces(stage)));
-  const retainedRequiredInputs = Object.fromEntries(Object.entries(carriedLoopState.required_inputs ?? {}).map(([stageId, inputs]) => [
+  const retainedRequiredInputs = Object.fromEntries(Object.entries(loopStateWithInvalidatedEvidence.required_inputs ?? {}).map(([stageId, inputs]) => [
     stageId,
     inputs.map((input) => {
       if (!regeneratedArtifacts.has(input.artifact_id)) return input;
@@ -2760,10 +2761,10 @@ function reenterLoop(
       return declaration;
     }),
   ]));
-  const retainedInputReceipts = Object.fromEntries(Object.entries(carriedLoopState.required_input_receipts ?? {}).filter(([, receipt]) =>
+  const retainedInputReceipts = Object.fromEntries(Object.entries(loopStateWithInvalidatedEvidence.required_input_receipts ?? {}).filter(([, receipt]) =>
     !receipt.inputs.some((input) => regeneratedArtifacts.has(input.artifact_id)),
   ));
-  const loopStateBase = { ...carriedLoopState };
+  const loopStateBase = { ...loopStateWithInvalidatedEvidence };
   if (Object.keys(retainedRequiredInputs).length > 0) loopStateBase.required_inputs = retainedRequiredInputs;
   else delete loopStateBase.required_inputs;
   if (Object.keys(retainedInputReceipts).length > 0) loopStateBase.required_input_receipts = retainedInputReceipts;

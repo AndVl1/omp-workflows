@@ -50,6 +50,7 @@ import type {
   MigrationReceipt,
   PauseKind,
   PendingState,
+  StageDef,
   StageStatus,
   TeamState,
   WorkIdentity,
@@ -1723,6 +1724,60 @@ export function reopenFromFeedback(
     pause: { kind: "none", reason: "" },
     updated_at: new Date().toISOString(),
   };
+}
+
+/**
+ * Invalidate only the mutable shared DoD evidence for a re-entry window that
+ * includes QA.  The manifest entry remains the source/path declaration; its
+ * hash is deliberately absent until the next explicit workflow_begin reads
+ * the current sidecar and binds a fresh receipt.
+ *
+ * This helper is shared by explicit rework and the existing bounded loopback
+ * path.  It is intentionally not re-exported from the package barrel.
+ */
+export function invalidateQaSharedDodEvidence(
+  state: TeamState,
+  profileStages: readonly StageDef[],
+  stageId: string,
+): TeamState {
+  const profileIndex = profileStages.findIndex((stage) => stage.id === stageId);
+  if (profileIndex < 0) return state;
+  const reentryStageIds = new Set(profileStages.slice(profileIndex).map((stage) => stage.id));
+  if (!reentryStageIds.has("qa_tests")) return state;
+
+  let requiredInputsChanged = false;
+  const retainedRequiredInputs = Object.fromEntries(
+    Object.entries(state.required_inputs ?? {}).map(([ownerStageId, inputs]) => {
+      if (!reentryStageIds.has(ownerStageId)) return [ownerStageId, inputs];
+      const retainedInputs = inputs.map((input) => {
+        if (input.artifact_id !== "dod" || !Object.prototype.hasOwnProperty.call(input, "sha256")) return input;
+        requiredInputsChanged = true;
+        const { sha256: _staleHash, ...declaration } = input;
+        return declaration;
+      });
+      return [ownerStageId, retainedInputs];
+    }),
+  );
+
+  const retainedInputReceipts = Object.fromEntries(
+    Object.entries(state.required_input_receipts ?? {}).filter(([ownerStageId, receipt]) => {
+      const receiptStageId = receipt.stage_id || ownerStageId;
+      return !(
+        reentryStageIds.has(receiptStageId)
+        && receipt.inputs.some((input) => input.artifact_id === "dod")
+      );
+    }),
+  );
+  const receiptsChanged = Object.keys(retainedInputReceipts).length !== Object.keys(state.required_input_receipts ?? {}).length;
+  if (!requiredInputsChanged && !receiptsChanged) return state;
+
+  const next: TeamState = { ...state };
+  if (requiredInputsChanged) next.required_inputs = retainedRequiredInputs;
+  if (receiptsChanged) {
+    if (Object.keys(retainedInputReceipts).length > 0) next.required_input_receipts = retainedInputReceipts;
+    else delete next.required_input_receipts;
+  }
+  return next;
 }
 
 /**

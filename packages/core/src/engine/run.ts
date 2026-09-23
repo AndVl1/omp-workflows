@@ -35,6 +35,7 @@ import {
   resolveActiveBranch,
   resolveCanonicalRun,
   reopenFromFeedback,
+  invalidateQaSharedDodEvidence,
   setStageStatus,
   updateStateAtomically,
   withWorkspaceTransaction,
@@ -452,7 +453,7 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
       let reworkBindings: ReworkArtifactBindings | null = null;
       state = reworkCanonicalRunAtomically(opts.cwd, runId, (current) => {
         reworkBindings = collectReworkArtifactBindings(opts.cwd, runId, current, profile, affectedStage);
-        const reopened = reopenFromFeedback(current, feedback, affectedStage);
+        const reopened = invalidateQaSharedDodEvidence(reopenFromFeedback(current, feedback, affectedStage), profile.stages, affectedStage);
         const retainedArtifacts = Object.fromEntries(Object.entries(reopened.artifacts ?? {}).filter(([artifactId]) => !reworkBindings!.artifactIds.has(artifactId)));
         return { ...reopened, artifacts: retainedArtifacts, schema: 2, run_id: runId, run_key: runId, lifecycle_status: "active", rework_generation: (current.rework_generation ?? 0) + 1, rework_feedback: [...(current.rework_feedback ?? []), { feedback, affected_stage: affectedStage, at: new Date().toISOString() }] };
       }, reworkRequest, reworkReceipt, {
