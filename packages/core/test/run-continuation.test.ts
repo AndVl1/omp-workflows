@@ -460,7 +460,7 @@ test("QA rework invalidates only downstream DoD evidence and rebinds a fresh sum
         { id: "implementation", title: "Implementation", type: "orchestrator", produces: "implementation" },
         { id: "review", title: "Review", type: "orchestrator", produces: "review" },
         { id: "qa_tests", title: "QA", type: "orchestrator", consumes: ["implementation", "review", "dod"], produces: "qa_tests" },
-        { id: "summary", title: "Summary", type: "orchestrator", consumes: ["implementation", "review", "dod"], produces: "summary" },
+        { id: "summary", title: "Summary", type: "orchestrator", consumes: ["implementation", "review", "qa_tests", "dod"], produces: "summary" },
       ],
     };
     registerWorkflowProfiles([qaProfile]);
@@ -481,8 +481,9 @@ test("QA rework invalidates only downstream DoD evidence and rebinds a fresh sum
     const target = runTarget(root, runId);
     const artifactsDir = target.artifactsDir!;
     mkdirSync(artifactsDir, { recursive: true });
-    const implementation = JSON.stringify({ source: "implementation-v1" });
-    const review = JSON.stringify({ source: "review-v1" });
+    const implementation = JSON.stringify({ files_touched: ["src/example.ts"], build_status: "pass" });
+    const review = JSON.stringify({ verdict: "approve", findings: [] });
+    const qaTests = JSON.stringify({ tests_added: ["qa-regression"], build_status: "pass" });
     const dod = JSON.stringify({
       items: [{
         id: "criterion-1",
@@ -494,14 +495,18 @@ test("QA rework invalidates only downstream DoD evidence and rebinds a fresh sum
     });
     const implementationHash = createHash("sha256").update(implementation, "utf8").digest("hex");
     const reviewHash = createHash("sha256").update(review, "utf8").digest("hex");
+    const qaTestsHash = createHash("sha256").update(qaTests, "utf8").digest("hex");
     const dodHash = createHash("sha256").update(dod, "utf8").digest("hex");
     writeFileSync(join(artifactsDir, "implementation.json"), implementation);
     writeFileSync(join(artifactsDir, "review.json"), review);
     writeFileSync(join(artifactsDir, "dod.json"), dod);
+    writeFileSync(join(artifactsDir, "qa_tests.json"), qaTests);
     const implementationInput = { artifact_id: "implementation", path: "implementation.json", sha256: implementationHash };
     const reviewInput = { artifact_id: "review", path: "review.json", sha256: reviewHash };
     const dodInput = { artifact_id: "dod", path: "dod.json", sha256: dodHash };
-    const summaryInputs = [implementationInput, reviewInput, dodInput];
+    const qaTestsInput = { artifact_id: "qa_tests", path: "qa_tests.json", sha256: qaTestsHash };
+    const qaInputs = [implementationInput, reviewInput, dodInput];
+    const summaryInputs = [implementationInput, reviewInput, qaTestsInput, dodInput];
     updateCanonicalRun(root, runId, (state) => ({
       ...state,
       stage_cursor: "summary",
@@ -518,7 +523,7 @@ test("QA rework invalidates only downstream DoD evidence and rebinds a fresh sum
       required_inputs: {
         implementation: [implementationInput],
         review: [reviewInput],
-        qa_tests: summaryInputs,
+        qa_tests: qaInputs,
         summary: summaryInputs,
       },
       required_input_receipts: {
@@ -558,7 +563,10 @@ test("QA rework invalidates only downstream DoD evidence and rebinds a fresh sum
       }],
     });
     const refreshedDodHash = createHash("sha256").update(refreshedDod, "utf8").digest("hex");
+    const refreshedQaTests = JSON.stringify({ tests_added: ["qa-regression-v2"], build_status: "pass" });
+    const refreshedQaTestsHash = createHash("sha256").update(refreshedQaTests, "utf8").digest("hex");
     writeFileSync(join(artifactsDir, "dod.json"), refreshedDod);
+    writeFileSync(join(artifactsDir, "qa_tests.json"), refreshedQaTests);
     updateCanonicalRun(root, runId, (state) => ({
       ...state,
       stage_cursor: "summary",
@@ -572,14 +580,15 @@ test("QA rework invalidates only downstream DoD evidence and rebinds a fresh sum
       "mutating a preserved implementation input remains fail-closed",
     );
     writeFileSync(join(artifactsDir, "implementation.json"), implementation);
-
     const instructions = resolveWorkflowContract(root, { runId, branch: BRANCH });
     assert.equal(instructions.stage.id, "summary");
     assert.equal(instructions.stage.required_input_contents.find((input) => input.artifact_id === "dod")?.sha256, refreshedDodHash);
+    assert.equal(instructions.stage.required_input_contents.find((input) => input.artifact_id === "qa_tests")?.sha256, refreshedQaTestsHash);
     const began = rawBeginCapability(root, undefined, { runId });
     assert.equal(began.ok, true, began.ok ? "summary begin reads the refreshed DoD" : began.error);
     if (!began.ok) return;
     const afterBeginInstructions = resolveWorkflowContract(root, { runId, branch: BRANCH });
+    assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "qa_tests")?.sha256, refreshedQaTestsHash);
     assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "dod")?.sha256, refreshedDodHash);
     assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "implementation")?.sha256, implementationHash);
     assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "review")?.sha256, reviewHash);

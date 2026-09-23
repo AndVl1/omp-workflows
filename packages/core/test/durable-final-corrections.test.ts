@@ -75,6 +75,7 @@ import {
   resumeCanonicalRun,
   runTarget,
   terminalControlPublication,
+  updateCanonicalRun,
   updateRunControl,
 } from "../src/engine/run-store.js";
 import { lifecyclePayloadHash, LifecycleError } from "../src/engine/run-lifecycle.js";
@@ -289,6 +290,28 @@ function loopProfile(): Profile {
     stages: [
       { id: "prepare", title: "Prepare", type: "orchestrator", produces: "prep" },
       { id: "check", title: "Check", type: "orchestrator", produces: "verdict", loop: { back_to: "prepare", until: "verdict.pass == true", max_iterations: 3, on_exhausted: "escalate_user" } },
+    ],
+  };
+}
+
+/** QA-shared DoD loop: loopback re-enters qa_tests and then checks its output. */
+function qaLoopProfile(): Profile {
+  return {
+    name: "final-qa-loop",
+    title: "Final QA loop",
+    description: "QA shared DoD bounded loop",
+    match: { type: ["OPS"] },
+    stages: [
+      { id: "prior", title: "Prior", type: "orchestrator", produces: "implementation" },
+      { id: "qa_tests", title: "QA", type: "orchestrator", consumes: ["implementation", "dod"], produces: "qa_tests" },
+      {
+        id: "check",
+        title: "Check",
+        type: "orchestrator",
+        consumes: ["qa_tests", "dod"],
+        produces: "verdict",
+        loop: { back_to: "qa_tests", until: "verdict.pass == true", max_iterations: 3, on_exhausted: "escalate_user" },
+      },
     ],
   };
 }
@@ -627,6 +650,7 @@ test("final: loop re-entry into a no-checkpoint orchestrator stage persists with
 
     // The blocker: re-entry wrote `work_identity: undefined` (own undefined)
     // and the persist threw before this fix.
+
     const reentered = advanceCursor(root, { ...advanceAuthOfHandoff(toCheck.handoff), evidence: "FAIL" });
     assert.equal(reentered.ok, true, reentered.ok ? "re-entered prepare" : reentered.error);
     const after = readState(root, "final");
@@ -645,6 +669,189 @@ test("final: loop re-entry into a no-checkpoint orchestrator stage persists with
     assert.equal(toCheck2.ok, true, toCheck2.ok ? "second pass advances" : toCheck2.error);
     if (!toCheck2.ok || !toCheck2.handoff) return;
     assert.equal(toCheck2.handoff.loop_iteration, 2, "check re-arms at iteration 2");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("final: QA loopback invalidates declared output and shared DoD evidence, then begin repins current bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-qa-loop-evidence-"));
+  try {
+    initGit(root);
+    const profile = qaLoopProfile();
+    registerWorkflowProfiles([profile]);
+    const issued = createCapability({
+      run_key: RUN_ID,
+      branch: "main",
+      workflow: profile.name,
+      profile_hash: profileHash(profile),
+      stage_cursor: "check",
+      kind: "none",
+      expected_roster: [],
+      loop_iteration: 1,
+    });
+    seedState(root, { profile, stageCursor: "check", slug: "final", capability: issued.state });
+
+    const artifactsDir = runTarget(root, RUN_ID).artifactsDir!;
+    const implementation = JSON.stringify({ files_touched: ["src/example.ts"], build_status: "pass" });
+    const qaTests = JSON.stringify({ tests_added: ["qa-loop"], build_status: "pass" });
+    const dod = JSON.stringify({
+      items: [{
+        id: "criterion-1",
+        criterion: "DoD evidence is current",
+        verify_method: "QA mutation",
+        status: "pending",
+        evidence: "",
+      }],
+    });
+    const verdict = JSON.stringify({ pass: false });
+    writeFileSync(join(artifactsDir, "implementation.json"), implementation);
+    writeFileSync(join(artifactsDir, "qa_tests.json"), qaTests);
+    writeFileSync(join(artifactsDir, "dod.json"), dod);
+    writeFileSync(join(artifactsDir, "verdict.json"), verdict);
+    const implementationInput = {
+      artifact_id: "implementation",
+      path: "implementation.json",
+      sha256: createHash("sha256").update(implementation, "utf8").digest("hex"),
+    };
+    const qaTestsInput = {
+      artifact_id: "qa_tests",
+      path: "qa_tests.json",
+      sha256: createHash("sha256").update(qaTests, "utf8").digest("hex"),
+    };
+    const dodInput = {
+      artifact_id: "dod",
+      path: "dod.json",
+      sha256: createHash("sha256").update(dod, "utf8").digest("hex"),
+    };
+    const receiptBinding = {
+      capability_id: issued.capability_id,
+      cursor_epoch: issued.state.issued_for!.cursor_epoch,
+      rework_generation: 0,
+      read_at: "2026-09-20T00:00:00.000Z",
+    };
+    updateCanonicalRun(root, RUN_ID, (state) => ({
+      ...state,
+      stage_cursor: "check",
+      stages: [
+        { id: "prior", status: "done" },
+        { id: "qa_tests", status: "done" },
+        { id: "check", status: "in_progress" },
+      ],
+      artifacts: {
+        implementation: "artifacts/implementation.json",
+        qa_tests: "artifacts/qa_tests.json",
+        dod: "artifacts/dod.json",
+        verdict: "artifacts/verdict.json",
+      },
+      required_inputs: {
+        prior: [],
+        qa_tests: [implementationInput, dodInput],
+        check: [qaTestsInput, dodInput],
+      },
+      required_input_receipts: {
+        prior: { stage_id: "prior", ...receiptBinding, inputs: [] },
+        qa_tests: { stage_id: "qa_tests", ...receiptBinding, inputs: [implementationInput, dodInput] },
+        check: { stage_id: "check", ...receiptBinding, inputs: [qaTestsInput, dodInput] },
+      },
+    }));
+
+    const reentered = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "check failed" });
+    assert.equal(reentered.ok, true, reentered.ok ? "the check loop re-entered QA" : reentered.error);
+    if (!reentered.ok || !reentered.handoff) return;
+    const afterLoop = readState(root, "final");
+    assert.equal(afterLoop.stage_cursor, "qa_tests");
+    assert.equal(afterLoop.required_inputs?.qa_tests?.find((input) => input.artifact_id === "implementation")?.sha256, implementationInput.sha256);
+    assert.equal(afterLoop.required_inputs?.qa_tests?.find((input) => input.artifact_id === "dod")?.sha256, undefined);
+    assert.equal(afterLoop.required_inputs?.check?.find((input) => input.artifact_id === "qa_tests")?.sha256, undefined);
+    assert.equal(afterLoop.required_inputs?.check?.find((input) => input.artifact_id === "dod")?.sha256, undefined);
+    assert.ok(afterLoop.required_input_receipts?.prior);
+    assert.equal(afterLoop.required_input_receipts?.qa_tests, undefined);
+    assert.equal(afterLoop.required_input_receipts?.check, undefined);
+
+    const refreshedQaTests = JSON.stringify({ tests_added: ["qa-loop-v2"], build_status: "pass" });
+    const refreshedDod = JSON.stringify({
+      items: [{
+        id: "criterion-1",
+        criterion: "DoD evidence is current",
+        verify_method: "QA mutation",
+        status: "met",
+        evidence: "QA refreshed the criterion",
+      }],
+    });
+    const refreshedQaTestsHash = createHash("sha256").update(refreshedQaTests, "utf8").digest("hex");
+    const refreshedDodHash = createHash("sha256").update(refreshedDod, "utf8").digest("hex");
+    writeFileSync(join(artifactsDir, "qa_tests.json"), refreshedQaTests);
+    writeFileSync(join(artifactsDir, "dod.json"), refreshedDod);
+
+    const toCheck = advanceCursor(root, { ...advanceAuthOfHandoff(reentered.handoff), evidence: "QA refreshed" });
+    assert.equal(toCheck.ok, true, toCheck.ok ? "QA advanced to check" : toCheck.error);
+    const began = beginCapability(root);
+    assert.equal(began.ok, true, began.ok ? "check begin repinned refreshed QA and DoD" : began.error);
+    if (!began.ok) return;
+    const afterBegin = readState(root, "final");
+    const receipt = afterBegin.required_input_receipts?.check;
+    assert.equal(receipt?.inputs.find((input) => input.artifact_id === "qa_tests")?.sha256, refreshedQaTestsHash);
+    assert.equal(receipt?.inputs.find((input) => input.artifact_id === "dod")?.sha256, refreshedDodHash);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("final: ordinary pending QA begin keeps hashes strict without re-entry invalidation", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-qa-pending-begin-"));
+  try {
+    initGit(root);
+    const profile = qaLoopProfile();
+    registerWorkflowProfiles([profile]);
+    seedState(root, { profile, stageCursor: "qa_tests", slug: "final" });
+    const artifactsDir = runTarget(root, RUN_ID).artifactsDir!;
+    const implementation = JSON.stringify({ source: "implementation-v1" });
+    const dod = JSON.stringify({
+      items: [{
+        id: "criterion-1",
+        criterion: "DoD evidence is current",
+        verify_method: "QA mutation",
+        status: "pending",
+        evidence: "",
+      }],
+    });
+    writeFileSync(join(artifactsDir, "implementation.json"), implementation);
+    writeFileSync(join(artifactsDir, "dod.json"), dod);
+    const implementationInput = {
+      artifact_id: "implementation",
+      path: "implementation.json",
+      sha256: createHash("sha256").update(implementation, "utf8").digest("hex"),
+    };
+    const dodInput = {
+      artifact_id: "dod",
+      path: "dod.json",
+      sha256: createHash("sha256").update(dod, "utf8").digest("hex"),
+    };
+    updateCanonicalRun(root, RUN_ID, (state) => ({
+      ...state,
+      stage_cursor: "qa_tests",
+      stages: [
+        { id: "prior", status: "done" },
+        { id: "qa_tests", status: "pending" },
+        { id: "check", status: "pending" },
+      ],
+      artifacts: {
+        implementation: "artifacts/implementation.json",
+        dod: "artifacts/dod.json",
+      },
+      required_inputs: { qa_tests: [implementationInput, dodInput] },
+      required_input_receipts: {},
+    }));
+
+    const began = beginCapability(root);
+    assert.equal(began.ok, true, began.ok ? "ordinary pending begin succeeds" : began.error);
+    if (!began.ok) return;
+    const afterBegin = readState(root, "final");
+    assert.equal(afterBegin.required_inputs?.qa_tests?.find((input) => input.artifact_id === "dod")?.sha256, dodInput.sha256);
+
+    writeFileSync(join(artifactsDir, "dod.json"), JSON.stringify({ items: [{ id: "criterion-1", criterion: "tampered", verify_method: "QA mutation", status: "met", evidence: "wrong" }] }));
+    const rejected = beginCapability(root);
+    assert.equal(rejected.ok, false, "ordinary pending begin remains strict after a current-input mutation");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

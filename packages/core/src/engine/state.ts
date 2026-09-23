@@ -1727,30 +1727,36 @@ export function reopenFromFeedback(
 }
 
 /**
- * Invalidate only the mutable shared DoD evidence for a re-entry window that
- * includes QA.  The manifest entry remains the source/path declaration; its
- * hash is deliberately absent until the next explicit workflow_begin reads
- * the current sidecar and binds a fresh receipt.
+ * Invalidate hash evidence owned by the affected profile suffix.  Declared
+ * suffix outputs are regenerated on every re-entry; the shared DoD sidecar is
+ * also mutable whenever that suffix contains qa_tests.  The declarations and
+ * paths remain available for the next explicit workflow_begin to reread.
  *
- * This helper is shared by explicit rework and the existing bounded loopback
- * path.  It is intentionally not re-exported from the package barrel.
+ * Explicit rework and bounded loopback share this pure state projection.  It
+ * is intentionally not re-exported from the package barrel.
  */
-export function invalidateQaSharedDodEvidence(
+export function invalidateReentryInputEvidence(
   state: TeamState,
   profileStages: readonly StageDef[],
   stageId: string,
 ): TeamState {
   const profileIndex = profileStages.findIndex((stage) => stage.id === stageId);
   if (profileIndex < 0) return state;
-  const reentryStageIds = new Set(profileStages.slice(profileIndex).map((stage) => stage.id));
-  if (!reentryStageIds.has("qa_tests")) return state;
+  const suffixStages = profileStages.slice(profileIndex);
+  const suffixStageIds = new Set(suffixStages.map((stage) => stage.id));
+  const invalidatedArtifactIds = new Set<string>();
+  for (const stage of suffixStages) {
+    const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+    for (const artifactId of produces) invalidatedArtifactIds.add(artifactId);
+  }
+  if (suffixStageIds.has("qa_tests")) invalidatedArtifactIds.add("dod");
 
   let requiredInputsChanged = false;
   const retainedRequiredInputs = Object.fromEntries(
     Object.entries(state.required_inputs ?? {}).map(([ownerStageId, inputs]) => {
-      if (!reentryStageIds.has(ownerStageId)) return [ownerStageId, inputs];
+      if (!suffixStageIds.has(ownerStageId)) return [ownerStageId, inputs];
       const retainedInputs = inputs.map((input) => {
-        if (input.artifact_id !== "dod" || !Object.prototype.hasOwnProperty.call(input, "sha256")) return input;
+        if (!invalidatedArtifactIds.has(input.artifact_id) || !Object.prototype.hasOwnProperty.call(input, "sha256")) return input;
         requiredInputsChanged = true;
         const { sha256: _staleHash, ...declaration } = input;
         return declaration;
@@ -1760,13 +1766,7 @@ export function invalidateQaSharedDodEvidence(
   );
 
   const retainedInputReceipts = Object.fromEntries(
-    Object.entries(state.required_input_receipts ?? {}).filter(([ownerStageId, receipt]) => {
-      const receiptStageId = receipt.stage_id || ownerStageId;
-      return !(
-        reentryStageIds.has(receiptStageId)
-        && receipt.inputs.some((input) => input.artifact_id === "dod")
-      );
-    }),
+    Object.entries(state.required_input_receipts ?? {}).filter(([ownerStageId]) => !suffixStageIds.has(ownerStageId)),
   );
   const receiptsChanged = Object.keys(retainedInputReceipts).length !== Object.keys(state.required_input_receipts ?? {}).length;
   if (!requiredInputsChanged && !receiptsChanged) return state;
