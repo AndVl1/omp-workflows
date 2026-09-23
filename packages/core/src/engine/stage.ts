@@ -28,6 +28,7 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { persistReturnedArtifacts, readArtifact, readArtifactInput, writeArtifact } from "./artifacts.js";
 import { validateProducedArtifact } from "./artifact-contract.js";
+import { validateTypedDoD } from "../gates/dod-backstop.js";
 import { resolveConfig } from "./config.js";
 import { type ScopeFlags } from "./scope.js";
 import { evaluatePredicate } from "./predicate.js";
@@ -185,6 +186,7 @@ interface SingleSpawnPayload {
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
+
 
 function contentText(value: unknown): string {
   if (!isObject(value) || !Array.isArray(value.content)) return "";
@@ -578,7 +580,6 @@ export function readOptionalStageInputs(stage: StageDef, state: TeamState, artif
   }
   return { ok: true, inputs, absent };
 }
-
 function persistTaskArtifacts(ctx: StageContext, result: TaskResult): { ids: string[]; error?: string } {
   try {
     return { ids: persistReturnedArtifacts(ctx.artifactsDir, result.artifacts ?? {}) };
@@ -602,6 +603,59 @@ function failAuthorizedDispatches(
 function taskEvidence(result: TaskResult, outcome: "succeeded" | "failed"): string {
   return result.output.trim() || result.error?.trim() || (outcome === "failed" ? "task failed" : "task completed");
 }
+
+interface QaDoDSnapshot {
+  path: string;
+  raw: string | null;
+  reason?: string;
+}
+
+
+const QA_DOD_ITEM_CONTRACT = [
+  "Root value is an object with an `items` array.",
+  "Each item is an object with non-empty string `criterion`, non-empty string `verify_method`, and `status` equal to `pending` or `met`.",
+  "`id` is optional but, when present, must be a non-empty string; `evidence` is optional but must be a string when present. A `met` item requires nonblank evidence.",
+].join("\n");
+
+function readQaDoDSnapshot(ctx: StageContext): QaDoDSnapshot {
+  const input = readArtifactInput(ctx.artifactsDir, "dod");
+  const path = resolve(ctx.artifactsDir, input.path);
+  if (input.status === "absent") {
+    return { path, raw: null, reason: `canonical DoD sidecar is unavailable at ${path}` };
+  }
+  if (input.status === "invalid") {
+    return { path, raw: null, reason: `canonical DoD sidecar is unreadable or malformed at ${path}: ${input.error}` };
+  }
+  const typed = validateTypedDoD(input.value);
+  if (!typed.ok) {
+    return { path, raw: input.content, reason: `canonical DoD sidecar is not typed DoD: ${typed.error}` };
+  }
+  return { path, raw: input.content };
+}
+
+function renderQaDoDContract(snapshot: QaDoDSnapshot): string {
+  const current = snapshot.raw === null
+    ? `DoD content is unavailable. Reason: ${snapshot.reason ?? "unknown read failure"}. Do not fabricate criteria or close items.`
+    : [
+      "### Exact current DoD JSON",
+      "```json",
+      snapshot.raw,
+      "```",
+      snapshot.reason ? `Typed-item validation note: ${snapshot.reason}` : "The current JSON satisfies validateTypedDoD.",
+    ].join("\n");
+  return [
+    "## Shared DoD sidecar contract (qa_tests)",
+    `Canonical expected shared sidecar path: ${snapshot.path}`,
+    "The DoD is shared mutable authored state, not a declared QA output or required-input receipt, and MUST NOT be added to workflow_complete artifact_ids.",
+    "### Source-backed typed DoD item contract",
+    QA_DOD_ITEM_CONTRACT,
+    current,
+    "Inspect every pending item against actual QA evidence and that item's criterion and verify_method. Move pending→met only with nonblank criterion-specific evidence. If evidence is insufficient, keep the item pending; never blanket-mark items met.",
+    "Never delete or rewrite unrelated criteria, verification methods, fields, metadata, or contributions or regress a met item. Preserve an empty items array exactly when it is empty; append a QA-owned item only when genuinely needed and only with a newly chosen non-empty id.",
+    "Write and verify the declared qa_tests artifact and the shared DoD sidecar when available. Return a closure summary with dod_updated, closed item IDs plus evidence references, and pending item IDs. Pending is valid; the later dod_complete gate remains authoritative.",
+  ].join("\n");
+}
+
 
 function hasCompletedDispatchForSlot(state: TeamState, stageId: string, slot: DispatchSlot): boolean {
   return (state.dispatch_capability?.dispatches ?? []).some((record) => {
@@ -658,15 +712,6 @@ async function runSingle(
   if (result.exitCode !== 0) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
   return validateProduced(stage, ctx, produces, `${agent} returned exit 0`);
 }
-
-/**
- * Executable `document` stage (shipped renderer: product-prd): the engine
- * itself — not an agent — renders the declared document from the stage's
- * declared sources and persists both the markdown document and the typed
- * artifact. Like bash stages this is deterministic engine work: no agent
- * dispatch and no durable dispatch records — the stage completes through
- * the normal produced-artifact validation and advance flow.
- */
 async function runProductPrdRender(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
   const contract = stage.document;
   if (!contract) {
@@ -974,6 +1019,11 @@ ${input.content}
   const roleHint = isOrchestratorRole(role)
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
+  let qaDoDContract = "";
+  if (stage.id === "qa_tests") {
+    const snapshot = readQaDoDSnapshot(ctx);
+    qaDoDContract = `\n\n${renderQaDoDContract(snapshot)}`;
+  }
   const capability = ctx.state.dispatch_capability;
   const markerCapabilityId = capability?.capability_id;
   const markerTaskId = markerCapabilityId
@@ -1004,6 +1054,8 @@ ${ctx.state.task}
 
 ### Stage instructions
 ${stage.prompt ?? "Follow the stage title and produce the declared artifact from the task and prior artifacts."}
+
+${qaDoDContract}
 
 ### Your job
 Execute this stage. Write your typed artifact to ${ctx.artifactsDir}/${slotScoped ? "<id>-<slot>.json" : "<id>.json"} matching the engine's schema (the engine reads only JSON, not prose).${slotScoped ? " This is a parallel consilium slot: write ONLY your own slot-scoped files (other slots write theirs). The engine deterministically synthesizes the shared artifacts at advance." : ""}
