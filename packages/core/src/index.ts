@@ -767,7 +767,9 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         nativeActor = undefined;
       }
     }
-    const trustedRunId = admissionResolutionFailed ? undefined : selectedRunId ?? nativeActor?.runId;
+    const trustedRunId = admissionResolutionFailed
+      ? undefined
+      : selectedRunId ?? (nativeActor?.kind === "workflow" ? nativeActor.runId : undefined);
     const gateContext = admissionCwd
       ? { ...c, cwd: admissionCwd, ...(trustedRunId ? { run_id: trustedRunId } : {}) }
       : undefined;
@@ -968,14 +970,16 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       !result
       && admissionCwd
       && event.toolName === "task"
-      && (trustedActor === "orchestrator" || trustedActor === "lead")
+      && (trustedActor === "orchestrator" || trustedActor === "lead" || authenticatedInteractiveHostNoRun)
     ) {
       try {
+        // A no-run host may bootstrap CTO leads; the native bridge still
+        // requires lead-only slice markers and validates each live CTO slice.
         nativeWorkerAuthority.admitTaskCall(
           ctx,
           event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
-          trustedActor,
-          eventRunId ?? trustedRunId,
+          trustedActor === "lead" ? "lead" : "orchestrator",
+          eventRunId ?? trustedRunId ?? nativeActor?.runId,
           nativeDispatchOrigins,
         );
       } catch {

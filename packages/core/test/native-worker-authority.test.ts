@@ -7,6 +7,8 @@ import { createNativeWorkerAuthority, type NativeWorkerAuthority } from "../src/
 import { newCtoState, appendWave, writeCtoState } from "../src/cto/state.js";
 import { buildCtoSliceMarker } from "../src/cto/slice-gate.js";
 import { resolveWorkflow } from "../src/engine/profile.js";
+import { registerTeamWorkflow } from "../src/index.js";
+import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 
 const RUN_ID = "123e4567-e89b-12d3-a456-426614174000";
 const CTO_RUN_ID = "run-lifecycle-full-resume";
@@ -119,9 +121,9 @@ test("native worker bridge denies a foreign fork while the legitimate active gra
     const input = { agent: "developer-go", task: "write the implementation" };
     startGrant(bus, parent, f.parentContext, input, "call-active", child.file, "developer-go");
 
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
     assert.equal(childAuthority.resolve(foreign.context, f.root), undefined, "copied parent marker in a foreign session cannot bind");
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID }, "foreign probe does not revoke the real grant");
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID }, "foreign probe does not revoke the real grant");
   } finally {
     f.close();
   }
@@ -148,7 +150,7 @@ test("native worker authority keeps pending candidates and active grants across 
       activeChild.file,
       "developer-go",
     );
-    assert.deepEqual(childAuthority.resolve(activeChild.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(activeChild.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
 
     // Ordinary idle has no authority teardown. The pending candidate must
     // still be promotable, and the active grant must remain usable.
@@ -161,8 +163,8 @@ test("native worker authority keeps pending candidates and active grants across 
       parentToolCallId: "idle-pending",
       index: 0,
     });
-    assert.deepEqual(childAuthority.resolve(pendingChild.context, f.root), { actor: "worker", runId: RUN_ID });
-    assert.deepEqual(childAuthority.resolve(activeChild.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(pendingChild.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(activeChild.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -177,7 +179,7 @@ test("native worker bridge accepts SDK headers without optional parentSession", 
     const child = childSession(f.root, f.parentFile, "sdk-18-0-6");
     delete child.header.parentSession;
     startGrant(bus, parent, f.parentContext, { agent: "developer-go", task: "header compatibility" }, "call-sdk-header", child.file, "developer-go");
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -213,8 +215,8 @@ test("native authority owners isolate same tool-call identities while child fact
       index: 0,
     });
     const childFactory = createNativeWorkerAuthority(bus, { bundleLabel: "shared-bundle" });
-    assert.deepEqual(childFactory.resolve(childA.context, f.root), { actor: "worker", runId: RUN_ID });
-    assert.deepEqual(childFactory.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childFactory.resolve(childA.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
+    assert.deepEqual(childFactory.resolve(childB.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
     bus.emit("task:subagent:lifecycle", {
       id: "owner-a-lifecycle",
       agent: "developer-go",
@@ -224,7 +226,7 @@ test("native authority owners isolate same tool-call identities while child fact
       index: 0,
     });
     assert.equal(childFactory.resolve(childA.context, f.root), undefined);
-    assert.deepEqual(childFactory.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childFactory.resolve(childB.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -241,21 +243,21 @@ test("native authority teardown is owner-isolated and the same factory can be re
     const childB = childSession(f.root, f.parentFile, "teardown-child-b");
     startGrant(bus, parentA, f.parentContext, { agent: "developer-go", task: "parent grant" }, "parent-call", childA.file, "developer-go");
     startGrant(bus, parentB, f.parentContext, { agent: "developer-go", task: "sibling grant" }, "sibling-call", childB.file, "developer-go");
-    assert.deepEqual(childAuthority.resolve(childA.context, f.root), { actor: "worker", runId: RUN_ID });
-    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childA.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
 
     childAuthority.teardown();
     const newChildAuthority = createNativeWorkerAuthority(bus);
-    assert.deepEqual(newChildAuthority.resolve(childA.context, f.root), { actor: "worker", runId: RUN_ID });
-    assert.deepEqual(newChildAuthority.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(newChildAuthority.resolve(childA.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
+    assert.deepEqual(newChildAuthority.resolve(childB.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
 
     parentA.teardown();
     assert.equal(newChildAuthority.resolve(childA.context, f.root), undefined);
-    assert.deepEqual(newChildAuthority.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(newChildAuthority.resolve(childB.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
 
     const reusedChild = childSession(f.root, f.parentFile, "reused-child");
     startGrant(bus, parentA, f.parentContext, { agent: "developer-go", task: "reused grant" }, "reused-call", reusedChild.file, "developer-go");
-    assert.deepEqual(newChildAuthority.resolve(reusedChild.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(newChildAuthority.resolve(reusedChild.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -275,12 +277,12 @@ test("native authority session shutdown revokes only the exact owner's parent re
     const pendingInput = { agent: "developer-go", task: "pending shutdown work" };
     parentA.admitTaskCall(f.parentContext, { toolName: "task", toolCallId: "shutdown-pending-call", input: pendingInput }, "orchestrator", RUN_ID);
     startGrant(bus, parentB, f.parentContext, { agent: "developer-go", task: "sibling shutdown grant" }, "shutdown-sibling-call", childB.file, "developer-go");
-    assert.deepEqual(childAuthority.resolve(childA.context, f.root), { actor: "worker", runId: RUN_ID });
-    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childA.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
 
     parentA.observeSessionShutdown(f.parentContext);
     assert.equal(childAuthority.resolve(childA.context, f.root), undefined);
-    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
 
     // The pending candidate was scoped to parentA and cannot be promoted
     // after parentA's exact shutdown.
@@ -294,7 +296,7 @@ test("native authority session shutdown revokes only the exact owner's parent re
       index: 0,
     });
     assert.equal(childAuthority.resolve(pendingA.context, f.root), undefined);
-    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -312,13 +314,13 @@ test("native authority ignores foreign, headless, and missing shutdown snapshots
     foreign.context.mode = "tui";
     foreign.context.hasUI = true;
     startGrant(bus, parent, f.parentContext, { agent: "developer-go", task: "survive foreign shutdown" }, "shutdown-foreign-call", child.file, "developer-go");
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
 
     parent.observeSessionShutdown(foreign.context);
     parent.observeSessionShutdown(headless.context);
     parent.observeSessionShutdown(undefined);
     parent.observeSessionShutdown({});
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -335,8 +337,8 @@ test("native authority child shutdown revokes its bound grant before a manager r
     const sibling = childSession(f.root, f.parentFile, "shutdown-bound-sibling");
     startGrant(bus, parent, f.parentContext, { agent: "developer-go", task: "bound shutdown grant" }, "shutdown-bound-call", child.file, "developer-go");
     startGrant(bus, siblingParent, f.parentContext, { agent: "developer-go", task: "sibling grant" }, "shutdown-bound-sibling-call", sibling.file, "developer-go");
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
-    assert.deepEqual(childAuthority.resolve(sibling.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(sibling.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
 
     childAuthority.observeSessionShutdown(child.context);
     const replacementHeader = { ...child.header };
@@ -348,7 +350,7 @@ test("native authority child shutdown revokes its bound grant before a manager r
     };
     const replacementContext = { sessionManager: replacementManager, mode: "print", hasUI: false };
     assert.equal(childAuthority.resolve(replacementContext, f.root), undefined);
-    assert.deepEqual(childAuthority.resolve(sibling.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(sibling.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -396,7 +398,7 @@ test("successful execution end before lifecycle start does not revoke a pending 
       parentToolCallId: "call-scheduled",
       index: 0,
     });
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -441,7 +443,7 @@ test("native authority lifecycle completed, failed, and aborted statuses revoke 
     const children = cases.map(({ suffix, callId }) => {
       const child = childSession(f.root, f.parentFile, suffix);
       startGrant(bus, parent, f.parentContext, { agent: "developer-go", task: suffix }, callId, child.file, "developer-go");
-      assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+      assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
       return child;
     });
 
@@ -473,7 +475,7 @@ test("native authority preserves headless session-start invalidation", () => {
     const pendingInput = { agent: "developer-go", task: "delayed headless work" };
     startGrant(bus, parent, f.parentContext, { agent: "developer-go", task: "headless invalidation" }, "headless-start-call", child.file, "developer-go");
     parent.admitTaskCall(f.parentContext, { toolName: "task", toolCallId: "headless-start-pending-call", input: pendingInput }, "orchestrator", RUN_ID);
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
 
     parent.observeSessionStart({ sessionManager: f.parentManager, mode: "print", hasUI: false });
     assert.equal(childAuthority.resolve(child.context, f.root), undefined);
@@ -518,7 +520,7 @@ test("native worker bridge binds the exact batch index and revokes only its gene
       parentToolCallId: "call-batch",
       index: 1,
     });
-    assert.deepEqual(childAuthority.resolve(childOne.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childOne.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
     assert.equal(childAuthority.resolve(childZero.context, f.root), undefined, "index zero cannot borrow index one");
 
     bus.emit("task:subagent:lifecycle", {
@@ -544,7 +546,7 @@ test("late terminal for an older lifecycle id cannot revoke a newer generation",
     const child = childSession(f.root, f.parentFile, "child-generation");
     const input = { agent: "developer-go", task: "generation" };
     startGrant(bus, parent, f.parentContext, input, "call-generation", child.file, "developer-go");
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
     parent.admitTaskCall(f.parentContext, { toolName: "task", toolCallId: "call-generation", input }, "orchestrator", RUN_ID);
     parent.observeToolExecutionStart({ toolName: "task", toolCallId: "call-generation", args: structuredClone(input) }, f.parentContext);
     bus.emit("task:subagent:lifecycle", {
@@ -563,7 +565,7 @@ test("late terminal for an older lifecycle id cannot revoke a newer generation",
       parentToolCallId: "call-generation",
       index: 0,
     });
-    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(childAuthority.resolve(child.context, f.root), { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -595,7 +597,7 @@ test("native worker bridge does not let an active worker arm nested delegation",
     const input = { agent: "developer-go", task: "worker" };
     startGrant(bus, parent, f.parentContext, input, "call-worker", child.file, "developer-go");
     const worker = childAuthority.resolve(child.context, f.root);
-    assert.deepEqual(worker, { actor: "worker", runId: RUN_ID });
+    assert.deepEqual(worker, { actor: "worker", kind: "workflow", runId: RUN_ID });
   } finally {
     f.close();
   }
@@ -611,7 +613,7 @@ test("native lead binding arms only matching CTO-slice children", () => {
     const sliceMarker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
     const leadInput = { agent: "team-lead", task: `${sliceMarker}\nlead slice` };
     startGrant(bus, parent, f.parentContext, leadInput, "call-lead", lead.file, "team-lead", 0, CTO_RUN_ID);
-    assert.deepEqual(childAuthority.resolve(lead.context, f.root), { actor: "lead", runId: CTO_RUN_ID });
+    assert.deepEqual(childAuthority.resolve(lead.context, f.root), { actor: "lead", kind: "cto", runId: CTO_RUN_ID });
 
     const nested = childSession(f.root, lead.file, "nested-worker");
     const nestedInput = { agent: "developer-go", task: `${sliceMarker}\nworker slice` };
@@ -625,7 +627,7 @@ test("native lead binding arms only matching CTO-slice children", () => {
       parentToolCallId: "call-nested",
       index: 0,
     });
-    assert.deepEqual(childAuthority.resolve(nested.context, f.root), { actor: "worker", runId: CTO_RUN_ID });
+    assert.deepEqual(childAuthority.resolve(nested.context, f.root), { actor: "worker", kind: "cto", runId: CTO_RUN_ID });
 
     const mismatched = childSession(f.root, lead.file, "nested-mismatch");
     const mismatchInput = { agent: "developer-go", task: `${buildCtoSliceMarker(CTO_RUN_ID, "slice-b")}\nwrong slice` };
@@ -643,6 +645,86 @@ test("native lead binding arms only matching CTO-slice children", () => {
     rmSync(join(f.root, ".work-state", "cto", CTO_RUN_ID, "state.json"));
     assert.equal(childAuthority.resolve(nested.context, f.root), undefined, "inherited worker grant goes stale with its CTO slice");
   } finally {
+    f.close();
+  }
+});
+
+test("registered no-run host grants CTO lead delegation without granting a copied foreign context", () => {
+  const f = fixture();
+  const bus = new TestBus();
+  const controller = createWorkflowSessionController({
+    cwd: f.root,
+    context: {
+      session_id: f.parentManager.getSessionId(),
+      caller: "host",
+      process_id: process.pid,
+      worktree: f.root,
+      branch: "main",
+      authority: "coordinator",
+    },
+  });
+  type Handler = (event: unknown, ctx: unknown) => unknown;
+  const registrations: Array<Record<string, Handler[]>> = [];
+  const register = () => {
+    const handlers: Record<string, Handler[]> = {};
+    registerTeamWorkflow({
+      events: bus,
+      setLabel() {},
+      on(name: string, handler: Handler) {
+        (handlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      observability: false,
+      resolveCwd: () => f.root,
+      getSessionController: (ctx) => ctx === f.parentContext
+        ? controller
+        : undefined,
+      resolveTrustedToolCallActor: (ctx) => ctx === f.parentContext
+        ? { kind: "authenticated-interactive-host-no-run" }
+        : undefined,
+    });
+    registrations.push(handlers);
+    return handlers;
+  };
+  try {
+    const parent = register();
+    const leadHooks = register();
+    const lead = childSession(f.root, f.parentFile, "registered-lead");
+    const marker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
+    const input = { tasks: [{ agent: "omp-team-lead", task: `${marker}\nlead slice` }] };
+    const toolCallId = "registered-no-run-lead";
+    assert.equal(parent.tool_call![0]!({ toolName: "task", toolCallId, input }, f.parentContext), undefined);
+    for (const handler of parent.tool_execution_start ?? []) {
+      handler({ toolName: "task", toolCallId, args: input }, f.parentContext);
+    }
+    bus.emit("task:subagent:lifecycle", {
+      id: "registered-lead-lifecycle",
+      agent: "omp-team-lead",
+      status: "started",
+      sessionFile: lead.file,
+      parentToolCallId: toolCallId,
+      index: 0,
+    });
+    const nested = {
+      toolName: "task",
+      toolCallId: "registered-lead-worker",
+      input: { tasks: [{ agent: "developer-go", task: `${marker}\nworker slice` }] },
+    };
+    assert.equal(leadHooks.tool_call![0]!(nested, lead.context), undefined);
+    const foreign = {
+      ...lead.context,
+      actor: "lead",
+      sessionManager: { ...lead.manager },
+    };
+    assert.equal(
+      (leadHooks.tool_call![0]!(nested, foreign) as { block?: boolean } | undefined)?.block,
+      true,
+    );
+    assert.equal(leadHooks.tool_call![0]!(nested, lead.context), undefined);
+  } finally {
+    for (const handlers of registrations) {
+      for (const handler of handlers.session_shutdown ?? []) handler({}, f.parentContext);
+    }
     f.close();
   }
 });

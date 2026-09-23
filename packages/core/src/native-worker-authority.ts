@@ -120,6 +120,7 @@ type RegistrySlot = Record<PropertyKey, unknown>;
 
 export type NativeWorkerResolution = {
   actor: NativeActor;
+  kind: "workflow" | "cto";
   runId: string;
 };
 
@@ -713,7 +714,7 @@ export function createNativeWorkerAuthority(
         revokeGrant(registry, grant);
         return undefined;
       }
-      return { actor: grant.actor, runId: grant.runId };
+      return { actor: grant.actor, kind: grant.ctoSlice ? "cto" : "workflow", runId: grant.runId };
     },
 
     observeSessionStart(ctx) {
