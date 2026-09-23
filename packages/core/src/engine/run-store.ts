@@ -15,7 +15,7 @@ import {
 import { beginLifecycleTransaction, commitLifecycleTransaction, type LifecycleFileContent } from "./lifecycle-journal.js";
 import { LifecycleError, lifecyclePayloadHash, selectRunCandidate } from "./run-lifecycle.js";
 import type { RunSelectionInput, RunSelectionResult } from "./run-lifecycle.js";
-import { isRecord, validateDispatchCapabilityValue, validatePrepareRequestReceiptValue } from "./control-plane-contract.js";
+import { isRecord, validateActiveCapabilityStateBinding, validateActiveDispatchCapabilityValue, validateDispatchCapabilityValue, validatePrepareRequestReceiptValue } from "./control-plane-contract.js";
 import type {
   LifecycleRequest,
   LifecycleStatus,
@@ -495,29 +495,123 @@ function claimBusy(claim: WorktreeExecutionClaim, context: TrustedExecutionConte
   }
 }
 
+type CrossRunClaimAdmission = { candidate: RunCandidate };
+
+function isExecutionClaim(value: unknown): value is WorktreeExecutionClaim {
+  if (!isRecord(value)) return false;
+  if (typeof value.token !== "string" || !value.token || typeof value.owner_kind !== "string" || !["workflow", "cto"].includes(value.owner_kind)) return false;
+  if (typeof value.run_id !== "string" || !value.run_id || typeof value.coordinator_session_id !== "string" || !value.coordinator_session_id
+    || typeof value.ownership_epoch !== "string" || !value.ownership_epoch) return false;
+  const ownerKind = value.owner_kind as "workflow" | "cto";
+  if (ownerKind === "workflow" ? !validRunId(value.run_id) : !/^[A-Za-z0-9._-]+$/.test(value.run_id)) return false;
+  if (!Array.isArray(value.worker_ids) || value.worker_ids.some((workerId) => typeof workerId !== "string")) return false;
+  if (value.coordinator_process_id !== undefined
+    && (!Number.isInteger(value.coordinator_process_id) || (value.coordinator_process_id as number) <= 0)) return false;
+  if (value.released_at !== null && (typeof value.released_at !== "string" || !value.released_at)) return false;
+  if (value.release_receipt !== undefined && typeof value.release_receipt !== "string") return false;
+  return true;
+}
+
+function claimBusyError(claim: unknown): LifecycleError {
+  const runId = isRecord(claim) && typeof claim.run_id === "string" ? claim.run_id : undefined;
+  return new LifecycleError(
+    "run_busy",
+    runId ? `worktree execution is owned by run ${runId}` : "worktree execution claim is malformed",
+    runId ? { run_id: runId } : {},
+  );
+}
+
+function assertExecutionClaim(value: unknown): asserts value is WorktreeExecutionClaim {
+  if (!isExecutionClaim(value)) throw claimBusyError(value);
+}
+
+function activePendingStatus(status: unknown): boolean {
+  return status === "authorized" || status === "running" || status === "pending";
+}
+
+function activeChildJoinStatus(status: unknown): boolean {
+  return status === "planned" || status === "authorized" || status === "pending" || status === "conflict";
+}
+
+function quiescentCanonicalRun(cwd: string, runId: string): CrossRunClaimAdmission | null {
+  if (!validRunId(runId)) return null;
+  try {
+    const resolved = resolveCanonicalRun(cwd, { kind: "team", runId });
+    const state = resolved?.state;
+    if (!state || state.schema !== 2 || state.run_id !== runId || state.run_key !== runId) return null;
+    if (state.pause.kind === "background_wait") return null;
+    if (activePendingStatus(state.pending?.status)) return null;
+    if (state.completion_envelope?.outcome === "pending") return null;
+
+    const capability = state.dispatch_capability;
+    if (capability !== undefined) {
+      if (!validateActiveDispatchCapabilityValue(capability).ok || !validateActiveCapabilityStateBinding(state).ok) return null;
+      if (capability.pending?.some((pending) => activePendingStatus(pending.status))) return null;
+      if (capability.dispatches?.some((dispatch) =>
+        activePendingStatus(dispatch.status)
+        || activePendingStatus(dispatch.pending?.status)
+        || dispatch.completion_envelope?.outcome === "pending",
+      )) return null;
+    }
+    if (activeChildJoinStatus(state.child_join?.state)) return null;
+    if (state.child_joins?.some((join) => activeChildJoinStatus(join.state))) return null;
+    return { candidate: candidateForState(state) };
+  } catch {
+    return null;
+  }
+}
+
+function canReplaceCrossRunClaim(
+  cwd: string,
+  claim: WorktreeExecutionClaim,
+  context: TrustedExecutionContext,
+): CrossRunClaimAdmission | null {
+  if (claim.owner_kind !== "workflow" || claim.worker_ids.length > 0) return null;
+  if (!claim.released_at && claim.coordinator_session_id !== context.session_id) {
+    if (!claim.coordinator_process_id) return null;
+    try {
+      process.kill(claim.coordinator_process_id, 0);
+      return null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") return null;
+    }
+  }
+  return quiescentCanonicalRun(cwd, claim.run_id);
+}
+
 export interface ClaimResult { claim: WorktreeExecutionClaim; idempotent: boolean }
 
 export function acquireExecutionClaim(cwd: string, input: { run_id: string; context: TrustedExecutionContext; owner_kind?: "workflow" | "cto"; worker_ids?: string[] }): ClaimResult {
-  ensureClaimId(input.run_id, input.owner_kind ?? "workflow");
+  const ownerKind = input.owner_kind ?? "workflow";
+  ensureClaimId(input.run_id, ownerKind);
   return withWorkspaceTransaction(cwd, () => {
     const before = controlContent(cwd);
     const control = readControlRaw(cwd);
-    const current = control.execution_claim;
-    const outstanding = current ? hasOutstandingDispatches(cwd, current.run_id, current.owner_kind) : false;
-    if (current && (current.run_id !== input.run_id || claimBusy(current, input.context) || outstanding !== false)) {
-      throw new LifecycleError("run_busy", `worktree execution is owned by run '${current.run_id}'`, { run_id: current.run_id, next_action: current.run_id === input.run_id ? "resume or reconcile the existing run" : "wait for the owner or choose another worktree" });
+    const currentValue: unknown = control.execution_claim;
+    if (currentValue !== null) assertExecutionClaim(currentValue);
+    const current = currentValue;
+    if (current && current.owner_kind !== ownerKind) throw claimBusyError(current);
+    if (current && current.run_id !== input.run_id) {
+      if (ownerKind !== "workflow" || !canReplaceCrossRunClaim(cwd, current, input.context)) {
+        throw new LifecycleError("run_busy", `worktree execution is owned by run '${current.run_id}'`, { run_id: current.run_id, next_action: "wait for the owner or choose another worktree" });
+      }
+    } else if (current) {
+      const outstanding = hasOutstandingDispatches(cwd, current.run_id, current.owner_kind);
+      if (claimBusy(current, input.context) || outstanding !== false) {
+        throw new LifecycleError("run_busy", `worktree execution is owned by run '${current.run_id}'`, { run_id: current.run_id, next_action: "resume or reconcile the existing run" });
+      }
     }
     if (current && current.run_id === input.run_id && current.coordinator_session_id === input.context.session_id && !current.released_at) {
       return { claim: current, idempotent: true };
     }
     const claim: WorktreeExecutionClaim = {
       token: randomUUID(),
-      owner_kind: input.owner_kind ?? "workflow",
+      owner_kind: ownerKind,
       run_id: input.run_id,
       coordinator_session_id: input.context.session_id,
       ...(input.context.process_id ? { coordinator_process_id: input.context.process_id } : {}),
       ownership_epoch: randomUUID(),
-      worker_ids: [...new Set(input.worker_ids ?? current?.worker_ids ?? [])],
+      worker_ids: [...new Set(input.worker_ids ?? (current?.run_id === input.run_id ? current.worker_ids : []))],
       released_at: null,
     };
     writeControlTransaction(cwd, before, { ...control, revision: control.revision + 1, execution_claim: claim }, "claim");
@@ -640,21 +734,17 @@ export function persistCanonicalRun(cwd: string, state: TeamState, options: Cano
       if (options.receipt) Object.assign(options.receipt, existing);
       return { target: { ...existingTarget, state: existingState }, state: existingState };
     }
+    const currentClaim: unknown = control.execution_claim;
+    if (currentClaim !== null) assertExecutionClaim(currentClaim);
+    let claim = currentClaim;
+    if (claim && claim.owner_kind !== "workflow") throw claimBusyError(claim);
     if (existsSync(statePath)) throw new LifecycleError("lifecycle_request_conflict", `run '${state.run_id}' already exists`, { run_id: state.run_id });
-    let claim = control.execution_claim;
     let previousCandidate: RunCandidate | null = null;
     if (options.context) {
       if (claim && claim.run_id !== runId) {
-        const sameSession = claim.coordinator_session_id === options.context.session_id && !claim.released_at;
-        const previous = sameSession ? resolveCanonicalRun(cwd, { kind: "team", runId: claim.run_id }) : null;
-        const previousState = previous?.state;
-        if (previousState) previousCandidate = candidateForState(previousState);
-        const previousPending = Boolean(previousState?.pending)
-          || (previousState?.dispatch_capability?.pending?.some((entry) => entry.status === "authorized" || entry.status === "running" || entry.status === "pending") ?? false)
-          || (previousState?.dispatch_capability?.dispatches?.some((entry) => entry.status === "authorized" || entry.status === "running" || entry.status === "pending") ?? false);
-        if (!sameSession || previousState === null || previousPending || claimBusy(claim, options.context)) {
-          throw new LifecycleError("run_busy", `worktree execution is owned by run ${claim.run_id}`, { run_id: claim.run_id });
-        }
+        const admitted = canReplaceCrossRunClaim(cwd, claim, options.context);
+        if (!admitted) throw new LifecycleError("run_busy", `worktree execution is owned by run ${claim.run_id}`, { run_id: claim.run_id });
+        previousCandidate = admitted.candidate;
       } else if (claim && claimBusy(claim, options.context)) {
         throw new LifecycleError("run_busy", `worktree execution is owned by run ${claim.run_id}`, { run_id: claim.run_id });
       }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -39,13 +39,19 @@ import {
   registerWorkflowProfiles,
   resolveWorkflowContract,
 } from "../src/index.js";
-import { reworkCanonicalRunAtomically } from "../src/engine/run-store.js";
-import { profileHash } from "../src/engine/profile.js";
+import { reworkCanonicalRunAtomically, selectSession, updateRunControl } from "../src/engine/run-store.js";
+import { createCapability } from "../src/engine/durable.js";
+import { loadProfile, profileHash } from "../src/engine/profile.js";
 import type {
+  CompletionEnvelope,
+  DispatchCapabilityState,
+  DispatchCompletion,
+  DispatchRecord,
   LifecycleRequest,
   PrepareRequestReceipt,
   Profile,
   RunCandidate,
+  PendingState,
   TeamState,
   TrustedExecutionContext,
   WorkIdentity,
@@ -81,11 +87,31 @@ function context(root: string, sessionId: string, branch = BRANCH, processId = p
   };
 }
 
-function childClaim(root: string, runId: string, sessionId: string, workerIds: string[] = []): Promise<{ code: number | null; output: string }> {
+type ChildClaimOutcome = "acquired" | "run_busy";
+type ChildClaimResult = { code: number | null; output: string; outcome?: ChildClaimOutcome };
+type HeldChildClaim = {
+  child: ChildProcess;
+  attempt: Promise<ChildClaimResult>;
+  closed: Promise<void>;
+  release: () => void;
+  terminate: () => void;
+};
+
+function childClaim(root: string, runId: string, sessionId: string, workerIds?: string[]): Promise<ChildClaimResult>;
+function childClaim(root: string, runId: string, sessionId: string, workerIds: string[], options: { holdOpen: true }): HeldChildClaim;
+function childClaim(
+  root: string,
+  runId: string,
+  sessionId: string,
+  workerIds: string[] = [],
+  options?: { holdOpen: true },
+): Promise<ChildClaimResult> | HeldChildClaim {
   const workerIdsLiteral = JSON.stringify(workerIds);
+  const holdOpen = options?.holdOpen === true;
   const script = `
     import { acquireExecutionClaim } from './packages/core/src/index.ts';
     const [root, runId, sessionId] = process.argv.slice(1);
+    let outcome = 'failed';
     try {
       acquireExecutionClaim(root, {
         run_id: runId,
@@ -99,24 +125,90 @@ function childClaim(root: string, runId: string, sessionId: string, workerIds: s
         },
         worker_ids: ${workerIdsLiteral}
       });
-      process.stdout.write('acquired');
+      outcome = 'acquired';
     } catch (error) {
-      process.stdout.write(error && typeof error === 'object' && 'code' in error ? String(error.code) : 'failed');
+      outcome = error && typeof error === 'object' && 'code' in error ? String(error.code) : 'failed';
       process.exitCode = 1;
     }
+    if (${String(holdOpen)}) {
+      process.stdout.write('__claim_attempt__:' + outcome + '\\n');
+      process.stdin.setEncoding('utf8');
+      process.stdin.resume();
+      process.stdin.once('data', () => process.exit());
+    } else {
+      process.stdout.write(outcome);
+    }
   `;
-  return new Promise((resolveResult) => {
-    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script, root, runId, sessionId], {
-      cwd: REPO_ROOT,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { output += chunk; });
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => { output += chunk; });
-    child.on("close", (code) => resolveResult({ code, output }));
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script, root, runId, sessionId], {
+    cwd: REPO_ROOT,
+    stdio: [holdOpen ? "pipe" : "ignore", "pipe", "pipe"],
   });
+  let output = "";
+  let stdoutOutput = "";
+  let attemptSettled = false;
+  let finalSettled = false;
+  let resolveAttempt!: (result: ChildClaimResult) => void;
+  let resolveFinal!: (result: ChildClaimResult) => void;
+  let resolveClosed!: () => void;
+  const attempt = new Promise<ChildClaimResult>((resolveResult) => { resolveAttempt = resolveResult; });
+  const final = new Promise<ChildClaimResult>((resolveResult) => { resolveFinal = resolveResult; });
+  const closed = new Promise<void>((resolveResult) => { resolveClosed = resolveResult; });
+  const settleAttempt = (result: ChildClaimResult): void => {
+    if (attemptSettled) return;
+    attemptSettled = true;
+    resolveAttempt(result);
+  };
+  const recordError = (error: unknown, stream?: string): void => {
+    const message = error instanceof Error ? error.message : String(error);
+    output += `\n${stream ? `${stream}: ` : ""}${message}`;
+    settleAttempt({ code: null, output });
+  };
+  const settleFinal = (code: number | null): void => {
+    if (finalSettled) return;
+    finalSettled = true;
+    const result = { code, output };
+    settleAttempt(result);
+    resolveFinal(result);
+  };
+  child.stdin?.on("error", (error) => recordError(error, "stdin"));
+  child.stdout?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    stdoutOutput += chunk;
+    output += chunk;
+    const marker = stdoutOutput.match(/__claim_attempt__:([^\n]+)\n/);
+    if (marker) {
+      if (marker[1] === "acquired" || marker[1] === "run_busy") {
+        const outcome: ChildClaimOutcome = marker[1];
+        settleAttempt({ code: outcome === "acquired" ? 0 : 1, output, outcome });
+      } else {
+        settleAttempt({ code: null, output });
+      }
+    }
+  });
+  child.stdout?.on("error", (error) => recordError(error, "stdout"));
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => { output += chunk; });
+  child.stderr?.on("error", (error) => recordError(error, "stderr"));
+  child.once("error", (error) => recordError(error));
+  child.once("close", (code) => {
+    settleFinal(code);
+    resolveClosed();
+  });
+  if (!holdOpen) return final;
+  let released = false;
+  return {
+    child,
+    attempt,
+    closed,
+    release: () => {
+      if (released || child.exitCode !== null || child.signalCode !== null) return;
+      released = true;
+      child.stdin?.end("\n");
+    },
+    terminate: () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    },
+  };
 }
 
 function candidate(runId: string, title: string, status: RunCandidate["status"] = "paused", branch = BRANCH): RunCandidate {
@@ -172,6 +264,127 @@ function identity(runId: string, workflow: WorkIdentity["workflow"] = "full-feat
   };
 }
 
+function completionEnvelope(identityValue: WorkIdentity, outcome: CompletionEnvelope["outcome"]): CompletionEnvelope {
+  return {
+    schema_version: 1,
+    identity: identityValue,
+    outcome,
+    terminal_signal: outcome === "pending" ? null : "workflow_complete",
+    artifact_refs: [],
+    evidence_ref: null,
+    conflict_ref: null,
+    completed_by: "workflow_complete",
+    emitted_at: "2026-09-19T00:00:00.000Z",
+  };
+}
+
+function pendingRootState(runId: string, pause: TeamState["pause"] = { kind: "user_checkpoint", reason: "awaiting a checkpoint decision" }): TeamState {
+  const workIdentity = identity(runId);
+  return state(runId, {
+    lifecycle_status: "active",
+    pause,
+    work_identity: workIdentity,
+    pending: {
+      identity: workIdentity,
+      status: "pending",
+      pending_reason: "transport_reconnect",
+      updated_at: "2026-09-19T00:00:00.000Z",
+    },
+    completion_envelope: completionEnvelope(workIdentity, "pending"),
+  });
+}
+
+function dispatchedState(runId: string, activeDispatch = false): TeamState {
+  const profile = loadProfile(CLASSIFICATION.workflow);
+  assert.ok(profile);
+  const issued = createCapability({
+    run_key: runId,
+    branch: BRANCH,
+    workflow: profile.name,
+    profile_hash: profileHash(profile),
+    stage_cursor: "implementation",
+    kind: "single",
+    expected_roster: [{ role: "dev", agent: "dev" }],
+  }).state;
+  const workIdentity: WorkIdentity = {
+    ...identity(runId, profile.name),
+    capability_id: issued.capability_id,
+    capability_epoch: issued.issued_for!.cursor_epoch,
+    loop_iteration: issued.issued_for!.loop_iteration!,
+    slot_id: "dev",
+    task_id: "completed-task",
+    dispatch_id: "completed-dispatch",
+    worker_id: "dev",
+  };
+  const timestamp = "2026-09-19T00:00:00.000Z";
+  const activePending: PendingState = {
+    identity: workIdentity,
+    status: "running",
+    pending_reason: "transport_reconnect",
+    updated_at: timestamp,
+  };
+  const record: DispatchRecord = {
+    id: workIdentity.dispatch_id,
+    role: "dev",
+    agent: "dev",
+    status: activeDispatch ? "running" : "succeeded",
+    attempt: 1,
+    created_at: timestamp,
+    work_identity: workIdentity,
+    completion_envelope: completionEnvelope(workIdentity, activeDispatch ? "pending" : "succeeded"),
+    ...(activeDispatch
+      ? { pending: activePending }
+      : {
+          completed_at: timestamp,
+          completion: {
+            dispatch_id: workIdentity.dispatch_id,
+            cursor_epoch: issued.issued_for!.cursor_epoch,
+            outcome: "succeeded",
+            artifact_ids: [],
+            evidence: "completed dispatch evidence",
+            completed_by: "workflow_complete",
+            completed_at: timestamp,
+            work_identity: workIdentity,
+          } satisfies DispatchCompletion,
+        }),
+  };
+  const capability: DispatchCapabilityState = {
+    ...issued,
+    status: activeDispatch ? "dispatched" : "complete",
+    work_identity: workIdentity,
+    pending: activeDispatch ? [activePending] : [],
+    dispatches: [record],
+  };
+  return state(runId, {
+    lifecycle_status: "active",
+    pause: { kind: "user_checkpoint", reason: "awaiting a required user decision" },
+    profile_hash: profileHash(profile),
+    cursor_epoch: issued.issued_for!.cursor_epoch,
+    work_identity: workIdentity,
+    pending: {
+      identity: workIdentity,
+      status: "succeeded",
+      pending_reason: "transport_reconnect",
+      updated_at: timestamp,
+    },
+    completion_envelope: completionEnvelope(workIdentity, "succeeded"),
+    typed_checkpoint_decisions: [],
+    dispatch_capability: capability,
+  });
+}
+
+function childJoin(parent: WorkIdentity, joinState: NonNullable<TeamState["child_join"]>["state"], completionEnvelopeRef: string | null): NonNullable<TeamState["child_join"]> {
+  return {
+    parent,
+    child: { ...parent, slot_id: "child#1", task_id: "child-task", dispatch_id: "child-dispatch", worker_id: "child-worker" },
+    state: joinState,
+    expected_artifact_ids: [],
+    completion_envelope_ref: completionEnvelopeRef,
+    attempt: 1,
+    created_at: "2026-09-19T00:00:00.000Z",
+    joined_at: "2026-09-19T00:00:00.000Z",
+  };
+}
 function prepareOptions(root: string, task: string, requestId: string, execution: TrustedExecutionContext) {
   return {
     task,
@@ -540,6 +753,62 @@ test("direct run new creates independent canonical transition receipts on one br
   }
 });
 
+test("direct canonical exact replay bypasses a later CTO claim without mutation", () => {
+  const root = scratch("omp-lifecycle-direct-replay-cto");
+  const runId = "41414141-4141-4141-8141-414141414141";
+  const execution = context(root, "direct-replay-session");
+  const request: LifecycleRequest = {
+    mode: "new",
+    request_id: "direct-replay-request",
+    execution,
+    task: "direct replay task",
+    branch: BRANCH,
+    classification: CLASSIFICATION,
+    files: [],
+    issue: null,
+  };
+  const receipt: PrepareRequestReceipt = {
+    request_id: request.request_id,
+    payload_hash: lifecyclePayloadHash(request),
+    operation: "new",
+    previous_run_id: null,
+    previous_title: null,
+    previous_status: null,
+    selected_run_id: runId,
+    selected_title: "direct replay task",
+    selected_status: "paused",
+    committed_at: "2026-09-24T00:00:00.000Z",
+    continuation: { stage: "implementation", status: "paused" },
+  };
+  const controlPath = join(root, ".work-state", "run-control.json");
+  try {
+    const committed = persistCanonicalRun(
+      root,
+      state(runId, { title: "direct replay task", task: "direct replay task" }),
+      { context: execution, request, receipt },
+    );
+    const committedReceipt = { ...receipt };
+    const workflowClaim = readRunControl(root).execution_claim;
+    assert.ok(workflowClaim);
+    releaseExecutionClaim(root, { run_id: runId, token: workflowClaim.token });
+    acquireExecutionClaim(root, {
+      run_id: "cto-replay-owner",
+      owner_kind: "cto",
+      context: context(root, "cto-replay-owner"),
+    });
+    const beforeState = readFileSync(runStatePath(root, runId));
+    const beforeControl = readFileSync(controlPath);
+    const replayReceipt = { ...committedReceipt };
+    const replayed = persistCanonicalRun(root, committed.state, { context: execution, request, receipt: replayReceipt });
+    assert.deepEqual(replayed.state, committed.state);
+    assert.deepEqual(replayReceipt, committedReceipt);
+    assert.deepEqual(readFileSync(runStatePath(root, runId)), beforeState);
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("busy new start publishes neither a second run nor a partial control transition", () => {
 
   const root = scratch("omp-lifecycle-busy");
@@ -557,6 +826,476 @@ test("busy new start publishes neither a second run nor a partial control transi
     );
     assert.deepEqual(readRunControl(root), before);
     assert.equal(existsSync(runStatePath(root, secondId)), false, "unpublished run must not have a state file");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("new ingress replaces a dead quiescent claim after completed dispatch and preserves old authority", () => {
+  const root = scratch("omp-lifecycle-cross-run-ingress");
+  const oldRunId = "12121212-1212-4121-8121-121212121212";
+  const deadPid = 31337;
+  const controlPath = join(root, ".work-state", "run-control.json");
+  const artifactPath = join(root, ".work-state", "runs", oldRunId, "artifacts", "upstream.json");
+  try {
+    initGit(root);
+    const oldState = dispatchedState(oldRunId);
+    persistCanonicalRun(root, oldState);
+    mkdirSync(dirname(artifactPath), { recursive: true });
+    const artifactBytes = Buffer.from('{"artifact":"old-authority","bytes":[1,2,3]}\n', "utf8");
+    writeFileSync(artifactPath, artifactBytes);
+    const oldClaim = acquireExecutionClaim(root, {
+      run_id: oldRunId,
+      context: context(root, "old-coordinator", BRANCH, deadPid),
+    });
+    selectSession(root, context(root, "foreign-selector"), oldRunId, BRANCH);
+    const beforeStateBytes = readFileSync(runStatePath(root, oldRunId));
+    const beforeArtifactBytes = readFileSync(artifactPath);
+    const beforeControl = readRunControl(root);
+    const originalKill = process.kill.bind(process);
+    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === deadPid) throw Object.assign(new Error("coordinator exited"), { code: "ESRCH" });
+      return originalKill(pid, signal);
+    }) as typeof process.kill;
+    try {
+      const prepared = prepareWorkflowState(prepareOptions(root, "new ingress task", "cross-run-ingress", context(root, "new-coordinator")));
+      const newRunId = prepared.state.run_id!;
+      assert.notEqual(newRunId, oldRunId);
+      assert.equal(prepared.transition?.previous_run_id, oldRunId);
+      assert.equal(prepared.transition?.previous_title, oldState.title);
+      assert.equal(prepared.transition?.previous_status, "active");
+      assert.equal(prepared.transition?.selected_run_id, newRunId);
+      assert.equal(prepared.transition?.selected_status, "active");
+      assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeStateBytes);
+      assert.deepEqual(readFileSync(artifactPath), beforeArtifactBytes);
+
+      const afterControl = readRunControl(root);
+      assert.equal(afterControl.execution_claim?.run_id, newRunId);
+      assert.notEqual(afterControl.execution_claim?.token, oldClaim.claim.token);
+      assert.deepEqual(afterControl.runs[oldRunId], beforeControl.runs[oldRunId]);
+      assert.deepEqual(afterControl.selections["foreign-selector"], beforeControl.selections["foreign-selector"]);
+      const receipt = afterControl.prepare_receipts["cross-run-ingress"];
+      assert.ok(receipt);
+      assert.equal(receipt.previous_run_id, oldRunId);
+      assert.equal(receipt.previous_title, oldState.title);
+      assert.equal(receipt.previous_status, "active");
+      assert.equal(receipt.selected_run_id, newRunId);
+    } finally {
+      process.kill = originalKill;
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("acquireExecutionClaim replaces a dead quiescent workflow claim for a different run", () => {
+  const root = scratch("omp-lifecycle-cross-run-acquire");
+  const oldRunId = "31313131-3131-4313-8313-313131313131";
+  const newRunId = "32323232-3232-4323-8323-323232323232";
+  const deadPid = 31337;
+  try {
+    persistCanonicalRun(root, state(oldRunId));
+    const oldClaim = acquireExecutionClaim(root, { run_id: oldRunId, context: context(root, "old-owner", BRANCH, deadPid) });
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    const originalKill = process.kill.bind(process);
+    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === deadPid) throw Object.assign(new Error("coordinator exited"), { code: "ESRCH" });
+      return originalKill(pid, signal);
+    }) as typeof process.kill;
+    try {
+      const replacement = acquireExecutionClaim(root, {
+        run_id: newRunId,
+        context: context(root, "new-owner"),
+        worker_ids: ["new-worker"],
+      });
+      assert.equal(replacement.claim.run_id, newRunId);
+      assert.deepEqual(replacement.claim.worker_ids, ["new-worker"]);
+      assert.notEqual(replacement.claim.token, oldClaim.claim.token);
+    } finally {
+      process.kill = originalKill;
+    }
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.equal(readRunControl(root).execution_claim?.run_id, newRunId);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("foreign selection without a claim is historical and does not block new ingress", () => {
+  const root = scratch("omp-lifecycle-cross-run-selection-only");
+  const oldRunId = "33333333-3333-4333-8333-333333333333";
+  try {
+    initGit(root);
+    persistCanonicalRun(root, pendingRootState(oldRunId));
+    selectSession(root, context(root, "foreign-selector"), oldRunId, BRANCH);
+    const before = readRunControl(root);
+    const prepared = prepareWorkflowState(prepareOptions(root, "selection-only ingress", "cross-run-selection-only", context(root, "new-owner")));
+    assert.equal(prepared.transition?.previous_run_id, null);
+    assert.equal(prepared.transition?.previous_title, null);
+    assert.equal(prepared.transition?.previous_status, null);
+    const after = readRunControl(root);
+    assert.deepEqual(after.selections["foreign-selector"], before.selections["foreign-selector"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("same-session quiescent claim admits a new run without changing old state", () => {
+  const root = scratch("omp-lifecycle-cross-run-same-session");
+  const oldRunId = "13131313-1313-4131-8131-131313131313";
+  const newRunId = "14141414-1414-4141-8141-141414141414";
+  try {
+    const execution = context(root, "same-session");
+    persistCanonicalRun(root, state(oldRunId));
+    const oldStateBytes = readFileSync(runStatePath(root, oldRunId));
+    const oldClaim = acquireExecutionClaim(root, { run_id: oldRunId, context: execution });
+    const before = readRunControl(root);
+    const oldCandidate = before.runs[oldRunId];
+    assert.ok(oldCandidate);
+    const committed = persistCanonicalRun(root, state(newRunId), { context: execution });
+    assert.equal(committed.state.run_id, newRunId);
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), oldStateBytes);
+    const after = readRunControl(root);
+    assert.equal(after.execution_claim?.run_id, newRunId);
+    assert.notEqual(after.execution_claim?.token, oldClaim.claim.token);
+    assert.deepEqual(after.runs[oldRunId], oldCandidate);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("released quiescent claim admits a foreign session without adopting its selection", () => {
+  const root = scratch("omp-lifecycle-cross-run-released");
+  const oldRunId = "15151515-1515-4151-8151-151515151515";
+  const newRunId = "16161616-1616-4161-8161-161616161616";
+  try {
+    const oldOwner = context(root, "released-owner");
+    persistCanonicalRun(root, state(oldRunId));
+    acquireExecutionClaim(root, { run_id: oldRunId, context: oldOwner });
+    selectSession(root, context(root, "foreign-selector"), oldRunId, BRANCH);
+    updateRunControl(root, (control) => {
+      if (!control.execution_claim) throw new Error("released test requires a claim");
+      return {
+        commit: true,
+        value: undefined,
+        control: {
+          ...control,
+          execution_claim: { ...control.execution_claim, released_at: "2026-09-24T00:00:00.000Z" },
+        },
+      };
+    });
+    const before = readRunControl(root);
+    const committed = persistCanonicalRun(root, state(newRunId), { context: context(root, "new-session", BRANCH, 31337) });
+    assert.equal(committed.state.run_id, newRunId);
+    const after = readRunControl(root);
+    assert.equal(after.execution_claim?.run_id, newRunId);
+    assert.deepEqual(after.selections["foreign-selector"], before.selections["foreign-selector"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("active old work denies cross-run replacement atomically", () => {
+  const root = scratch("omp-lifecycle-cross-run-active");
+  const oldRunId = "17171717-1717-4171-8171-171717171717";
+  const newRunId = "18181818-1818-4181-8181-181818181818";
+  const deadPid = 31337;
+  try {
+    const oldState = pendingRootState(oldRunId);
+    persistCanonicalRun(root, oldState);
+    acquireExecutionClaim(root, { run_id: oldRunId, context: context(root, "old-owner", BRANCH, deadPid) });
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeControl = readFileSync(controlPath);
+    const originalKill = process.kill.bind(process);
+    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === deadPid) throw Object.assign(new Error("coordinator exited"), { code: "ESRCH" });
+      return originalKill(pid, signal);
+    }) as typeof process.kill;
+    try {
+      assert.throws(
+        () => persistCanonicalRun(root, state(newRunId), { context: context(root, "new-owner") }),
+        (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+      );
+    } finally {
+      process.kill = originalKill;
+    }
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.equal(existsSync(runStatePath(root, newRunId)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("active dispatch pending denies same-session cross-run replacement atomically", () => {
+  const root = scratch("omp-lifecycle-cross-run-dispatch-pending");
+  const oldRunId = "43434343-4343-4343-8343-434343434343";
+  const newRunId = "44444444-4444-4444-8444-444444444444";
+  const execution = context(root, "dispatch-pending-session");
+  const controlPath = join(root, ".work-state", "run-control.json");
+  try {
+    persistCanonicalRun(root, dispatchedState(oldRunId, true));
+    acquireExecutionClaim(root, { run_id: oldRunId, context: execution });
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    const beforeControl = readFileSync(controlPath);
+    assert.throws(
+      () => persistCanonicalRun(root, state(newRunId), { context: execution }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.equal(existsSync(runStatePath(root, newRunId)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("background wait denies same-session cross-run replacement atomically", () => {
+  const root = scratch("omp-lifecycle-cross-run-background-wait");
+  const oldRunId = "45454545-4545-4545-8545-454545454545";
+  const newRunId = "46464646-4646-4646-8464-464646464646";
+  const execution = context(root, "background-wait-session");
+  const controlPath = join(root, ".work-state", "run-control.json");
+  try {
+    persistCanonicalRun(root, state(oldRunId, { pause: { kind: "background_wait", reason: "provider still running" } }));
+    acquireExecutionClaim(root, { run_id: oldRunId, context: execution });
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    const beforeControl = readFileSync(controlPath);
+    assert.throws(
+      () => persistCanonicalRun(root, state(newRunId), { context: execution }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.equal(existsSync(runStatePath(root, newRunId)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("child-join conflict denies same-session cross-run replacement atomically", () => {
+  const root = scratch("omp-lifecycle-cross-run-child-join");
+  const oldRunId = "47474747-4747-4747-8474-474747474747";
+  const newRunId = "48484848-4848-4848-8484-484848484848";
+  const execution = context(root, "child-join-session");
+  const controlPath = join(root, ".work-state", "run-control.json");
+  try {
+    const parent = identity(oldRunId);
+    persistCanonicalRun(root, state(oldRunId, { work_identity: parent, child_join: childJoin(parent, "conflict", null) }));
+    acquireExecutionClaim(root, { run_id: oldRunId, context: execution });
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    const beforeControl = readFileSync(controlPath);
+    assert.throws(
+      () => persistCanonicalRun(root, state(newRunId), { context: execution }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.equal(existsSync(runStatePath(root, newRunId)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed old canonical state denies cross-run replacement atomically", () => {
+  const root = scratch("omp-lifecycle-cross-run-malformed-state");
+  const oldRunId = "19191919-1919-4191-8191-191919191919";
+  const newRunId = "20202020-2020-4202-8202-202020202020";
+  const deadPid = 31337;
+  try {
+    persistCanonicalRun(root, state(oldRunId));
+    acquireExecutionClaim(root, { run_id: oldRunId, context: context(root, "old-owner", BRANCH, deadPid) });
+    const malformedBytes = Buffer.from("{\"schema\":2,\"run_id\":\n", "utf8");
+    writeFileSync(runStatePath(root, oldRunId), malformedBytes);
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeControl = readFileSync(controlPath);
+    const originalKill = process.kill.bind(process);
+    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === deadPid) throw Object.assign(new Error("coordinator exited"), { code: "ESRCH" });
+      return originalKill(pid, signal);
+    }) as typeof process.kill;
+    try {
+      assert.throws(
+        () => persistCanonicalRun(root, state(newRunId), { context: context(root, "new-owner") }),
+        (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+      );
+    } finally {
+      process.kill = originalKill;
+    }
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), malformedBytes);
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.equal(existsSync(runStatePath(root, newRunId)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed execution claim denies cross-run replacement without changing bytes", () => {
+  const root = scratch("omp-lifecycle-cross-run-malformed-claim");
+  const oldRunId = "21212121-2121-4212-8212-212121212121";
+  const newRunId = "22222222-2222-4222-8222-222222222222";
+  const controlPath = join(root, ".work-state", "run-control.json");
+  try {
+    persistCanonicalRun(root, state(oldRunId));
+    const control = readRunControl(root);
+    writeFileSync(controlPath, `${JSON.stringify({
+      ...control,
+      execution_claim: {
+        token: "malformed-token",
+        owner_kind: "workflow",
+        run_id: oldRunId,
+        coordinator_session_id: "old-owner",
+        ownership_epoch: "malformed-epoch",
+        worker_ids: "not-an-array",
+        released_at: null,
+      },
+    }, null, 2)}\n`);
+    const beforeControl = readFileSync(controlPath);
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    assert.throws(
+      () => persistCanonicalRun(root, state(newRunId), { context: context(root, "new-owner") }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.equal(existsSync(runStatePath(root, newRunId)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("live foreign coordinator denies a quiescent cross-run replacement atomically", () => {
+  const root = scratch("omp-lifecycle-cross-run-live");
+  const oldRunId = "23232323-2323-4232-8232-232323232323";
+  const newRunId = "24242424-2424-4242-8242-242424242424";
+  try {
+    persistCanonicalRun(root, state(oldRunId));
+    acquireExecutionClaim(root, { run_id: oldRunId, context: context(root, "live-owner", BRANCH, process.pid) });
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeControl = readFileSync(controlPath);
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    assert.throws(
+      () => persistCanonicalRun(root, state(newRunId), { context: context(root, "new-owner") }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.equal(existsSync(runStatePath(root, newRunId)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unknown foreign coordinator denies a quiescent cross-run replacement atomically", () => {
+  const root = scratch("omp-lifecycle-cross-run-unknown");
+  const oldRunId = "25252525-2525-4252-8252-252525252525";
+  const newRunId = "26262626-2626-4262-8262-262626262626";
+  const unknownPid = 31337;
+  try {
+    persistCanonicalRun(root, state(oldRunId));
+    acquireExecutionClaim(root, { run_id: oldRunId, context: context(root, "unknown-owner", BRANCH, unknownPid) });
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeControl = readFileSync(controlPath);
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    const originalKill = process.kill.bind(process);
+    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === unknownPid) throw Object.assign(new Error("coordinator liveness unavailable"), { code: "EACCES" });
+      return originalKill(pid, signal);
+    }) as typeof process.kill;
+    try {
+      assert.throws(
+        () => persistCanonicalRun(root, state(newRunId), { context: context(root, "new-owner") }),
+        (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+      );
+    } finally {
+      process.kill = originalKill;
+    }
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.equal(existsSync(runStatePath(root, newRunId)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("missing foreign coordinator pid denies a quiescent cross-run replacement", () => {
+  const root = scratch("omp-lifecycle-cross-run-missing-pid");
+  const oldRunId = "27272727-2727-4272-8272-272727272727";
+  const newRunId = "28282828-2828-4282-8282-282828282828";
+  try {
+    persistCanonicalRun(root, state(oldRunId));
+    const owner = { ...context(root, "missing-pid-owner"), process_id: undefined };
+    acquireExecutionClaim(root, { run_id: oldRunId, context: owner });
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeControl = readFileSync(controlPath);
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    assert.throws(
+      () => persistCanonicalRun(root, state(newRunId), { context: context(root, "new-owner") }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.equal(existsSync(runStatePath(root, newRunId)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("owner-kind mismatch denies a same-ID claim before idempotence", () => {
+  const root = scratch("omp-lifecycle-claim-kind-mismatch");
+  const runId = "29292929-2929-4292-8292-292929292929";
+  const controlPath = join(root, ".work-state", "run-control.json");
+  try {
+    const workflowClaim = acquireExecutionClaim(root, {
+      run_id: runId,
+      owner_kind: "workflow",
+      context: context(root, "workflow-owner"),
+    });
+    const beforeControl = readFileSync(controlPath);
+    assert.throws(
+      () => acquireExecutionClaim(root, { run_id: runId, owner_kind: "cto", context: context(root, "cto-owner") }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.equal(readRunControl(root).execution_claim?.token, workflowClaim.claim.token);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("receipt binding failure for a displaced run leaves missing index and new ingress unpublished", () => {
+  const root = scratch("omp-lifecycle-cross-run-missing-index");
+  const oldRunId = "30303030-3030-4303-8303-303030303030";
+  const deadPid = 31337;
+  const controlPath = join(root, ".work-state", "run-control.json");
+  try {
+    initGit(root);
+    persistCanonicalRun(root, state(oldRunId));
+    acquireExecutionClaim(root, { run_id: oldRunId, context: context(root, "old-owner", BRANCH, deadPid) });
+    updateRunControl(root, (control) => {
+      const runs = { ...control.runs };
+      delete runs[oldRunId];
+      return { commit: true, value: undefined, control: { ...control, runs } };
+    });
+    const beforeControl = readFileSync(controlPath);
+    const beforeState = readFileSync(runStatePath(root, oldRunId));
+    const originalKill = process.kill.bind(process);
+    process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+      if (pid === deadPid) throw Object.assign(new Error("coordinator exited"), { code: "ESRCH" });
+      return originalKill(pid, signal);
+    }) as typeof process.kill;
+    try {
+      assert.throws(
+        () => prepareWorkflowState(prepareOptions(root, "missing index ingress", "cross-run-missing-index", context(root, "new-owner"))),
+        (error: unknown) => error instanceof LifecycleError && error.code === "recovery_required",
+      );
+    } finally {
+      process.kill = originalKill;
+    }
+    assert.deepEqual(readFileSync(controlPath), beforeControl);
+    assert.deepEqual(readFileSync(runStatePath(root, oldRunId)), beforeState);
+    assert.equal(listRuns(root, { includeTerminal: true }).filter((run) => run.run_id !== oldRunId).length, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -926,21 +1665,34 @@ test("same-run dead-owner resume rotates ownership epoch without changing rework
 
 test("concurrent process starts serialize to one execution claim", async () => {
   const root = scratch("omp-lifecycle-process-race");
+  const contenders: HeldChildClaim[] = [];
   try {
     const firstId = "abababab-abab-4bab-8bab-abababababab";
     const secondId = "cdcdcdcd-cdcd-4cdc-8cdc-cdcdcdcdcdcd";
     persistCanonicalRun(root, state(firstId));
     persistCanonicalRun(root, state(secondId));
-    const [first, second] = await Promise.all([
-      childClaim(root, firstId, "process-one"),
-      childClaim(root, secondId, "process-two"),
-    ]);
-    const results = [first, second];
-    assert.equal(results.filter((result) => result.code === 0).length, 1);
-    assert.equal(results.filter((result) => result.code !== 0).length, 1);
-    assert.ok(results.find((result) => result.code !== 0)?.output.length);
+    contenders.push(childClaim(root, firstId, "process-one", [], { holdOpen: true }));
+    contenders.push(childClaim(root, secondId, "process-two", [], { holdOpen: true }));
+    const results = await Promise.all(contenders.map((contender) => contender.attempt));
+    assert.equal(contenders.filter(({ child }) => child.exitCode === null && child.signalCode === null).length, 2);
+    assert.deepEqual(results.map((result) => result.code).sort(), [0, 1]);
+    assert.equal(results.filter((result) => result.code === 0 && result.outcome === "acquired").length, 1);
+    assert.equal(results.filter((result) => result.code === 1 && result.outcome === "run_busy").length, 1);
     assert.ok(readRunControl(root).execution_claim);
   } finally {
+    for (const contender of contenders) {
+      try {
+        contender.release();
+      } catch {
+        // The child may have already closed; termination below is still required.
+      }
+      try {
+        contender.terminate();
+      } catch {
+        // A closed child needs no further termination.
+      }
+    }
+    await Promise.all(contenders.map((contender) => contender.closed));
     rmSync(root, { recursive: true, force: true });
   }
 });
