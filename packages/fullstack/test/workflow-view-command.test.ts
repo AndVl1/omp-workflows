@@ -6,7 +6,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import workflowViewFactory, { formatWorkflowViewStatus, parseWorkflowViewArgs, selectWorkflowSessions } from "../commands/workflow-view/index.js";
-import { VISUALIZE_OUTPUT_ROOT, sessionPagePath, type CanonicalRunReportListEntry, type VisualizationSnapshot } from "@andvl1/omp-workflows-core";
+import {
+  VISUALIZE_OUTPUT_ROOT,
+  newCtoState,
+  sessionPagePath,
+  writeCtoState,
+  type CanonicalRunReportListEntry,
+  type TeamPlan,
+  type VisualizationSnapshot,
+} from "@andvl1/omp-workflows-core";
 
 const RUN_A = "11111111-1111-4111-8111-111111111111";
 const RUN_B = "22222222-2222-4222-8222-222222222222";
@@ -45,12 +53,27 @@ function writeLegacyFeature(root: string, slug: string): void {
   });
 }
 function writeCtoFixture(root: string, runId: string): void {
-  writeJson(join(root, `.work-state/cto/${runId}/state.json`), {
-    schema: 2, id: runId, task: "Decompose the payments migration", branch: "feat/payments", autonomous: false,
-    plan: { teams: [{ team: "backend", scope: ["**/*.kt"], slice: "API", profile: "full-feature", worktree: "same_branch", depends_on: [] }] },
-    teams: [{ id: "backend", status: "done", escalations: {}, dod_path: `.work-state/cto/${runId}/teams/backend/dod.json` }],
-    integration: { status: "in_progress", note: "waiting for web" }, pause: { kind: "background_wait", reason: "escalation pending" }, updated_at: "2026-08-10T11:00:00.000Z",
+  const task = "Decompose the payments migration";
+  const plan: TeamPlan = {
+    id: runId,
+    task,
+    created_at: "2026-08-08T10:00:00.000Z",
+    teams: [
+      { team: "backend", scope: ["**/*.kt"], slice: "API", profile: "full-feature", worktree: "same_branch", depends_on: [] },
+    ],
+  };
+  const state = newCtoState({
+    id: runId,
+    task,
+    branch: "feat/payments",
+    autonomous: false,
+    plan,
   });
+  state.teams[0]!.status = "done";
+  state.teams[0]!.dod_path = `.work-state/cto/${runId}/teams/backend/dod.json`;
+  state.integration = { status: "in_progress", note: "waiting for web" };
+  state.pause = { kind: "background_wait", reason: "escalation pending" };
+  writeCtoState(state, root);
 }
 function listEntry(runId: string, updatedAt: string): CanonicalRunReportListEntry {
   return { kind: "run", run_id: runId, revision_id: null, title: runId, task: runId, branch: "main", status: "active", stage: "implementation", updated_at: updatedAt, rework_generation: 0 };

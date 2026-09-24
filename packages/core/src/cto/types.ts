@@ -122,11 +122,9 @@ export interface EscalationReceipt {
  * restarts and compaction). See `escalation.ts` for the file helpers.
  *
  * The inbound surface (`pollOnce` / `setPlainMessageHandler` /
- * `sendPlainText`) is OPTIONAL — bidirectional channels (telegram today,
- * any consumer transport) implement it; push-only channels (http) skip it.
- * The in-session dispatcher and the standalone bridge duck-type on these
- * methods, so a new transport works the same the moment its adapter
- * implements them (register it via `registerEscalationAdapter`).
+ * `sendPlainText`) is OPTIONAL for consumers. The standalone `tg-bridge`
+ * specifically uses these hooks for Telegram; push-only consumers may omit
+ * them. The in-session dispatcher also duck-types the hooks when present.
  */
 export interface EscalationInboundMessage {
   id: string;

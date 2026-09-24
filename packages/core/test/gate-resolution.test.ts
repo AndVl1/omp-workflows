@@ -79,13 +79,21 @@ function registerGate(
   return handlers[0]!;
 }
 
-test("history without a selected run does not gate task compatibility", () => {
+test("history without a selected run ignores forged namespace identifiers", () => {
   const root = mkdtempSync(join(tmpdir(), "omp-gate-history-"));
   try {
     mkdirSync(join(root, ".work-state"), { recursive: true });
     writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify(minimalState()));
     const handler = registerGate(root, false);
-    const result = handler({ toolName: "task", input: { task: "ordinary task" } }, { cwd: root });
+    const result = handler(
+      { toolName: "task", input: { task: "ordinary task" } },
+      {
+        cwd: root,
+        run_id: "not-a-canonical-run-id",
+        cto_run_id: "foreign-cto-run",
+        cto_ownership_epoch: "forged-epoch",
+      },
+    );
     assert.equal(result, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });

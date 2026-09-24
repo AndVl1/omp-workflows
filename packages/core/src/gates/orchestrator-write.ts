@@ -48,6 +48,7 @@ export function createTrustedOrchestratorWriteProof(artifactsDir: string): Trust
 interface ToolCallContext {
   cwd: string;
   run_id?: string;
+  cto_run_id?: string;
   hasUI?: boolean;
   actor?: Actor;
   [TRUSTED_ORCHESTRATOR_WRITE_PROOF]?: TrustedOrchestratorWriteProof;
@@ -57,12 +58,33 @@ export function orchestratorWriteGate(
   event: ToolCallEvent,
   ctx: ToolCallContext,
 ): { block?: boolean; reason?: string } | void {
-  if (!hasStrictOrchestratorState(ctx.cwd, ctx.run_id)) return;
+  const actor = trustedActorOf(ctx);
+  const policyActive = hasStrictOrchestratorState(ctx.cwd, ctx.run_id) || hasActiveCtoState(ctx.cwd, ctx.cto_run_id);
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
   // Registered lifecycle devices use the generic write transport, but only
   // exact route writes are exempt from project-write policy.
   if (isRegisteredLifecycleDeviceWrite(event)) return;
-  const actor = trustedActorOf(ctx);
+
+  // Canonical CTO state is engine-owned even when no ordinary strict run or
+  // active CTO scope is selected (for example, immediately after a managed
+  // zero-slot suspension). This narrow preflight uses the same supported
+  // mutation detectors as the policy-active path and does not broaden
+  // protection to noncanonical artifacts or source files.
+  if (event.toolName === "bash") {
+    const earlyBash = bashProofInput(event.input);
+    if (earlyBash.valid) {
+      const canonical = bashMutationTargets(earlyBash.command).find((path) => isCanonicalStatePath(path, ctx.cwd));
+      if (canonical || looksLikeWorkflowStateMutation(earlyBash.command)) {
+        return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused bash mutation${canonical ? ` '${canonical}'` : ""}` };
+      }
+    }
+  } else {
+    const canonical = pathsFromInput(event.input).find((path) => isCanonicalStatePath(path, ctx.cwd));
+    if (canonical) {
+      return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused '${canonical}'` };
+    }
+  }
+  if (!policyActive) return;
   const bashSnapshot = event.toolName === "bash" ? bashProofInput(event.input) : undefined;
   const bashCommand = event.toolName === "bash" && bashSnapshot?.valid ? bashSnapshot.command : "";
 
@@ -468,6 +490,19 @@ export function hasStrictOrchestratorState(cwd: string, runId?: string): boolean
     const state = JSON.parse(readFileSync(path, "utf8")) as { policy?: { strict_orchestrator?: boolean } };
     return state.policy?.strict_orchestrator === true;
   } catch { return false; }
+}
+
+function hasActiveCtoState(cwd: string, runId?: string): boolean {
+  if (!runId || !/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === "..") return false;
+  try {
+    const value = JSON.parse(readFileSync(join(resolve(cwd, ".work-state"), "cto", runId, "state.json"), "utf8")) as {
+      schema?: unknown;
+      id?: unknown;
+    };
+    return value.schema === 2 && value.id === runId;
+  } catch {
+    return false;
+  }
 }
 
 // ── Bounded write_scope experiment (scope 7) ───────────────────────────────

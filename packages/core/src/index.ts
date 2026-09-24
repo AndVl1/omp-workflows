@@ -27,31 +27,32 @@ import {
   createTrustedOrchestratorWriteProof,
   TRUSTED_ORCHESTRATOR_WRITE_PROOF,
   type TrustedOrchestratorWriteProof,
+  type WorkerWriteScope,
 } from "./gates/orchestrator-write.js";
 import { dispatchGate, parseDispatchMarker, trustedDispatchRequests, type DispatchMarker } from "./gates/dispatch.js";
-import type { ExtensionAPI, BeforeAgentStartEvent, SessionStopEvent, ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 import { classificationGate, classificationToolGate } from "./gates/classification.js";
 import { monotonicGate } from "./gates/monotonic.js";
 import { dodBackstop } from "./gates/dod-backstop.js";
 import { safetyGuard } from "./gates/safety.js";
 import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
-import { ctoSliceTaskGate } from "./cto/slice-gate.js";
+import { ctoSliceTaskGate, parseCtoSliceMarker } from "./cto/slice-gate.js";
+import { isCtoRunTerminal, readCtoState } from "./cto/state.js";
+import { resolveActiveBranch } from "./engine/state.js";
 import { registerObservabilityHooks, recordToolCallAttempt, setObservabilityRun } from "./observability/index.js";
 import { authorizeDispatchTrusted, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, recordCheckpointDecision, validateCheckpointAsk, commitCheckpointAnswer, hashDispatchSecret } from "./engine/durable.js";
 import { loadProfile, registerWorkflowProfiles } from "./engine/profile.js";
 import { prepareWorkflowState, type ModelClassification, type WorkflowPrepareOptions } from "./engine/run.js";
-import { resolveActiveBranch } from "./engine/state.js";
+import { LifecycleError } from "./engine/run-lifecycle.js";
 import { resolveWorkflowContract, WorkflowContractError } from "./engine/workflow-contract.js";
 import { findCurrentCheckpointDecision } from "./engine/checkpoints.js";
-import { LifecycleError } from "./engine/run-lifecycle.js";
-import { createWorkflowSessionController, type WorkflowSessionController } from "./engine/host-controller.js";
-import { createWorkflowReadSelector } from "./engine/read-selector.js";
+import { createWorkflowSessionController, ctoClaimCredentials, type WorkflowSessionController } from "./engine/host-controller.js";
+import { suspendCtoSession, finalizeCtoSession, readCtoStateForModel, commitCtoStateForModel } from "./cto/run.js";
 import { readDispatchOriginLocator, rememberDispatchOriginLocator } from "./dispatch-origin-locator.js";
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
-import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, readRunControl, readRunControlNoRecovery, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, type DispatchOrigin } from "./engine/run-store.js";
-import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector } from "./engine/types.js";
-import type { WorkerWriteScope } from "./gates/orchestrator-write.js";
+import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, readRunControl, readRunControlNoRecovery, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, reserveExecutionClaimWorkers, settleExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
+import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector, CtoClaimScope, RunControl } from "./engine/types.js";
 import { createNativeWorkerAuthority, type NativeWorkerResolution } from "./native-worker-authority.js";
 import type { ScopeRuntimeClassTable } from "./engine/scope.js";
 import type { DispatchAuth, RosterBeginSelection } from "./engine/durable.js";
@@ -226,8 +227,8 @@ export type TrustedToolCallActor = "orchestrator" | "worker" | "lead";
 export type TrustedToolCallResolution =
   | { readonly actor: "orchestrator"; readonly artifactsDir: string }
   | { readonly actor: "worker" | "lead" }
-  | { readonly kind: "authenticated-interactive-host-no-run" };
-
+  | { readonly kind: "authenticated-interactive-host-no-run" }
+  | { readonly kind: "authenticated-interactive-host-cto"; readonly run_id: string; readonly ownership_epoch: string };
 /**
  * Bundle-owned adapter seam for the current authenticated tool-call context.
  * The callback receives host context only; model/tool input is never passed.
@@ -366,10 +367,9 @@ function resolveCwdFromContext(ctx: unknown): string | undefined {
 function sessionIdFromContext(ctx: unknown): string | undefined {
   if (!ctx || typeof ctx !== "object") return undefined;
   const value = ctx as { session_id?: unknown; sessionId?: unknown; sessionManager?: unknown };
-  if (typeof value.session_id === "string" && value.session_id.length > 0) return value.session_id;
-  if (typeof value.sessionId === "string" && value.sessionId.length > 0) return value.sessionId;
   const manager = value.sessionManager;
-  if (manager && typeof manager === "object" && "getSessionId" in manager && typeof manager.getSessionId === "function") {
+  if (manager && typeof manager === "object") {
+    if (!("getSessionId" in manager) || typeof manager.getSessionId !== "function") return undefined;
     try {
       const id = manager.getSessionId();
       return typeof id === "string" && id.length > 0 ? id : undefined;
@@ -377,8 +377,70 @@ function sessionIdFromContext(ctx: unknown): string | undefined {
       return undefined;
     }
   }
-  return undefined;
+  if (typeof value.session_id === "string" && value.session_id.length > 0) return value.session_id;
+  return typeof value.sessionId === "string" && value.sessionId.length > 0 ? value.sessionId : undefined;
 }
+function sessionFileFromContext(ctx: unknown): string | undefined {
+  if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return undefined;
+  const value = ctx as { sessionFile?: unknown; session_file?: unknown; sessionManager?: unknown };
+  const explicit = typeof value.sessionFile === "string" && value.sessionFile.length > 0
+    ? value.sessionFile
+    : typeof value.session_file === "string" && value.session_file.length > 0
+      ? value.session_file
+      : undefined;
+  const manager = value.sessionManager;
+  if (manager && typeof manager === "object") {
+    if (!("getSessionFile" in manager) || typeof manager.getSessionFile !== "function") return undefined;
+    try {
+      const file = manager.getSessionFile();
+      if (typeof file !== "string" || file.length === 0 || (explicit !== undefined && explicit !== file)) return undefined;
+      return file;
+    } catch {
+      return undefined;
+    }
+  }
+  return explicit;
+}
+function sessionSwitchActorIsAdmissible(event: unknown, ctx: unknown): boolean {
+  for (const value of [event, ctx]) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    if (!Object.prototype.hasOwnProperty.call(value, "actor")) continue;
+    const actor = (value as Record<string, unknown>).actor;
+    if (actor !== undefined && actor !== "host" && actor !== "main" && actor !== "orchestrator") return false;
+  }
+  return true;
+}
+
+type LifecycleEventType = "session_start" | "session_switch" | "session_shutdown";
+
+/**
+ * Host lifecycle events carry routing metadata, never a replacement identity.
+ * When a host includes optional identity fields, every supplied alias must
+ * agree with the callback context; otherwise the event is malformed and must
+ * not release or revoke any local authority.
+ */
+function lifecycleEventIdentityIsAdmissible(event: unknown, ctx: unknown, expectedType: LifecycleEventType): boolean {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+  const eventValue = event as Record<string, unknown>;
+  const hasType = Object.prototype.hasOwnProperty.call(eventValue, "type");
+  if (
+    expectedType === "session_start"
+      ? hasType && eventValue.type !== expectedType
+      : eventValue.type !== expectedType
+  ) return false;
+  const eventPart = lifecycleIdentityPart(event);
+  const contextPart = lifecycleIdentityPart(ctx);
+  if (!eventPart.valid || !contextPart.valid) return false;
+  const eventIdentity = eventPart.identity;
+  const contextIdentity = contextPart.identity;
+  if (!contextIdentity?.session_id || !contextIdentity.cwd) return false;
+  if (eventIdentity?.session_id && eventIdentity.session_id !== contextIdentity.session_id) return false;
+  if (eventIdentity?.cwd && !sameLifecyclePath(eventIdentity.cwd, contextIdentity.cwd)) return false;
+  if (eventIdentity?.session_manager && eventIdentity.session_manager !== contextIdentity.session_manager) return false;
+  if (eventIdentity?.session_file && (!contextIdentity.session_file || !sameLifecyclePath(eventIdentity.session_file, contextIdentity.session_file))) return false;
+  return true;
+}
+
 
 function ownerAtCwd(source: WorkflowOwnerSource, cwd: string): WorkflowOwnerIdentity {
   return typeof source === "function" ? source(canonicalProjectRoot(cwd)) : source;
@@ -696,6 +758,446 @@ function taskOriginsForResult(toolCallId: string, markerFilter: TaskMarkerFilter
   const known = knownDispatchOrigins(toolCallId, markerFilter);
   return known.length > 0 ? known : durableTaskOrigins(toolCallId, markerFilter);
 }
+function ctoReservationWorkerIds(toolCallId: string | undefined, input: unknown, ownershipEpoch: string | undefined): string[] {
+  if (!toolCallId || !ownershipEpoch) return [];
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    const value = input as Record<string, unknown>;
+    if (Array.isArray(value.tasks)) {
+      return value.tasks.length > 0
+        ? value.tasks.map((_item, index) => `cto:${ownershipEpoch}:${toolCallId}:${index}`)
+        : [];
+    }
+    if (typeof value.task === "string") return [`cto:${ownershipEpoch}:${toolCallId}:0`];
+  }
+  return [];
+}
+
+function ctoMarkerRunIds(input: unknown): string[] {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return [];
+  const value = input as Record<string, unknown>;
+  const ids: string[] = [];
+  const singleTask = typeof value.task === "string" ? value.task : undefined;
+  const tasks = Array.isArray(value.tasks) ? value.tasks : [];
+  if (singleTask) {
+    const marker = parseCtoSliceMarker(singleTask);
+    if (marker) ids.push(marker.runId);
+  }
+  for (const item of tasks) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const task = (item as Record<string, unknown>).task;
+    const marker = parseCtoSliceMarker(typeof task === "string" ? task : "");
+    if (marker) ids.push(marker.runId);
+  }
+  return ids;
+}
+function trustedLegacyCtoOwnerForRun(
+  cwd: string,
+  runId: string,
+  context: TrustedExecutionContext | undefined,
+  rawContext: unknown,
+): boolean {
+  const interactive = trustedInteractiveHostProfileFromContext(rawContext);
+  if (
+    !/^[A-Za-z0-9._-]+$/.test(runId)
+    || runId === "."
+    || runId === ".."
+    || !context
+    || !interactive
+    || context.caller !== "host"
+    || context.authority !== "coordinator"
+    || context.session_id !== interactive.session_id
+  ) return false;
+  try {
+    if (resolve(context.worktree) !== resolve(cwd) || resolve(interactive.cwd ?? "") !== resolve(cwd)) return false;
+    const control = readRunControlNoRecovery(cwd);
+    if (control.execution_claim !== null || Object.prototype.hasOwnProperty.call(control.cto_releases, runId)) return false;
+    const state = readCtoState(runId, cwd);
+    return !!state
+      && state.id === runId
+      && !isCtoRunTerminal(state)
+      && state.branch === context.branch
+      && state.owner_session === context.session_id;
+  } catch {
+    // A malformed/unsupported cto_releases entry or path fails closed:
+    // legacy bootstrap must never treat unreadable state as absent.
+    return false;
+  }
+}
+
+function trustedLegacyCtoRunId(
+  cwd: string,
+  input: unknown,
+  context: TrustedExecutionContext | undefined,
+  activeCtoScope: CtoClaimScope | undefined,
+  rawContext: unknown,
+): string | undefined {
+  if (activeCtoScope) return undefined;
+  const ids = ctoMarkerRunIds(input);
+  if (ids.length === 0 || ids.some((id) => id !== ids[0])) return undefined;
+  return trustedLegacyCtoOwnerForRun(cwd, ids[0]!, context, rawContext) ? ids[0] : undefined;
+}
+
+type CtoToolResultAsyncStatus = "sync" | "active" | "terminal" | "unknown";
+
+function ctoToolResultAsyncStatus(details: unknown): CtoToolResultAsyncStatus {
+  if (!nativeRecord(details) || !Object.prototype.hasOwnProperty.call(details, "async")) return "sync";
+  const asyncDetails = details.async;
+  if (!nativeRecord(asyncDetails)
+    || asyncDetails.type !== "task"
+    || typeof asyncDetails.jobId !== "string"
+    || asyncDetails.jobId.length === 0
+  ) return "unknown";
+  if (asyncDetails.state === "running") return "active";
+  if (asyncDetails.state === "completed" || asyncDetails.state === "failed") return "terminal";
+  return "unknown";
+}
+
+function ctoSingleResultIsTerminal(row: unknown, expectedIndex: number): boolean {
+  if (!nativeRecord(row)) return false;
+  const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(row, key);
+  if (
+    !has("index")
+    || !has("id")
+    || !has("agent")
+    || !has("agentSource")
+    || !has("task")
+    || !has("exitCode")
+    || !has("output")
+    || !has("stderr")
+    || !has("truncated")
+    || !has("durationMs")
+    || !has("tokens")
+    || !has("requests")
+  ) return false;
+  const source = row.agentSource;
+  return row.index === expectedIndex
+    && Number.isInteger(row.index)
+    && typeof row.id === "string"
+    && row.id.length > 0
+    && typeof row.agent === "string"
+    && row.agent.length > 0
+    && (source === "bundled" || source === "user" || source === "project")
+    && typeof row.task === "string"
+    && row.task.length > 0
+    && typeof row.exitCode === "number"
+    && Number.isFinite(row.exitCode)
+    && Number.isInteger(row.exitCode)
+    && typeof row.output === "string"
+    && typeof row.stderr === "string"
+    && typeof row.truncated === "boolean"
+    && typeof row.durationMs === "number"
+    && Number.isFinite(row.durationMs)
+    && row.durationMs >= 0
+    && typeof row.tokens === "number"
+    && Number.isFinite(row.tokens)
+    && row.tokens >= 0
+    && typeof row.requests === "number"
+    && Number.isFinite(row.requests)
+    && row.requests >= 0;
+}
+
+function ctoResultHasTerminalSlots(details: unknown, expectedIndexes: readonly number[], isError = false): boolean {
+  if (isError || expectedIndexes.length === 0 || new Set(expectedIndexes).size !== expectedIndexes.length) return false;
+  if (!nativeRecord(details)) return false;
+  const asyncStatus = ctoToolResultAsyncStatus(details);
+  if (asyncStatus === "active" || asyncStatus === "unknown") return false;
+  const rows = details.results;
+  if (!Array.isArray(rows) || rows.length !== expectedIndexes.length) return false;
+  const expected = new Set(expectedIndexes);
+  const indexes = new Set<number>();
+  for (const row of rows) {
+    if (!nativeRecord(row)) return false;
+    const rowIndex = row.index;
+    if (typeof rowIndex !== "number" || !Number.isInteger(rowIndex) || !expected.has(rowIndex) || indexes.has(rowIndex)) return false;
+    if (!ctoSingleResultIsTerminal(row, rowIndex)) return false;
+    indexes.add(rowIndex);
+  }
+  return indexes.size === expected.size;
+}
+
+function ctoExpectedTaskCount(input: unknown): number {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return 0;
+  const value = input as Record<string, unknown>;
+  if (Array.isArray(value.tasks)) return value.tasks.length;
+  return typeof value.task === "string" ? 1 : 0;
+}
+
+function ctoInputsMatch(left: unknown, right: unknown): boolean {
+  try {
+    const leftJson = JSON.stringify(canonicalize(left));
+    const rightJson = JSON.stringify(canonicalize(right));
+    return leftJson !== undefined && leftJson === rightJson;
+  } catch {
+    return false;
+  }
+}
+function ctoSnapshotInput(value: unknown): unknown | undefined {
+  try {
+    const snapshot = canonicalize(value);
+    return snapshot === undefined ? undefined : snapshot;
+  } catch {
+    return undefined;
+  }
+}
+
+
+/**
+ * The host's dynamic preflight/eval failures use the same exact empty result
+ * image as shape validation. The original input disambiguates the flat and
+ * batch wire forms; every reported batch line must name a captured item.
+ */
+function ctoPinnedTaskPreflightError(input: unknown, content: string): boolean {
+  const text = content.trim();
+  const flatPrefix = "Task execution failed: ";
+  if (text.startsWith(flatPrefix) && text.slice(flatPrefix.length).trim().length > 0) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+    const value = input as Record<string, unknown>;
+    return !Array.isArray(value.tasks);
+  }
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const tasks = (input as Record<string, unknown>).tasks;
+  if (!Array.isArray(tasks) || tasks.length === 0) return false;
+  const expected = new Set<string>();
+  for (let index = 0; index < tasks.length; index += 1) {
+    const item = tasks[index];
+    const itemRecord = item && typeof item === "object" && !Array.isArray(item)
+      ? item as Record<string, unknown>
+      : undefined;
+    const name = typeof itemRecord?.name === "string" && itemRecord.name.trim().length > 0
+      ? itemRecord.name.trim()
+      : `#${index + 1}`;
+    expected.add(name);
+  }
+  const lines = text.split("\n");
+  if (lines.length === 0) return false;
+  const seen = new Set<string>();
+  for (const line of lines) {
+    const match = /^Task (.+) failed preflight: (.+)$/.exec(line);
+    if (!match || match[2]!.trim().length === 0 || !expected.has(match[1]!) || seen.has(match[1]!)) return false;
+    seen.add(match[1]!);
+  }
+  return seen.size > 0;
+}
+
+function ctoAllScheduleRefusal(content: string): boolean {
+  const text = content.trim();
+  const match = /^Failed to start background task jobs?:\s+(.+)$/.exec(text);
+  return match !== null && match[1]!.trim().length > 0;
+}
+
+function ctoEmptyRefusalDetails(details: unknown): boolean {
+  if (!details || typeof details !== "object" || Array.isArray(details)) return false;
+  const value = details as Record<string, unknown>;
+  const keys = Object.keys(value).sort();
+  return keys.length === 3
+    && keys[0] === "projectAgentsDir"
+    && keys[1] === "results"
+    && keys[2] === "totalDurationMs"
+    && value.projectAgentsDir === null
+    && Array.isArray(value.results)
+    && value.results.length === 0
+    && value.totalDurationMs === 0;
+}
+function ctoPinnedTaskValidationError(input: unknown, content: string): boolean {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const value = input as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(value, "schema") && content === "The task tool uses `outputSchema`; rename the stale `schema` field.") return true;
+  const disallowed = (["tasks", "context"] as const).filter((field) => value[field] !== undefined);
+  if (disallowed.length > 0) {
+    const expected = `task.batch is disabled, so the task tool does not accept ${disallowed.map((field) => `\`${field}\``).join(" or ")}. Spawn one agent per call with \`task\`, or enable the task.batch setting.`;
+    if (content === expected) return true;
+  }
+
+  const tasks = value.tasks;
+  const hasTask = typeof value.task === "string" && value.task.trim() !== "";
+  if (Array.isArray(tasks) && tasks.length > 0) {
+    if (hasTask && content === "Top-level `task` is not part of the batch shape. Put the work in `tasks[]` items.") return true;
+    for (let index = 0; index < tasks.length; index += 1) {
+      const item = tasks[index];
+      const itemRecord = item && typeof item === "object" && !Array.isArray(item)
+        ? item as Record<string, unknown>
+        : undefined;
+      const rawName = itemRecord?.name;
+      const name = rawName ? ` (\`${String(rawName)}\`)` : "";
+      if (!itemRecord || typeof itemRecord.task !== "string" || itemRecord.task.trim() === "") {
+        const expected = `Task ${index + 1}${name} is missing \`task\`. Every task needs complete, self-contained instructions.`;
+        if (content === expected) return true;
+        continue;
+      }
+      const effort = itemRecord.effort;
+      if (effort !== undefined && effort !== "lo" && effort !== "med" && effort !== "hi") {
+        const expected = `Task ${index + 1}${name} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
+        if (content === expected) return true;
+      }
+    }
+    const seen = new Map<string, string>();
+    for (const item of tasks) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const rawName = (item as Record<string, unknown>).name;
+      if (typeof rawName !== "string") continue;
+      const name = rawName.trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      const existing = seen.get(key);
+      if (existing !== undefined) {
+        const expected = `Duplicate task name ${existing === name ? `\`${name}\`` : `\`${existing}\` / \`${name}\``}. Provided names must be unique within a call (case-insensitive).`;
+        if (content === expected) return true;
+      }
+      seen.set(key, name);
+    }
+    if (
+      (typeof value.context !== "string" || value.context.trim() === "")
+      && content === "Missing `context`. Provide the shared background for this batch — goal, constraints, and any contract the tasks share."
+    ) return true;
+  } else if (
+    Object.prototype.hasOwnProperty.call(value, "tasks")
+    && content === "Missing `tasks`. Provide at least one task item ({ name?, agent?, task })."
+  ) {
+    return true;
+  } else if (!hasTask) {
+    if (content === "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context.") return true;
+    if (content === "Missing `task`. Provide complete, self-contained instructions for the agent.") return true;
+  } else {
+    const effort = value.effort;
+    if (effort !== undefined && effort !== "lo" && effort !== "med" && effort !== "hi") {
+      return content === `The call has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
+    }
+  }
+  return false;
+}
+
+/**
+ * Return only slots for which the pinned Task host response proves that no
+ * child lifecycle started. The exact empty-details image is paired with the
+ * original input and one of the host's exact shape/preflight/schedule
+ * messages; generic errors, empty results, and async acknowledgements remain
+ * pending.
+ */
+function ctoPreSpawnRefusalIndexes(
+  input: unknown,
+  details: unknown,
+  content: string,
+  expectedCount: number,
+): number[] {
+  if (
+    expectedCount === 0
+    || ctoExpectedTaskCount(input) !== expectedCount
+    || !ctoEmptyRefusalDetails(details)
+  ) return [];
+  const text = content.trim();
+  if (
+    !ctoPinnedTaskValidationError(input, text)
+    && !ctoPinnedTaskPreflightError(input, text)
+    && !ctoAllScheduleRefusal(text)
+  ) return [];
+  return Array.from({ length: expectedCount }, (_value, index) => index);
+}
+
+function ctoScheduleRefusalIndexes(details: unknown, content: string, expectedCount: number): number[] {
+  if (!details || typeof details !== "object" || Array.isArray(details)) return [];
+  const value = details as Record<string, unknown>;
+  if (!Array.isArray(value.progress) || value.progress.length !== expectedCount || expectedCount === 0) return [];
+  const rows = value.progress as unknown[];
+  const seenIndexes = new Set<number>();
+  const failed: Record<string, unknown>[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return [];
+    const progress = row as Record<string, unknown>;
+    if (
+      typeof progress.index !== "number"
+      || !Number.isInteger(progress.index)
+      || progress.index < 0
+      || progress.index >= expectedCount
+      || seenIndexes.has(progress.index)
+    ) return [];
+    seenIndexes.add(progress.index);
+    if (progress.status === "failed") {
+      if (typeof progress.id !== "string" || progress.id.length === 0) return [];
+      failed.push(progress);
+    }
+  }
+  if (seenIndexes.size !== expectedCount || failed.length === 0) return [];
+  const summaryStart = content.indexOf("Failed to schedule ");
+  if (summaryStart < 0) return [];
+  const summary = content.slice(summaryStart).trim();
+  const countMatch = /^Failed to schedule (\d+) spawns?:\s+(.+)$/.exec(summary);
+  if (!countMatch || Number(countMatch[1]) !== failed.length) return [];
+  const labels = new Set<string>();
+  for (const entry of countMatch[2]!.split("; ")) {
+    const separator = entry.indexOf(": ");
+    const label = separator >= 0 ? entry.slice(0, separator) : "";
+    if (!label || labels.has(label)) return [];
+    labels.add(label);
+  }
+  if (labels.size !== failed.length || failed.some((row) => !labels.has(String(row.id)))) return [];
+  const resultIndexes = new Set<number>();
+  if (Array.isArray(value.results)) {
+    for (const row of value.results) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) return [];
+      const index = (row as Record<string, unknown>).index;
+      if (
+        typeof index !== "number"
+        || !Number.isInteger(index)
+        || index < 0
+        || index >= expectedCount
+        || resultIndexes.has(index)
+      ) return [];
+      resultIndexes.add(index);
+    }
+  }
+  return failed
+    .map((row) => row.index as number)
+    .filter((index) => !resultIndexes.has(index))
+    .sort((left, right) => left - right);
+}
+
+type CtoReservationHostIdentity = {
+  cwd: string;
+  origin_session_id?: string;
+  origin_session_file?: string;
+};
+
+function ctoReservationMatchesResult(
+  reservation: CtoReservationHostIdentity & { input: unknown },
+  resultInput: unknown,
+  ctx: unknown,
+): boolean {
+  if (!ctoInputsMatch(reservation.input, resultInput)) return false;
+  const resultCwd = resolveCwdFromContext(ctx);
+  if (!resultCwd) return false;
+  try {
+    if (resolve(resultCwd) !== resolve(reservation.cwd)) return false;
+  } catch {
+    return false;
+  }
+  const resultSessionId = sessionIdFromContext(ctx);
+  if (reservation.origin_session_id !== resultSessionId) return false;
+  const resultSessionFile = sessionFileFromContext(ctx);
+  return reservation.origin_session_file === resultSessionFile;
+}
+
+type CtoReservation = CtoReservationHostIdentity & {
+  run_id: string;
+  token: string;
+  worker_ids: string[];
+  ownership_epoch: string;
+  worker_indexes: number[];
+  input: unknown;
+};
+
+/**
+ * Tool result events expose only the host call id, input, and current session
+ * context. Once a call's reservation is consumed, retaining its id privately
+ * is the only fail-closed way to reject an indistinguishable same-id replay;
+ * this ledger is process-local and never becomes execution-claim state.
+ */
+function ctoReservationReuseBlocked(
+  toolCallId: string,
+  reservations: ReadonlyMap<string, CtoReservation>,
+  retiredToolCalls: ReadonlySet<string>,
+): boolean {
+  return reservations.has(toolCallId) || retiredToolCalls.has(toolCallId);
+}
 
 export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
   if (opts.cwd && opts.owner) {
@@ -706,7 +1208,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   if (opts.workflowProfiles?.length) registerWorkflowProfiles(opts.workflowProfiles);
 
   const resolveCwd = opts.resolveCwd ?? resolveCwdFromContext;
-  const nativeWorkerAuthority = createNativeWorkerAuthority(pi.events, { bundleLabel: label });
+  const ctoReservations = new Map<string, CtoReservation>();
+  // Retain consumed host-call identities for this registration lifetime.
+  // Host result events expose no immutable generation discriminator, so
+  // shutdown or session replacement cannot safely make a same-id replay
+  // reusable while an older delayed result may still be delivered.
+  const retiredCtoToolCalls = new Set<string>();
   const resolverConfigured = typeof opts.resolveTrustedToolCallActor === "function";
   const controllerConfigured = typeof opts.getSessionController === "function";
   const bindSession = (ctx: unknown): void => {
@@ -717,12 +1224,237 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     const runId = opts.getSessionController?.(ctx, cwd)?.selectedRunId();
     if (runId) restoreDispatchOrigins(cwd, runId);
   };
-  pi.on("session_start", (_event, ctx: unknown) => {
+  type LifecycleBinding = {
+    controller: WorkflowSessionController;
+    key: string;
+    identity: HostSessionIdentity;
+  };
+  let lifecycleBinding: LifecycleBinding | undefined;
+  const resolveLifecycleBinding = (ctx: unknown): LifecycleBinding | undefined => {
+    const cwd = opts.cwd ?? resolveCwd(ctx);
+    if (!cwd || !opts.getSessionController) return undefined;
+    const hostIdentity = hostSessionIdentityFromContext(ctx);
+    if (!hostIdentity.session_id || !hostIdentity.cwd) return undefined;
+    let controller: WorkflowSessionController | undefined;
+    try {
+      controller = opts.getSessionController(ctx, cwd);
+    } catch {
+      return undefined;
+    }
+    if (!controller) return undefined;
+    let controllerContext: TrustedExecutionContext;
+    try {
+      controllerContext = controller.context();
+    } catch {
+      return undefined;
+    }
+    if (
+      controllerContext.session_id !== hostIdentity.session_id
+      || !controllerContext.worktree
+    ) return undefined;
+    try {
+      if (
+        resolve(controllerContext.worktree) !== resolve(hostIdentity.cwd)
+        || resolve(controllerContext.worktree) !== resolve(cwd)
+      ) return undefined;
+    } catch {
+      return undefined;
+    }
+    const identity: HostSessionIdentity = {
+      ...(hostIdentity.session_id ? { session_id: hostIdentity.session_id } : {}),
+      ...(hostIdentity.cwd ? { cwd: hostIdentity.cwd } : {}),
+      ...(hostIdentity.session_manager ? { session_manager: hostIdentity.session_manager } : {}),
+      ...(hostIdentity.session_file ? { session_file: hostIdentity.session_file } : {}),
+    };
+    return { controller, key: `${identity.session_id}\u0000${identity.cwd}`, identity };
+  };
+  const sameLifecycleIdentity = (left: HostSessionIdentity, right: HostSessionIdentity): boolean => {
+    if (!left.session_id || !right.session_id || left.session_id !== right.session_id) return false;
+    if (!left.cwd || !right.cwd) return false;
+    try {
+      if (resolve(left.cwd) !== resolve(right.cwd)) return false;
+    } catch {
+      return false;
+    }
+    if (left.session_manager || right.session_manager) {
+      if (!left.session_manager || !right.session_manager || left.session_manager !== right.session_manager) return false;
+    }
+    if (left.session_file || right.session_file) {
+      if (!left.session_file || !right.session_file || left.session_file !== right.session_file) return false;
+    }
+    return true;
+  };
+  const verifiedLifecycleHost = (ctx: unknown): { identity: HostSessionIdentity; mode: "tui" | "rpc" } | undefined => {
+    if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return undefined;
+    const value = ctx as Record<string, unknown>;
+    const actor = value.actor;
+    if (actor !== undefined && actor !== "host") return undefined;
+    if (value.mode !== undefined && value.mode !== "tui" && value.mode !== "rpc") return undefined;
+    if (value.hasUI !== undefined && value.hasUI !== true) return undefined;
+    const identity = hostSessionIdentityFromContext(ctx);
+    if (!identity.session_id || !identity.cwd) return undefined;
+    return {
+      identity,
+      mode: value.mode === "rpc" ? "rpc" : "tui",
+    };
+  };
+  const lifecycleBindingFor = (ctx: unknown): LifecycleBinding | undefined => {
+    try {
+      return resolveLifecycleBinding(ctx);
+    } catch {
+      return undefined;
+    }
+  };
+  const nativeWorkerAuthority = createNativeWorkerAuthority(pi.events, {
+    bundleLabel: label,
+    legacyAuthority: (ctx, cwd, runId) => {
+      if (!runId || !lifecycleBinding) return undefined;
+      const verified = verifiedLifecycleHost(ctx);
+      let currentController: WorkflowSessionController | undefined;
+      try {
+        currentController = opts.getSessionController?.(ctx, cwd);
+      } catch {
+        return undefined;
+      }
+      if (
+        !verified
+        || currentController !== lifecycleBinding.controller
+        || !sameLifecycleIdentity(lifecycleBinding.identity, hostSessionIdentityFromContext(ctx))
+      ) return undefined;
+      let trustedContext: TrustedExecutionContext;
+      try {
+        trustedContext = lifecycleBinding.controller.context();
+        if (lifecycleBinding.controller.activeCtoClaim()) return undefined;
+      } catch {
+        return undefined;
+      }
+      return trustedLegacyCtoOwnerForRun(cwd, runId, trustedContext, ctx) ? lifecycleBinding : undefined;
+    },
+    legacyAuthorityCurrent: (origin, cwd, runId, sessionId) => {
+      const binding = lifecycleBinding;
+      if (!binding || binding !== origin || binding.identity.session_id !== sessionId) return false;
+      if (!binding.identity.cwd) return false;
+      try {
+        if (resolve(binding.identity.cwd) !== resolve(cwd)) return false;
+      } catch {
+        return false;
+      }
+      let trustedContext: TrustedExecutionContext;
+      try {
+        trustedContext = binding.controller.context();
+        if (binding.controller.activeCtoClaim()) return false;
+      } catch {
+        return false;
+      }
+      if (trustedContext.session_id !== sessionId) return false;
+      const rawContext = {
+        ...(binding.identity.session_manager ? { sessionManager: binding.identity.session_manager } : {}),
+        ...(binding.identity.session_id ? { session_id: binding.identity.session_id } : {}),
+        ...(binding.identity.cwd ? { cwd: binding.identity.cwd } : {}),
+        mode: "tui" as const,
+        hasUI: true,
+      };
+      try {
+        const currentController = opts.getSessionController?.(rawContext, cwd);
+        if (currentController && currentController !== binding.controller) return false;
+      } catch {
+        return false;
+      }
+      return trustedLegacyCtoOwnerForRun(cwd, runId, trustedContext, rawContext);
+    },
+  });
+  pi.on("session_start", (event: unknown, ctx: unknown) => {
+    if (!sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_start")) return;
+    const verified = verifiedLifecycleHost(ctx);
+    if (!verified) {
+      nativeWorkerAuthority.observeSessionStart(ctx);
+      return;
+    }
+    const next = lifecycleBindingFor(ctx);
+    if (!next) {
+      if (!lifecycleBinding) nativeWorkerAuthority.observeSessionStart(ctx);
+      return;
+    }
+    if (!lifecycleBinding) {
+      lifecycleBinding = next;
+      nativeWorkerAuthority.observeSessionStart(ctx);
+      return;
+    }
+    if (!sameLifecycleIdentity(lifecycleBinding.identity, next.identity)) return;
+    if (lifecycleBinding.controller !== next.controller) return;
     nativeWorkerAuthority.observeSessionStart(ctx);
   });
-  // Idle session_stop must retain native worker grants. Only the host's
-  // parent-scoped shutdown proof may revoke this owner's bindings.
-  pi.on("session_shutdown", (_event: unknown, ctx: unknown) => {
+  pi.on("session_switch", (event: unknown, ctx: unknown) => {
+    const verified = verifiedLifecycleHost(ctx);
+    const binding = lifecycleBinding;
+    if (!verified || !sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_switch")) return;
+    const next = lifecycleBindingFor(ctx);
+    if (!next) return;
+    const switchEvent = event && typeof event === "object" && !Array.isArray(event) ? event as Record<string, unknown> : {};
+    const eventType = "type" in switchEvent ? switchEvent.type : undefined;
+    const reason = "reason" in switchEvent ? switchEvent.reason : undefined;
+    const hasPreviousSessionFile = Object.prototype.hasOwnProperty.call(switchEvent, "previousSessionFile");
+    const rawPreviousSessionFile = hasPreviousSessionFile ? switchEvent.previousSessionFile : undefined;
+    const previousSessionFile = typeof rawPreviousSessionFile === "string" && rawPreviousSessionFile.length > 0
+      ? rawPreviousSessionFile
+      : undefined;
+    if (
+      eventType !== "session_switch"
+      || (reason !== "new" && reason !== "resume" && reason !== "fork")
+      || hasPreviousSessionFile && rawPreviousSessionFile !== undefined && previousSessionFile === undefined
+    ) return;
+    if (!binding) {
+      lifecycleBinding = next;
+      nativeWorkerAuthority.observeSessionStart(ctx);
+      return;
+    }
+    if (
+      !binding.identity.session_manager
+      || !verified.identity.session_manager
+      || binding.identity.session_manager !== verified.identity.session_manager
+      || !binding.identity.session_id
+      || binding.identity.session_id === verified.identity.session_id
+    ) return;
+    if (
+      !binding.identity.session_file
+      || !previousSessionFile
+      || binding.identity.session_file !== previousSessionFile
+    ) return;
+    let oldClaim: CtoClaimScope | undefined;
+    try {
+      oldClaim = binding.controller.activeCtoClaim();
+    } catch {
+      // A bound but unverifiable private claim is typed refusal, not absence.
+      // Do not release or adopt a replacement binding after this failure.
+      return;
+    }
+    if (oldClaim) {
+      try {
+        suspendCtoSession(binding.controller, "session-replacement");
+      } catch {
+        return;
+      }
+    }
+    lifecycleBinding = next;
+    nativeWorkerAuthority.observeSessionStart(ctx);
+  });
+  // session_shutdown is a type-only disposal event, not a session switch.
+  // The host supplies no old-session id here; replacement uses session_switch.
+  pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
+    if (!sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_shutdown")) return;
+    const verified = verifiedLifecycleHost(ctx);
+    const binding = lifecycleBinding;
+    if (!verified || !binding || !sameLifecycleIdentity(binding.identity, verified.identity)) return;
+    try {
+      suspendCtoSession(binding.controller, "session-shutdown");
+    } catch {
+      // Canonical release failure is fail-closed, but must not leave the
+      // process-local binding available to a later raw tool call.
+      lifecycleBinding = undefined;
+      nativeWorkerAuthority.observeSessionShutdown(ctx);
+      return;
+    }
+    lifecycleBinding = undefined;
     nativeWorkerAuthority.observeSessionShutdown(ctx);
   });
   pi.on("tool_execution_start", (event, ctx: unknown) => {
@@ -738,7 +1470,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       actor?: TrustedToolCallActor;
       session_id?: string;
       sessionId?: string;
+      run_id?: unknown;
+      cto_run_id?: unknown;
+      cto_ownership_epoch?: unknown;
     };
+    const originSessionId = sessionIdFromContext(ctx);
+    const originSessionFile = sessionFileFromContext(ctx);
     // Resolve admission exactly once. The configured bundle resolver is the
     // authority (fullstack resolves sessionManager.getCwd() before any stale
     // copied context value); never substitute the process cwd or selection.
@@ -746,33 +1483,53 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     let admissionResolutionFailed = false;
     let sharedController: WorkflowSessionController | undefined;
     let selectedRunId: string | undefined;
+    let authorityRunId: string | undefined;
     let activeClaimRunId: string | undefined;
+    let activeCtoScope: CtoClaimScope | undefined;
     if (admissionCwd) {
       try {
         const controller = opts.getSessionController?.(ctx, admissionCwd);
-        const resolvedRunId = controller?.selectedRunId();
-        const resolvedActiveClaimRunId = controller?.activeClaimRunId();
         sharedController = controller;
-        selectedRunId = resolvedRunId;
-        activeClaimRunId = resolvedActiveClaimRunId;
+        activeCtoScope = controller?.activeCtoClaim();
+        if (activeCtoScope) {
+          // A live CTO claim is the exact target for CTO authority and native
+          // resolution, but it is not an ordinary canonical workflow run.
+          authorityRunId = activeCtoScope.run_id;
+          const ctoState = readCtoState(activeCtoScope.run_id, admissionCwd);
+          if (!ctoState || ctoState.branch !== controller?.context().branch) {
+            throw new Error("active CTO claim branch/state is unavailable");
+          }
+        } else {
+          selectedRunId = controller?.selectedRunId();
+          authorityRunId = selectedRunId;
+          activeClaimRunId = controller?.activeClaimRunId();
+        }
       } catch {
         admissionResolutionFailed = true;
       }
     }
+    const ctoMarkerIds = event.toolName === "task" ? ctoMarkerRunIds(event.input) : [];
+    const sharedContext = (() => {
+      try { return sharedController?.context(); } catch { return undefined; }
+    })();
+    const legacyCtoRunId = admissionCwd && sharedContext && !admissionResolutionFailed
+      ? trustedLegacyCtoRunId(admissionCwd, event.input, sharedContext, activeCtoScope, ctx)
+      : undefined;
+    const legacyCtoAdmission = legacyCtoRunId !== undefined;
+    if (authorityRunId === undefined && legacyCtoRunId) authorityRunId = legacyCtoRunId;
     let nativeActor: NativeWorkerResolution | undefined;
     if (admissionCwd && !admissionResolutionFailed) {
       try {
-        nativeActor = nativeWorkerAuthority.resolve(ctx, admissionCwd, selectedRunId);
+        nativeActor = nativeWorkerAuthority.resolve(ctx, admissionCwd, authorityRunId);
       } catch {
         nativeActor = undefined;
       }
     }
+    // Only an ordinary selected run or an ordinary native grant enters the
+    // classification/monotonic namespace. CTO targets stay in cto_run_id.
     const trustedRunId = admissionResolutionFailed
       ? undefined
       : selectedRunId ?? (nativeActor?.kind === "workflow" ? nativeActor.runId : undefined);
-    const gateContext = admissionCwd
-      ? { ...c, cwd: admissionCwd, ...(trustedRunId ? { run_id: trustedRunId } : {}) }
-      : undefined;
     // A configured bundle resolver/controller is the sole authority for raw
     // tool calls. Model/tool actor fields and legacy hasUI are never
     // credentials; the legacy actor path is retained only without either
@@ -783,11 +1540,40 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     let adaptedActor: TrustedToolCallResolution | undefined;
     if (admissionCwd && resolverConfigured && !admissionResolutionFailed) {
       try {
-        adaptedActor = opts.resolveTrustedToolCallActor!(ctx, admissionCwd, selectedRunId);
+        adaptedActor = opts.resolveTrustedToolCallActor!(ctx, admissionCwd, authorityRunId);
       } catch {
         adaptedActor = undefined;
       }
     }
+    const authenticatedCtoScope =
+      adaptedActor
+      && "kind" in adaptedActor
+      && adaptedActor.kind === "authenticated-interactive-host-cto"
+      && activeCtoScope
+      && activeCtoScope.run_id === adaptedActor.run_id
+      && activeCtoScope.ownership_epoch === adaptedActor.ownership_epoch
+      ? activeCtoScope
+      : undefined;
+    const ctoRunId = admissionResolutionFailed
+      ? undefined
+      : authenticatedCtoScope?.run_id
+        ?? legacyCtoRunId
+        ?? (nativeActor?.kind === "cto" ? nativeActor.runId : undefined);
+    const {
+      run_id: _rawRunId,
+      cto_run_id: _rawCtoRunId,
+      cto_ownership_epoch: _rawCtoOwnershipEpoch,
+      ...gateContextBase
+    } = c;
+    const gateContext = admissionCwd
+      ? {
+        ...gateContextBase,
+        cwd: admissionCwd,
+        ...(trustedRunId ? { run_id: trustedRunId } : {}),
+        ...(ctoRunId ? { cto_run_id: ctoRunId } : {}),
+        ...(authenticatedCtoScope ? { cto_ownership_epoch: authenticatedCtoScope.ownership_epoch } : {}),
+      }
+      : undefined;
     let trustedProof: TrustedOrchestratorWriteProof | undefined;
     if (
       !admissionResolutionFailed
@@ -815,7 +1601,9 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       ? adaptedActor.actor === "orchestrator"
         ? (trustedProof ? adaptedActor.actor : undefined)
         : adaptedActor.actor
-      : undefined;
+      : authenticatedCtoScope
+        ? "orchestrator"
+        : undefined;
     let authenticatedInteractiveHostNoRun = false;
     if (
       !admissionResolutionFailed
@@ -833,6 +1621,13 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         authenticatedInteractiveHostNoRun = false;
       }
     }
+    const ctoMarkedTask = event.toolName === "task" && ctoMarkerIds.length > 0;
+    const nativeCtoMarkerAdmission = nativeActor?.kind === "cto"
+      && ctoMarkerIds.length > 0
+      && ctoMarkerIds.every((runId) => runId === nativeActor.runId);
+    const legacyCtoTaskAdmission = legacyCtoAdmission && ctoMarkedTask;
+    const ctoAuthorizedDispatch = authenticatedCtoScope !== undefined || legacyCtoAdmission || nativeCtoMarkerAdmission;
+    const nativeCtoTargeted = authenticatedCtoScope !== undefined || legacyCtoTaskAdmission || nativeActor?.kind === "cto";
     const actorAuthorityConfigured = resolverConfigured || controllerConfigured;
     const trustedActor = admissionResolutionFailed
       ? undefined
@@ -860,6 +1655,15 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       } catch {
         lifecycleDeviceWrite = false;
       }
+    }
+    if (
+      !result
+      && ctoMarkedTask
+      && !authenticatedCtoScope
+      && !legacyCtoRunId
+      && !nativeCtoMarkerAdmission
+    ) {
+      run({ block: true, reason: "CTO slice marker requires an exact authenticated CTO claim or trusted owned legacy run" });
     }
     if (
       admissionResolutionFailed
@@ -892,7 +1696,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       && event.toolName === "task"
       && actorAuthorityConfigured
       && !nativeActor
-      && !trustedActor
+      && !legacyCtoTaskAdmission
       && (
         !sharedController
         || (selectedRunId !== undefined && activeClaimRunId !== selectedRunId)
@@ -914,17 +1718,17 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], writeGateContext ?? gateContext!));
       run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...(writeGateContext ?? gateContext!), writeScope: opts.writeScope }));
       run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], gateContext));
-      run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], { ...gateContext, controller: sharedController }));
+      if (!ctoAuthorizedDispatch) run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], { ...gateContext, controller: sharedController }));
     }
     if (!admissionResolutionBlocked) run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], (gateContext ?? c) as Parameters<typeof safetyGuard>[1]));
-    let eventRunId = event.toolName === "task" ? undefined : trustedRunId;
-    let eventRunIdTrusted = event.toolName !== "task" && typeof trustedRunId === "string" && trustedRunId.length > 0;
+    let eventRunId = event.toolName === "task" ? ctoRunId : trustedRunId;
+    let eventRunIdTrusted = typeof eventRunId === "string" && eventRunId.length > 0;
     let nativeDispatchOrigins: DispatchOrigin[] | undefined;
-    if (!result && event.toolName === "task") {
+    if (!result && event.toolName === "task" && !ctoAuthorizedDispatch) {
       const authorization = gateContext
         ? trustedDispatchRequests(
             event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
-            { ...gateContext, session_id: c.session_id ?? c.sessionId, controller: sharedController },
+            { ...gateContext, session_id: originSessionId, controller: sharedController },
           )
         : { ok: true as const, requests: [] };
       if (!authorization.ok) {
@@ -966,23 +1770,67 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         if (origins.length > 0) nativeDispatchOrigins = origins;
       }
     }
+    let pendingCtoReservation: CtoReservation | undefined;
+    const authenticatedCtoParent = Boolean(authenticatedCtoScope && trustedActor === "orchestrator");
+    if (!result && authenticatedCtoParent && admissionCwd && event.toolName === "task") {
+      const credentials = sharedController ? ctoClaimCredentials(sharedController) : undefined;
+      const workerIds = ctoReservationWorkerIds(event.toolCallId, event.input, credentials?.ownership_epoch);
+      const reservationInput = ctoSnapshotInput(event.input);
+      if (
+        !event.toolCallId
+        || workerIds.length === 0
+        || reservationInput === undefined
+        || !credentials
+        || credentials.run_id !== authenticatedCtoScope!.run_id
+        || eventRunId !== undefined && eventRunId !== authenticatedCtoScope!.run_id
+      ) {
+        run({ block: true, reason: "cto claim reservation requires the exact authenticated run and task call identity" });
+      } else {
+        // Native admission owns the locked reservation. Keep the exact
+        // authenticated slot image here so the matching host result can
+        // settle/refuse it without a second deduplicating reservation.
+        pendingCtoReservation = {
+          cwd: admissionCwd,
+          run_id: credentials.run_id,
+          token: credentials.token,
+          ownership_epoch: credentials.ownership_epoch,
+          worker_ids: workerIds,
+          worker_indexes: workerIds.map((_workerId, index) => index),
+          input: reservationInput,
+          ...(originSessionId ? { origin_session_id: originSessionId } : {}),
+          ...(originSessionFile ? { origin_session_file: originSessionFile } : {}),
+        };
+        if (ctoReservationReuseBlocked(event.toolCallId, ctoReservations, retiredCtoToolCalls)) {
+          pendingCtoReservation = undefined;
+          run({ block: true, reason: "cto task call identity is still reserved by an earlier host invocation" });
+        }
+      }
+    }
     if (
       !result
-      && admissionCwd
       && event.toolName === "task"
-      && (trustedActor === "orchestrator" || trustedActor === "lead" || authenticatedInteractiveHostNoRun)
+      && admissionCwd
+      && (trustedActor === "orchestrator" || trustedActor === "lead" || authenticatedInteractiveHostNoRun || legacyCtoTaskAdmission)
     ) {
       try {
         // A no-run host may bootstrap CTO leads; the native bridge still
         // requires lead-only slice markers and validates each live CTO slice.
-        nativeWorkerAuthority.admitTaskCall(
+        const admitted = nativeWorkerAuthority.admitTaskCall(
           ctx,
           event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
           trustedActor === "lead" ? "lead" : "orchestrator",
           eventRunId ?? trustedRunId ?? nativeActor?.runId,
           nativeDispatchOrigins,
         );
+        if (nativeCtoTargeted && !admitted) {
+          pendingCtoReservation = undefined;
+          run({ block: true, reason: "native authority refused the CTO task admission" });
+        } else if (pendingCtoReservation && event.toolCallId) {
+          ctoReservations.set(event.toolCallId, pendingCtoReservation);
+        }
       } catch {
+        if (pendingCtoReservation) pendingCtoReservation = undefined;
+        if (nativeCtoTargeted) run({ block: true, reason: "native authority failed the CTO task admission" });
         // Native authority is fail-closed; a malformed host context never
         // changes the already-allowed task decision or creates a grant.
       }
@@ -993,43 +1841,143 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     }
     return result;
   });
-  pi.on("tool_result", (event: ToolResultEvent, _ctx: unknown) => {
+  pi.on("tool_result", (event: ToolResultEvent, ctx: unknown) => {
     if (event.toolName !== "task") return;
     if (nativeMigrationIngress(event.input) || nativeMigrationIngress(event.details) || nativeMigrationIngress(event.content)) {
       console.warn(`omp workflow task reconciliation rejected: migration-only completion provenance for tool call ${event.toolCallId}`);
       return;
     }
-    const details = (event as unknown as { details?: { async?: { state?: string } } }).details;
-    const asyncState = details?.async?.state;
-    const asyncActive = asyncState === "running" || asyncState === "spawned" || asyncState === "scheduled";
+    const details = event.details as unknown;
+    const asyncState = details && typeof details === "object" && !Array.isArray(details)
+      && "async" in details
+      && details.async && typeof details.async === "object" && !Array.isArray(details.async)
+      && "state" in details.async
+      && typeof details.async.state === "string"
+      ? details.async.state
+      : undefined;
+    const asyncStatus = ctoToolResultAsyncStatus(details);
+    const asyncActive = asyncStatus === "active";
+    const unknownAsync = asyncStatus === "unknown";
     const content = event.content
       .filter((part): part is { type: "text"; text: string } => part.type === "text")
       .map((part) => part.text)
       .join("\n")
       .trim();
     const evidence = content || (event.isError ? "native task failed" : "native task completed");
+    const ctoReservationCandidate = ctoReservations.get(event.toolCallId);
+    if (
+      ctoReservationCandidate
+      && !ctoReservationMatchesResult(ctoReservationCandidate, event.input, ctx)
+    ) {
+      console.warn(`omp workflow CTO result rejected: host invocation identity does not match tool call ${event.toolCallId}`);
+      return;
+    }
+    if (!ctoReservationCandidate && retiredCtoToolCalls.has(event.toolCallId)) {
+      console.warn(`omp workflow CTO result rejected: consumed tool call identity cannot be replayed ${event.toolCallId}`);
+      return;
+    }
+    const ctoReservation = ctoReservationCandidate;
+    const markerRunIds = ctoMarkerRunIds(event.input);
+    const markerRunId = markerRunIds.length > 0 && markerRunIds.every((runId) => runId === markerRunIds[0])
+      ? markerRunIds[0]
+      : undefined;
+    const ctoRunId = ctoReservation?.run_id ?? markerRunId;
+    const nativeCtoResult = ctoReservation !== undefined || markerRunId !== undefined;
+    let ctoWorkerIds = ctoReservation?.worker_ids ?? [];
+    let ctoWorkerIndexes = ctoReservation?.worker_indexes ?? [];
+    const settlementCwd = ctoReservation?.cwd ?? resolveCwdFromContext(ctx);
+    if (ctoReservation && settlementCwd && ctoRunId && ctoWorkerIds.length > 0) {
+      const originalWorkerCount = ctoWorkerIndexes.length > 0 ? Math.max(...ctoWorkerIndexes) + 1 : 0;
+      const refusalIndexes = ctoPreSpawnRefusalIndexes(
+        ctoReservation.input,
+        details,
+        content,
+        originalWorkerCount,
+      );
+      const scheduleRefusalIndexes = ctoScheduleRefusalIndexes(
+        details,
+        content,
+        originalWorkerCount,
+      );
+      const refusedIndexes = [...new Set([...refusalIndexes, ...scheduleRefusalIndexes])].sort((left, right) => left - right);
+      const refusedIndexSet = new Set(refusedIndexes);
+      const refusedPositions = new Set<number>();
+      for (let position = 0; position < ctoWorkerIndexes.length; position += 1) {
+        if (refusedIndexSet.has(ctoWorkerIndexes[position]!)) refusedPositions.add(position);
+      }
+      const refusedWorkerIds = ctoWorkerIds
+        .filter((_workerId, position) => refusedPositions.has(position));
+      if (refusedWorkerIds.length > 0) {
+        try {
+          settleCtoExecutionClaimWorkersByToolCall(settlementCwd, {
+            run_id: ctoReservation.run_id,
+            tool_call_id: event.toolCallId,
+            token: ctoReservation.token,
+            ownership_epoch: ctoReservation.ownership_epoch,
+            worker_ids: refusedWorkerIds,
+          });
+          ctoWorkerIds = ctoWorkerIds.filter((_workerId, position) => !refusedPositions.has(position));
+          ctoWorkerIndexes = ctoWorkerIndexes.filter((_originalIndex, position) => !refusedPositions.has(position));
+          if (ctoWorkerIds.length === 0) {
+            ctoReservations.delete(event.toolCallId);
+            retiredCtoToolCalls.add(event.toolCallId);
+          } else {
+            ctoReservations.set(event.toolCallId, {
+              ...ctoReservation,
+              worker_ids: ctoWorkerIds,
+              worker_indexes: ctoWorkerIndexes,
+            });
+          }
+        } catch {
+          console.warn(`omp workflow CTO pre-spawn refusal settlement deferred for tool call ${event.toolCallId}`);
+        }
+      }
+    }
+    if (
+      ctoReservation
+      && settlementCwd
+      && ctoWorkerIds.length > 0
+      && ctoResultHasTerminalSlots(details, ctoWorkerIndexes, event.isError)
+    ) {
+      try {
+        settleCtoExecutionClaimWorkersByToolCall(settlementCwd, {
+          run_id: ctoReservation.run_id,
+          tool_call_id: event.toolCallId,
+          token: ctoReservation.token,
+          ownership_epoch: ctoReservation.ownership_epoch,
+          worker_ids: ctoWorkerIds,
+        });
+        ctoReservations.delete(event.toolCallId);
+        retiredCtoToolCalls.add(event.toolCallId);
+      } catch {
+        console.warn(`omp workflow CTO reservation settlement deferred for tool call ${event.toolCallId}`);
+      }
+    }
     // The original task input carries the trusted structured marker. Use its
     // canonical run only to select an already persisted dispatch origin; the
     // marker itself never authorizes or invents a dispatch.
     const markerFilter = taskMarkerFilter(event.input);
     const origins = taskOriginsForResult(event.toolCallId, markerFilter);
     if (origins.length === 0) {
+      if (nativeCtoResult) return;
       console.warn(`omp workflow task reconciliation rejected: no exact origin for tool call ${event.toolCallId}`);
       return;
     }
-    const outcomes = taskOutcomeRows(event.input, event.details, evidence, origins);
+    const outcomes = unknownAsync
+      ? { mapped: [], unresolved: origins }
+      : taskOutcomeRows(event.input, event.details, evidence, origins);
     if (!outcomes) {
       console.warn("omp workflow task reconciliation rejected: incomplete or ambiguous batch result for tool call " + event.toolCallId);
       return;
     }
-    const terminalWholeCallError = !asyncActive && (event.isError || (asyncState === "failed" && content.length > 0));
-    const unresolvedPendingReason = asyncActive
+    const terminalWholeCallError = !asyncActive && !unknownAsync && (event.isError || (asyncState === "failed" && content.length > 0));
+    const unresolvedPendingReason = asyncActive || unknownAsync
       ? (asyncState === "running" ? "provider_running" as const : "awaiting_result" as const)
       : terminalWholeCallError ? undefined : "transport_reconnect" as const;
     const unresolvedEvidence = terminalWholeCallError
       ? evidence
       : `transport_reconnect: task result omitted terminal row; recovery required (tool call ${event.toolCallId})`;
-    const asyncPendingEvidence = asyncActive
+    const asyncPendingEvidence = asyncActive || unknownAsync
       ? `native task provider acknowledgement (${String(asyncState)}); awaiting result (tool call ${event.toolCallId})`
       : undefined;
     for (const { origin, outcome, evidence: slotEvidence } of outcomes.mapped) {
@@ -1112,12 +2060,6 @@ interface HostAskSurface {
   } | { kind: "chat" } | undefined>;
   select?(title: string, options: string[], dialogOptions?: { helpText?: string; signal?: AbortSignal }): Promise<string | undefined>;
 }
-
-/**
- * Authoritative host session identity captured from the session_start event
- * context. The installed host emits session_start only after the extension
- * runner is initialized with the runtime mode and UI context.
- */
 interface HostSessionProfile {
   mode: string;
   hasUI: boolean;
@@ -1125,41 +2067,189 @@ interface HostSessionProfile {
   session_id?: string;
   cwd?: string;
   session_manager?: object;
+  session_file?: string;
 }
 
 type HostSessionIdentity = {
   session_id?: string;
   cwd?: string;
   session_manager?: object;
+  session_file?: string;
+};
+type LifecycleIdentityPart = Partial<HostSessionIdentity>;
+type LifecycleIdentityPartResult = { valid: true; identity?: LifecycleIdentityPart } | { valid: false };
+type LifecycleSessionManager = {
+  getCwd?: () => unknown;
+  getSessionId?: () => unknown;
+  getSessionFile?: () => unknown;
 };
 
+function lifecycleStringField(value: Record<string, unknown>, key: string): { valid: boolean; value?: string } {
+  if (!Object.prototype.hasOwnProperty.call(value, key)) return { valid: true };
+  return typeof value[key] === "string" && value[key].length > 0
+    ? { valid: true, value: value[key] }
+    : { valid: false };
+}
+
+function lifecycleAliasedString(value: Record<string, unknown>, first: string, second: string): { valid: boolean; value?: string } {
+  const left = lifecycleStringField(value, first);
+  const right = lifecycleStringField(value, second);
+  if (!left.valid || !right.valid || left.value !== undefined && right.value !== undefined && left.value !== right.value) return { valid: false };
+  return { valid: true, value: left.value ?? right.value };
+}
+
+function sameLifecyclePath(left: string, right: string): boolean {
+  try {
+    return resolve(left) === resolve(right);
+  } catch {
+    return false;
+  }
+}
+
+function lifecycleAliasedPath(value: Record<string, unknown>, first: string, second: string): { valid: boolean; value?: string } {
+  const left = lifecycleStringField(value, first);
+  const right = lifecycleStringField(value, second);
+  if (!left.valid || !right.valid || left.value !== undefined && right.value !== undefined && !sameLifecyclePath(left.value, right.value)) return { valid: false };
+  return { valid: true, value: left.value ?? right.value };
+}
+
+function lifecycleSessionFile(value: Record<string, unknown>, manager: LifecycleSessionManager): { valid: boolean; value?: string } {
+  const supplied = lifecycleAliasedPath(value, "sessionFile", "session_file");
+  if (!supplied.valid) return supplied;
+  if (typeof manager.getSessionFile !== "function") return supplied;
+  let managerFile: unknown;
+  try {
+    managerFile = manager.getSessionFile();
+  } catch {
+    return supplied.value === undefined ? { valid: true } : { valid: false };
+  }
+  if (typeof managerFile !== "string" || managerFile.length === 0) {
+    return supplied.value === undefined ? { valid: true } : { valid: false };
+  }
+  if (supplied.value !== undefined && !sameLifecyclePath(supplied.value, managerFile)) return { valid: false };
+  return { valid: true, value: managerFile };
+}
+
+function lifecycleIdentityPart(value: unknown): LifecycleIdentityPartResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { valid: true };
+  const objectValue = value as Record<string, unknown>;
+  const hasManager = Object.prototype.hasOwnProperty.call(objectValue, "sessionManager");
+  const managerValue = objectValue.sessionManager;
+  const manager = managerValue && typeof managerValue === "object" ? managerValue as LifecycleSessionManager : undefined;
+  if (hasManager && (
+    !manager
+    || typeof manager.getCwd !== "function"
+    || typeof manager.getSessionId !== "function"
+  )) return { valid: false };
+  if (manager) {
+    let cwd: unknown;
+    let sessionId: unknown;
+    try {
+      cwd = manager.getCwd!();
+      sessionId = manager.getSessionId!();
+    } catch {
+      return { valid: false };
+    }
+    if (typeof cwd !== "string" || cwd.length === 0 || typeof sessionId !== "string" || sessionId.length === 0) return { valid: false };
+    const suppliedCwd = lifecycleStringField(objectValue, "cwd");
+    const suppliedSessionId = lifecycleAliasedString(objectValue, "session_id", "sessionId");
+    const suppliedFile = lifecycleSessionFile(objectValue, manager);
+    if (
+      !suppliedCwd.valid
+      || !suppliedSessionId.valid
+      || !suppliedFile.valid
+      || suppliedCwd.value !== undefined && !sameLifecyclePath(suppliedCwd.value, cwd)
+      || suppliedSessionId.value !== undefined && suppliedSessionId.value !== sessionId
+    ) return { valid: false };
+    return {
+      valid: true,
+      identity: {
+        session_id: sessionId,
+        cwd,
+        session_manager: manager,
+        ...(suppliedFile.value ? { session_file: suppliedFile.value } : {}),
+      },
+    };
+  }
+  const cwd = lifecycleStringField(objectValue, "cwd");
+  const sessionId = lifecycleAliasedString(objectValue, "session_id", "sessionId");
+  const sessionFile = lifecycleAliasedPath(objectValue, "sessionFile", "session_file");
+  if (!cwd.valid || !sessionId.valid || !sessionFile.valid) return { valid: false };
+  return cwd.value || sessionId.value || sessionFile.value
+    ? {
+      valid: true,
+      identity: {
+        ...(cwd.value ? { cwd: cwd.value } : {}),
+        ...(sessionId.value ? { session_id: sessionId.value } : {}),
+        ...(sessionFile.value ? { session_file: sessionFile.value } : {}),
+      },
+    }
+    : { valid: true };
+}
+
 function hostSessionIdentityFromContext(ctx: unknown): HostSessionIdentity {
-  if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return {};
-  const value = ctx as { sessionManager?: unknown };
-  return {
-    ...(sessionIdFromContext(ctx) ? { session_id: sessionIdFromContext(ctx) } : {}),
-    ...(resolveCwdFromContext(ctx) ? { cwd: resolveCwdFromContext(ctx) } : {}),
-    ...(value.sessionManager && typeof value.sessionManager === "object" ? { session_manager: value.sessionManager } : {}),
-  };
+  const result = lifecycleIdentityPart(ctx);
+  return result.valid ? result.identity ?? {} : {};
 }
 
 function sameHostSessionIdentity(left: HostSessionIdentity, right: HostSessionIdentity): boolean {
-  if (left.session_manager && left.session_manager !== right.session_manager) return false;
-  if (left.session_id && left.session_id !== right.session_id) return false;
-  if (left.cwd && !right.cwd) return false;
-  if (left.cwd && right.cwd) {
-    try {
-      if (resolve(left.cwd) !== resolve(right.cwd)) return false;
-    } catch {
-      return false;
-    }
+  if (!left.session_id || !right.session_id || left.session_id !== right.session_id) return false;
+  if (!left.cwd || !right.cwd) return false;
+  try {
+    if (resolve(left.cwd) !== resolve(right.cwd)) return false;
+  } catch {
+    return false;
   }
-  return Boolean(
-    (left.session_manager && right.session_manager)
-    || (left.session_id && right.session_id)
-    || (left.cwd && right.cwd),
-  );
+  if (left.session_manager || right.session_manager) {
+    if (!left.session_manager || !right.session_manager || left.session_manager !== right.session_manager) return false;
+  }
+  if (left.session_file || right.session_file) {
+    if (!left.session_file || !right.session_file || left.session_file !== right.session_file) return false;
+  }
+  return true;
 }
+function trustedInteractiveHostProfileFromContext(ctx: unknown): HostSessionProfile | null {
+  if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return null;
+  const actor = "actor" in ctx ? ctx.actor : undefined;
+  const mode = "mode" in ctx ? ctx.mode : undefined;
+  const hasUI = "hasUI" in ctx ? ctx.hasUI : undefined;
+  if (actor !== undefined && actor !== "host") return null;
+  if (hasUI !== true || (mode !== "tui" && mode !== "rpc")) return null;
+  const identity = hostSessionIdentityFromContext(ctx);
+  if (!identity.session_id || !identity.cwd) return null;
+  const ui = "ui" in ctx ? ctx.ui : undefined;
+  return {
+    mode,
+    hasUI: true,
+    ui,
+    session_id: identity.session_id,
+    cwd: identity.cwd,
+    ...(identity.session_manager ? { session_manager: identity.session_manager } : {}),
+    ...(identity.session_file ? { session_file: identity.session_file } : {}),
+  };
+}
+function capturedHostContextIsAdmissible(profile: HostSessionProfile, ctx: unknown): boolean {
+  if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return false;
+  const identity = hostSessionIdentityFromContext(ctx);
+  if (!sameHostSessionIdentity({
+    ...(profile.session_id ? { session_id: profile.session_id } : {}),
+    ...(profile.cwd ? { cwd: profile.cwd } : {}),
+    ...(profile.session_manager ? { session_manager: profile.session_manager } : {}),
+    ...(profile.session_file ? { session_file: profile.session_file } : {}),
+  }, identity)) return false;
+  const value = ctx as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(value, "actor") && value.actor !== undefined && value.actor !== "host") return false;
+  if (Object.prototype.hasOwnProperty.call(value, "mode") && value.mode !== undefined && value.mode !== profile.mode) return false;
+  if (Object.prototype.hasOwnProperty.call(value, "hasUI") && value.hasUI !== undefined && value.hasUI !== true) return false;
+  return true;
+}
+function trustedLifecycleHostProfileFromContext(ctx: unknown, captured: HostSessionProfile | undefined): HostSessionProfile | null {
+  const profile = trustedInteractiveHostProfileFromContext(ctx);
+  if (profile) return profile;
+  if (!captured || !capturedHostContextIsAdmissible(captured, ctx)) return null;
+  return captured;
+}
+
 
 
 type WorkflowToolResult = { content: [{ type: "text"; text: string }]; details: unknown };
@@ -1269,145 +2359,133 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   let sessionController: WorkflowSessionController | null = null;
   let lifecycleRevoked = false;
   if (typeof (pi as { on?: unknown }).on === "function") {
-    pi.on("session_start", (_event: unknown, ctx: unknown) => {
-      const c = ctx as { mode?: unknown; hasUI?: unknown; ui?: unknown } | undefined;
-      const incomingMode = typeof c?.mode === "string" ? c.mode : "print";
-      const incomingHasUI = c?.hasUI === true;
-      const incomingTrusted = incomingHasUI && (incomingMode === "tui" || incomingMode === "rpc");
-      const incomingIdentity = hostSessionIdentityFromContext(ctx);
-      const cwd = options.cwd ?? incomingIdentity.cwd;
-      const sessionId = incomingIdentity.session_id;
-      const controllerContext = (() => {
-        try { return sessionController?.context(); } catch { return undefined; }
-      })();
-      const currentIdentity: HostSessionIdentity = {
-        ...(hostSession?.session_id ? { session_id: hostSession.session_id } : controllerContext?.session_id ? { session_id: controllerContext.session_id } : {}),
-        ...(hostSession?.cwd ? { cwd: hostSession.cwd } : controllerContext?.worktree ? { cwd: controllerContext.worktree } : {}),
-        ...(hostSession?.session_manager ? { session_manager: hostSession.session_manager } : {}),
-      };
-      const sameIdentity = hostSession !== null && sameHostSessionIdentity(currentIdentity, incomingIdentity);
-      let incomingController: WorkflowSessionController | null = null;
-      if (cwd) {
-        try {
-          incomingController = options.getSessionController?.(ctx, cwd) ?? null;
-          if (incomingController) {
-            const incomingControllerContext = incomingController.context();
-            if (
-              (incomingIdentity.session_id && incomingControllerContext.session_id !== incomingIdentity.session_id)
-              || (incomingIdentity.cwd && resolve(incomingControllerContext.worktree) !== resolve(incomingIdentity.cwd))
-            ) incomingController = null;
-          }
-        } catch {
-          incomingController = null;
-        }
+    const resolveIncomingController = (profile: HostSessionProfile, ctx: unknown): WorkflowSessionController | null => {
+      if (!options.getSessionController || !profile.cwd) return null;
+      try {
+        const controller = options.getSessionController(ctx, profile.cwd);
+        if (!controller) return null;
+        const controllerContext = controller.context();
+        if (
+          controllerContext.session_id !== profile.session_id
+          || resolve(controllerContext.worktree) !== resolve(profile.cwd)
+        ) return null;
+        return controller;
+      } catch {
+        return null;
       }
-      let requireFreshController = lifecycleRevoked;
-      // A headless worker/print start may share the extension runner with the
-      // interactive host. It is ignored when foreign, but a same-identity
-      // headless transition revokes the retained interactive claim.
-      if (hostSession && !sameIdentity) {
-        if (!incomingTrusted) return;
-        if (options.getSessionController && !incomingController) return;
-        requireFreshController = true;
-        try {
-          sessionController?.release("host-session-replaced");
-        } catch {
-          // Canonical ownership remains untouched; local authority is still
-          // revoked below so a failed release cannot authorize this process.
-        }
-        sessionController = null;
-        hostSession = null;
-        lifecycleRevoked = true;
+    };
+    const profileIdentity = (profile: HostSessionProfile | null): HostSessionIdentity => profile
+      ? {
+        ...(profile.session_id ? { session_id: profile.session_id } : {}),
+        ...(profile.cwd ? { cwd: profile.cwd } : {}),
+        ...(profile.session_manager ? { session_manager: profile.session_manager } : {}),
+        ...(profile.session_file ? { session_file: profile.session_file } : {}),
       }
-      if (hostSession && sameIdentity && !incomingTrusted) {
-        requireFreshController = true;
-        try {
-          sessionController?.release("host-session-unavailable");
-        } catch {
-          // Canonical ownership remains untouched; local authority is still
-          // revoked below.
-        }
-        sessionController = null;
-        lifecycleRevoked = true;
-        hostSession = {
-          mode: incomingMode,
-          hasUI: incomingHasUI,
-          ui: c?.ui,
-          ...(sessionId ? { session_id: sessionId } : {}),
-          ...(cwd ? { cwd } : {}),
-          ...(incomingIdentity.session_manager ? { session_manager: incomingIdentity.session_manager } : {}),
+      : {};
+    const createLocalController = (profile: HostSessionProfile): WorkflowSessionController | null => {
+      if (options.getSessionController || !profile.session_id || !profile.cwd) return null;
+      try {
+        const branch = resolveActiveBranch(profile.cwd);
+        const context: TrustedExecutionContext = {
+          session_id: profile.session_id,
+          caller: "host",
+          process_id: process.pid,
+          worktree: profile.cwd,
+          branch,
+          authority: "coordinator",
         };
+        return createWorkflowSessionController({ cwd: profile.cwd, context });
+      } catch {
+        return null;
+      }
+    };
+    pi.on("session_start", (event: unknown, ctx: unknown) => {
+      if (!sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_start")) return;
+      const incoming = trustedLifecycleHostProfileFromContext(ctx, hostSession ?? undefined);
+      if (!incoming) return;
+      const incomingIdentity = profileIdentity(incoming);
+      if (hostSession && !sameHostSessionIdentity(profileIdentity(hostSession), incomingIdentity)) {
+        // session_start is not a replacement proof; wait for session_switch.
         return;
       }
-      hostSession = {
-        mode: incomingMode,
-        hasUI: incomingHasUI,
-        ui: c?.ui,
-        ...(sessionId ? { session_id: sessionId } : {}),
-        ...(cwd ? { cwd } : {}),
-        ...(incomingIdentity.session_manager ? { session_manager: incomingIdentity.session_manager } : {}),
-      };
-      sessionController = incomingController ?? (sameIdentity ? sessionController : null);
-      if (!sessionController && !options.getSessionController && sessionId && cwd && incomingTrusted) {
-        try {
-          const branch = resolveActiveBranch(cwd);
-          const context: TrustedExecutionContext = { session_id: sessionId, caller: "host", process_id: process.pid, worktree: cwd, branch, authority: "coordinator" };
-          sessionController = createWorkflowSessionController({ cwd, context });
-        } catch {
-          sessionController = null;
-        }
+      const incomingController = resolveIncomingController(incoming, ctx);
+      hostSession = incoming;
+      sessionController = incomingController ?? (hostSession ? sessionController : null) ?? createLocalController(incoming);
+      lifecycleRevoked = false;
+    });
+    pi.on("session_switch", (event: unknown, ctx: unknown) => {
+      const prior = hostSession;
+      const incoming = trustedLifecycleHostProfileFromContext(ctx, prior ?? undefined);
+      if (
+        !incoming
+        || !prior
+        || !sessionSwitchActorIsAdmissible(event, ctx)
+        || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_switch")
+      ) return;
+      const priorIdentity = profileIdentity(prior);
+      const incomingIdentity = profileIdentity(incoming);
+      if (
+        !priorIdentity.session_manager
+        || !incomingIdentity.session_manager
+        || priorIdentity.session_manager !== incomingIdentity.session_manager
+        || !priorIdentity.session_id
+        || priorIdentity.session_id === incomingIdentity.session_id
+      ) return;
+      const switchEvent = event && typeof event === "object" && !Array.isArray(event) ? event : {};
+      const eventType = "type" in switchEvent ? switchEvent.type : undefined;
+      const reason = "reason" in switchEvent ? switchEvent.reason : undefined;
+      const previousSessionFile = "previousSessionFile" in switchEvent && typeof switchEvent.previousSessionFile === "string" && switchEvent.previousSessionFile.length > 0
+        ? switchEvent.previousSessionFile
+        : undefined;
+      if (
+        eventType !== "session_switch"
+        || (reason !== "new" && reason !== "resume" && reason !== "fork")
+      ) return;
+      if (
+        !priorIdentity.session_file
+        || !previousSessionFile
+        || priorIdentity.session_file !== previousSessionFile
+      ) return;
+      const oldController = sessionController;
+      let oldCto: CtoClaimScope | undefined;
+      try {
+        oldCto = oldController?.activeCtoClaim();
+      } catch {
+        // A stale private claim must not fall through to ordinary release or
+        // reset the incoming binding.
+        return;
       }
-      if (incomingTrusted && requireFreshController && sessionController) {
+      let oldOrdinaryClaim = false;
+      if (!oldCto) {
+        try { oldOrdinaryClaim = oldController?.activeClaimRunId() !== undefined; } catch { return; }
+      }
+      if (oldCto || oldOrdinaryClaim) {
         try {
-          if (sessionController.activeClaimRunId() !== undefined) {
-            sessionController = null;
-            lifecycleRevoked = true;
-            hostSession = { ...hostSession, mode: incomingMode, hasUI: false, ui: undefined };
-            return;
-          }
+          if (oldCto && oldController) suspendCtoSession(oldController, "session-replacement");
+          else oldController?.release("host-session-replaced");
         } catch {
-          sessionController = null;
-          lifecycleRevoked = true;
-          hostSession = { ...hostSession, mode: incomingMode, hasUI: false, ui: undefined };
           return;
         }
       }
-      if (incomingTrusted) lifecycleRevoked = false;
+      const incomingController = resolveIncomingController(incoming, ctx);
+      hostSession = incoming;
+      sessionController = incomingController ?? createLocalController(incoming);
+      lifecycleRevoked = false;
     });
-    const lifecycleIdentity = (event: unknown, ctx: unknown): HostSessionIdentity => ({
-      ...(sessionIdFromContext(event) ? { session_id: sessionIdFromContext(event) } : sessionIdFromContext(ctx) ? { session_id: sessionIdFromContext(ctx) } : {}),
-      ...(resolveCwdFromContext(ctx) ? { cwd: resolveCwdFromContext(ctx) } : resolveCwdFromContext(event) ? { cwd: resolveCwdFromContext(event) } : {}),
-      ...(hostSessionIdentityFromContext(ctx).session_manager ? { session_manager: hostSessionIdentityFromContext(ctx).session_manager } : hostSessionIdentityFromContext(event).session_manager ? { session_manager: hostSessionIdentityFromContext(event).session_manager } : {}),
-    });
-    const controllerIdentity = (): HostSessionIdentity => {
-      const controllerContext = (() => {
-        try { return sessionController?.context(); } catch { return undefined; }
-      })();
-      return {
-        ...(hostSession?.session_id ? { session_id: hostSession.session_id } : controllerContext?.session_id ? { session_id: controllerContext.session_id } : {}),
-        ...(hostSession?.cwd ? { cwd: hostSession.cwd } : controllerContext?.worktree ? { cwd: controllerContext.worktree } : {}),
-        ...(hostSession?.session_manager ? { session_manager: hostSession.session_manager } : {}),
-      };
-    };
-    pi.on("session_stop", (event: SessionStopEvent, ctx: unknown) => {
-      const stopped = lifecycleIdentity(event, ctx);
-      if (!stopped.session_id || !stopped.cwd || !sameHostSessionIdentity(controllerIdentity(), stopped)) return;
-      try {
-        sessionController?.release("host-session-stop");
-      } catch {
-        // Preserve identity and selection when canonical ownership is
-        // unreadable or has changed; never hide a live conflict.
-      }
-    });
+    // session_shutdown is a type-only disposal event; replacement uses session_switch.
     pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
-      const stopped = lifecycleIdentity(event, ctx);
-      if (!stopped.session_id || !stopped.cwd || !sameHostSessionIdentity(controllerIdentity(), stopped)) return;
-      lifecycleRevoked = true;
+      if (!sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_shutdown")) return;
+      const incoming = trustedLifecycleHostProfileFromContext(ctx, hostSession ?? undefined);
+      if (!incoming || !hostSession || !sameHostSessionIdentity(profileIdentity(hostSession), profileIdentity(incoming))) return;
       try {
-        sessionController?.release("host-session-shutdown");
+        const cto = sessionController?.activeCtoClaim();
+        if (cto && sessionController) suspendCtoSession(sessionController, "session-shutdown");
+        else sessionController?.release("host-session-shutdown");
       } catch {
-        // Canonical ownership remains untouched; local authority is revoked.
+        // Keep durable claim bytes untouched on a release failure; the
+        // local binding is still revoked so stale authority cannot survive.
       } finally {
+        lifecycleRevoked = true;
         sessionController = null;
         hostSession = null;
       }
@@ -1432,6 +2510,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     // when no session_start profile was captured.
     const ownsTools = hostSession !== null
       ? trustedInteractiveProfile() !== null
+        && capturedHostContextIsAdmissible(hostSession, ctx)
       : (options.isMainSession ?? defaultMainSession)(ctx);
     if (!ownsTools) {
       return toolResult({
@@ -1487,6 +2566,66 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       error: "a workflow run is selected but this session does not hold its active execution claim; call workflow_prepare to rebind",
     });
   };
+  pi.registerTool({
+    name: "cto_state",
+    label: "Read or commit CTO state",
+    description: "Read the exact authenticated CTO run state or commit a revision-checked candidate through the engine-owned lifecycle transaction. Canonical CTO state must not be written with Write, Edit, or Bash.",
+    parameters: z.object({
+      operation: z.enum(["read", "commit"]),
+      run_id: z.string().min(1),
+      expected_state_revision: z.string().min(1).optional(),
+      state: z.unknown().optional(),
+    }).strict() as never,
+    async execute(_id, params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = currentCwd(ctx);
+      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const input = params as {
+        operation: "read" | "commit";
+        run_id: string;
+        expected_state_revision?: string;
+        state?: unknown;
+      };
+      try {
+        const controller = controllerFor(ctx, cwd);
+        if (input.operation === "read") {
+          const result = readCtoStateForModel(controller, cwd, input.run_id);
+          return toolResult({
+            ok: true,
+            operation: "read",
+            run_id: input.run_id,
+            state: result.state,
+            state_revision: result.state_revision,
+          });
+        }
+        if (!input.expected_state_revision || input.state === undefined) {
+          return toolResult({
+            ok: false,
+            code: "CTO_STATE_REJECTED",
+            error: "cto_state commit requires state and the exact state_revision returned by read",
+          });
+        }
+        const result = commitCtoStateForModel({
+          controller,
+          cwd,
+          run_id: input.run_id,
+          expected_state_revision: input.expected_state_revision,
+          state: input.state,
+        });
+        return toolResult({
+          ok: true,
+          operation: "commit",
+          run_id: input.run_id,
+          state: result.state,
+          state_revision: result.state_revision,
+          transition: result.transition,
+        });
+      } catch (error) {
+        return lifecycleFailure("CTO_STATE_REJECTED", error);
+      }
+    },
+  });
   const classificationParameters = z.object({
     type: z.enum(["FEATURE", "REFACTOR", "OPS", "BUG_FIX", "SPEC", "REGRESS", "INVESTIGATION", "REVIEW", "HOTFIX", "PRODUCT_DISCOVERY"]),
     complexity: z.enum(["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"]),
@@ -2304,6 +3443,8 @@ export {
   resolveRunSelection,
   acquireExecutionClaim,
   releaseExecutionClaim,
+  reserveExecutionClaimWorkers,
+  settleExecutionClaimWorkers,
   handoverExecutionClaim,
   persistCanonicalRun,
   updateCanonicalRun,
@@ -2517,9 +3658,9 @@ export type {
   OrdinaryRunSchema,
   OrdinaryRunIdentity,
   LifecycleMode,
-  LifecycleOperation,
-  LifecycleStatus,
   TrustedExecutionContext,
+  CtoClaimScope,
+  CtoReleaseProvenance,
   LifecycleSelector,
   LifecycleRequestBase,
   NewLifecycleRequest,
@@ -2588,9 +3729,19 @@ export {
 	findWaveBySourceId,
 } from "./cto/state.js";
 export { teamDoDComplete, integrationDoD, ctoBackstop } from "./cto/gates.js";
-export { runCto, ctoRunId, finalizeCtoExecution, type RunCtoOptions, type RunCtoResult } from "./cto/run.js";
 export {
-  ctoCommand,
+  runCto,
+  ctoRunId,
+  finalizeCtoExecution,
+  suspendCtoSession,
+  finalizeCtoSession,
+  type RunCtoOptions,
+  type RunCtoResult,
+  type CtoIngressOptions,
+  type CtoIngressResult,
+} from "./cto/run.js";
+export {
+  parseCtoCommand,
   parseEnvelope as parseCtoEnvelope,
   buildCtoPrompt,
   buildAmendPrompt,
@@ -2598,6 +3749,9 @@ export {
   renderChannelSection,
   findActiveCtoRun,
   type ParsedCtoEnvelope,
+  type ParsedCtoCommand,
+  type ParsedCtoCommandFailure,
+  type CtoCommandParseResult,
   type CtoPromptOptions,
 } from "./commands/cto.js";
 export {

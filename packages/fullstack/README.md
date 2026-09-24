@@ -170,6 +170,7 @@ Provider comparisons use the dependency-light API at `@andvl1/omp-workflows-full
 | Command | Purpose |
 | --- | --- |
 | `/cto <task>` | Main-session CTO orchestration into parallel teams. |
+| `/cto --run <exact-run-id> [task]` | Reacquire one explicit CTO run; no latest-run fallback is used. |
 | `/do-work <task>` | Classification-first profile-driven workflow. |
 | `/team <task>` | Compatibility alias for `/do-work`. |
 | `/init-team` | Write `.omp/team.config.json` with detected/default stack mappings. |
@@ -178,7 +179,40 @@ Provider comparisons use the dependency-light API at `@andvl1/omp-workflows-full
 | `/session-report [do-work|cto] [id=<id>] [revision=<id>] [--full]` | Generate a self-contained offline HTML snapshot of one workflow session. |
 | `/workflow-view [do-work|cto] [id=<id>] [revision=<id>] [--all] [--full]` | Render a canonical workflow visualization bundle. |
 
+`/cto --run <exact-run-id> [task]` is the managed, explicit reacquisition path: it binds the selected CTO run to the current interactive controller and never scans for a latest run. A turn-level `session_stop` does not suspend that resident claim; verified host shutdown or replacement suspends it before the old controller/dispatcher is reset. OMP 18.2.2 replacement is a `session_switch` on the same mutable session manager, and an active claim is accepted only when the callback's interactive profile and `previousSessionFile` match the captured old session file. An independent manager, headless/worker callback, contradictory cwd/id/file/mode/UI, or stale old callback cannot release the current binding. Messenger tasks and answers remain durable under the exact current claim: write the outbox escalation, then use the real `read` tool on the exact `.work-state/cto/<run-id>/answers/<escId>.json` during reconciliation. Persisted answers are not replayed merely because an epoch changed; only a dispatcher-recorded pre-send rejection with its matching retry marker is automatically retryable on a fresh exact claim, while in-flight, unknown, accepted, or legacy delivery retains the original files and requires explicit reconciliation.
+
 The three workflow entry points are registered directly; `/init-team`, `/interview`, `/omp-model-roles`, `/session-report`, and `/workflow-view` remain custom-TS modules copied into project-local `.omp/commands/`. Most commands return prompts and do not dispatch subagents directly. `/session-report` and `/workflow-view` are deterministic read-only renderers: they require canonical selectors, read persisted state/artifacts, and write only under `.work-state`.
+
+### CTO canonical state authority
+
+The resident CTO is the sole model-visible coordinator for canonical CTO
+state. For every model-origin plan, classification, wave, progress, amendment,
+completion, terminal, or follow-up transition, it uses the registered
+`cto_state` tool:
+
+```text
+{ "operation": "read", "run_id": "<exact CTO id>" }
+→ validated CtoState + opaque state_revision
+
+{ "operation": "commit",
+  "run_id": "<same exact CTO id>",
+  "expected_state_revision": "<state_revision from read>",
+  "state": <candidate CtoState> }
+```
+
+The candidate is edited after the read and domain-validated before mutation.
+Only the authenticated bound coordinator proof (current token, epoch, and
+session) may commit, and it is checked under the lifecycle lock; `run_id` is
+not a path or ordinary UUID selector. Leads and workers return per-team
+artifacts and cannot call `cto_state`. DoDs, decisions, answers, and other
+permitted noncanonical artifacts remain ordinary files written with the usual
+artifact tools; raw `Write`/`Edit`/`Bash` cannot publish canonical state.
+
+A stale revision or claim refusal leaves state and binding unchanged; the
+coordinator re-reads and resolves a legitimate conflict, without a blind
+retry. A terminal commit releases only the exact originating managed private
+binding atomically; completion of a wave alone is not terminal. Runtime
+acceptance of this model ingress remains pending Main validation.
 
 ## Model roles
 

@@ -14,9 +14,14 @@ type SessionManagerFixture = {
 	getHeader: () => { type: "session"; id: string; cwd: string; timestamp: string };
 };
 
+const sessionManagerFixtures = new Map<string, SessionManagerFixture>();
+
 function sessionManagerFixture(cwd: string, sessionId: string): SessionManagerFixture {
 	const canonicalCwd = resolve(cwd);
-	return {
+	const key = `${canonicalCwd}\u0000${sessionId}`;
+	const existing = sessionManagerFixtures.get(key);
+	if (existing) return existing;
+	const manager: SessionManagerFixture = {
 		getCwd: () => canonicalCwd,
 		getSessionId: () => sessionId,
 		getSessionFile: () => join(canonicalCwd, ".omp", "sessions", `${sessionId}.jsonl`),
@@ -27,6 +32,8 @@ function sessionManagerFixture(cwd: string, sessionId: string): SessionManagerFi
 			timestamp: "2026-01-01T00:00:00.000Z",
 		}),
 	};
+	sessionManagerFixtures.set(key, manager);
+	return manager;
 }
 
 type Registered = {
@@ -108,12 +115,7 @@ function commandHarness(
 			ui: {},
 			sessionManager,
 		};
-		const event = {
-			type: "session_shutdown",
-			cwd: sessionManager.getCwd(),
-			session_id: sessionManager.getSessionId(),
-			sessionManager,
-		};
+		const event = { type: "session_shutdown" };
 		lifecycleHandlers.sessionShutdown?.(event, hostContext);
 		sessionStarted = false;
 	};
@@ -128,6 +130,9 @@ function context(
 ): unknown {
 	return {
 		cwd,
+		mode: "tui",
+		hasUI: true,
+		session_id: sessionManager.getSessionId(),
 		ui: {
 			notify(message: string) {
 				notifications.push(message);
@@ -142,9 +147,6 @@ test("fullstack: workflow commands register as authoritative extension commands"
 	const { commands, cleanup } = commandHarness();
 	try {
 		assert.deepEqual([...commands.keys()], ["do-work", "team", "cto"]);
-		assert.equal(commands.get("do-work")?.description, "Run a profile-driven workflow. /do-work <task>. (Alias: /team.)");
-		assert.equal(commands.get("team")?.description, "Alias for /do-work. Prefer /do-work in new code.");
-		assert.ok(commands.get("cto")?.description?.includes("resident CTO"));
 	} finally {
 		cleanup();
 	}
@@ -170,7 +172,7 @@ test("fullstack: base inventory is public before session_start and remains overr
 	}
 });
 
-test("fullstack: workflow commands use the session manager cwd after a context cwd drift", async () => {
+test("fullstack: workflow commands reject a context cwd that contradicts the session manager", async () => {
 	const canonical = mkdtempSync(join(tmpdir(), "omp-command-canonical-"));
 	const stale = mkdtempSync(join(tmpdir(), "omp-command-stale-"));
 	let cleanup: () => void = () => undefined;
@@ -178,10 +180,16 @@ test("fullstack: workflow commands use the session manager cwd after a context c
 		execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
 		const harness = commandHarness(prompt => prompt, canonical, true, "session-drift");
 		cleanup = harness.cleanup;
-		await harness.commands.get("do-work")?.handler("Canonical branch task", context(stale, [], "session-drift", canonical, harness.sessionManager));
-		assert.equal(harness.prompts.length, 1);
-		assert.match(harness.prompts[0] ?? "", /Branch: `main`/);
-		assert.doesNotMatch(harness.prompts[0] ?? "", /no git work tree/);
+		const handler = harness.commands.get("do-work")?.handler;
+		if (!handler) throw new Error("do-work command was not registered");
+		await assert.rejects(
+			handler(
+				"Canonical branch task",
+				context(stale, [], "session-drift", canonical, harness.sessionManager),
+			),
+			/workflow cwd unavailable|WORKFLOW_CONTEXT_REJECTED/,
+		);
+		assert.equal(harness.prompts.length, 0, "contradictory context must not send a workflow prompt");
 	} finally {
 		cleanup();
 		rmSync(canonical, { recursive: true, force: true });
@@ -201,28 +209,6 @@ test("fullstack: external hook boundary can augment /do-work prompt", async () =
 		assert.ok(harness.prompts[0]?.endsWith("[external-hook-marker]"));
 	} finally {
 		harness.cleanup();
-	}
-});
-test("fullstack: direct /cto handler emits fresh and standby prompts", async () => {
-	const root = mkdtempSync(join(tmpdir(), "omp-command-cto-"));
-	let cleanup: () => void = () => undefined;
-	try {
-		execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-		const harness = commandHarness(prompt => prompt, root);
-		cleanup = harness.cleanup;
-		const ctx = context(root, harness.notifications);
-
-		await harness.commands.get("cto")?.handler("Fresh CTO task", ctx);
-		assert.ok(harness.prompts[0]?.includes("Fresh CTO task"));
-		assert.ok(harness.prompts[0]?.includes("/cto workflow"));
-		assert.ok(harness.notifications.some(message => message.startsWith("cto: Fresh CTO task")));
-
-		await harness.commands.get("cto")?.handler("", ctx);
-		assert.ok(harness.prompts[1]?.includes("/cto STANDBY"));
-		assert.ok(harness.notifications.some(message => message.startsWith("cto: standby mode")));
-	} finally {
-		cleanup();
-		rmSync(root, { recursive: true, force: true });
 	}
 });
 

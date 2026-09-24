@@ -157,6 +157,83 @@ test("registered ingress infers only natural lifecycle modes and never mints the
   }
 });
 
+test("reentrant CTO acquisition preserves a newer consumed-hook token until exact supersession", async () => {
+  const root = mkdtempSync(join(tmpdir(), "command-intent-cto-reentrant-"));
+  try {
+    const sessionId = "reentrant-cto-session";
+    const controller = createWorkflowSessionController({ cwd: root, context: trustedContext(root, sessionId) });
+    const harness = commandHarness();
+    const context = {
+      cwd: root,
+      sessionManager: {
+        getCwd: () => root,
+        getSessionId: () => sessionId,
+        getSessionFile: () => join(root, `${sessionId}.jsonl`),
+      },
+      ui: { notify() {} },
+    };
+    let reenterDuringAcquire = false;
+    let reentrantPrompt = "";
+    let reentrantTurn: { systemPrompt: string[] } | undefined;
+    let beforeAgentStart: EventHandler | undefined;
+    const originalActiveCtoClaim = controller.activeCtoClaim;
+    controller.activeCtoClaim = () => {
+      const activeClaim = originalActiveCtoClaim();
+      if (reenterDuringAcquire) {
+        reenterDuringAcquire = false;
+        void harness.commands.get("do-work")!.handler("--new newer during cto acquire", context);
+        reentrantPrompt = harness.prompts.at(-1)!;
+        reentrantTurn = beforeAgentStart?.({ prompt: reentrantPrompt, systemPrompt: [] }, context) as { systemPrompt: string[] } | undefined;
+      }
+      return activeClaim;
+    };
+    registerWorkflowCommands(harness.pi as never, {
+      resolveCwd: () => root,
+      getSessionController: () => controller,
+      buildDoWorkPrompt: envelope => `${envelope.mode}:${envelope.command_intent_id ?? "missing"}:${envelope.task}`,
+    });
+    beforeAgentStart = harness.handlers.get("before_agent_start")?.[0];
+    assert.equal(typeof beforeAgentStart, "function");
+
+    await harness.commands.get("do-work")!.handler("--new older tracked predecessor", context);
+    const olderPrompt = harness.prompts.at(-1)!;
+    assert.ok(beforeAgentStart!({ prompt: olderPrompt, systemPrompt: [] }, context), "the predecessor is consumed and tracked");
+
+    reenterDuringAcquire = true;
+    await harness.commands.get("cto")!.handler("outer CTO acquisition", context);
+    assert.ok(reentrantPrompt, "the acquisition callback ran a newer explicit command");
+    assert.ok(reentrantTurn, "the newer prompt was consumed by the registered hook during acquisition");
+    assert.equal(reentrantTurn?.systemPrompt.length, 1, "the registered hook augments the reentrant turn");
+
+    const outerPrompt = harness.prompts.at(-1)!;
+    assert.match(outerPrompt, /outer CTO acquisition/);
+    assert.equal(
+      beforeAgentStart!({ prompt: outerPrompt, systemPrompt: [] }, context),
+      undefined,
+      "the outer CTO prompt cannot replace the newer consumed-hook owner",
+    );
+    const newerToken = reentrantPrompt.split(":")[1]!;
+    assert.equal(
+      controller.consumeCommandIntent({ command_intent_id: newerToken, mode: "new" })?.intent_id,
+      newerToken,
+      "newer reentrant controller token remains pending after CTO acquisition",
+    );
+    const runId = /CTO run id: `([^`]+)`/.exec(outerPrompt)?.[1];
+    assert.ok(runId, "outer prompt carries its exact acquired run id");
+
+    await harness.commands.get("cto")!.handler(`--run ${runId} exact superseding ingress`, context);
+    const supersedingPrompt = harness.prompts.at(-1)!;
+    assert.match(supersedingPrompt, /exact superseding ingress/);
+    assert.ok(
+      beforeAgentStart!({ prompt: supersedingPrompt, systemPrompt: [] }, context),
+      "the exact superseding ingress owns and arms its outer prompt",
+    );
+    lifecycleConflict(() => controller.consumeCommandIntent({ command_intent_id: newerToken, mode: "new" }));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("registered workflow prompts arm private one-shot turn provenance", async () => {
   const root = mkdtempSync(join(tmpdir(), "command-intent-commands-"));
   const foreignRoot = mkdtempSync(join(tmpdir(), "command-intent-foreign-"));
@@ -171,7 +248,11 @@ test("registered workflow prompts arm private one-shot turn provenance", async (
     const harness = commandHarness();
     const contextFor = (cwd: string, id: string) => ({
       cwd,
-      sessionManager: { getCwd: () => cwd, getSessionId: () => id },
+      sessionManager: {
+        getCwd: () => cwd,
+        getSessionId: () => id,
+        getSessionFile: () => join(cwd, `${id}.jsonl`),
+      },
       ui: { notify() {} },
     });
     const hostContext = contextFor(root, sessionId);
@@ -250,10 +331,20 @@ test("registered workflow prompts arm private one-shot turn provenance", async (
     assert.ok(start(foreignSessionPrompt, hostContext), "foreign session cannot consume or clear host provenance");
     await harness.commands.get("do-work")!.handler("same identity controller task", hostContext);
     const sameIdentityPrompt = harness.prompts.at(-1)!;
+    const sameIdentityDifferentManagerContext = contextFor(root, sessionId);
+    assert.equal(
+      start(sameIdentityPrompt, sameIdentityDifferentManagerContext),
+      undefined,
+      "a distinct same-session manager cannot consume or clear the original candidate",
+    );
+    assert.ok(start(sameIdentityPrompt, hostContext), "the original manager still augments its exact candidate once");
+    assert.equal(start(sameIdentityPrompt, hostContext), undefined, "same-session provenance remains one-shot");
+    await harness.commands.get("do-work")!.handler("same identity controller mismatch task", hostContext);
+    const controllerMismatchPrompt = harness.prompts.at(-1)!;
     resolvedHostController = replacementController;
-    assert.equal(start(sameIdentityPrompt, hostContext), undefined, "different controller cannot consume same identity provenance");
+    assert.equal(start(controllerMismatchPrompt, hostContext), undefined, "different controller cannot augment prompt and consumes candidate fail-closed");
     resolvedHostController = controller;
-    assert.equal(start(sameIdentityPrompt, hostContext), undefined, "controller mismatch consumes the candidate fail-closed");
+    assert.equal(start(controllerMismatchPrompt, hostContext), undefined, "consumed controller-mismatch candidate cannot replay");
     await harness.commands.get("do-work")!.handler("--new cleanup conflict", hostContext);
     const cleanupConflictPrompt = harness.prompts.at(-1)!;
     const newerCleanupIntent = controller.issueCommandIntent("new");
@@ -299,16 +390,23 @@ test("registered workflow prompts arm private one-shot turn provenance", async (
     controller.release("test-release");
     sessionStop!({ session_id: sessionId }, hostContext);
     assert.equal(start(releasedLifecyclePrompt, hostContext), undefined, "stop cleanup works after controller release");
-
     await harness.commands.get("do-work")!.handler("host cleanup task", hostContext);
     const hostCleanupPrompt = harness.prompts.at(-1)!;
     sessionStop!({ session_id: sessionId }, hostContext);
     assert.equal(start(hostCleanupPrompt, hostContext), undefined);
+    await harness.commands.get("do-work")!.handler("contradictory stop task", hostContext);
+    const contradictoryStopPrompt = harness.prompts.at(-1)!;
+    sessionStop!({ session_id: sessionId, session_file: join(root, "newer-session.jsonl") }, hostContext);
+    assert.ok(start(contradictoryStopPrompt, hostContext), "a same-session stop for a different session file cannot clear current provenance");
+    await harness.commands.get("do-work")!.handler("matching stop task", hostContext);
+    const matchingStopPrompt = harness.prompts.at(-1)!;
+    sessionStop!({ session_id: sessionId, session_file: join(root, `${sessionId}.jsonl`) }, hostContext);
+    assert.equal(start(matchingStopPrompt, hostContext), undefined, "the captured session file clears its own provenance");
     await harness.commands.get("do-work")!.handler("host shutdown task", hostContext);
     const hostShutdownPrompt = harness.prompts.at(-1)!;
     const sessionShutdown = harness.handlers.get("session_shutdown")?.[0];
     assert.equal(typeof sessionShutdown, "function");
-    sessionShutdown!({}, hostContext);
+    sessionShutdown!({ type: "session_shutdown" }, hostContext);
     assert.equal(start(hostShutdownPrompt, hostContext), undefined);
 
     await harness.commands.get("do-work")!.handler("seed usage cleanup", hostContext);
@@ -409,7 +507,12 @@ test("registered workflow prompts arm private one-shot turn provenance", async (
     await noResolver.commands.get("do-work")!.handler("unbound task", hostContext);
     await noResolver.commands.get("do-work")!.handler("", hostContext);
     await noResolver.commands.get("do-work")!.handler("--list", hostContext);
-    await noResolver.commands.get("cto")!.handler("", hostContext);
+    const promptsBeforeCto = noResolver.prompts.length;
+    await assert.rejects(
+      noResolver.commands.get("cto")!.handler("", hostContext),
+      /WORKFLOW_CONTEXT_REJECTED/,
+    );
+    assert.equal(noResolver.prompts.length, promptsBeforeCto, "unbound CTO refusal does not send a prompt");
     await noResolver.commands.get("do-work")!.handler("--new", hostContext);
     const noResolverHook = noResolver.handlers.get("before_agent_start")?.[0];
     for (const prompt of noResolver.prompts) {

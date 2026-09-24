@@ -4,9 +4,10 @@ import {
 	buildAmendPrompt,
 	buildCtoPrompt,
 	buildStandbyCtoPrompt,
-	findActiveCtoRun,
+	parseCtoCommand,
 	parseEnvelope as parseCtoEnvelope,
 } from "./cto.js";
+import { acquireCtoIngress, suspendCtoSession, type CtoIngressResult } from "../cto/run.js";
 import { buildDoWorkPrompt, parseWorkEnvelope, type ParsedWorkEnvelope } from "./do-work.js";
 import { parseWorkflowCommand, type WorkflowCommandMode } from "./envelope.js";
 import { createSelectionSnapshot } from "../engine/run-store.js";
@@ -26,7 +27,7 @@ function teamDescription(doWork: string): string {
 	return `Alias for /${doWork}. Prefer /${doWork} in new code.`;
 }
 function ctoDescription(cto: string): string {
-	return `CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /${cto} <task>; /${cto} alone starts STANDBY (tasks arrive via messenger inbox). Runs in-session — never task(agent=cto)`;
+	return `CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /${cto} [--run <exact-cto-id>] <task>; /${cto} alone starts STANDBY (tasks arrive via messenger inbox). Registered ingress acquires the exact host claim before the prompt; no latest-run scan. Runs in-session — never task(agent=cto)`;
 }
 
 export interface WorkflowCommandOptions {
@@ -65,8 +66,9 @@ export function resolveCommandCwd(ctx: ExtensionCommandContext): string | undefi
 type SessionIdentity = {
 	sessionId: string;
 	cwd: string;
+	manager: object;
+	sessionFile?: string;
 };
-
 type TrustedControllerBinding = {
 	controller: WorkflowSessionController;
 	identity: SessionIdentity;
@@ -82,18 +84,22 @@ type CommandProvenanceRecord = SessionIdentity & {
 	controller: WorkflowSessionController;
 	prompt?: string;
 	intent?: CommandIntentOwnership;
+	cto?: {
+		ingress: CtoIngressResult;
+	};
 };
 
 type CommandInvocation = {
 	commandIntentId?: string;
 	/** Natural-language mode is a routing hint, never an explicit command token. */
 	inferredMode?: Exclude<WorkflowCommandMode, "list">;
+	/** Exact CTO ingress acquired before prompt construction. */
+	ctoIngress?: CtoIngressResult;
 	/** Removes this invocation's record and, if owned, its exact intent. */
 	cleanup?: () => void;
 	/** Arms the same ingress record after the exact prompt has been built. */
 	arm?: (prompt: string) => void;
 };
-
 /**
  * Narrow, private context for the one turn caused by a registered workflow
  * command. It requests managed execution; only the current engine-returned
@@ -117,6 +123,19 @@ function canonicalCwd(value: unknown): string | undefined {
 function provenanceKey(identity: SessionIdentity): string {
 	return `${identity.sessionId}\u0000${identity.cwd}`;
 }
+function sameSessionIdentity(left: SessionIdentity, right: SessionIdentity): boolean {
+	return (
+		left.sessionId === right.sessionId
+		&& left.cwd === right.cwd
+		&& left.manager === right.manager
+		&& (
+			left.sessionFile === undefined
+			|| right.sessionFile === undefined
+			|| left.sessionFile === right.sessionFile
+		)
+	);
+}
+
 
 function sessionIdentityFromManager(ctx: unknown): SessionIdentity | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
@@ -124,20 +143,46 @@ function sessionIdentityFromManager(ctx: unknown): SessionIdentity | undefined {
 		sessionManager?: {
 			getCwd?: () => unknown;
 			getSessionId?: () => unknown;
+			getSessionFile?: () => unknown;
 		};
 	};
 	const manager = value.sessionManager;
-	if (!manager || typeof manager.getCwd !== "function" || typeof manager.getSessionId !== "function") return undefined;
+	if (!manager || typeof manager !== "object" || typeof manager.getCwd !== "function" || typeof manager.getSessionId !== "function") return undefined;
 	try {
 		const cwd = canonicalCwd(manager.getCwd());
 		const sessionId = manager.getSessionId();
 		if (!cwd || typeof sessionId !== "string" || sessionId.length === 0) return undefined;
-		return { sessionId, cwd };
+		const sessionFile = typeof manager.getSessionFile === "function" ? manager.getSessionFile() : undefined;
+		return {
+			sessionId,
+			cwd,
+			manager,
+			...(typeof sessionFile === "string" && sessionFile.length > 0 ? { sessionFile } : {}),
+		};
 	} catch {
 		return undefined;
 	}
 }
-
+function sessionFileFromManager(ctx: unknown): string | undefined {
+	if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return undefined;
+	const explicit = "sessionFile" in ctx && typeof ctx.sessionFile === "string" && ctx.sessionFile.length > 0
+		? ctx.sessionFile
+		: "session_file" in ctx && typeof ctx.session_file === "string" && ctx.session_file.length > 0
+			? ctx.session_file
+			: undefined;
+	const manager = "sessionManager" in ctx ? ctx.sessionManager : undefined;
+	if (manager && typeof manager === "object") {
+		if (!("getSessionFile" in manager) || typeof manager.getSessionFile !== "function") return undefined;
+		try {
+			const file = manager.getSessionFile();
+			if (typeof file !== "string" || file.length === 0 || (explicit !== undefined && explicit !== file)) return undefined;
+			return file;
+		} catch {
+			return undefined;
+		}
+	}
+	return explicit;
+}
 function controllerMatchesIdentity(
 	binding: TrustedControllerBinding,
 	cwd: string | undefined,
@@ -150,6 +195,10 @@ function controllerMatchesIdentity(
 		requestedCwd !== binding.identity.cwd
 		|| managerIdentity.sessionId !== binding.identity.sessionId
 		|| managerIdentity.cwd !== binding.identity.cwd
+		|| managerIdentity.manager !== binding.identity.manager
+		|| managerIdentity.sessionFile !== undefined
+			&& binding.identity.sessionFile !== undefined
+			&& managerIdentity.sessionFile !== binding.identity.sessionFile
 	) return false;
 	try {
 		const context = binding.controller.context();
@@ -201,9 +250,14 @@ function resolveTrustedController(
 }
 function eventSessionId(event: unknown): string | undefined {
 	if (!event || typeof event !== "object") return undefined;
-	const value = event as { session_id?: unknown; sessionId?: unknown };
-	if (typeof value.session_id === "string" && value.session_id.length > 0) return value.session_id;
-	return typeof value.sessionId === "string" && value.sessionId.length > 0 ? value.sessionId : undefined;
+	const value = event as { session_id?: unknown };
+	return typeof value.session_id === "string" && value.session_id.length > 0 ? value.session_id : undefined;
+}
+
+function eventSessionFile(event: unknown): string | undefined {
+	if (!event || typeof event !== "object") return undefined;
+	const value = event as { session_file?: unknown };
+	return typeof value.session_file === "string" && value.session_file.length > 0 ? value.session_file : undefined;
 }
 
 function eventCwd(event: unknown): string | undefined {
@@ -230,6 +284,8 @@ function resolveTrustedEventController(
 	if (!binding) return undefined;
 	const requestedSessionId = eventSessionId(event);
 	if (requestedSessionId && requestedSessionId !== binding.identity.sessionId) return undefined;
+	const requestedSessionFile = eventSessionFile(event);
+	if (requestedSessionFile && requestedSessionFile !== binding.identity.sessionFile) return undefined;
 	const requestedCwd = eventCwd(event);
 	if (requestedCwd && requestedCwd !== binding.identity.cwd) return undefined;
 	return binding;
@@ -271,12 +327,23 @@ function deleteExactProvenanceRecord(
 ): CommandProvenanceRecord | undefined {
 	const key = provenanceKey(identity);
 	const record = provenance.get(key);
-	if (!record || record.sessionId !== identity.sessionId || record.cwd !== identity.cwd || provenance.get(key) !== record) {
+	if (!record || !sameSessionIdentity(record, identity) || provenance.get(key) !== record) {
 		return undefined;
 	}
 	provenance.delete(key);
 	return record;
 }
+
+
+function deleteTrackedIntentRecord(
+	tracked: Map<string, CommandProvenanceRecord>,
+	identity: SessionIdentity,
+): void {
+	const key = provenanceKey(identity);
+	const record = tracked.get(key);
+	if (record && sameSessionIdentity(record, identity)) tracked.delete(key);
+}
+
 
 function clearCurrentProvenance(
 	provenance: Map<string, CommandProvenanceRecord>,
@@ -291,20 +358,24 @@ function clearCurrentProvenance(
 
 function clearCurrentCommandIngress(
 	provenance: Map<string, CommandProvenanceRecord>,
+	trackedIntentProvenance: Map<string, CommandProvenanceRecord>,
 	options: WorkflowCommandOptions,
 	ctx: ExtensionCommandContext,
 	boundController?: WorkflowSessionController,
+	controllerManagers?: WeakMap<WorkflowSessionController, object>,
 ): void {
+	const identity = sessionIdentityFromManager(ctx);
 	const record = clearCurrentProvenance(provenance, ctx);
+	if (identity) deleteTrackedIntentRecord(trackedIntentProvenance, identity);
 	if (record?.intent) return;
 	let controller = boundController;
 	if (!controller) {
-		const identity = sessionIdentityFromManager(ctx);
 		const binding = identity ? resolveTrustedController(options, ctx, identity.cwd) : undefined;
 		controller = binding?.controller;
 	}
+	if (!controller || !identity || !controllerManagers || controllerManagers.get(controller) !== identity.manager) return;
 	try {
-		controller?.clearCommandIntent();
+		controller.clearCommandIntent();
 	} catch {
 		// Cleanup must not mask the command's own error path.
 	}
@@ -315,6 +386,7 @@ type CommandPromptBuilder = (
 	cwd: string | undefined,
 	commandIntentId?: string,
 	inferredMode?: Exclude<WorkflowCommandMode, "list">,
+	ctoIngress?: CtoIngressResult,
 ) => string;
 type BeforeCommandExecute = (
 	args: string,
@@ -348,7 +420,14 @@ function registerPromptCommand(
 			const invocation = beforeExecute?.(normalizedArgs, cwd, ctx);
 			let prompt: string;
 			try {
-				prompt = buildPrompt(normalizedArgs, ctx, cwd, invocation?.commandIntentId, invocation?.inferredMode);
+				prompt = buildPrompt(
+					normalizedArgs,
+					ctx,
+					cwd,
+					invocation?.commandIntentId,
+					invocation?.inferredMode,
+					invocation?.ctoIngress,
+				);
 			} catch (error) {
 				try {
 					invocation?.cleanup?.();
@@ -432,23 +511,43 @@ function buildDoWorkCommandPrompt(
 	return promptBuilder(envelope, cwd);
 }
 
-function buildCtoCommandPrompt(args: string, ctx: ExtensionCommandContext, ctoName: string, cwd: string | undefined): string {
-	if (!cwd) return "ERROR: workflow cwd unavailable.";
-	if (!args) {
-		ctx.ui.notify(`${ctoName}: standby mode — awaiting tasks via messenger inbox`, "info");
-		return buildStandbyCtoPrompt(cwd);
-	}
+function preflightCtoCommand(args: string): string | undefined {
+	const command = parseCtoCommand(args);
+	return command.ok ? undefined : `ERROR [${command.code}]: ${command.error}`;
+}
 
+function buildCtoCommandPrompt(
+	args: string,
+	ctx: ExtensionCommandContext,
+	ctoName: string,
+	cwd: string | undefined,
+	_ctoCommandIntentId?: string,
+	_ctoInferredMode?: Exclude<WorkflowCommandMode, "list">,
+	ingress?: CtoIngressResult,
+): string {
+	if (!cwd) return "ERROR: workflow cwd unavailable.";
+	if (!ingress) return "ERROR [WORKFLOW_CONTEXT_REJECTED]: trusted CTO session is unavailable.";
+	const command = parseCtoCommand(args);
+	if (!command.ok) return `ERROR [${command.code}]: ${command.error}`;
 	const sessionId = ctx.sessionManager.getSessionId();
-	const envelope = parseCtoEnvelope(args, cwd);
+	const task = command.task || (ingress.state.standby ? "" : ingress.state.task);
+	if (!task) {
+		ctx.ui.notify(`${ctoName}: standby mode — awaiting tasks via messenger inbox`, "info");
+		return buildStandbyCtoPrompt(cwd, { runId: ingress.run_id });
+	}
+	const envelope = parseCtoEnvelope(task, cwd);
 	if (!envelope.task) return "ERROR: empty task after stripping prefix.";
-	const active = findActiveCtoRun(cwd, { sessionId });
-	if (active) {
-		ctx.ui.notify(`${ctoName}: amending run ${active.runId} with: ${envelope.task.slice(0, 50)}`, "info");
-		return buildAmendPrompt(envelope, cwd, active, { sessionId });
+	if (!ingress.created) {
+		ctx.ui.notify(`${ctoName}: amending run ${ingress.run_id} with: ${envelope.task.slice(0, 50)}`, "info");
+		return buildAmendPrompt(
+			envelope,
+			cwd,
+			{ runId: ingress.run_id, state: ingress.state },
+			{ sessionId, runId: ingress.run_id },
+		);
 	}
 	ctx.ui.notify(`${ctoName}: ${envelope.task.slice(0, 60)} (decomposition pending)`, "info");
-	return buildCtoPrompt(envelope, cwd, { sessionId });
+	return buildCtoPrompt(envelope, cwd, { sessionId, runId: ingress.run_id });
 }
 function commandName(prefix: string | undefined, base: "do-work" | "team" | "cto"): string {
 	if (!prefix) return base;
@@ -474,23 +573,110 @@ function bindCommandController(
 	if (!binding) throw new Error("WORKFLOW_CONTEXT_REJECTED: trusted session identity is unavailable");
 	return binding;
 }
-
-function prepareCommandInvocation(
+function prepareCtoCommandInvocation(
 	provenance: Map<string, CommandProvenanceRecord>,
+	trackedIntentProvenance: Map<string, CommandProvenanceRecord>,
 	options: WorkflowCommandOptions,
 	args: string,
 	cwd: string | undefined,
 	ctx: ExtensionCommandContext,
+	controllerManagers: WeakMap<WorkflowSessionController, object>,
+): CommandInvocation {
+	const binding = bindCommandController(options, cwd, ctx);
+	if (!binding) throw new Error("WORKFLOW_CONTEXT_REJECTED: trusted CTO session is unavailable");
+	controllerManagers.set(binding.controller, binding.identity.manager);
+	const sessionFile = sessionFileFromManager(ctx);
+	if (!sessionFile || binding.identity.sessionFile !== sessionFile) {
+		throw new Error("WORKFLOW_CONTEXT_REJECTED: CTO ingress requires the host session file association");
+	}
+	const command = parseCtoCommand(args);
+	if (!command.ok) throw new Error(`ERROR [${command.code}]: ${command.error}`);
+	const envelope = parseCtoEnvelope(command.task, binding.identity.cwd);
+	const provenanceBindingKey = provenanceKey(binding.identity);
+	// Snapshot both exact map entries before any controller call can re-enter
+	// another registered command. The map and tracked token are independent CAS
+	// guards: a consumed hook may leave provenance empty while replacing the
+	// tracked owner with a newer explicit command.
+	const predecessorAtAcquire = provenance.get(provenanceBindingKey);
+	const trackedAtAcquire = trackedIntentProvenance.get(provenanceBindingKey);
+	const predecessor = predecessorAtAcquire && sameSessionIdentity(predecessorAtAcquire, binding.identity)
+		? predecessorAtAcquire
+		: undefined;
+	const trackedPredecessor = trackedAtAcquire && sameSessionIdentity(trackedAtAcquire, binding.identity)
+		? trackedAtAcquire
+		: undefined;
+	const context = binding.controller.context();
+	const ingress = acquireCtoIngress({
+		cwd: binding.identity.cwd,
+		branch: context.branch,
+		task: envelope.task,
+		...(command.run_id ? { run_id: command.run_id } : {}),
+		controller: binding.controller,
+	});
+	// Compare both ownership slots before mutating either one. No host callback
+	// occurs between these reads and the exact-entry deletes below.
+	const canReplaceCurrent =
+		provenance.get(provenanceBindingKey) === predecessorAtAcquire
+		&& trackedIntentProvenance.get(provenanceBindingKey) === trackedAtAcquire
+		&& (predecessorAtAcquire === undefined || predecessor !== undefined)
+		&& (trackedAtAcquire === undefined || trackedPredecessor !== undefined);
+	let canInstallOuter = false;
+	if (canReplaceCurrent) {
+		if (predecessorAtAcquire !== undefined && provenance.get(provenanceBindingKey) === predecessorAtAcquire) {
+			provenance.delete(provenanceBindingKey);
+		}
+		if (trackedAtAcquire !== undefined && trackedIntentProvenance.get(provenanceBindingKey) === trackedAtAcquire) {
+			trackedIntentProvenance.delete(provenanceBindingKey);
+		}
+		if (predecessor && predecessor !== trackedPredecessor) cleanupIntent(predecessor);
+		if (trackedPredecessor) cleanupIntent(trackedPredecessor);
+		// cleanupIntent is controller-owned and may re-enter a registered
+		// command. Publish the outer record only if both slots stayed empty.
+		canInstallOuter =
+			provenance.get(provenanceBindingKey) === undefined
+			&& trackedIntentProvenance.get(provenanceBindingKey) === undefined;
+	}
+	const record: CommandProvenanceRecord = {
+		...binding.identity,
+		controller: binding.controller,
+		cto: { ingress },
+	};
+	if (canInstallOuter) provenance.set(provenanceBindingKey, record);
+	return {
+		ctoIngress: ingress,
+		arm: (prompt: string) => armCommandProvenance(provenance, record, cwd, ctx, prompt),
+		cleanup: () => {
+			if (provenance.get(provenanceBindingKey) === record) provenance.delete(provenanceBindingKey);
+			try {
+				suspendCtoSession(binding.controller, "session-replacement");
+			} catch {
+				// Preserve the original prompt-build/send error.
+			}
+		},
+	};
+}
+
+
+function prepareCommandInvocation(
+	provenance: Map<string, CommandProvenanceRecord>,
+	trackedIntentProvenance: Map<string, CommandProvenanceRecord>,
+	options: WorkflowCommandOptions,
+	args: string,
+	cwd: string | undefined,
+	ctx: ExtensionCommandContext,
+	controllerManagers: WeakMap<WorkflowSessionController, object>,
 ): CommandInvocation | undefined {
 	const ownIdentity = sessionIdentityFromManager(ctx);
 	let previousHadIntent = false;
 	if (ownIdentity) {
+		deleteTrackedIntentRecord(trackedIntentProvenance, ownIdentity);
 		const previous = deleteExactProvenanceRecord(provenance, ownIdentity);
 		previousHadIntent = Boolean(previous?.intent);
 		if (previous) cleanupIntent(previous);
 	}
 	const binding = bindCommandController(options, cwd, ctx);
 	if (!binding) return undefined;
+	controllerManagers.set(binding.controller, binding.identity.manager);
 	const provenanceBindingKey = provenanceKey(binding.identity);
 	const command = parseWorkflowCommand(args);
 	if (!command.ok || command.mode === "list" || !args) {
@@ -529,7 +715,6 @@ function prepareCommandInvocation(
 			cleanupIntent(record);
 		},
 	};
-
 }
 function readBeforeAgentStartEvent(event: unknown): { prompt: string; systemPrompt: string[] } | undefined {
 	if (!event || typeof event !== "object") return undefined;
@@ -542,14 +727,17 @@ function readBeforeAgentStartEvent(event: unknown): { prompt: string; systemProm
 }
 function clearCommandIntent(
 	provenance: Map<string, CommandProvenanceRecord>,
+	trackedIntentProvenance: Map<string, CommandProvenanceRecord>,
 	options: WorkflowCommandOptions,
 	ctx: ExtensionCommandContext,
 ): undefined {
-	clearCurrentCommandIngress(provenance, options, ctx);
+	clearCurrentCommandIngress(provenance, trackedIntentProvenance, options, ctx);
 	return undefined;
 }
 export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowCommandOptions = {}): void {
 	const provenance = new Map<string, CommandProvenanceRecord>();
+	const trackedIntentProvenance = new Map<string, CommandProvenanceRecord>();
+	const controllerManagers = new WeakMap<WorkflowSessionController, object>();
 	const prefix = options.commandPrefix ?? options.namespace;
 	const names = {
 		doWork: commandName(prefix, "do-work"),
@@ -570,9 +758,12 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 		if (!identity) return;
 		const requestedSessionId = eventSessionId(event);
 		if (requestedSessionId && requestedSessionId !== identity.sessionId) return;
+		const requestedSessionFile = eventSessionFile(event);
+		if (requestedSessionFile && requestedSessionFile !== identity.sessionFile) return;
 		const requestedCwd = eventCwd(event);
 		if (requestedCwd && requestedCwd !== identity.cwd) return;
 		deleteExactProvenanceRecord(provenance, identity);
+		deleteTrackedIntentRecord(trackedIntentProvenance, identity);
 	};
 	const registerProvenanceHooks = (): void => {
 		if (typeof pi.on !== "function") return;
@@ -583,20 +774,40 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			if (!identity) return undefined;
 			const requestedSessionId = eventSessionId(event);
 			if (requestedSessionId && requestedSessionId !== identity.sessionId) return undefined;
+			const requestedSessionFile = eventSessionFile(event);
+			if (requestedSessionFile && requestedSessionFile !== identity.sessionFile) return undefined;
 			const requestedCwd = eventCwd(event);
 			if (requestedCwd && requestedCwd !== identity.cwd) return undefined;
-			const record = provenance.get(provenanceKey(identity));
-			if (!record || record.prompt === undefined || provenance.get(provenanceKey(identity)) !== record) return undefined;
-			provenance.delete(provenanceKey(identity));
+			const provenanceBindingKey = provenanceKey(identity);
+			const record = provenance.get(provenanceBindingKey);
+			if (
+				!record
+				|| record.prompt === undefined
+				|| provenance.get(provenanceBindingKey) !== record
+				|| record.manager !== identity.manager
+			) return undefined;
+			// Once an exact identity has a candidate prompt, consume that
+			// one-shot record before any controller authorization. A forged or
+			// replaced controller must fail closed without leaving a replayable
+			// prompt behind. Successful consumption is tracked privately so a
+			// later CTO ingress can clear only this exact pending intent.
+			provenance.delete(provenanceBindingKey);
+			deleteTrackedIntentRecord(trackedIntentProvenance, identity);
 			if (record.prompt !== incoming.prompt) {
 				cleanupIntent(record);
 				return undefined;
 			}
 			const binding = resolveTrustedEventController(options, event, ctx, resolveEffectiveCwd);
-			if (!binding || binding.controller !== record.controller || provenanceKey(binding.identity) !== provenanceKey(identity)) {
+			if (
+				!binding
+				|| binding.controller !== record.controller
+				|| binding.identity.manager !== identity.manager
+				|| provenanceKey(binding.identity) !== provenanceBindingKey
+			) {
 				cleanupIntent(record);
 				return undefined;
 			}
+			if (record.intent) trackedIntentProvenance.set(provenanceBindingKey, record);
 			return { systemPrompt: [...incoming.systemPrompt, WORKFLOW_TURN_CONTRACT] };
 		});
 		pi.on("session_stop", clearOwnProvenance);
@@ -620,10 +831,10 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			resolveEffectiveCwd,
 			(args, cwd, ctx) => {
 				claimForCommand?.(cwd);
-				return prepareCommandInvocation(provenance, options, args, cwd, ctx);
+				return prepareCommandInvocation(provenance, trackedIntentProvenance, options, args, cwd, ctx, controllerManagers);
 			},
 			preflightWorkflowCommand,
-			(ctx) => clearCurrentCommandIngress(provenance, options, ctx),
+			(ctx) => clearCurrentCommandIngress(provenance, trackedIntentProvenance, options, ctx, undefined, controllerManagers),
 		);
 		registerPromptCommand(
 			pi,
@@ -633,18 +844,24 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			resolveEffectiveCwd,
 			(args, cwd, ctx) => {
 				claimForCommand?.(cwd);
-				return prepareCommandInvocation(provenance, options, args, cwd, ctx);
+				return prepareCommandInvocation(provenance, trackedIntentProvenance, options, args, cwd, ctx, controllerManagers);
 			},
 			preflightWorkflowCommand,
-			(ctx) => clearCurrentCommandIngress(provenance, options, ctx),
+			(ctx) => clearCurrentCommandIngress(provenance, trackedIntentProvenance, options, ctx, undefined, controllerManagers),
 		);
 		registerPromptCommand(
 			pi,
 			names.cto,
 			options.ctoDescription ?? ctoDescription(names.cto),
-			(args, ctx, cwd) => buildCtoCommandPrompt(args, ctx, names.cto, cwd),
+			(args, ctx, cwd, commandIntentId, inferredMode, ingress) =>
+				buildCtoCommandPrompt(args, ctx, names.cto, cwd, commandIntentId, inferredMode, ingress),
 			resolveEffectiveCwd,
-			(_args, cwd, ctx) => { claimForCommand?.(cwd); return clearCommandIntent(provenance, options, ctx); },
+			(args, cwd, ctx) => {
+				claimForCommand?.(cwd);
+				return prepareCtoCommandInvocation(provenance, trackedIntentProvenance, options, args, cwd, ctx, controllerManagers);
+			},
+			preflightCtoCommand,
+			(ctx) => clearCurrentCommandIngress(provenance, trackedIntentProvenance, options, ctx, undefined, controllerManagers),
 		);
 	};
 

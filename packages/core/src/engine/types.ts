@@ -391,6 +391,43 @@ export interface RunSelectionSnapshot {
   candidates: RunCandidate[];
 }
 
+/** Public, non-secret proof that a host session owns a CTO claim. */
+export interface CtoClaimScope {
+  readonly run_id: string;
+  readonly ownership_epoch: string;
+}
+
+/**
+ * Host-issued release evidence for a managed CTO coordinator.
+ *
+ * `worker_ids`, `issuance_token`, and `snapshot_hash` are immutable issuance
+ * evidence. `pending_worker_ids`/`ledger_revision` are the separately
+ * journaled reservation ledger used while workers settle after the
+ * coordinator has released the claim.
+ */
+export interface CtoReleaseProvenance {
+  schema: 2;
+  run_id: string;
+  branch: string;
+  ownership_epoch: string;
+  coordinator_session_id: string;
+  coordinator_process_id?: number;
+  /** Immutable worker reservation captured when the host issued release. */
+  worker_ids: string[];
+  /** Mutable pending reservation ledger; never rewrite worker_ids. */
+  pending_worker_ids: string[];
+  ledger_revision: number;
+  /** Private-to-core issuance proof persisted for exact receipt validation. */
+  issuance_token: string;
+  released_at: string;
+  reason: "session-shutdown" | "session-replacement" | "terminal";
+  release_receipt: string;
+  /** Immutable state image hash captured at issuance. */
+  snapshot_hash: string;
+  /** Persisted state witness checked against the canonical image; arbitrary writes do not rehash it. */
+  current_snapshot_hash: string;
+}
+
 export interface WorktreeExecutionClaim {
   token: string;
   owner_kind: "workflow" | "cto";
@@ -409,6 +446,8 @@ export interface RunControl {
   runs: Record<string, RunCandidate>;
   selections: Record<string, { run_id: string; branch: string; selected_at: string; active: boolean }>;
   execution_claim: WorktreeExecutionClaim | null;
+  /** Managed CTO release receipts keyed by exact CTO run id. */
+  cto_releases: Record<string, CtoReleaseProvenance>;
   prepare_receipts: Record<string, PrepareRequestReceipt>;
   selection_snapshots: Record<string, RunSelectionSnapshot>;
 }

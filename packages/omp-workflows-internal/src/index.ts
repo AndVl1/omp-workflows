@@ -46,6 +46,7 @@ import {
 	registerWorkflowCommands,
 	resolveActiveBranch,
 	runTarget,
+	suspendCtoSession,
 	writeRuntimeConfig,
 	workflowOwnerFor,
 	type RegisterOptions,
@@ -96,7 +97,7 @@ const NAMESPACED_DESCRIPTIONS = {
 	doWorkDescription: "Run a profile-driven workflow. /omp-do-work <task>. (Alias: /omp-team.)",
 	teamDescription: "Alias for /omp-do-work. Prefer /omp-do-work in new code.",
 	ctoDescription:
-		"CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /omp-cto <task>; /omp-cto alone starts STANDBY (tasks arrive via messenger inbox). Runs in-session — never task(agent=cto)",
+		"CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /omp-cto [--run <exact-cto-id>] <task>; /omp-cto alone starts STANDBY (tasks arrive via messenger inbox). Managed suspension preserves pending work across verified session replacement/shutdown. Runs in-session — never task(agent=cto)",
 } as const;
 
 interface InternalSessionBinding {
@@ -104,6 +105,8 @@ interface InternalSessionBinding {
 	interactive: boolean;
 	mode: "tui" | "rpc";
 	sessionId?: string;
+	sessionManager?: object;
+	sessionFile?: string;
 	controller?: WorkflowSessionController;
 }
 
@@ -132,11 +135,45 @@ function sessionIdFromContext(ctx: unknown): string | undefined {
 	return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
 }
 
+function sessionManagerFromContext(ctx: unknown): object | undefined {
+	if (!ctx || typeof ctx !== "object") return undefined;
+	const manager = (ctx as { sessionManager?: unknown }).sessionManager;
+	if (!manager || typeof manager !== "object") return undefined;
+	const value = manager as { getCwd?: unknown; getSessionId?: unknown };
+	return typeof value.getCwd === "function" && typeof value.getSessionId === "function"
+		? manager
+		: undefined;
+}
+
+function sessionFileFromManager(manager: object | undefined): string | undefined {
+	if (!manager) return undefined;
+	const value = manager as { getSessionFile?: () => unknown };
+	if (typeof value.getSessionFile !== "function") return undefined;
+	try {
+		const sessionFile = value.getSessionFile();
+		return typeof sessionFile === "string" && sessionFile.length > 0 ? sessionFile : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function trustedInteractiveSession(ctx: unknown): boolean {
 	if (!ctx || typeof ctx !== "object") return false;
 	const host = ctx as { mode?: unknown; hasUI?: unknown };
 	return host.hasUI === true && (host.mode === "tui" || host.mode === "rpc");
 }
+
+/**
+ * Host callbacks omit `actor`; an explicit actor is trusted only when it is
+ * the orchestrator. Worker/lead/unknown labels cannot borrow host authority.
+ */
+function trustedHostActor(ctx: unknown): boolean {
+	if (!ctx || typeof ctx !== "object") return false;
+	const value = ctx as Record<string, unknown>;
+	if (!("actor" in value)) return true;
+	return value.actor === undefined || value.actor === "orchestrator";
+}
+
 
 interface SessionIdentity {
 	cwd?: string;
@@ -155,19 +192,20 @@ function sessionIdentityFromValue(value: unknown): SessionIdentity | undefined {
 	const explicitCwd = typeof objectValue.cwd === "string" && objectValue.cwd.length > 0
 		? objectValue.cwd
 		: undefined;
+	if (objectValue.cwd !== undefined && explicitCwd === undefined) return undefined;
 	const explicitSessionId = objectValue.session_id ?? objectValue.sessionId;
 	if (
-		(objectValue.session_id !== undefined && typeof objectValue.session_id !== "string")
-		|| (objectValue.sessionId !== undefined && typeof objectValue.sessionId !== "string")
+		(objectValue.session_id !== undefined
+			&& (typeof objectValue.session_id !== "string" || objectValue.session_id.length === 0))
+		|| (objectValue.sessionId !== undefined
+			&& (typeof objectValue.sessionId !== "string" || objectValue.sessionId.length === 0))
 		|| (
 			typeof objectValue.session_id === "string"
 			&& typeof objectValue.sessionId === "string"
 			&& objectValue.session_id !== objectValue.sessionId
 		)
 	) return undefined;
-	const sessionId = typeof explicitSessionId === "string" && explicitSessionId.length > 0
-		? explicitSessionId
-		: undefined;
+	const sessionId = typeof explicitSessionId === "string" ? explicitSessionId : undefined;
 	const manager = objectValue.sessionManager;
 	if (manager !== undefined) {
 		if (!manager || typeof manager !== "object") return undefined;
@@ -175,10 +213,10 @@ function sessionIdentityFromValue(value: unknown): SessionIdentity | undefined {
 			getCwd?: () => unknown;
 			getSessionId?: () => unknown;
 		};
-		if (typeof sessionManager.getCwd !== "function" || typeof sessionManager.getSessionId !== "function") return undefined;
 		let managerCwd: unknown;
 		let managerSessionId: unknown;
 		try {
+			if (typeof sessionManager.getCwd !== "function" || typeof sessionManager.getSessionId !== "function") return undefined;
 			managerCwd = sessionManager.getCwd();
 			managerSessionId = sessionManager.getSessionId();
 		} catch {
@@ -189,7 +227,11 @@ function sessionIdentityFromValue(value: unknown): SessionIdentity | undefined {
 		}
 		if (explicitCwd && resolve(explicitCwd) !== resolve(managerCwd)) return undefined;
 		if (sessionId && sessionId !== managerSessionId) return undefined;
-		return { cwd: managerCwd, sessionId: managerSessionId, managerBacked: true };
+		return {
+			cwd: managerCwd,
+			sessionId: managerSessionId,
+			managerBacked: true,
+		};
 	}
 	if (!explicitCwd && !sessionId) return {};
 	return {
@@ -223,15 +265,127 @@ function lifecycleSessionIdentity(event: unknown, ctx: unknown): SessionIdentity
 	};
 }
 
+function isVerifiedSessionSwitch(
+	binding: InternalSessionBinding,
+	event: unknown,
+	ctx: unknown,
+): boolean {
+	if (
+		!event
+		|| typeof event !== "object"
+		|| (event as { type?: unknown }).type !== "session_switch"
+		|| !["new", "resume", "fork"].includes((event as { reason?: unknown }).reason as string)
+	) return false;
+	const previousSessionFileValue = (event as { previousSessionFile?: unknown }).previousSessionFile;
+	const previousSessionFileSupplied = "previousSessionFile" in event;
+	const previousSessionFile = typeof previousSessionFileValue === "string" && previousSessionFileValue.length > 0
+		? previousSessionFileValue
+		: undefined;
+	if (!trustedInteractiveSession(ctx) || !trustedHostActor(event) || !trustedHostActor(ctx)) return false;
+	if (!sessionManagerMatchesBinding(binding, ctx)) return false;
+	const identity = sessionIdentityFromValue(ctx);
+	if (
+		!identity
+		|| identity.managerBacked !== true
+		|| !identity.cwd
+		|| !identity.sessionId
+		|| !binding.sessionId
+		|| identity.sessionId === binding.sessionId
+		|| resolve(identity.cwd) !== resolve(binding.cwd)
+		|| (ctx as { mode?: unknown }).mode !== binding.mode
+	) return false;
+	const activeCtoClaim = hasActiveCtoClaim(binding);
+	const activeOrdinaryClaim = !activeCtoClaim && (() => {
+		try {
+			return binding.controller?.activeClaimRunId() !== undefined;
+		} catch {
+			return true;
+		}
+	})();
+	if (binding.sessionFile !== undefined) {
+		if (!previousSessionFile) return false;
+		try {
+			if (resolve(previousSessionFile) !== resolve(binding.sessionFile)) return false;
+		} catch {
+			return false;
+		}
+		return true;
+	}
+	if (activeCtoClaim || activeOrdinaryClaim || previousSessionFileSupplied) return false;
+	return true;
+}
+
+
+function switchSessionBinding(pi: object, event: unknown, ctx: unknown): void {
+	const prior = sessionBindings.get(pi);
+	if (!prior || !isVerifiedSessionSwitch(prior, event, ctx)) return;
+	const cwd = resolveSessionCwd(ctx);
+	if (!cwd || resolve(cwd) !== resolve(prior.cwd)) return;
+	if (!releaseSessionBinding(pi, "host-session-switched", "session-replacement")) return;
+	captureSessionBinding(pi, ctx, cwd);
+}
+
+function sessionManagerMatchesBinding(binding: InternalSessionBinding, ctx: unknown): boolean {
+	const manager = sessionManagerFromContext(ctx);
+	return manager !== undefined && binding.sessionManager !== undefined && manager === binding.sessionManager;
+}
+
 function sameBindingIdentity(binding: InternalSessionBinding, identity: SessionIdentity | undefined): boolean {
 	return Boolean(
 		binding.sessionId
 		&& identity?.sessionId
 		&& binding.sessionId === identity.sessionId
 		&& identity.cwd
-		&& resolve(binding.cwd) === resolve(identity.cwd),
+		&& resolve(binding.cwd) === resolve(identity.cwd)
 	);
 }
+
+function capturedManagerIdentity(
+	binding: InternalSessionBinding,
+	ctx: unknown,
+	cwd: string,
+): SessionIdentity | undefined {
+	const manager = sessionManagerFromContext(ctx);
+	const identity = sessionIdentityFromValue(ctx);
+	if (
+		!identity
+		|| identity.managerBacked !== true
+		|| !identity.cwd
+		|| !identity.sessionId
+		|| !manager
+		|| (binding.sessionManager !== undefined && manager !== binding.sessionManager)
+	) return undefined;
+	if (
+		resolve(identity.cwd) !== resolve(binding.cwd)
+		|| resolve(cwd) !== resolve(binding.cwd)
+		|| (binding.sessionId !== undefined && identity.sessionId !== binding.sessionId)
+	) return undefined;
+	return identity;
+}
+
+type CapturedHostSurface = "command" | "raw";
+
+/**
+ * Validate only the host-authored profile fields that are meaningful for the
+ * ingress surface. Registered commands retain the explicit interactive UI
+ * contract; raw tool calls may omit mode/UI only after their exact manager
+ * identity is validated by the caller.
+ */
+function matchesCapturedHostContext(
+	binding: InternalSessionBinding,
+	ctx: unknown,
+	surface: CapturedHostSurface,
+): boolean {
+	if (!ctx || typeof ctx !== "object" || !trustedHostActor(ctx)) return false;
+	const value = ctx as { mode?: unknown; hasUI?: unknown };
+	if (value.mode !== undefined && value.mode !== binding.mode) return false;
+	if (value.hasUI !== undefined && value.hasUI !== true) return false;
+	if (surface === "command") {
+		return value.mode === binding.mode && value.hasUI === true;
+	}
+	return true;
+}
+
 
 function trustedInteractiveLifecycle(
 	binding: InternalSessionBinding,
@@ -239,17 +393,80 @@ function trustedInteractiveLifecycle(
 	ctx: unknown,
 ): boolean {
 	if (!trustedInteractiveSession(ctx)) return false;
+	if (!sessionManagerMatchesBinding(binding, ctx)) return false;
 	for (const value of [event, ctx]) {
 		if (!value || typeof value !== "object") continue;
-		const actor = (value as { actor?: unknown }).actor;
-		if (actor === "worker" || actor === "lead") return false;
+		if (!trustedHostActor(value)) return false;
+	}
+	if (
+		event
+		&& typeof event === "object"
+		&& !Array.isArray(event)
+		&& "type" in event
+		&& event.type === "session_stop"
+		&& "session_file" in event
+	) {
+		const suppliedSessionFile = event.session_file;
+		const managerSessionFile = sessionFileFromManager(sessionManagerFromContext(ctx));
+		if (
+			typeof suppliedSessionFile !== "string"
+			|| suppliedSessionFile.length === 0
+			|| !binding.sessionFile
+			|| !managerSessionFile
+		) return false;
+		try {
+			if (
+				resolve(suppliedSessionFile) !== resolve(binding.sessionFile)
+				|| resolve(managerSessionFile) !== resolve(binding.sessionFile)
+			) return false;
+		} catch {
+			return false;
+		}
 	}
 	const mode = (ctx as { mode?: unknown }).mode;
 	if (mode !== binding.mode) return false;
 	return sameBindingIdentity(binding, lifecycleSessionIdentity(event, ctx));
 }
 
-function releaseController(binding: InternalSessionBinding, receipt: string): boolean {
+type CtoSuspensionReason = "session-shutdown" | "session-replacement";
+
+function hasActiveCtoClaim(binding: InternalSessionBinding): boolean {
+	try {
+		return binding.controller?.activeCtoClaim() !== undefined;
+	} catch {
+		// An unreadable claim is conservative evidence that this binding may
+		// still own CTO state. Do not let an idle stop release it.
+		return true;
+	}
+}
+
+function suspendCtoBeforeReset(binding: InternalSessionBinding, reason: CtoSuspensionReason): boolean {
+	if (!binding.controller) return true;
+	try {
+		suspendCtoSession(binding.controller, reason);
+		return true;
+	} catch {
+		console.warn(`[${COMMAND_NAME}]`, JSON.stringify({
+			bundle: OMP_INTERNAL_BUNDLE_ID,
+			code: "session_cto_suspend_failed",
+			reason,
+		}));
+		return false;
+	}
+}
+
+function resetControllerForLifecycle(
+	binding: InternalSessionBinding,
+	receipt: string,
+	reason?: CtoSuspensionReason,
+): boolean {
+	const ctoClaim = hasActiveCtoClaim(binding);
+	if (reason && !suspendCtoBeforeReset(binding, reason)) return false;
+	// CTO suspension owns release/retention of the CTO claim. Calling the
+	// ordinary controller release afterwards could erase a retained pending
+	// reservation, so a bound CTO controller is reset only by forgetting this
+	// adapter binding.
+	if (ctoClaim) return true;
 	try {
 		binding.controller?.release(receipt);
 		return true;
@@ -268,9 +485,13 @@ function releaseController(binding: InternalSessionBinding, receipt: string): bo
  * replaced. A failed release is retained as a conservative busy binding; it
  * is never silently converted into an unowned session.
  */
-function releaseSessionBinding(pi: object, receipt: string): boolean {
+function releaseSessionBinding(
+	pi: object,
+	receipt: string,
+	reason?: CtoSuspensionReason,
+): boolean {
 	const prior = sessionBindings.get(pi);
-	if (!prior || !releaseController(prior, receipt)) return !prior;
+	if (!prior || !resetControllerForLifecycle(prior, receipt, reason)) return !prior;
 	sessionBindings.delete(pi);
 	return true;
 }
@@ -278,22 +499,29 @@ function releaseSessionBinding(pi: object, receipt: string): boolean {
 /**
  * Release the exact trusted interactive binding while retaining its profile,
  * controller and selected-run view. Core's canonical release semantics clear
- * only the private execution claim and pending command reservation.
+ * only the private execution claim and pending command reservation. A resident
+ * CTO claim is intentionally not released by an idle turn stop.
  */
 function settleSessionBinding(pi: object, event: unknown, ctx: unknown): boolean {
 	const binding = sessionBindings.get(pi);
 	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
-	return releaseController(binding, "host-session-stop");
+	return resetControllerForLifecycle(binding, "host-session-stop");
 }
 
 /**
  * Release and forget only the exact trusted interactive binding. Foreign,
  * worker and headless lifecycle events cannot tear down another host session.
  */
-function teardownSessionBinding(pi: object, event: unknown, ctx: unknown, receipt: string): boolean {
+function teardownSessionBinding(
+	pi: object,
+	event: unknown,
+	ctx: unknown,
+	receipt: string,
+	reason?: CtoSuspensionReason,
+): boolean {
 	const binding = sessionBindings.get(pi);
 	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
-	if (!releaseController(binding, receipt)) return false;
+	if (!resetControllerForLifecycle(binding, receipt, reason)) return false;
 	sessionBindings.delete(pi);
 	return true;
 }
@@ -317,40 +545,35 @@ function buildTrustedController(
 		return undefined;
 	}
 }
-
 /**
  * Capture the host session before any lifecycle callback can suspend. A
- * verified replacement releases the old coordinator before the new binding
- * is stored; pending workers remain reserved by core's release semantics.
+ * verified replacement suspends a resident CTO before releasing the old
+ * ordinary controller and storing the new binding; pending workers remain
+ * reserved by core's managed suspension semantics.
  * Same-identity headless starts revoke interactive authority but retain the
- * binding so a later trusted interactive ingress can replace it safely.
+ * binding and every claim so a later trusted interactive ingress can restore it.
  */
 function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 	const interactive = trustedInteractiveSession(ctx);
 	const current = sessionBindings.get(pi);
-	const value = ctx as { mode?: unknown; hasUI?: unknown; actor?: unknown };
+	const value = ctx as { mode?: unknown; hasUI?: unknown };
+	const incomingManager = sessionManagerFromContext(ctx);
 	const incomingIdentity = sessionIdentityFromValue(ctx);
-	if (value.actor === "worker" || value.actor === "lead") return;
+	if (!trustedHostActor(ctx)) return;
 	if (!interactive) {
 		if (
 			current
 			&& current.interactive
+			&& sessionManagerMatchesBinding(current, ctx)
 			&& incomingIdentity?.managerBacked === true
 			&& sameBindingIdentity(current, incomingIdentity)
 			&& incomingIdentity.cwd
 			&& resolve(incomingIdentity.cwd) === resolve(cwd)
 		) {
-			// A same-identity headless ingress revokes the private claim before
-			// retaining a marker that cannot resolve a controller. If release
-			// itself fails, retain the controller only as a conservative busy
-			// marker; interactive authority remains disabled and the next
-			// verified ingress can retry the release.
-			const released = releaseController(current, "host-session-headless");
-			sessionBindings.set(pi, {
-				...current,
-				interactive: false,
-				...(released ? { controller: undefined } : {}),
-			});
+			// Headless/worker ingress can revoke interactive authority, but it
+			// is not a trusted teardown and must not release either ordinary
+			// ownership or a resident CTO claim.
+			sessionBindings.set(pi, { ...current, interactive: false });
 		}
 		return;
 	}
@@ -360,15 +583,25 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 		const sameIdentity = sameBindingIdentity(current, incomingIdentity)
 			&& incomingIdentity?.cwd
 			&& resolve(incomingIdentity.cwd) === resolve(cwd);
+		if (sameIdentity && !sessionManagerMatchesBinding(current, ctx)) return;
 		if (sameIdentity && current.interactive && current.mode === mode) return;
-		// A replacement is accepted only from a complete trusted manager
-		// identity. Unknown identity cannot release a retained controller.
+		if (sameIdentity && !current.interactive) {
+			// Re-entry of the exact manager-backed host restores UI authority
+			// without replacing the resident controller or its CTO claim.
+			sessionBindings.set(pi, { ...current, interactive: true, mode });
+			return;
+		}
+		// A different identity must arrive through the authenticated
+		// session_switch path. session_start may only upgrade a managerless
+		// placeholder that never held a controller or ownership.
+		if (current.sessionId !== undefined || current.sessionManager !== undefined || current.controller !== undefined) return;
 		if (
 			incomingIdentity?.managerBacked !== true
 			|| !incomingIdentity.sessionId
 			|| !incomingIdentity.cwd
+			|| (current.sessionManager !== undefined && incomingManager !== current.sessionManager)
 		) return;
-		if (!releaseSessionBinding(pi, "host-session-replaced")) return;
+		if (!releaseSessionBinding(pi, "host-session-replaced", "session-replacement")) return;
 	}
 	const sessionId = incomingIdentity?.managerBacked === true ? incomingIdentity.sessionId : undefined;
 	const controller = sessionId ? buildTrustedController(cwd, sessionId) : undefined;
@@ -377,6 +610,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 		interactive,
 		mode,
 		...(sessionId ? { sessionId } : {}),
+		...(incomingManager ? { sessionManager: incomingManager, sessionFile: sessionFileFromManager(incomingManager) } : {}),
 		...(controller ? { controller } : {}),
 	});
 }
@@ -390,25 +624,23 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
  */
 function sharedSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
 	const binding = sessionBindings.get(pi);
-	if (!binding || binding.cwd !== cwd || !binding.interactive) return undefined;
-	if (ctx && typeof ctx === "object") {
-		// Host tool contexts carry actor as a trusted in-process discriminator.
-		const hostContext = ctx as { actor?: unknown };
-		const actor = hostContext.actor;
-		if (actor === "worker" || actor === "lead") return undefined;
-	}
-	const identity = sessionIdentityFromValue(ctx);
-	if (
-		identity?.managerBacked !== true
-		|| !identity.cwd
-		|| !identity.sessionId
-		|| resolve(identity.cwd) !== resolve(binding.cwd)
-	) return undefined;
-	if (binding.sessionId && identity.sessionId !== binding.sessionId) return undefined;
+	if (!binding || resolve(binding.cwd) !== resolve(cwd) || !binding.interactive) return undefined;
+	if (!matchesCapturedHostContext(binding, ctx, "command")) return undefined;
+	const identity = capturedManagerIdentity(binding, ctx, cwd);
+	if (!identity) return undefined;
+	const sessionId = identity.sessionId;
+	if (!sessionId) return undefined;
+	const manager = sessionManagerFromContext(ctx);
+	if (!manager) return undefined;
+	// A manager can expose its file after the lifecycle binding was first captured.
+	// CTO ingress refuses to acquire without it; retain that official association
+	// now so a later verified session_switch can still release the admitted claim.
+	if (binding.sessionFile === undefined) binding.sessionFile = sessionFileFromManager(manager);
 	if (binding.controller) return binding.controller;
-	const controller = buildTrustedController(cwd, identity.sessionId);
+	const controller = buildTrustedController(cwd, sessionId);
 	if (!controller) return undefined;
-	binding.sessionId = identity.sessionId;
+	binding.sessionId = sessionId;
+	binding.sessionManager = manager;
 	binding.controller = controller;
 	return controller;
 }
@@ -424,47 +656,40 @@ function resolveInternalTrustedToolCallActor(
 	cwd: string,
 	runId: string | undefined,
 ): TrustedToolCallResolution | undefined {
-	if (!ctx || typeof ctx !== "object") return undefined;
 	const binding = sessionBindings.get(pi);
 	if (!binding?.interactive || !binding.sessionId || !binding.controller) return undefined;
-	const value = ctx as {
-		session_id?: unknown;
-		sessionId?: unknown;
-		mode?: unknown;
-		hasUI?: unknown;
-		sessionManager?: { getCwd?: () => unknown; getSessionId?: () => unknown };
-	};
-	if (typeof value.session_id === "string" && value.session_id !== binding.sessionId) return undefined;
-	if (typeof value.sessionId === "string" && value.sessionId !== binding.sessionId) return undefined;
-	const manager = value.sessionManager;
-	if (!manager || typeof manager.getCwd !== "function" || typeof manager.getSessionId !== "function") return undefined;
-	let managerCwd: unknown;
-	let managerSessionId: unknown;
-	try {
-		managerCwd = manager.getCwd();
-		managerSessionId = manager.getSessionId();
-	} catch {
-		return undefined;
-	}
-	if (
-		typeof managerCwd !== "string"
-		|| typeof managerSessionId !== "string"
-		|| managerSessionId !== binding.sessionId
-		|| resolve(managerCwd) !== resolve(binding.cwd)
-		|| resolve(cwd) !== resolve(binding.cwd)
-	) return undefined;
-	if (value.mode !== undefined && value.mode !== binding.mode) return undefined;
-	if (value.hasUI !== undefined && (binding.mode === "rpc" ? value.hasUI !== false : value.hasUI !== true)) return undefined;
+	if (!matchesCapturedHostContext(binding, ctx, "raw")) return undefined;
+	const identity = capturedManagerIdentity(binding, ctx, cwd);
+	if (!identity || identity.sessionId !== binding.sessionId) return undefined;
 	try {
 		const controllerContext = binding.controller.context();
-		const selectedRunId = binding.controller.selectedRunId();
-		const activeClaimRunId = binding.controller.activeClaimRunId();
 		if (
 			controllerContext.session_id !== binding.sessionId
 			|| resolve(controllerContext.worktree) !== resolve(binding.cwd)
-			|| selectedRunId !== runId
-			|| activeClaimRunId !== runId
 		) return undefined;
+
+		// CTO authority is the controller's exact current claim proof. It is
+		// intentionally resolved before ordinary selection/claim checks: a CTO
+		// run is not authorized by selectedRunId, owner_session, runTarget, or
+		// an ordinary run UUID.
+		const ctoClaim = binding.controller.activeCtoClaim();
+		if (ctoClaim !== undefined) {
+			if (
+				typeof ctoClaim.run_id !== "string"
+				|| ctoClaim.run_id.length === 0
+				|| typeof ctoClaim.ownership_epoch !== "string"
+				|| ctoClaim.ownership_epoch.length === 0
+			) return undefined;
+			return {
+				kind: "authenticated-interactive-host-cto",
+				run_id: ctoClaim.run_id,
+				ownership_epoch: ctoClaim.ownership_epoch,
+			};
+		}
+
+		const selectedRunId = binding.controller.selectedRunId();
+		const activeClaimRunId = binding.controller.activeClaimRunId();
+		if (selectedRunId !== runId || activeClaimRunId !== runId) return undefined;
 		if (runId === undefined) return { kind: "authenticated-interactive-host-no-run" };
 		const artifactsDir = runTarget(binding.cwd, runId).artifactsDir;
 		const expectedArtifactsDir = resolve(binding.cwd, ".work-state", "runs", runId, "artifacts");
@@ -476,27 +701,13 @@ function resolveInternalTrustedToolCallActor(
 	}
 }
 function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
+	if (!ctx || typeof ctx !== "object") return undefined;
 	const binding = sessionBindings.get(pi);
-	if (!binding?.interactive || !binding.controller || !ctx || typeof ctx !== "object") return undefined;
-	const value = ctx as {
-		session_id?: unknown;
-		sessionId?: unknown;
-		sessionManager?: { getCwd?: () => unknown; getSessionId?: () => unknown };
-	};
-	if (typeof value.session_id === "string" && value.session_id !== binding.sessionId) return undefined;
-	if (typeof value.sessionId === "string" && value.sessionId !== binding.sessionId) return undefined;
-	const manager = value.sessionManager;
-	if (!manager || typeof manager.getCwd !== "function" || typeof manager.getSessionId !== "function") return undefined;
+	if (!binding?.interactive || !binding.controller) return undefined;
+	if (!matchesCapturedHostContext(binding, ctx, "raw")) return undefined;
+	const identity = capturedManagerIdentity(binding, ctx, cwd);
+	if (!identity || identity.sessionId !== binding.sessionId) return undefined;
 	try {
-		const managerCwd = manager.getCwd();
-		const managerSessionId = manager.getSessionId();
-		if (
-			typeof managerCwd !== "string"
-			|| typeof managerSessionId !== "string"
-			|| managerSessionId !== binding.sessionId
-			|| resolve(managerCwd) !== resolve(binding.cwd)
-			|| resolve(cwd) !== resolve(binding.cwd)
-		) return undefined;
 		const controllerContext = binding.controller.context();
 		return controllerContext.session_id === binding.sessionId
 			&& resolve(controllerContext.worktree) === resolve(binding.cwd)
@@ -521,13 +732,13 @@ export function resolveSessionCwd(ctx: unknown): string | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
 	const objectContext = ctx as { cwd?: unknown; sessionManager?: unknown };
 	const manager = objectContext.sessionManager;
-	if (manager && typeof manager === "object" && "getCwd" in manager && typeof manager.getCwd === "function") {
+	if (manager && typeof manager === "object") {
 		try {
-			// Structurally verified by the `in` + typeof check above; TS cannot
-			// narrow `unknown` to a callable member on its own.
-			const sessionManager = manager as { getCwd: () => unknown };
-			const sessionCwd = sessionManager.getCwd();
-			if (typeof sessionCwd === "string" && sessionCwd.length > 0) return sessionCwd;
+			if ("getCwd" in manager && typeof manager.getCwd === "function") {
+				const sessionManager = manager as { getCwd: () => unknown };
+				const sessionCwd = sessionManager.getCwd();
+				if (typeof sessionCwd === "string" && sessionCwd.length > 0) return sessionCwd;
+			}
 		} catch {
 			// Fall through to the context cwd.
 		}
@@ -780,6 +991,14 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 			pi.sendUserMessage(buildDoWorkPrompt(envelope, cwd));
 		},
 	});
+	// OMP18.2.2 emits session_switch after /new and /resume mutate the same
+	// live SessionManager. Register the bundle transition before core's lazy
+	// lifecycle handlers so the old controller is suspended and the new
+	// same-manager binding is available when core resolves its incoming
+	// controller; a missing/foreign previous file leaves the old claim intact.
+	pi.on("session_switch", (event: unknown, ctx: unknown) => {
+		switchSessionBinding(pi, event, ctx);
+	});
 	// Namespaced core registration surface: `/omp-do-work`, `/omp-team`,
 	// `/omp-cto`. Descriptors publish eagerly during extension load so OMP's
 	// slash-suggestion snapshot sees them; marker gating remains in the cwd
@@ -798,7 +1017,7 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 			// Only the exact trusted interactive lifecycle identity can end
 			// the host binding; foreign and headless starts preserve it.
 			if (trustedInteractiveSession(ctx)) {
-				teardownSessionBinding(pi, event, ctx, "host-session-unavailable");
+				teardownSessionBinding(pi, event, ctx, "host-session-unavailable", "session-replacement");
 			}
 			return;
 		}
@@ -843,6 +1062,6 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 		settleSessionBinding(pi, event, ctx);
 	});
 	pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
-		teardownSessionBinding(pi, event, ctx, "host-session-shutdown");
+		teardownSessionBinding(pi, event, ctx, "host-session-shutdown", "session-shutdown");
 	});
 }

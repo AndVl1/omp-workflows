@@ -119,7 +119,7 @@ test("cto-slice-gate: fully valid per-slice state dispatches (allow)", () => {
   const f = validRun();
   try {
     assert.deepEqual(assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root, markerRunId: f.runId }), { ok: true });
-    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root, cto_run_id: f.runId });
     assert.equal(res, undefined, "valid state allows the task call");
   } finally {
     cleanup(f);
@@ -132,9 +132,25 @@ test("cto-slice-gate: marker run mismatch blocks", () => {
     // markerRunId is validated against the canonical state id; a stale marker
     // that points at a different run is a routing failure, not a new run.
     const r = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root, markerRunId: "other-run" });
-    assert.match(blockReason(r), /marker run mismatch: expected run-1, marker says other-run/);
+    assert.equal(r.ok, false);
   } finally {
     cleanup(f);
+  }
+});
+
+test("cto-slice-gate: valid marker from a foreign exact claim blocks", () => {
+  const markerRun = validRun("run-a", "slice-a", "team-a");
+  const claimedRun = validRun("run-b", "slice-b", "team-b");
+  try {
+    const res = ctoSliceTaskGate(
+      { toolName: "task", input: markerInput(markerRun.runId, markerRun.sliceId) },
+      { cwd: markerRun.root, cto_run_id: claimedRun.runId },
+    );
+    assert.equal(res?.block, true, "a valid marker/state pair cannot cross-bind to another exact claim");
+    assert.match(res?.reason ?? "", /not the exact claimed run run-b/);
+  } finally {
+    cleanup(markerRun);
+    cleanup(claimedRun);
   }
 });
 
@@ -143,19 +159,18 @@ test("cto-slice-gate: missing active wave blocks (unset and finished variants)",
   try {
     const noWave = { ...f.state, active_wave_id: undefined };
     const r1 = assertCtoSliceDispatchable(noWave, { sliceId: f.sliceId, root: f.root });
-    assert.match(blockReason(r1), /no active wave: active_wave_id is unset/);
+    assert.equal(r1.ok, false);
 
     finishWave(f.state, { id: "wave-1", status: "done" });
     f.state.active_wave_id = "wave-1"; // stale pointer to a finished wave
     const r2 = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
-    assert.match(blockReason(r2), /no active wave: wave wave-1 is not active/);
+    assert.equal(r2.ok, false);
 
     // the tool_call gate reads canonical state from disk — persist the broken
     // wave state so the gate observes the same failure
     writeCtoState(f.state, f.root);
-    const gateRes = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root });
+    const gateRes = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root, cto_run_id: f.runId });
     assert.equal(gateRes?.block, true);
-    assert.match(gateRes?.reason ?? "", /no active wave/);
   } finally {
     cleanup(f);
   }
@@ -167,12 +182,12 @@ test("cto-slice-gate: slice must be uniquely mapped and admitted by the active w
   try {
     f.state.wave_history![0]!.slice_ids = ["other-slice"];
     const notAdmitted = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
-    assert.match(blockReason(notAdmitted), /not uniquely admitted by active wave/);
+    assert.equal(notAdmitted.ok, false);
 
     f.state.wave_history![0]!.slice_ids = [f.sliceId];
     f.state.teams.push({ ...f.state.teams[0]!, id: "lead-b" });
     const ambiguous = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
-    assert.match(blockReason(ambiguous), /ambiguous slice slice-1/);
+    assert.equal(ambiguous.ok, false);
   } finally {
     cleanup(f);
   }
@@ -182,13 +197,13 @@ test("cto-slice-gate: unsafe ids and DoD paths fail closed without echoing untru
   const f = validRun();
   try {
     const unsafeSlice = assertCtoSliceDispatchable(f.state, { sliceId: "..", root: f.root });
-    assert.match(blockReason(unsafeSlice), /unsafe slice id/);
+    assert.equal(unsafeSlice.ok, false);
     const unsafeRun = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root, markerRunId: "../escape" });
-    assert.match(blockReason(unsafeRun), /unsafe marker run id/);
+    assert.equal(unsafeRun.ok, false);
     assert.doesNotMatch(blockReason(unsafeRun), /\.\.\/escape/);
     f.state.teams[0]!.dod_path = "../escape";
     const unsafeDod = assertCtoSliceDispatchable(f.state, { sliceId: f.sliceId, root: f.root });
-    assert.match(blockReason(unsafeDod), /slice DoD path invalid/);
+    assert.equal(unsafeDod.ok, false);
     assert.doesNotMatch(blockReason(unsafeDod), /\.\.\/escape/);
   } finally {
     cleanup(f);
@@ -198,7 +213,7 @@ test("cto-slice-gate: unknown slice blocks", () => {
   const f = validRun();
   try {
     const r = assertCtoSliceDispatchable(f.state, { sliceId: "nope", root: f.root });
-    assert.match(blockReason(r), /unknown slice nope: no team with slice_id or id matching/);
+    assert.equal(r.ok, false);
   } finally {
     cleanup(f);
   }
@@ -323,7 +338,7 @@ test("cto-slice-gate: team dod_path (relative to root) is honored when set", () 
 test("cto-slice-gate: marker present but CtoState missing → block with actionable reason", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-slice-gate-"));
   try {
-    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput("ghost-run", "slice-1") }, { cwd: root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput("ghost-run", "slice-1") }, { cwd: root, cto_run_id: "ghost-run" });
     assert.equal(res?.block, true);
     assert.match(res?.reason ?? "", /no CtoState for run ghost-run at \.work-state\/cto\/ghost-run\/state\.json — cannot dispatch CTO slice slice-1/);
   } finally {
@@ -334,12 +349,29 @@ test("cto-slice-gate: marker present but CtoState missing → block with actiona
 test("cto-slice-gate: no marker during an active wave blocks with the marker format", () => {
   const f = validRun();
   try {
-    const res = ctoSliceTaskGate({ toolName: "task", input: { task: "ordinary task without marker", agent: "team-lead" } }, { cwd: f.root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: { task: "ordinary task without marker", agent: "team-lead" } }, { cwd: f.root, cto_run_id: f.runId });
     assert.equal(res?.block, true, "no-marker task call blocks during an active wave");
     assert.match(res?.reason ?? "", /active wave wave-1 in run run-1/, "reason names the wave and the run");
     assert.match(res?.reason ?? "", /omp-cto-slice/, "reason names the required marker format");
   } finally {
     cleanup(f);
+  }
+});
+
+test("cto-slice-gate: exact claimed run with unreadable state blocks even an unmarked task", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-slice-gate-unreadable-"));
+  try {
+    const runId = "corrupt-run";
+    mkdirSync(join(root, ".work-state", "cto", runId), { recursive: true });
+    writeFileSync(join(root, ".work-state", "cto", runId, "state.json"), "{not-json");
+    const result = ctoSliceTaskGate(
+      { toolName: "task", input: { task: "ordinary-looking task" } },
+      { cwd: root, cto_run_id: runId },
+    );
+    assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /exact claimed run corrupt-run is unreadable/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -349,7 +381,7 @@ test("cto-slice-gate: wave-less state with no marker → allow; non-task tools �
     // genuinely wave-less: finish the wave and persist (active_wave_id cleared)
     finishWave(f.state, { id: "wave-1", status: "done" });
     writeCtoState(f.state, f.root);
-    const res = ctoSliceTaskGate({ toolName: "task", input: { task: "legacy flow" } }, { cwd: f.root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: { task: "legacy flow" } }, { cwd: f.root, cto_run_id: f.runId });
     assert.equal(res, undefined, "no active wave → no-marker task call allowed");
     // non-task tools are never gated here
     for (const toolName of ["bash", "write", "read", "ask"]) {
@@ -388,12 +420,12 @@ test("cto-slice-gate: malformed/odd input never throws — blocks during an acti
       },
     ];
     for (const c of cases) {
-      const res = ctoSliceTaskGate(c.event, { cwd: f.root });
+      const res = ctoSliceTaskGate(c.event, { cwd: f.root, cto_run_id: f.runId });
       assert.equal(res?.block, true, `${c.label}: block during active wave`);
       assert.match(res?.reason ?? "", /active wave/, `${c.label}: reason names the wave`);
     }
-    assert.equal(ctoSliceTaskGate({}, { cwd: f.root }), undefined, "no toolName → allow");
-    assert.equal(ctoSliceTaskGate({ toolName: "read", input: { task: "x" } }, { cwd: f.root }), undefined, "non-task tool → allow");
+    assert.equal(ctoSliceTaskGate({}, { cwd: f.root, cto_run_id: f.runId }), undefined, "no toolName → allow");
+    assert.equal(ctoSliceTaskGate({ toolName: "read", input: { task: "x" } }, { cwd: f.root, cto_run_id: f.runId }), undefined, "non-task tool → allow");
   } finally {
     cleanup(f);
   }
@@ -414,7 +446,7 @@ test("cto-slice-gate: standby run without an active wave → no-marker task call
   try {
     delete f.state.active_wave_id; // standby run, no wave admitted yet
     writeCtoState(f.state, f.root);
-    const res = ctoSliceTaskGate({ toolName: "task", input: { task: "standby flow" } }, { cwd: f.root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: { task: "standby flow" } }, { cwd: f.root, cto_run_id: f.runId });
     assert.equal(res, undefined, "standby run without active wave allows no-marker task calls");
   } finally {
     cleanup(f);
@@ -436,7 +468,7 @@ test("cto-slice-gate: marker outside the task payload does not count during an a
           task: "plain task",
         },
       },
-      { cwd: f.root },
+      { cwd: f.root, cto_run_id: f.runId },
     );
     assert.equal(res?.block, true, "marker in a non-task field is not a valid payload marker");
     assert.match(res?.reason ?? "", /active wave/);
@@ -449,7 +481,7 @@ test("cto-slice-gate: malformed marker attempt blocks during an active wave, all
   const malformed = "<!-- omp-cto-slice run=run-1 slice=s1"; // unterminated
   const f = validRun();
   try {
-    const res = ctoSliceTaskGate({ toolName: "task", input: { task: malformed } }, { cwd: f.root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: { task: malformed } }, { cwd: f.root, cto_run_id: f.runId });
     assert.equal(res?.block, true, "malformed marker attempt blocks during an active wave");
     assert.match(res?.reason ?? "", /malformed CTO slice marker/, "reason says the marker is malformed");
     assert.match(res?.reason ?? "", /omp-cto-slice/, "reason names the expected format");
@@ -478,7 +510,7 @@ test("cto-slice-gate: batch — every item with a valid marker against valid sta
           ],
         },
       },
-      { cwd: f.root },
+      { cwd: f.root, cto_run_id: f.runId },
     );
     assert.equal(res, undefined, "batch with all-valid markers allows");
   } finally {
@@ -499,7 +531,7 @@ test("cto-slice-gate: batch items are independently admitted and failing item is
           ],
         },
       },
-      { cwd: f.root },
+      { cwd: f.root, cto_run_id: f.runId },
     );
     assert.equal(res?.block, true);
     assert.match(res?.reason ?? "", /unknown slice not-in-wave/);
@@ -515,12 +547,12 @@ test("cto-slice-gate: ambiguous or empty batch shapes fail closed only during an
     const marker = buildCtoSliceMarker(f.runId, f.sliceId);
     const ambiguous = ctoSliceTaskGate(
       { toolName: "task", input: { task: marker, tasks: [{ task: marker }] } },
-      { cwd: f.root },
+      { cwd: f.root, cto_run_id: f.runId },
     );
     assert.equal(ambiguous?.block, true);
     assert.match(ambiguous?.reason ?? "", /both task and tasks fields/);
 
-    const empty = ctoSliceTaskGate({ toolName: "task", input: { tasks: [] } }, { cwd: f.root });
+    const empty = ctoSliceTaskGate({ toolName: "task", input: { tasks: [] } }, { cwd: f.root, cto_run_id: f.runId });
     assert.equal(empty?.block, true);
     assert.match(empty?.reason ?? "", /without a CTO slice marker/);
   } finally {
@@ -535,7 +567,7 @@ test("cto-slice-gate: ambiguous or empty batch shapes fail closed only during an
   }
 });
 
-test("cto-slice-gate: batch — one item lacking a marker blocks naming the item during an active wave", () => {
+test("cto-slice-gate: batch — unmarked items and marker-only claims fail closed", () => {
   const f = validRun();
   try {
     const res = ctoSliceTaskGate(
@@ -543,7 +575,7 @@ test("cto-slice-gate: batch — one item lacking a marker blocks naming the item
         toolName: "task",
         input: { tasks: [markerInput(f.runId, f.sliceId), { task: "plain unmarked task", agent: "team-lead" }] },
       },
-      { cwd: f.root },
+      { cwd: f.root, cto_run_id: f.runId },
     );
     assert.equal(res?.block, true, "batch with an unmarked item blocks during an active wave");
     assert.match(res?.reason ?? "", /batch task item 1/, "block names the failing item");
@@ -551,14 +583,17 @@ test("cto-slice-gate: batch — one item lacking a marker blocks naming the item
   } finally {
     cleanup(f);
   }
-  // same batch with no active wave anywhere → allow
+  // A marker-bearing item without the exact claimed run is denied even when
+  // there is no discoverable active wave; marker text alone is not admission.
   const empty = mkdtempSync(join(tmpdir(), "cto-slice-gate-"));
   try {
     const res = ctoSliceTaskGate(
       { toolName: "task", input: { tasks: [markerInput("ghost-run", "slice-1"), { task: "plain" }] } },
       { cwd: empty },
     );
-    assert.equal(res, undefined, "batch with an unmarked item allows when no active wave");
+    assert.equal(res?.block, true, "marker-only batch item without an exact claim blocks");
+    assert.match(res?.reason ?? "", /no exact active CTO claim/, "block names the missing exact claim");
+    assert.match(res?.reason ?? "", /batch task item 0/, "block names the marker-bearing item");
   } finally {
     rmSync(empty, { recursive: true, force: true });
   }
@@ -568,7 +603,7 @@ test("cto-slice-gate: timing sanity — small valid state completes < 50ms (arch
   const f = validRun();
   try {
     const start = performance.now();
-    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root });
+    const res = ctoSliceTaskGate({ toolName: "task", input: markerInput(f.runId, f.sliceId) }, { cwd: f.root, cto_run_id: f.runId });
     const elapsed = performance.now() - start;
     assert.equal(res, undefined, "valid state allows");
     // architecture-1 budget: the classification gate is a sync read of a

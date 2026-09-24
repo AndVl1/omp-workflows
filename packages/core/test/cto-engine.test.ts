@@ -16,8 +16,9 @@ import {
   buildTeamPlan,
   validateDecompositionDepth,
   runCto,
-  finalizeCtoExecution,
   ctoRunId,
+  suspendCtoSession,
+  createWorkflowSessionController,
   newCtoState,
   writeCtoState,
   readCtoState,
@@ -28,6 +29,7 @@ import {
   expireEscalations,
   pendingEscalations,
   activeTeams,
+  appendWave,
   setIntegration,
   setCtoPause,
   integrationDoD,
@@ -53,9 +55,11 @@ import {
   evaluateDissent,
   dissentGate,
   readRunControl,
+  releaseExecutionClaim,
   acquireExecutionClaim,
   LifecycleError,
-} from "@andvl1/omp-workflows-core";
+} from "../src/index.js";
+import { acquireCtoIngress } from "../src/cto/run.js";
 import type { TrustedExecutionContext } from "../src/engine/types.js";
 
 function sampleDefs(): Record<string, TeamDef> {
@@ -287,7 +291,9 @@ test("cto-engine: terminal CTO release permits a later ordinary claim", () => {
     assert.ok(claim);
     assert.equal(claim?.owner_kind, "cto");
     setCtoPause(res.state, "done", "finished", root);
-    finalizeCtoExecution(root, res.plan.id, claim!.token);
+    const terminalControl = readRunControl(root);
+    assert.equal(terminalControl.execution_claim, null, "terminal transition settles the common claim automatically");
+    assert.equal(terminalControl.cto_releases[res.plan.id]?.reason, "terminal", "terminal release records managed provenance");
     assert.equal(readRunControl(root).execution_claim, null, "terminal CTO release clears the common claim");
 
     const ordinary = acquireExecutionClaim(root, {
@@ -296,6 +302,213 @@ test("cto-engine: terminal CTO release permits a later ordinary claim", () => {
       owner_kind: "workflow",
     });
     assert.equal(ordinary.claim.owner_kind, "workflow");
+  } finally {
+
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("cto-engine: stale terminal transition cannot reset a same-run handover", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-terminal-fence-"));
+  try {
+    const controllerA = createWorkflowSessionController({
+      cwd: root,
+      context: executionContext(root, "terminal-owner-a"),
+    });
+    const ingressA = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "stale terminal fence",
+      controller: controllerA,
+    });
+    const claimA = readRunControl(root).execution_claim;
+    assert.ok(claimA);
+    assert.equal(claimA?.token, ingressA.claim.claim.token, "ingress publishes the captured A claim");
+    suspendCtoSession(controllerA, "session-replacement");
+
+    const releasedControl = readRunControl(root);
+    assert.equal(releasedControl.execution_claim, null, "a suspension clears the common claim when no reservation is pending");
+    assert.ok(releasedControl.cto_releases[ingressA.run_id]?.released_at, "A suspension retains managed release provenance");
+    const controllerB = createWorkflowSessionController({
+      cwd: root,
+      context: executionContext(root, "terminal-owner-b"),
+    });
+    const ingressB = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "same-run handover",
+      run_id: ingressA.run_id,
+      controller: controllerB,
+    });
+    assert.notEqual(ingressB.claim.claim.token, claimA!.token, "B acquires a fresh token for the same run");
+
+    const statePath = join(root, ".work-state", "cto", ingressA.run_id, "state.json");
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeState = readFileSync(statePath, "utf8");
+    const beforeControl = readFileSync(controlPath, "utf8");
+    assert.throws(
+      () => setCtoPause(ingressA.state, "done", "stale owner", root),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+    );
+    assert.equal(readFileSync(statePath, "utf8"), beforeState, "stale A does not publish a terminal state over B");
+    assert.equal(readFileSync(controlPath, "utf8"), beforeControl, "stale A leaves B run-control bytes unchanged");
+    assert.equal(readRunControl(root).execution_claim?.token, ingressB.claim.claim.token, "B claim remains current");
+    assert.equal(readCtoState(ingressA.run_id, root)?.pause.kind, "none", "stale A terminal candidate is not persisted");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("cto-engine: same-owner stale terminal candidate preserves state and control after a domain wave write", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-terminal-domain-race-"));
+  try {
+    const res = runCto({
+      task: "domain terminal race",
+      cwd: root,
+      branch: "main",
+      autonomous: false,
+      teams: [{ team: "frontend", slice: "s" }],
+      defs: sampleDefs(),
+      execution: executionContext(root, "domain-race-owner"),
+    });
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const domainState = readCtoState(res.plan.id, root);
+    assert.ok(domainState);
+    appendWave(domainState!, {
+      id: "domain-race-wave",
+      source: "test",
+      source_id: "domain-race-source",
+      task: "new domain work",
+    }, root);
+    const statePath = join(root, ".work-state", "cto", res.plan.id, "state.json");
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeState = readFileSync(statePath, "utf8");
+    const beforeControl = readFileSync(controlPath, "utf8");
+    assert.throws(
+      () => setCtoPause(res.state, "done", "stale owner", root),
+      /stale|changed|originating snapshot/i,
+    );
+    assert.equal(readFileSync(statePath, "utf8"), beforeState);
+    assert.equal(readFileSync(controlPath, "utf8"), beforeControl);
+    assert.equal(readCtoState(res.plan.id, root)?.wave_history.at(-1)?.source_id, "domain-race-source");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("cto-engine: suspended CTO state changes remain recovery-required", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-release-witness-"));
+  try {
+    const controllerA = createWorkflowSessionController({
+      cwd: root,
+      context: executionContext(root, "release-owner-a"),
+    });
+    const ingressA = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "release witness",
+      controller: controllerA,
+    });
+    suspendCtoSession(controllerA, "session-shutdown");
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeControl = readFileSync(controlPath, "utf8");
+    const beforeState = readFileSync(ingressA.statePath, "utf8");
+    const mutated = readCtoState(ingressA.run_id, root);
+    assert.ok(mutated);
+    mutated!.task = "unexplained suspended mutation";
+    writeCtoState(mutated!, root);
+    const changedState = readFileSync(ingressA.statePath, "utf8");
+    assert.notEqual(changedState, beforeState, "the fixture changes canonical state bytes");
+
+    const controllerB = createWorkflowSessionController({
+      cwd: root,
+      context: executionContext(root, "release-owner-b"),
+    });
+    assert.throws(
+      () => acquireCtoIngress({
+        cwd: root,
+        branch: "main",
+        task: "resume changed release",
+        run_id: ingressA.run_id,
+        controller: controllerB,
+      }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "recovery_required",
+    );
+    assert.equal(readFileSync(controlPath, "utf8"), beforeControl, "unexplained state change does not rehash or rewrite run-control");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-engine: resumed release cannot replace stored issuance provenance", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-resumed-release-provenance-"));
+  try {
+    const controllerA = createWorkflowSessionController({
+      cwd: root,
+      context: executionContext(root, "release-provenance-owner-a"),
+    });
+    const ingressA = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "resumed release provenance",
+      controller: controllerA,
+    });
+    suspendCtoSession(controllerA, "session-shutdown");
+
+    const initialControl = readRunControl(root);
+    const storedRelease = initialControl.cto_releases[ingressA.run_id];
+    assert.ok(storedRelease);
+
+    const controllerB = createWorkflowSessionController({
+      cwd: root,
+      context: executionContext(root, "release-provenance-owner-b"),
+    });
+    const ingressB = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "resumed release provenance",
+      run_id: ingressA.run_id,
+      controller: controllerB,
+    });
+    const resumedClaim = readRunControl(root).execution_claim;
+    assert.ok(resumedClaim);
+    assert.equal(resumedClaim?.token, ingressB.claim.claim.token);
+
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeForgedRelease = readFileSync(controlPath, "utf8");
+    const forgedRelease = {
+      ...storedRelease,
+      released_at: "2099-01-01T00:00:00.000Z",
+      ledger_revision: storedRelease.ledger_revision + 1,
+    };
+    assert.throws(
+      () => releaseExecutionClaim(root, {
+        run_id: ingressA.run_id,
+        token: resumedClaim!.token,
+        receipt: forgedRelease.release_receipt,
+        cto_release: forgedRelease,
+      }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "recovery_required",
+    );
+    assert.equal(readFileSync(controlPath, "utf8"), beforeForgedRelease);
+    const afterForgedRelease = readRunControl(root);
+    assert.equal(afterForgedRelease.execution_claim?.token, resumedClaim!.token);
+    assert.equal(afterForgedRelease.execution_claim?.released_at, null);
+    assert.deepEqual(afterForgedRelease.cto_releases[ingressA.run_id], storedRelease);
+
+    const resumedState = readCtoState(ingressA.run_id, root);
+    assert.ok(resumedState);
+    resumedState!.task = "trusted resumed state change";
+    writeCtoState(resumedState!, root);
+    suspendCtoSession(controllerB, "session-shutdown");
+
+    const finalControl = readRunControl(root);
+    assert.equal(finalControl.execution_claim, null);
+    const finalRelease = finalControl.cto_releases[ingressA.run_id];
+    assert.ok(finalRelease);
+    assert.notEqual(finalRelease.current_snapshot_hash, storedRelease.current_snapshot_hash);
+    assert.deepEqual(
+      { ...finalRelease, current_snapshot_hash: storedRelease.current_snapshot_hash },
+      storedRelease,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -335,7 +548,7 @@ test("cto-engine: state transitions persist and are readable", () => {
 });
 
 test("cto-engine: expireEscalations expires only elapsed non-blocker pendings", () => {
-  const state = newCtoState({ id: "r", task: "t", branch: "b", autonomous: false, plan: { id: "r", task: "t", teams: [], created_at: "" } });
+  const state = newCtoState({ id: "r", task: "t", branch: "b", autonomous: false, plan: { id: "r", task: "t", teams: [], created_at: "2026-08-04T00:00:00.000Z" } });
   state.teams = [
     {
       id: "frontend",
@@ -356,7 +569,7 @@ test("cto-engine: expireEscalations expires only elapsed non-blocker pendings", 
 });
 
 test("cto-engine: pendingEscalations lists only pending across teams", () => {
-  const state = newCtoState({ id: "r", task: "t", branch: "b", autonomous: false, plan: { id: "r", task: "t", teams: [], created_at: "" } });
+  const state = newCtoState({ id: "r", task: "t", branch: "b", autonomous: false, plan: { id: "r", task: "t", teams: [], created_at: "2026-08-04T00:00:00.000Z" } });
   state.teams = [
     { id: "a", status: "parked", escalations: { e1: { status: "pending" }, e2: { status: "answered" } } },
     { id: "b", status: "done", escalations: { e3: { status: "pending" } } },
@@ -561,7 +774,7 @@ test("cto-core: canonicalizeState rewrites a partial schema-2 file once and is i
       schema: 2,
       id: runId,
       task: "standby — awaiting inbox tasks",
-      branch: "",
+      branch: "main",
       autonomous: true,
       plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: "2026-08-07T00:00:00.000Z" },
       teams: [],
@@ -623,7 +836,7 @@ test("cto-core: writeCtoState round-trips schema 2 with stable defaults", () => 
       task: "t",
       branch: "b",
       autonomous: false,
-      plan: { id: "rt-run", task: "t", teams: [], created_at: "" },
+      plan: { id: "rt-run", task: "t", teams: [], created_at: "2026-08-07T00:00:00.000Z" },
     });
     assert.equal(state.schema, 2);
     assert.deepEqual(state.budget, {
@@ -655,17 +868,19 @@ test("cto-core: writeCtoState round-trips schema 2 with stable defaults", () => 
 test("cto-core: readCtoState never observes partial state during concurrent writes", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-atomic-"));
   const initial = newCtoState({ id: "atomic-run", task: "t", branch: "b", autonomous: false,
-    plan: { id: "atomic-run", task: "t", teams: [], created_at: "" } });
+    plan: { id: "atomic-run", task: "t", teams: [], created_at: new Date().toISOString() } });
   initial.plan.task = "x".repeat(256 * 1024);
   writeCtoState(initial, root);
   const writer = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
-    import { writeCtoState, newCtoState } from './src/cto/state.ts';
+    import { writeCtoState, readCtoState } from './src/cto/state.ts';
     const root = process.env.CTO_ROOT;
     if (!root) throw new Error('missing CTO_ROOT');
-    const state = newCtoState({ id: 'atomic-run', task: 't', branch: 'b', autonomous: false,
-      plan: { id: 'atomic-run', task: 't', teams: [], created_at: '' } });
-    state.plan.task = 'x'.repeat(256 * 1024);
-    for (let i = 0; i < 200; i++) writeCtoState(state, root);
+    for (let i = 0; i < 200; i++) {
+      const state = readCtoState('atomic-run', root);
+      if (!state) throw new Error('missing atomic state');
+      state.plan.task = 'x'.repeat(256 * 1024);
+      writeCtoState(state, root);
+    }
   `], { cwd: resolve(dirname(fileURLToPath(import.meta.url)), ".."), env: { ...process.env, CTO_ROOT: root }, stdio: ["ignore", "ignore", "pipe"] });
   let writerError = "";
   writer.stderr?.on("data", (chunk: Buffer) => { writerError += String(chunk); });
@@ -686,7 +901,7 @@ test("cto-core: readCtoState never observes partial state during concurrent writ
 
 
 function leaseFixture(id = "lease-run"): CtoState {
-  return newCtoState({ id, task: "t", branch: "b", autonomous: false, plan: { id, task: "t", teams: [], created_at: "" } });
+  return newCtoState({ id, task: "t", branch: "b", autonomous: false, plan: { id, task: "t", teams: [], created_at: "2026-08-04T00:00:00.000Z" } });
 }
 
 test("cto-core: acquireLease creates a lease with a fresh fence token", () => {
@@ -833,7 +1048,7 @@ test("cto-core: lease root persistence round-trips through writeCtoState", () =>
 // ── cto-core decision memory (br-zps.11) ─────────────────────────────────
 
 function decisionFixture(id = "decision-run", decisions: DecisionMemoryEntry[] = []): CtoState {
-  const state = newCtoState({ id, task: "t", branch: "b", autonomous: false, plan: { id, task: "t", teams: [], created_at: "" } });
+  const state = newCtoState({ id, task: "t", branch: "b", autonomous: false, plan: { id, task: "t", teams: [], created_at: "2026-08-04T00:00:00.000Z" } });
   state.decisions = decisions;
   return state;
 }
@@ -980,7 +1195,7 @@ import {
   buildDigest,
   startWaveScheduler,
   type TeamPlan,
-} from "@andvl1/omp-workflows-core";
+} from "../src/index.js";
 
 describe("cto-operations budget", () => {
   function sampleState(overrides: Partial<CtoState> = {}): CtoState {

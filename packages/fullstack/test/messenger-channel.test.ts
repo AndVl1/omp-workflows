@@ -15,28 +15,6 @@ function withChannel(root: string, adapter: "telegram" | "http" | null): void {
   );
 }
 
-function withActiveRun(root: string, ownerSession = "session-direct"): void {
-  const runDir = join(root, ".work-state", "cto", "run-one");
-  mkdirSync(runDir, { recursive: true });
-  const now = new Date().toISOString();
-  writeFileSync(
-    join(runDir, "state.json"),
-    JSON.stringify({
-      schema: 1,
-      id: "run-one",
-      task: "Some task",
-      branch: "main",
-      autonomous: true,
-      owner_session: ownerSession,
-      plan: { id: "run-one", task: "Some task", teams: [], created_at: now },
-      teams: [],
-      integration: { status: "pending" },
-      pause: { kind: "none", reason: "" },
-      updated_at: now,
-    }),
-  );
-}
-
 test("messenger: channelMode reads .omp/escalation.json", () => {
   const root = mkdtempSync(join(tmpdir(), "chan-mode-"));
   try {
@@ -49,11 +27,29 @@ test("messenger: channelMode reads .omp/escalation.json", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
-test("messenger: ask gate blocks only for an owned CTO run and session", () => {
+test("messenger: ask gate blocks only for a claim proven by the originating host context", () => {
   const root = mkdtempSync(join(tmpdir(), "ask-gate-"));
   try {
-    const gate = createAskRedirectGate();
-    const ownedContext = { cwd: root, session_id: "session-direct" };
+    const ownerManager = { getCwd: () => root, getSessionId: () => "session-direct" };
+    const ownedContext = {
+      cwd: root,
+      session_id: "session-direct",
+      mode: "tui",
+      hasUI: true,
+      sessionManager: ownerManager,
+    };
+    let hasExactClaim = false;
+    const gate = createAskRedirectGate((ctx, cwd) => {
+      if (
+        !ctx || typeof ctx !== "object"
+        || cwd !== root
+        || (ctx as { sessionManager?: unknown }).sessionManager !== ownerManager
+        || (ctx as { session_id?: unknown }).session_id !== "session-direct"
+        || (ctx as { mode?: unknown }).mode !== "tui"
+        || (ctx as { hasUI?: unknown }).hasUI !== true
+      ) return undefined;
+      return hasExactClaim ? { run_id: "run-one", ownership_epoch: "epoch-1" } : undefined;
+    });
 
     // no channel -> ask passes
     assert.equal(gate({ toolName: "ask" }, ownedContext), undefined, "no channel -> pass");
@@ -62,18 +58,35 @@ test("messenger: ask gate blocks only for an owned CTO run and session", () => {
     withChannel(root, "telegram");
     assert.equal(gate({ toolName: "ask" }, ownedContext), undefined, "telegram without run -> pass");
 
-    // telegram + owned active run -> ask blocked with the outbox contract
-    withActiveRun(root);
+    // telegram + exact host claim -> ask blocked with the outbox contract
+    hasExactClaim = true;
     const blocked = gate({ toolName: "ask" }, ownedContext);
     assert.ok(blocked?.block === true, "ask blocked in messenger mode");
     assert.ok(blocked?.reason.includes("outbox"), "block reason names the outbox route");
     assert.ok(blocked?.reason.includes("answers/"), "block reason names the answers dir");
-    assert.ok(blocked?.reason.includes("run-one"), "block reason names the owned run");
+    assert.ok(blocked?.reason.includes("run-one"), "block reason names the claimed run");
 
-    // A foreign session must not route to the owned run.
-    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "foreign-session" }), undefined);
-    // Missing origin session is never allowed to use a global latest-run fallback.
+    // An independent same-cwd manager and a missing origin never route to the
+    // owner's run, even when their copied fields look interactive.
+    assert.equal(
+      gate({ toolName: "ask" }, {
+        ...ownedContext,
+        session_id: "foreign-session",
+        sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" },
+      }),
+      undefined,
+    );
     assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined);
+    assert.equal(
+      gate({ toolName: "ask" }, { ...ownedContext, hasUI: false }),
+      undefined,
+      "explicit headless context cannot route the owner's ask",
+    );
+    assert.equal(
+      gate({ toolName: "ask" }, { ...ownedContext, mode: "rpc" }),
+      undefined,
+      "contradictory host mode cannot route the owner's ask",
+    );
 
     // other tools unaffected
     assert.equal(gate({ toolName: "read" }, ownedContext), undefined, "non-ask tools pass");

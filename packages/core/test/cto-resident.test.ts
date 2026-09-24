@@ -44,7 +44,7 @@ function makeStandby(id = "run-sb"): ReturnType<typeof newCtoState> {
   return newCtoState({
     id,
     task: "standby — awaiting inbox tasks",
-    branch: "",
+    branch: "main",
     autonomous: true,
     standby: true,
     plan: { id, task: "standby — awaiting inbox tasks", teams: [], created_at: new Date().toISOString() },

@@ -50,6 +50,41 @@ export default function (pi: ExtensionAPI) {
 
 UUID не обязателен для обычного пользовательского сценария: имя задачи, однозначный фрагмент или пункт показанного списка разрешаются в точный `run_id` до мутации. `--run <run-id>` остаётся техническим selector для автоматизации и диагностики. `--` завершает разбор options, поэтому флаги внутри текста задачи не интерпретируются. Неоднозначный выбор возвращает список с названием, веткой, статусом и этапом; ошибочный явный selector не получает fallback.
 
+### CTO lifecycle and exact-run continuation
+
+`/cto` is a registered host ingress, not a prompt-only command. Use
+`/cto --run <exact-cto-id> <task>` only when continuing a known CTO run; the
+selector identifies the run but does not prove ownership. Ingress acquires the
+authenticated host claim and publishes the CTO state atomically before the
+prompt is sent. It never scans for a latest active run.
+
+The claim is bound to the worktree, branch, host session, process and ownership
+epoch. A managed session release may retain pending worker slots, so a later
+`/cto --run` continuation must reacquire the same run and inspect its canonical
+answers plus escalation state before dispatching. Only a dispatcher-created
+`.omp/inbox/answer-retry-*.json` marker together with a persisted
+`delivery_status: "pre-send-rejected"` answer whose `delivery_run_id`,
+`delivery_ownership_epoch` and `delivery_session_id` match the current claim
+may be retried once. Canonical status alone is not replay authority.
+`accepted`, `in-flight`, `unknown`, legacy or mismatched answers are
+advisory/recovery evidence; never blindly replay them. Transport-only
+`.omp/inbox/answer-*` markers do not grant replay authority.
+
+Corrupt or markdown-only legacy CTO state fails closed with recovery guidance.
+An explicit selector still requires an exact branch and authenticated owner;
+the marker in a task prompt alone is never authority. Native child reservations
+settle from the persisted CTO tool-call/slot identity, independently of
+ordinary workflow dispatch origins, and terminal claim settlement happens only
+on an actual terminal CTO state transition.
+
+Release provenance is a state witness, not a writable acknowledgement: after
+handoff, an unexplained canonical CTO state change makes reacquisition
+`recovery_required`; core does not rehash arbitrary suspended-state writes.
+The supported host lifecycle is a type-only `session_shutdown` emitted on
+actual session disposal. Session replacement is handled by the authenticated
+`session_switch` transition; core does not infer an old owner from a
+non-existent shutdown `session_id` field.
+
 ### Канонический запуск и восстановление
 
 Для ordinary workflow используется schema 2: `run_id`, `run_key` и `WorkIdentity.run_id` обязаны совпадать. Канонический state находится в `.work-state/runs/<run-id>/state.json`, а неизменяемые результаты доработки или миграции — в `.work-state/runs/<run-id>/revisions/<revision-id>/`. Ветка — контекст маршрутизации и проверки совместимости, а не ключ identity или каталог: новая задача на другой ветке создаёт независимый run; `resume`/`rework` на чужой ветке отклоняются как `run_context_mismatch`.

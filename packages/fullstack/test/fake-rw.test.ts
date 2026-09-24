@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createEscalationAdapter, loadEscalationConfig, MAX_INBOX_TEXT_LENGTH } from "../src/adapters/registry.js";
+import { createEscalationAdapter, loadEscalationConfig, MAX_INBOX_TEXT_LENGTH, pollInbox } from "../src/adapters/registry.js";
 import { MockEscalationAdapter } from "../src/adapters/mock.js";
 
 function withConfig(root: string, config: unknown): void {
@@ -28,6 +28,7 @@ test("fake-rw: adapter A persists; adapter B observes the answer and the task", 
     const dir = join(root, "rw");
     const a = new MockEscalationAdapter({ persisted: { dir } });
     const b = new MockEscalationAdapter({ persisted: { dir } });
+    b.setAnswerPersistenceHandler(() => undefined);
 
     // A: outbound + inbound, no handler on A.
     await a.send({ id: "run-1/team-a/q1", level: "question", title: "Q", body: "q" });
@@ -104,6 +105,7 @@ test("fake-rw: injectAnswer writes the file AND queues in memory without double-
   try {
     const dir = join(root, "rw");
     const a = new MockEscalationAdapter({ persisted: { dir } });
+    a.setAnswerPersistenceHandler(() => undefined);
     a.injectAnswer("run/esc/1", "answer", "u");
     // The file is durable on disk.
     assert.equal(readdirSync(join(dir, "answers")).filter((n) => n.endsWith(".json")).length, 1);
@@ -112,6 +114,137 @@ test("fake-rw: injectAnswer writes the file AND queues in memory without double-
     assert.equal(answers[0]?.answer, "answer");
     const again = await a.pollOnce();
     assert.deepEqual(again, [], "answer consumed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fake-rw: canonical answer persistence failure leaves the exact transport answer pending", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fake-rw-answer-retry-"));
+  try {
+    const dir = join(root, "rw");
+    const adapter = new MockEscalationAdapter({ persisted: { dir } });
+    adapter.injectAnswer("run/esc/1", "answer", "u");
+    adapter.setAnswerPersistenceHandler(() => {
+      throw new Error("canonical answers directory unavailable");
+    });
+
+    await assert.rejects(() => adapter.pollOnce(), /source retained for retry/);
+    assert.equal(readdirSync(join(dir, "answers")).filter((name) => name.endsWith(".json")).length, 1);
+    assert.equal(existsSync(join(dir, "answers", "processed", "ans-1.json")), false);
+
+    adapter.setAnswerPersistenceHandler(() => undefined);
+    const answers = await adapter.pollOnce();
+    assert.equal(answers.length, 1);
+    assert.equal(answers[0]?.id, "run/esc/1");
+    assert.equal(existsSync(join(dir, "answers", "processed", "ans-1.json")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("fake-rw: same answer id with changed content stays in the transport and records a conflict", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fake-rw-answer-conflict-"));
+  try {
+    const dir = join(root, "rw");
+    const runId = "run-conflict";
+    const answerDir = join(root, ".work-state", "cto", runId, "answers");
+    mkdirSync(answerDir, { recursive: true });
+    writeFileSync(
+      join(answerDir, "run-conflict-esc-1.json"),
+      JSON.stringify({ id: `${runId}/esc-1`, answer: "original" }),
+    );
+    const adapter = new MockEscalationAdapter({ persisted: { dir } });
+    adapter.injectAnswer(`${runId}/esc-1`, "changed", "mock");
+
+    await pollInbox(
+      root,
+      adapter,
+      undefined,
+      () => undefined,
+      { session_id: "fake-rw-session", getClaim: () => ({ run_id: runId, ownership_epoch: "fake-rw-epoch" }) },
+    );
+
+    assert.equal(existsSync(join(dir, "answers", "ans-1.json")), true, "conflicting source remains pending");
+    assert.equal(existsSync(join(dir, "answers", "processed", "ans-1.json")), false, "conflicting source is not archived");
+    assert.ok(
+      readdirSync(join(answerDir, "rejected")).some((name) => name.includes(".conflict-")),
+      "canonical conflict writes a durable diagnostic",
+    );
+    const original = JSON.parse(readFileSync(join(answerDir, "run-conflict-esc-1.json"), "utf8")) as { answer?: string };
+    assert.equal(original.answer, "original", "the first canonical answer remains authoritative");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("fake-rw: earlier persisted answer is delivered when a later answer fails, then the failed source recovers", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fake-rw-answer-mixed-"));
+  try {
+    const dir = join(root, "rw");
+    const adapter = new MockEscalationAdapter({ persisted: { dir } });
+    adapter.injectAnswer("run/esc/first", "first", "u");
+    adapter.injectAnswer("run/esc/second", "second", "u");
+
+    let attempts = 0;
+    adapter.setAnswerPersistenceHandler((answer) => {
+      attempts += 1;
+      if (answer.id === "run/esc/second") throw new Error("canonical collision");
+    });
+
+    const first = await adapter.pollOnce();
+    assert.deepEqual(first.map((answer) => answer.id), ["run/esc/first"], "earlier success remains deliverable");
+    assert.equal(attempts, 2, "each disk source was attempted once");
+    assert.equal(existsSync(join(dir, "answers", "processed", "ans-1.json")), true);
+    assert.equal(existsSync(join(dir, "answers", "processed", "ans-2.json")), false);
+    assert.equal(readdirSync(join(dir, "answers")).filter((name) => name === "ans-2.json").length, 1, "failed source stays pending");
+
+    adapter.setAnswerPersistenceHandler(() => undefined);
+    const second = await adapter.pollOnce();
+    assert.deepEqual(second.map((answer) => answer.id), ["run/esc/second"], "pending source is delivered after persistence recovers");
+    assert.equal(existsSync(join(dir, "answers", "processed", "ans-2.json")), true);
+    assert.deepEqual(await adapter.pollOnce(), [], "both sources are delivered exactly once");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fake-rw: persisted answers stay pending until canonical persistence is bound", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fake-rw-answer-boundary-"));
+  try {
+    const dir = join(root, "rw");
+    const adapter = new MockEscalationAdapter({ persisted: { dir } });
+    adapter.injectAnswer("run/esc/1", "answer", "u");
+
+    assert.deepEqual(await adapter.pollOnce(), [], "unbound persisted answers are not exposed or archived");
+    assert.equal(readdirSync(join(dir, "answers")).filter((name) => name.endsWith(".json")).length, 1);
+    assert.equal(existsSync(join(dir, "answers", "processed")), false);
+
+    adapter.setAnswerPersistenceHandler(() => undefined);
+    const answers = await adapter.pollOnce();
+    assert.equal(answers.length, 1);
+    assert.equal(answers[0]?.answer, "answer");
+    assert.equal(existsSync(join(dir, "answers", "processed", "ans-1.json")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fake-rw: persisted task without a handler remains pending instead of being archived", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fake-rw-no-handler-"));
+  try {
+    const dir = join(root, "rw");
+    const adapter = new MockEscalationAdapter({ persisted: { dir } });
+    adapter.injectTask("wait for a handler");
+
+    await adapter.pollOnce();
+    assert.equal(readdirSync(join(dir, "inbound")).filter((name) => name.endsWith(".json")).length, 1);
+    assert.equal(existsSync(join(dir, "inbound", "processed")), true);
+    assert.equal(readdirSync(join(dir, "inbound", "processed")).filter((name) => name.endsWith(".json")).length, 0);
+
+    const tasks: string[] = [];
+    adapter.setPlainMessageHandler((msg) => tasks.push(msg.text));
+    await adapter.pollOnce();
+    assert.deepEqual(tasks, ["wait for a handler"]);
+    assert.equal(readdirSync(join(dir, "inbound", "processed")).filter((name) => name.endsWith(".json")).length, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

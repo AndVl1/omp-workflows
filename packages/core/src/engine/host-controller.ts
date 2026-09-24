@@ -21,7 +21,7 @@ import {
   type WorkflowPrepareOptions,
 } from "./run.js";
 import { createWorkflowReadSelector, type WorkflowReadSelector } from "./read-selector.js";
-import type { LifecycleMode, RunSelectionSnapshot, TrustedExecutionContext } from "./types.js";
+import type { CtoClaimScope, LifecycleMode, RunSelectionSnapshot, TrustedExecutionContext, WorktreeExecutionClaim } from "./types.js";
 
 export interface WorkflowSessionControllerOptions {
   cwd: string;
@@ -64,6 +64,11 @@ export interface WorkflowSessionController {
    * or unreadable. This is a read-only proof and never repairs state.
    */
   activeClaimRunId(): string | undefined;
+  /**
+   * Exact non-secret scope of the current authenticated CTO claim. A bound
+   * token that cannot be verified is a typed refusal, never ordinary absence.
+   */
+  activeCtoClaim(): CtoClaimScope | undefined;
   /** Issue a one-shot opaque binding for an explicit user lifecycle command. */
   issueCommandIntent(mode: WorkflowCommandIntentMode, run_id?: string): WorkflowCommandIntent;
   /** Validate and reserve the issued binding before workflow_prepare mutates state. */
@@ -76,6 +81,14 @@ export interface WorkflowSessionController {
   bind(runId: string, token?: string): void;
   release(receipt?: string): void;
 }
+
+export interface CtoClaimCredentials {
+  readonly run_id: string;
+  readonly token: string;
+  readonly ownership_epoch: string;
+}
+
+const ctoClaimBindings = new WeakMap<WorkflowSessionController, CtoClaimCredentials>();
 
 function exactActiveClaim(
   claim: unknown,
@@ -98,6 +111,47 @@ function exactActiveClaim(
     && value.ownership_epoch.length > 0
     && Array.isArray(value.worker_ids)
     && value.worker_ids.every((workerId) => typeof workerId === "string" && workerId.length > 0);
+}
+
+/** Internal domain seam: only the CTO adapter can bind its private token. */
+export function bindCtoClaim(controller: WorkflowSessionController, claim: WorktreeExecutionClaim): void {
+  if (claim.owner_kind !== "cto" || claim.released_at !== null) {
+    throw new LifecycleError("run_busy", "cannot bind an inactive CTO execution claim", { run_id: claim.run_id });
+  }
+  ctoClaimBindings.set(controller, {
+    run_id: claim.run_id,
+    token: claim.token,
+    ownership_epoch: claim.ownership_epoch,
+  });
+}
+
+export function ctoClaimCredentials(controller: WorkflowSessionController): CtoClaimCredentials | undefined {
+  const value = ctoClaimBindings.get(controller);
+  return value ? { ...value } : undefined;
+}
+
+export function clearCtoClaim(controller: WorkflowSessionController): void {
+  ctoClaimBindings.delete(controller);
+}
+
+function activeCtoClaimFor(controller: WorkflowSessionController, context: TrustedExecutionContext, cwd: string): CtoClaimScope | undefined {
+  const binding = ctoClaimBindings.get(controller);
+  if (!binding) return undefined;
+  let claim: unknown;
+  try {
+    claim = readRunControlNoRecovery(cwd).execution_claim;
+  } catch (error) {
+    if (error instanceof LifecycleError) throw error;
+    throw new LifecycleError("recovery_required", "bound CTO claim could not be verified", { run_id: binding.run_id, next_action: "recover lifecycle state before continuing" });
+  }
+  if (!exactActiveClaim(claim, "cto", binding.run_id, binding.token, context)) {
+    throw new LifecycleError("run_busy", "bound CTO claim is no longer current", { run_id: binding.run_id, next_action: "resume or reconcile the current coordinator before continuing" });
+  }
+  const value = claim as Record<string, unknown>;
+  if (value.ownership_epoch !== binding.ownership_epoch) {
+    throw new LifecycleError("run_busy", "bound CTO claim ownership epoch is stale", { run_id: binding.run_id, next_action: "resume or reconcile the current coordinator before continuing" });
+  }
+  return { run_id: binding.run_id, ownership_epoch: binding.ownership_epoch };
 }
 
 function selectionRunId(
@@ -225,7 +279,7 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
     boundRunId = undefined;
   }
 
-  return {
+  const controller: WorkflowSessionController = {
     context: () => structuredClone(trusted),
     readSelector: () => selector,
     selectedRunId: () => {
@@ -255,6 +309,7 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
       return selection.run_id;
     },
     activeClaimRunId,
+    activeCtoClaim: () => activeCtoClaimFor(controller, trusted, cwd),
     issueCommandIntent,
     consumeCommandIntent,
     commitCommandIntent,
@@ -263,4 +318,5 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
     bind: bindClaim,
     release,
   };
+  return controller;
 }

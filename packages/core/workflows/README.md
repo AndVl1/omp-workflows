@@ -41,6 +41,29 @@ Status/report/view используют один canonical run/revision reader. 
 
 Пользовательская справка и точные флаги находятся в [`core README`](../README.md) и [`fullstack command guide`](../../fullstack/README.md).
 
+## CTO exact-run lifecycle
+
+The registered `/cto` ingress acquires a host-owned claim before rendering a
+prompt. `/cto --run <exact-cto-id> <task>` is an exact selector, not ownership
+proof: branch, session, process and ownership-epoch provenance are checked under
+the workspace lock, and no latest-active scan is used.
+
+On continuation, read canonical state only through the registered
+`cto_state(operation: "read", run_id: "<exact-cto-id>")` route. Read answer and
+escalation records only from that exact run's scoped namespace; never scan a
+sibling or latest-run directory.
+Retry at most once only for a persisted `delivery_status: "pre-send-rejected"` record whose run, ownership epoch and session match the
+current claim. `accepted`, `in-flight`, `unknown`, legacy or mismatched
+delivery stays advisory/recovery evidence; it must not be blindly replayed.
+Transport-only answer markers do not authorize a retry. Corrupt or markdown-only legacy state fails closed.
+
+Managed release provenance keeps the issuance state witness unchanged; core
+does not rehash arbitrary writes made while a CTO run is suspended. An
+unexplained state-image mismatch remains `recovery_required` with persisted
+bytes untouched. The supported host shutdown event is type-only and belongs to
+actual disposal; replacement uses the authenticated `session_switch` event,
+not a fabricated old-session field on shutdown.
+
 ## Files
 
 | File | Purpose |

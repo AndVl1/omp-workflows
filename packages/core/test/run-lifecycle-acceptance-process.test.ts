@@ -20,8 +20,8 @@ import {
   readRunState,
   runTarget,
   registerTeamWorkflow,
+  registerWorkflowCommands,
   registerWorkflowTools,
-  releaseExecutionClaim,
   selectSession,
   updateCanonicalRun,
   workflowOwnerFor,
@@ -29,6 +29,8 @@ import {
   registerWorkflowProfiles,
   type TaskCaller,
 } from "../src/index.js";
+import { acquireCtoIngress, suspendCtoSession } from "../src/cto/run.js";
+import { appendWave, newCtoState, readCtoState, writeCtoState } from "../src/cto/state.js";
 import { authorizeDispatch, completeDispatch, createCapability, materializeMigratedDispatches } from "../src/engine/durable.js";
 import { beginLifecycleTransaction, recoverLifecycleTransactions, commitLifecycleTransaction } from "../src/engine/lifecycle-journal.js";
 import { discoverLegacySources, migrateLegacySource } from "../src/engine/run-migration.js";
@@ -37,10 +39,13 @@ import { resolveConfig } from "../src/engine/config.js";
 import { buildDispatchMarker } from "../src/gates/dispatch.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
 import { prepareWorkflowState } from "../src/engine/run.js";
-import { readRunControl } from "../src/engine/run-store.js";
+import { publishCtoClaim, readRunControl, releaseExecutionClaim } from "../src/engine/run-store.js";
 import { normalizePersistedState } from "../src/engine/state.js";
 import { DISPATCH_ORIGIN_LOCATOR_ENV, rememberDispatchOriginLocator } from "../src/dispatch-origin-locator.js";
 const coreIndexUrl = new URL("../src/index.ts", import.meta.url).href;
+const ctoStateUrl = new URL("../src/cto/state.ts", import.meta.url).href;
+const ctoRunEngineUrl = new URL("../src/cto/run.ts", import.meta.url).href;
+const runStoreUrl = new URL("../src/engine/run-store.ts", import.meta.url).href;
 const runEngineUrl = new URL("../src/engine/run.ts", import.meta.url).href;
 const migrationEngineUrl = new URL("../src/engine/run-migration.ts", import.meta.url).href;
 const durableEngineUrl = new URL("../src/engine/durable.ts", import.meta.url).href;
@@ -48,10 +53,21 @@ const repositoryRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 
 type ToolHandler = (...args: unknown[]) => unknown;
 type RegisteredTool = { name: string; execute: (...args: unknown[]) => Promise<{ details: unknown }> };
+type RegisteredCommand = { description?: string; handler: (args: string, ctx: unknown) => Promise<void> };
 type FakePi = {
-  pi: { zod: { z: typeof z }; setLabel: () => void; on: (name: string, handler: ToolHandler) => void; registerTool: (tool: RegisteredTool) => void };
+  pi: {
+    zod: { z: typeof z };
+    setLabel: () => void;
+    on: (name: string, handler: ToolHandler) => void;
+    events: { on: (name: string, handler: ToolHandler) => void };
+    registerTool: (tool: RegisteredTool) => void;
+    registerCommand: (name: string, command: RegisteredCommand) => void;
+    sendUserMessage: (prompt: string) => void;
+  };
   handlers: Map<string, ToolHandler[]>;
   tools: Map<string, RegisteredTool>;
+  commands: Map<string, RegisteredCommand>;
+  messages: string[];
   emit: (name: string, ...args: unknown[]) => Promise<unknown[]>;
 };
 
@@ -120,13 +136,21 @@ function publishMapping(root: string): void {
 function fakePi(): FakePi {
   const handlers = new Map<string, ToolHandler[]>();
   const tools = new Map<string, RegisteredTool>();
+  const commands = new Map<string, RegisteredCommand>();
+  const messages: string[] = [];
+  const on = (name: string, handler: ToolHandler): void => {
+    handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+  };
   return {
-    handlers, tools,
+    handlers, tools, commands, messages,
     pi: {
       zod: { z },
       setLabel() {},
-      on(name, handler) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      on,
+      events: { on },
       registerTool(tool) { tools.set(tool.name, tool); },
+      registerCommand(name, command) { commands.set(name, command); },
+      sendUserMessage(prompt) { messages.push(prompt); },
     },
     async emit(name, ...args) {
       return Promise.all((handlers.get(name) ?? []).map((handler) => handler(...args)));
@@ -273,6 +297,492 @@ test("process acceptance: workflow_prepare host retry exact-replays and rejects 
     assert.match(String(c.error), /lifecycle_request_conflict|different payload/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("process acceptance: registered cto_state performs read/CAS/barrier/terminal lifecycle", async () => {
+  const root = scratch("rl-registered-cto-state");
+  try {
+    initGit(root);
+    const ownerSessionFile = join(root, "registered-cto-owner.jsonl");
+    const ownerManager = {
+      getCwd: () => root,
+      getSessionId: () => "registered-cto-owner",
+      getSessionFile: () => ownerSessionFile,
+      getHeader: () => ({ id: "registered-cto-owner", cwd: root }),
+    };
+    const ownerContext = {
+      ...context(root, "registered-cto-owner"),
+      cwd: root,
+      mode: "tui",
+      hasUI: true,
+      sessionFile: ownerSessionFile,
+      sessionManager: ownerManager,
+      ui: { notify() {} },
+    };
+    const ownerController = createWorkflowSessionController({ cwd: root, context: context(root, ownerContext.session_id) });
+    const foreignSessionFile = join(root, "registered-cto-foreign.jsonl");
+    const foreignManager = {
+      getCwd: () => root,
+      getSessionId: () => "registered-cto-foreign",
+      getSessionFile: () => foreignSessionFile,
+      getHeader: () => ({ id: "registered-cto-foreign", cwd: root }),
+    };
+    const foreignContext = {
+      ...context(root, "registered-cto-foreign"),
+      cwd: root,
+      mode: "tui",
+      hasUI: true,
+      sessionFile: foreignSessionFile,
+      sessionManager: foreignManager,
+      ui: { notify() {} },
+    };
+    const foreignController = createWorkflowSessionController({ cwd: root, context: context(root, foreignContext.session_id) });
+    const bus = fakePi();
+    const registrationOptions = {
+      cwd: root,
+      resolveCwd: () => root,
+      observability: false,
+      getSessionController: (value: unknown) => value === ownerContext
+        ? ownerController
+        : value === foreignContext
+          ? foreignController
+          : undefined,
+    };
+    registerTeamWorkflow(bus.pi as never, registrationOptions);
+    registerWorkflowTools(bus.pi as never, registrationOptions);
+    registerWorkflowCommands(bus.pi as never, registrationOptions);
+    await bus.emit("session_start", { type: "session_start" }, ownerContext);
+    const ctoCommand = bus.commands.get("cto");
+    assert.ok(ctoCommand, "registered /cto command is present");
+    await ctoCommand.handler("registered cto state", ownerContext);
+    assert.equal(bus.messages.length, 1, "registered /cto command sends exactly one prompt");
+    const ingressRunId = readRunControl(root).execution_claim?.run_id;
+    assert.ok(ingressRunId, "registered /cto command acquires a claim before prompting");
+    const ingressState = readCtoState(ingressRunId, root);
+    assert.ok(ingressState);
+    const ingress = { run_id: ingressRunId, state: ingressState };
+    const ctoState = bus.tools.get("cto_state");
+    assert.ok(ctoState);
+    const invoke = async (callId: string, value: unknown, executionContext = ownerContext) =>
+      record((await ctoState.execute(callId, value, undefined, undefined, executionContext)).details);
+    const read = async (callId: string, executionContext = ownerContext) =>
+      invoke(callId, { operation: "read", run_id: ingress.run_id }, executionContext);
+    const ownerRead = await read("registered-cto-read-r1");
+    assert.equal(ownerRead.ok, true, JSON.stringify(ownerRead));
+    const revisionR1 = String(ownerRead.state_revision);
+    const statePath = join(root, ".work-state", "cto", ingress.run_id, "state.json");
+    const domainR2 = readCtoState(ingress.run_id, root);
+    assert.ok(domainR2);
+    appendWave(domainR2!, {
+      id: "wave-domain-r2",
+      source: "acceptance",
+      source_id: "domain-r2",
+      task: "domain inbox wave",
+    }, root);
+    const beforeStale = readFileSync(statePath, "utf8");
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeStaleControl = readFileSync(controlPath, "utf8");
+    const stale = structuredClone(ownerRead.state) as Record<string, unknown>;
+    stale.pause = { kind: "none", reason: "stale overwrite" };
+    const staleResult = record((await ctoState.execute(
+      "registered-cto-stale",
+      { operation: "commit", run_id: ingress.run_id, expected_state_revision: revisionR1, state: stale },
+      undefined,
+      undefined,
+      ownerContext,
+    )).details);
+    assert.equal(staleResult.ok, false);
+    assert.match(String(staleResult.error), /stale|revision|conflict/i);
+    assert.equal(readFileSync(statePath, "utf8"), beforeStale, "stale registered commit preserves domain wave bytes");
+    assert.equal(readFileSync(controlPath, "utf8"), beforeStaleControl, "stale registered commit preserves control bytes");
+
+    const progressRead = await read("registered-cto-read-progress");
+    const progress = structuredClone(progressRead.state) as Record<string, unknown>;
+    progress.pause = { kind: "none", reason: "progress" };
+    const committedProgress = record((await ctoState.execute(
+      "registered-cto-commit-progress",
+      { operation: "commit", run_id: ingress.run_id, expected_state_revision: String(progressRead.state_revision), state: progress },
+      undefined,
+      undefined,
+      ownerContext,
+    )).details);
+    assert.equal(committedProgress.ok, true, JSON.stringify(committedProgress));
+
+    const beforeForeignState = readFileSync(statePath, "utf8");
+    const beforeForeignControl = readFileSync(controlPath, "utf8");
+    const foreignRead = await read("registered-cto-foreign-read", foreignContext);
+    assert.equal(foreignRead.ok, false);
+    assert.equal(foreignRead.code, "WORKFLOW_CONTEXT_REJECTED");
+    assert.equal(readFileSync(statePath, "utf8"), beforeForeignState, "foreign read preserves domain state bytes");
+    assert.equal(readFileSync(controlPath, "utf8"), beforeForeignControl, "foreign read preserves control bytes");
+
+    const freshRead = await read("registered-cto-read-r2");
+    const pending = structuredClone(freshRead.state) as Record<string, unknown>;
+    pending.pending = { identity: identity(ingress.run_id), status: "pending", updated_at: new Date().toISOString() };
+    const malformedTyped = structuredClone(freshRead.state) as Record<string, unknown>;
+    malformedTyped.pending = { identity: identity(ingress.run_id), status: "bogus", updated_at: new Date().toISOString() };
+    malformedTyped.child_join = {};
+    malformedTyped.completion_envelope = { outcome: "pending" };
+    const beforeMalformedState = readFileSync(statePath, "utf8");
+    const beforeMalformedControl = readFileSync(controlPath, "utf8");
+    const malformedResult = record((await ctoState.execute(
+      "registered-cto-malformed-typed",
+      { operation: "commit", run_id: ingress.run_id, expected_state_revision: String(freshRead.state_revision), state: malformedTyped },
+      undefined,
+      undefined,
+      ownerContext,
+    )).details);
+    assert.equal(malformedResult.ok, false);
+    assert.match(String(malformedResult.error), /pending|child_join|completion|invalid/i);
+    assert.equal(readFileSync(statePath, "utf8"), beforeMalformedState, "malformed typed candidate preserves state bytes");
+    assert.equal(readFileSync(controlPath, "utf8"), beforeMalformedControl, "malformed typed candidate preserves control bytes");
+    const pendingCommit = record((await ctoState.execute(
+      "registered-cto-pending",
+      { operation: "commit", run_id: ingress.run_id, expected_state_revision: String(freshRead.state_revision), state: pending },
+      undefined,
+      undefined,
+      ownerContext,
+    )).details);
+    assert.equal(pendingCommit.ok, true, JSON.stringify(pendingCommit));
+
+    const pendingRead = await read("registered-cto-read-r3");
+    const omission = structuredClone(pendingRead.state) as Record<string, unknown>;
+    omission.pause = { kind: "done", reason: "finished" };
+    delete omission.pending;
+    const beforeBarrierDenial = readFileSync(statePath, "utf8");
+    const barrierDenied = record((await ctoState.execute(
+      "registered-cto-barrier-denied",
+      { operation: "commit", run_id: ingress.run_id, expected_state_revision: String(pendingRead.state_revision), state: omission },
+      undefined,
+      undefined,
+      ownerContext,
+    )).details);
+    assert.equal(barrierDenied.ok, false);
+    assert.match(String(barrierDenied.error), /pending|barrier|busy/i);
+    assert.equal(readFileSync(statePath, "utf8"), beforeBarrierDenial, "barrier denial preserves state bytes");
+
+    const settled = structuredClone(pendingRead.state) as Record<string, unknown>;
+    settled.pause = { kind: "done", reason: "finished" };
+    (settled.pending as Record<string, unknown>).status = "succeeded";
+    const terminal = record((await ctoState.execute(
+      "registered-cto-terminal",
+      { operation: "commit", run_id: ingress.run_id, expected_state_revision: String(pendingRead.state_revision), state: settled },
+      undefined,
+      undefined,
+      ownerContext,
+    )).details);
+    assert.equal(terminal.ok, true, JSON.stringify(terminal));
+    assert.equal(readRunControl(root).execution_claim, null, "terminal registered commit releases the claim");
+    assert.equal(ownerController.activeCtoClaim(), undefined, "terminal commit clears only the originating binding");
+
+    const next = acquireCtoIngress({
+      cwd: root,
+      branch: BRANCH,
+      task: "next registered cto run",
+      controller: ownerController,
+    });
+    assert.notEqual(next.run_id, ingress.run_id, "a released terminal run does not get reused for a new task");
+    suspendCtoSession(ownerController, "session-shutdown");
+    const firstRelease = readRunControl(root).cto_releases[next.run_id];
+    assert.ok(firstRelease);
+    const resumedController = createWorkflowSessionController({ cwd: root, context: context(root, "registered-cto-resume-1") });
+    const resumed = acquireCtoIngress({
+      cwd: root,
+      branch: BRANCH,
+      task: "resume registered cto run",
+      run_id: next.run_id,
+      controller: resumedController,
+    });
+    assert.equal(resumed.claim.claim.release_receipt, firstRelease?.release_receipt, "claimless reacquire carries the verified release receipt");
+    suspendCtoSession(resumedController, "session-replacement");
+    const resumedAgainController = createWorkflowSessionController({ cwd: root, context: context(root, "registered-cto-resume-2") });
+    const resumedAgain = acquireCtoIngress({
+      cwd: root,
+      branch: BRANCH,
+      task: "repeat resume registered cto run",
+      run_id: next.run_id,
+      controller: resumedAgainController,
+    });
+    assert.equal(resumedAgain.claim.claim.release_receipt, firstRelease?.release_receipt, "repeat suspension preserves original issuance receipt");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("process acceptance: registered CTO journal faults retain A and protect foreign B", async () => {
+  const root = scratch("rl-cto-terminal-journal");
+  try {
+    initGit(root);
+    const owner = createWorkflowSessionController({ cwd: root, context: context(root, "journal-owner") });
+    const ingress = acquireCtoIngress({
+      cwd: root,
+      branch: BRANCH,
+      task: "journal terminal recovery",
+      controller: owner,
+    });
+    suspendCtoSession(owner, "session-shutdown");
+    const child = await childScript(`
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      const [root, runId] = process.argv.slice(1);
+      const originalRename = fs.renameSync.bind(fs);
+      let fault;
+      const injected = [];
+      fs.renameSync = ((from, to) => {
+        originalRename(from, to);
+        const destination = String(to);
+        if (fault === "pre-marker" && destination.includes("/lifecycle-transactions/") && destination.endsWith("/transaction.json")) {
+          fault = undefined;
+          injected.push("pre-marker");
+          throw new Error("cto terminal pre-marker fault");
+        }
+        if (fault === "post-state" && destination.includes("/.work-state/cto/") && destination.endsWith("/state.json")) {
+          fault = undefined;
+          injected.push("post-state");
+          throw new Error("cto terminal post-state publication fault");
+        }
+      });
+      syncBuiltinESMExports();
+      const { z } = await import("zod");
+      const {
+        createWorkflowSessionController,
+        readRunControl,
+        recoverLifecycleTransactions,
+        registerTeamWorkflow,
+        registerWorkflowCommands,
+        registerWorkflowTools,
+      } = await import(${JSON.stringify(coreIndexUrl)});
+      const { acquireCtoIngress, readCtoStateForModel, suspendCtoSession } = await import(${JSON.stringify(ctoRunEngineUrl)});
+      const { setCtoPause } = await import(${JSON.stringify(ctoStateUrl)});
+      const { ctoClaimCredentials } = await import(${JSON.stringify(new URL("../src/engine/host-controller.ts", import.meta.url).href)});
+      const makeContext = (session_id, sessionFile) => ({
+        session_id,
+        caller: "host",
+        process_id: process.pid,
+        worktree: root,
+        branch: ${JSON.stringify(BRANCH)},
+        authority: "coordinator",
+        cwd: root,
+        mode: "tui",
+        hasUI: true,
+        sessionFile,
+        sessionManager: {
+          getCwd: () => root,
+          getSessionId: () => session_id,
+          getSessionFile: () => sessionFile,
+          getHeader: () => ({ id: session_id, cwd: root }),
+        },
+        ui: { notify() {} },
+      });
+      const ownerFile = root + "/journal-owner.jsonl";
+      const ownerContext = makeContext("journal-origin", ownerFile);
+      const controllerA = createWorkflowSessionController({ cwd: root, context: {
+        session_id: "journal-origin",
+        caller: "host",
+        process_id: process.pid,
+        worktree: root,
+        branch: ${JSON.stringify(BRANCH)},
+        authority: "coordinator",
+      }});
+      const controllers = new Map([[ownerContext, controllerA]]);
+      const handlers = new Map();
+      const commands = new Map();
+      const tools = new Map();
+      const on = (name, handler) => {
+        const list = handlers.get(name) ?? [];
+        list.push(handler);
+        handlers.set(name, list);
+      };
+      const pi = {
+        zod: { z },
+        events: { on },
+        on,
+        setLabel() {},
+        registerTool(tool) { tools.set(tool.name, tool); },
+        registerCommand(name, command) { commands.set(name, command); },
+        sendUserMessage() {},
+      };
+      const registration = {
+        cwd: root,
+        resolveCwd: () => root,
+        observability: false,
+        getSessionController: (ctx) => controllers.get(ctx),
+      };
+      registerTeamWorkflow(pi, registration);
+      registerWorkflowTools(pi, registration);
+      registerWorkflowCommands(pi, registration);
+      const originalReleaseA = readRunControl(root).cto_releases[runId];
+      const reacquired = acquireCtoIngress({
+        cwd: root,
+        branch: ${JSON.stringify(BRANCH)},
+        task: "journal terminal recovery",
+        run_id: runId,
+        controller: controllerA,
+      });
+      const statePath = reacquired.statePath;
+      const controlPath = root + "/.work-state/run-control.json";
+      const beforePreState = fs.readFileSync(statePath, "utf8");
+      const beforePreControl = fs.readFileSync(controlPath, "utf8");
+      fault = "pre-marker";
+      let preFailed = false;
+      try {
+        setCtoPause(reacquired.state, "done", "journal pre-marker", root);
+      } catch {
+        preFailed = true;
+      }
+      const afterPreState = fs.readFileSync(statePath, "utf8");
+      const afterPreControl = fs.readFileSync(controlPath, "utf8");
+      const preCredentials = ctoClaimCredentials(controllerA);
+      const preBindingRetained = preCredentials !== undefined
+        && preCredentials.run_id === runId
+        && preCredentials.token === reacquired.claim.claim.token
+        && preCredentials.ownership_epoch === reacquired.claim.claim.ownership_epoch;
+      recoverLifecycleTransactions(root);
+      const afterRollbackState = fs.readFileSync(statePath, "utf8");
+      const afterRollbackControl = fs.readFileSync(controlPath, "utf8");
+      const preBindingVerified = controllerA.activeCtoClaim()?.run_id === runId;
+
+      fault = "post-state";
+      let postFailed = false;
+      try {
+        setCtoPause(reacquired.state, "done", "journal committed", root);
+      } catch {
+        postFailed = true;
+      }
+      const committedState = fs.readFileSync(statePath, "utf8");
+      const committedControl = fs.readFileSync(controlPath, "utf8");
+      recoverLifecycleTransactions(root);
+      const recoveredRelease = readRunControl(root).cto_releases[runId];
+      const originalIssuanceRetained = originalReleaseA !== undefined
+        && recoveredRelease !== undefined
+        && recoveredRelease.schema === originalReleaseA.schema
+        && recoveredRelease.run_id === originalReleaseA.run_id
+        && recoveredRelease.branch === originalReleaseA.branch
+        && recoveredRelease.ownership_epoch === originalReleaseA.ownership_epoch
+        && recoveredRelease.coordinator_session_id === originalReleaseA.coordinator_session_id
+        && (recoveredRelease.coordinator_process_id ?? undefined) === (originalReleaseA.coordinator_process_id ?? undefined)
+        && recoveredRelease.worker_ids.length === originalReleaseA.worker_ids.length
+        && recoveredRelease.worker_ids.every((workerId, index) => workerId === originalReleaseA.worker_ids[index])
+        && recoveredRelease.issuance_token === originalReleaseA.issuance_token
+        && recoveredRelease.released_at === originalReleaseA.released_at
+        && recoveredRelease.reason === originalReleaseA.reason
+        && recoveredRelease.release_receipt === originalReleaseA.release_receipt
+        && recoveredRelease.snapshot_hash === originalReleaseA.snapshot_hash;
+      const recoveredControl = fs.readFileSync(controlPath, "utf8");
+      const nextCommand = commands.get("cto");
+      if (!nextCommand) throw new Error("registered /cto command is missing");
+      await nextCommand.handler("journal next ingress", ownerContext);
+      const nextRunId = readRunControl(root).execution_claim?.run_id;
+      const nextBinding = nextRunId === undefined ? undefined : controllerA.activeCtoClaim()?.run_id;
+
+      const controllerCFile = root + "/journal-c.jsonl";
+      const controllerCContext = makeContext("journal-c", controllerCFile);
+      const controllerC = createWorkflowSessionController({ cwd: root, context: {
+        session_id: "journal-c",
+        caller: "host",
+        process_id: process.pid,
+        worktree: root,
+        branch: ${JSON.stringify(BRANCH)},
+        authority: "coordinator",
+      }});
+      controllers.set(controllerCContext, controllerC);
+      suspendCtoSession(controllerA, "session-replacement");
+      const ingressC = acquireCtoIngress({
+        cwd: root,
+        branch: ${JSON.stringify(BRANCH)},
+        task: "foreign B replacement",
+        controller: controllerC,
+      });
+      fault = "post-state";
+      try {
+        setCtoPause(ingressC.state, "done", "late A cleanup", root);
+      } catch {}
+      recoverLifecycleTransactions(root);
+      const controllerBFile = root + "/journal-b.jsonl";
+      const controllerBContext = makeContext("journal-b", controllerBFile);
+      const controllerB = createWorkflowSessionController({ cwd: root, context: {
+        session_id: "journal-b",
+        caller: "host",
+        process_id: process.pid,
+        worktree: root,
+        branch: ${JSON.stringify(BRANCH)},
+        authority: "coordinator",
+      }});
+      controllers.set(controllerBContext, controllerB);
+      const ingressB = acquireCtoIngress({
+        cwd: root,
+        branch: ${JSON.stringify(BRANCH)},
+        task: "foreign B current",
+        controller: controllerB,
+      });
+      const foreignStateBefore = fs.readFileSync(ingressB.statePath, "utf8");
+      const foreignControlBefore = fs.readFileSync(controlPath, "utf8");
+      const foreignBindingBefore = controllerB.activeCtoClaim()?.run_id === ingressB.run_id;
+      let lateCleanupRejected = false;
+      try {
+        readCtoStateForModel(controllerC, root, ingressC.run_id);
+      } catch {
+        lateCleanupRejected = true;
+      }
+      const foreignStateAfter = fs.readFileSync(ingressB.statePath, "utf8");
+      const foreignControlAfter = fs.readFileSync(controlPath, "utf8");
+      const foreignBindingAfter = controllerB.activeCtoClaim()?.run_id === ingressB.run_id;
+      const cCredentials = ctoClaimCredentials(controllerC);
+      const cBindingRetained = cCredentials !== undefined
+        && cCredentials.run_id === ingressC.run_id
+        && cCredentials.token === ingressC.claim.claim.token
+        && cCredentials.ownership_epoch === ingressC.claim.claim.ownership_epoch;
+      console.log("JOURNAL_RESULT " + JSON.stringify({
+        preInjected: injected.includes("pre-marker"),
+        preFailed,
+        preBindingRetained,
+        preBindingVerified,
+        preStateUnchanged: beforePreState === afterPreState && beforePreState === afterRollbackState,
+        preControlUnchanged: beforePreControl === afterPreControl && beforePreControl === afterRollbackControl,
+        postInjected: injected.includes("post-state"),
+        postFailed,
+        committedStateChanged: committedState !== beforePreState,
+        committedControlChanged: committedControl !== beforePreControl,
+        recoveredControlChanged: recoveredControl !== beforePreControl,
+        originalIssuanceRetained,
+        nextRunId,
+        nextBinding,
+        foreignRunId: ingressB.run_id,
+        foreignStatePreserved: foreignStateBefore === foreignStateAfter,
+        foreignControlPreserved: foreignControlBefore === foreignControlAfter,
+        foreignBindingBefore,
+        foreignBindingAfter,
+        lateCleanupRejected,
+        cBindingRetained,
+      }));
+      suspendCtoSession(controllerB, "session-shutdown");
+    `, [root, ingress.run_id]);
+    assert.equal(child.code, 0, child.output);
+    const resultLine = child.output.split("\n").find((line) => line.startsWith("JOURNAL_RESULT "));
+    assert.ok(resultLine, child.output);
+    const result = JSON.parse(resultLine!.slice("JOURNAL_RESULT ".length)) as Record<string, unknown>;
+    assert.equal(result.preInjected, true, child.output);
+    assert.equal(result.preFailed, true, child.output);
+    assert.equal(result.preBindingRetained, true, child.output);
+    assert.equal(result.preBindingVerified, true, child.output);
+    assert.equal(result.preStateUnchanged, true, child.output);
+    assert.equal(result.preControlUnchanged, true, child.output);
+    assert.equal(result.postInjected, true, child.output);
+    assert.equal(result.postFailed, true, child.output);
+    assert.equal(result.committedStateChanged, true, child.output);
+    assert.equal(result.committedControlChanged, false, child.output);
+    assert.equal(result.recoveredControlChanged, true, child.output);
+    assert.equal(result.originalIssuanceRetained, true, child.output);
+    assert.match(String(result.nextRunId), /^journal-next-ingress-/);
+    assert.equal(result.nextBinding, result.nextRunId, child.output);
+    assert.equal(result.foreignStatePreserved, true, child.output);
+    assert.equal(result.foreignControlPreserved, true, child.output);
+    assert.equal(result.foreignBindingBefore, true, child.output);
+    assert.equal(result.foreignBindingAfter, true, child.output);
+    assert.equal(result.lateCleanupRejected, true, child.output);
+    assert.equal(result.cBindingRetained, true, child.output);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 // Host10: terminal ownership is detached while historical state remains readable.
 test("process acceptance: releasing a terminal controller clears selected enforcement", () => {
   const root = scratch("rl-host-terminal-detach");
@@ -312,6 +822,58 @@ test("process acceptance: invalid canonical state blocks claim release and prese
     );
     assert.deepEqual(readRunControl(root).execution_claim, claim);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+// A legacy claim attachment must reject a malformed canonical CTO image before
+// it can acquire a new claim, while preserving both persisted images.
+test("process acceptance: malformed legacy CTO publication fails closed under the workspace lock", () => {
+  const root = scratch("rl-malformed-cto-publication");
+  try {
+    const runId = "malformed-cto-publication";
+    const sessionId = "legacy-cto-owner";
+    const execution = context(root, sessionId);
+    const planCreatedAt = "2026-09-24T00:00:00.000Z";
+    const state = newCtoState({
+      id: runId,
+      task: "legacy CTO publication",
+      branch: BRANCH,
+      autonomous: false,
+      owner_session: sessionId,
+      plan: { id: runId, task: "legacy CTO publication", teams: [], created_at: planCreatedAt },
+    });
+    writeCtoState(state, root);
+    const statePath = join(root, ".work-state", "cto", runId, "state.json");
+    const malformed = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+    (malformed.plan as Record<string, unknown>).created_at = "";
+    const malformedBytes = `${JSON.stringify(malformed, null, 2)}\n`;
+    writeFileSync(statePath, malformedBytes);
+    assert.equal(malformed.schema, 2);
+    assert.equal(malformed.id, runId);
+    assert.equal(malformed.task, state.task);
+    assert.equal(malformed.branch, BRANCH);
+
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeControl = existsSync(controlPath) ? readFileSync(controlPath, "utf8") : null;
+    assert.throws(
+      () => publishCtoClaim(root, {
+        run_id: runId,
+        branch: BRANCH,
+        context: execution,
+        state_snapshot: { branch: BRANCH, terminal: false, owner_session: sessionId },
+        legacy_owner_session_id: sessionId,
+      }),
+      (error: unknown) => {
+        const value = record(error);
+        assert.equal(value.code, "recovery_required");
+        assert.match(String(value.message), /plan\.created_at/);
+        return true;
+      },
+    );
+    assert.equal(readFileSync(statePath, "utf8"), malformedBytes);
+    assert.equal(existsSync(controlPath), beforeControl !== null);
+    if (beforeControl !== null) assert.equal(readFileSync(controlPath, "utf8"), beforeControl);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 // A child killed during artifact snapshot must leave the prior claim, selection, and state intact.
 test("process acceptance: interrupted rework snapshot preserves prior ownership", async () => {
@@ -667,6 +1229,7 @@ test("workflow tools ignore a foreign session_stop without dropping the trusted 
     const claimBefore = readRunControl(root).execution_claim;
     await bus.emit("session_start", {}, { cwd: root, mode: "print", hasUI: false, session_id: "foreign-worker-session" });
     await bus.emit("session_stop", { session_id: "foreign-worker-session" }, { cwd: root, mode: "print", hasUI: false, session_id: "foreign-worker-session" });
+    await bus.emit("session_start", {}, { cwd: root, mode: "print", hasUI: false, session_id: owner.session_id });
     const status = await bus.tools.get("workflow_status")!.execute("foreign-stop-status", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
     const statusValue = record(status.details);
     assert.equal(statusValue.ok, true, JSON.stringify(statusValue));
@@ -674,13 +1237,131 @@ test("workflow tools ignore a foreign session_stop without dropping the trusted 
     const replay = await prepare.execute("session-stop-prepare", params, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
     assert.equal(record(replay.details).ok, true, JSON.stringify(replay.details));
     assert.deepEqual(readRunControl(root).execution_claim, claimBefore);
-    await bus.emit("session_stop", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
-    assert.equal(readRunControl(root).execution_claim, null, "idle stop releases coordinator claim");
+    await bus.emit("session_stop", { session_id: owner.session_id }, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.notEqual(readRunControl(root).execution_claim, null, "idle stop retains the coordinator claim");
     const afterStop = await bus.tools.get("workflow_status")!.execute("same-session-after-stop", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
     assert.equal(record(afterStop.details).ok, true, "retained host session keeps read access after idle stop");
-    await bus.emit("session_shutdown", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
+    await bus.emit("session_shutdown", { type: "session_shutdown" }, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    assert.equal(readRunControl(root).execution_claim, null, "verified owner shutdown releases coordinator claim");
     const afterShutdown = await bus.tools.get("workflow_status")!.execute("same-session-after-shutdown", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
     assert.equal(record(afterShutdown.details).code, "WORKFLOW_CONTEXT_REJECTED", "shutdown clears only the exact host identity");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workflow tools release only the captured manager/session-file owner on session_switch", async () => {
+  const root = scratch("rl-session-switch-proof");
+  try {
+    initGit(root); publishMapping(root);
+    let sessionId = "switch-old";
+    let sessionFile = join(root, "old-session.jsonl");
+    const manager = {
+      getCwd: () => root,
+      getSessionId: () => sessionId,
+      getSessionFile: () => sessionFile,
+    };
+    const foreignManager = {
+      getCwd: () => root,
+      getSessionId: () => "foreign-switch",
+      getSessionFile: () => join(root, "foreign-session.jsonl"),
+    };
+    const oldContext = context(root, sessionId);
+    const oldController = createWorkflowSessionController({ cwd: root, context: oldContext });
+    const newController = createWorkflowSessionController({ cwd: root, context: { ...oldContext, session_id: "switch-new" } });
+    const bus = fakePi();
+    const managerFor = (value: unknown): unknown => (
+      value && typeof value === "object" && !Array.isArray(value) && "sessionManager" in value
+        ? value.sessionManager
+        : undefined
+    );
+    registerWorkflowTools(bus.pi as never, {
+      cwd: root,
+      getSessionController: (ctx) => (managerFor(ctx) === manager ? oldController : newController),
+    });
+    const hostContext = { sessionManager: manager, mode: "tui", hasUI: true };
+    await bus.emit("session_start", {}, hostContext);
+    oldController.prepare({ mode: "new", task: "switch-owned", classification: CLASSIFICATION });
+    const claimBefore = readRunControl(root).execution_claim;
+    assert.ok(claimBefore);
+    sessionId = "switch-new";
+    sessionFile = join(root, "new-session.jsonl");
+    await bus.emit(
+      "session_switch",
+      { type: "session_switch", reason: "resume", previousSessionFile: join(root, "wrong-session.jsonl") },
+      hostContext,
+    );
+    assert.deepEqual(readRunControl(root).execution_claim, claimBefore, "mismatched previous session file cannot release the old claim");
+    await bus.emit(
+      "session_switch",
+      { type: "session_switch", reason: "resume", previousSessionFile: join(root, "old-session.jsonl") },
+      hostContext,
+    );
+    assert.equal(readRunControl(root).execution_claim, null, "the authenticated same-manager switch releases the old owner");
+    // A different manager in the same cwd is never a release authority.
+    const secondController = createWorkflowSessionController({ cwd: root, context: context(root, "foreign-owner") });
+    secondController.prepare({ mode: "new", task: "foreign-switch-owned", classification: CLASSIFICATION });
+    const foreignClaim = readRunControl(root).execution_claim;
+    assert.ok(foreignClaim);
+    await bus.emit(
+      "session_switch",
+      { type: "session_switch", reason: "new", previousSessionFile: join(root, "new-session.jsonl") },
+      { sessionManager: foreignManager, mode: "tui", hasUI: true },
+    );
+    assert.deepEqual(readRunControl(root).execution_claim, foreignClaim, "foreign manager cannot release the current owner");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workflow tools do not adopt a replacement after a stale CTO switch proof", async () => {
+  const root = scratch("rl-stale-cto-switch-proof");
+  try {
+    initGit(root); publishMapping(root);
+    let sessionId = "stale-cto-old";
+    let sessionFile = join(root, "stale-cto-old.jsonl");
+    const manager = {
+      getCwd: () => root,
+      getSessionId: () => sessionId,
+      getSessionFile: () => sessionFile,
+    };
+    const oldContext = context(root, "stale-cto-old");
+    const oldController = createWorkflowSessionController({ cwd: root, context: oldContext });
+    const newController = createWorkflowSessionController({ cwd: root, context: context(root, "stale-cto-new") });
+    let resolverCalls = 0;
+    const bus = fakePi();
+    registerWorkflowTools(bus.pi as never, {
+      cwd: root,
+      getSessionController: () => {
+        resolverCalls += 1;
+        return sessionId === "stale-cto-old" ? oldController : newController;
+      },
+    });
+    const hostContext = { sessionManager: manager, mode: "tui", hasUI: true };
+    await bus.emit("session_start", {}, hostContext);
+    const ingress = acquireCtoIngress({
+      cwd: root,
+      branch: BRANCH,
+      task: "stale CTO switch",
+      controller: oldController,
+    });
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeControl = readFileSync(controlPath, "utf8");
+    const control = readRunControl(root);
+    assert.ok(control.execution_claim);
+    writeFileSync(controlPath, JSON.stringify({
+      ...control,
+      execution_claim: { ...control.execution_claim, token: "stale-switch-token" },
+    }) + "\n");
+    const staleControl = readFileSync(controlPath, "utf8");
+    assert.notEqual(staleControl, beforeControl);
+
+    sessionId = "stale-cto-new";
+    sessionFile = join(root, "stale-cto-new.jsonl");
+    await bus.emit(
+      "session_switch",
+      { type: "session_switch", reason: "resume", previousSessionFile: join(root, "stale-cto-old.jsonl") },
+      hostContext,
+    );
+    assert.equal(resolverCalls, 1, "stale proof returns before resolving or adopting the replacement controller");
+    assert.equal(readFileSync(controlPath, "utf8"), staleControl, "stale switch does not release or rewrite the old CTO claim");
+    assert.equal(ingress.run_id, readRunControl(root).execution_claim?.run_id);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -730,25 +1411,26 @@ test("workflow shutdown revokes local authority even when canonical release is u
     const controller = createWorkflowSessionController({ cwd: root, context: owner });
     const bus = fakePi();
     registerWorkflowTools(bus.pi as never, { cwd: root, getSessionController: () => controller });
-    await bus.emit("session_start", {}, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const hostContext = { cwd: root, mode: "tui" as const, hasUI: true, session_id: owner.session_id };
+    await bus.emit("session_start", {}, hostContext);
     const prepared = controller.prepare({ mode: "new", task: "shutdown release failure", classification: CLASSIFICATION });
     const claimBefore = readRunControl(root).execution_claim;
     assert.ok(claimBefore);
     const controlPath = join(root, ".work-state", "run-control.json");
     writeFileSync(join(root, ".work-state", "runs", prepared.state.run_id!, "state.json"), "{}\n");
-    await bus.emit("session_stop", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
+    await bus.emit("session_stop", { session_id: owner.session_id }, hostContext);
     assert.deepEqual(
       record(JSON.parse(readFileSync(controlPath, "utf8"))).execution_claim,
       claimBefore,
       "failed idle release preserves canonical ownership",
     );
-    await bus.emit("session_shutdown", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
+    await bus.emit("session_shutdown", { type: "session_shutdown" }, hostContext);
     assert.deepEqual(
       record(JSON.parse(readFileSync(controlPath, "utf8"))).execution_claim,
       claimBefore,
       "failed shutdown release preserves canonical ownership",
     );
-    const afterShutdown = await bus.tools.get("workflow_status")!.execute("release-failure-after-shutdown", {}, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const afterShutdown = await bus.tools.get("workflow_status")!.execute("release-failure-after-shutdown", {}, undefined, undefined, hostContext);
     assert.equal(record(afterShutdown.details).code, "WORKFLOW_CONTEXT_REJECTED");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -1661,14 +2343,31 @@ test("process acceptance: interrupted legacy-root archive repairs state docs", a
     rmSync(root, { recursive: true, force: true });
   }
 });
-// CTO IDs are a separate claim namespace and can be released normally.
+// CTO IDs are a separate claim namespace and can be released through the
+// authenticated registered ingress.
 test("process acceptance: CTO slug claim release does not enter ordinary UUID validation", () => {
   const root = scratch("rl-cto-claim");
   try {
-    const runId = "run-lifecycle-01a0bacd";
-    const claim = acquireExecutionClaim(root, { run_id: runId, owner_kind: "cto", context: context(root, "cto") });
-    releaseExecutionClaim(root, { run_id: runId, token: claim.claim.token, receipt: "cto-terminal" });
+    const firstController = createWorkflowSessionController({ cwd: root, context: context(root, "cto-first") });
+    const first = acquireCtoIngress({
+      cwd: root,
+      branch: BRANCH,
+      task: "managed CTO release",
+      controller: firstController,
+    });
+    suspendCtoSession(firstController, "session-shutdown");
+    const resumedController = createWorkflowSessionController({ cwd: root, context: context(root, "cto-resumed") });
+    const resumed = acquireCtoIngress({
+      cwd: root,
+      branch: BRANCH,
+      task: "managed CTO resume",
+      run_id: first.run_id,
+      controller: resumedController,
+    });
+    assert.equal(resumed.run_id, first.run_id);
+    suspendCtoSession(resumedController, "session-shutdown");
     assert.equal(readRunControl(root).execution_claim, null);
+    assert.equal(readRunControl(root).cto_releases[first.run_id]?.run_id, first.run_id);
     assert.equal(workflowOwnerFor(root, "workflow_tools"), undefined);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

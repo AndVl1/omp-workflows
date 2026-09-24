@@ -229,7 +229,7 @@ test("cto-class: standby is engine-created — no classification, top-level auto
     const standby = newCtoState({
       id: "standby-1",
       task: "standby — awaiting inbox tasks",
-      branch: "",
+      branch: "main",
       autonomous: true,
       standby: true,
       plan: { id: "standby-1", task: "standby — awaiting inbox tasks", teams: [], created_at: now },

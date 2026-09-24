@@ -1410,6 +1410,16 @@ test("raw tool_call authenticated no-run host admission requires an empty canoni
     for (const [toolName, input] of ordinaryCalls) {
       assert.equal(invoke(toolName, input), undefined, `${toolName} should pass with canonical execution_claim null`);
     }
+    const canonicalCalls: Array<[string, Record<string, unknown>]> = [
+      ["write", { path: ".work-state/cto/managed/state.json", content: "direct" }],
+      ["edit", { path: ".work-state/cto/managed/state.json", oldText: "direct", newText: "bypass" }],
+      ["bash", { command: "printf '{}' > .work-state/cto/managed/state.json" }],
+    ];
+    for (const [toolName, input] of canonicalCalls) {
+      const blocked = invoke(toolName, input);
+      assert.equal(blocked?.block, true, `${toolName} must deny canonical CTO state without a claim`);
+      assert.match(blocked?.reason ?? "", /canonical workflow state/);
+    }
 
     const persistedClaims: Array<[string, Record<string, unknown>]> = [
       ["active", {

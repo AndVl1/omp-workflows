@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sessionReportFactory, { parseSessionReportArgs, sessionReportTargetPath } from "../commands/session-report/index.js";
-import type { SessionReport } from "@andvl1/omp-workflows-core";
+import { newCtoState, writeCtoState, type SessionReport, type TeamPlan } from "@andvl1/omp-workflows-core";
 
 const RUN_A = "11111111-1111-4111-8111-111111111111";
 const RUN_B = "22222222-2222-4222-8222-222222222222";
@@ -85,26 +85,32 @@ function writeLegacyFeature(root: string, slug: string): void {
 }
 
 function writeCtoFixture(root: string, runId: string): void {
-  writeJson(join(root, `.work-state/cto/${runId}/state.json`), {
-    schema: 2,
+  const task = "Decompose the payments migration";
+  const plan: TeamPlan = {
     id: runId,
-    task: "Decompose the payments migration",
+    task,
+    created_at: "2026-08-08T10:00:00.000Z",
+    teams: [
+      { team: "backend", scope: ["**/*.kt"], slice: "API", profile: "full-feature", worktree: "same_branch", depends_on: [] },
+      { team: "web", scope: ["**/*.tsx"], slice: "Frontend", profile: "standard", worktree: "same_branch", depends_on: ["backend"] },
+    ],
+  };
+  const state = newCtoState({
+    id: runId,
+    task,
     branch: "feat/payments",
     autonomous: false,
-    plan: {
-      teams: [
-        { team: "backend", scope: ["**/*.kt"], slice: "API", profile: "full-feature", worktree: "same_branch", depends_on: [] },
-        { team: "web", scope: ["**/*.tsx"], slice: "Frontend", profile: "standard", worktree: "same_branch", depends_on: ["backend"] },
-      ],
-    },
-    teams: [
-      { id: "backend", status: "done", escalations: {}, dod_path: `.work-state/cto/${runId}/teams/backend/dod.json` },
-      { id: "web", status: "parked", escalations: { "esc-1": { id: "esc-1" } } },
-    ],
-    integration: { status: "in_progress", note: "waiting for web" },
-    pause: { kind: "background_wait", reason: "escalation pending" },
-    updated_at: "2026-08-08T11:00:00.000Z",
+    plan,
   });
+  state.teams[0]!.status = "done";
+  state.teams[0]!.dod_path = `.work-state/cto/${runId}/teams/backend/dod.json`;
+  state.teams[1]!.status = "parked";
+  state.teams[1]!.escalations = {
+    "esc-1": { status: "pending", sent_at: "2026-08-08T11:00:00.000Z" },
+  };
+  state.integration = { status: "in_progress", note: "waiting for web" };
+  state.pause = { kind: "background_wait", reason: "escalation pending" };
+  writeCtoState(state, root);
 }
 
 test("command: parses explicit canonical run/revision and exact CTO arguments", () => {

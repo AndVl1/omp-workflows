@@ -9,13 +9,9 @@
  * Handles:
  *   1. Escalation answers (reply / inline button) -> answers/<escId>.json
  *      (delegated to TelegramEscalationAdapter.pollOnce).
- *   2. Plain messages:
- *      - active CTO run -> filed to <cwd>/.omp/inbox/ (the live session's
- *        dispatcher picks it up in <=10s; no reply — the session owns it);
- *      - finished run with summary.json -> replies with the run status
- *        (no LLM) AND files the message as a standby task;
- *      - nothing -> creates a standby run, files the task, replies that it
- *        was saved.
+ *   2. Plain messages -> durable local-drop tasks in
+ *      <cwd>/.omp/inbox/. A live dispatcher delivers them only after an
+ *      exact controller claim; this daemon does not select or create runs.
  *
  * Start:
  *   node packages/fullstack/bin/tg-bridge.mjs --cwd /path/to/project
@@ -25,7 +21,6 @@
  * Requires <cwd>/.omp/escalation.json with adapter: telegram.
  */
 
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   loadEscalationConfig,
@@ -56,6 +51,14 @@ writeBridgeLock(cwd);
 
 const { token, chatId } = config.telegram;
 const adapter = createEscalationAdapter(config, cwd);
+
+if (typeof adapter.setAnswerMarkerHandler !== "function") {
+  throw new Error("tg-bridge: telegram adapter does not expose the durable answer-marker boundary");
+}
+adapter.setAnswerMarkerHandler((answer) => {
+  const marker = writeAnswerMarker(cwd, answer);
+  console.log(`tg-bridge: answer ${answer.id} -> answers/ + marker ${marker ?? "(dup)"}`);
+});
 const replied = new Set(); // message ids we already answered (dedupe)
 
 adapter.setPlainMessageHandler((msg) => {
@@ -91,13 +94,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function pollLoop() {
   while (!stopped) {
     try {
-      // Answers are written to answers/ by the adapter; forward each as a
-      // marker so a live session wakes [CTO-ANSWER] without polling telegram.
+      // TelegramEscalationAdapter invokes the marker handler before it
+      // advances its offset. A marker failure therefore rejects this poll
+      // round and leaves the update available for retry.
       const answers = await adapter.pollOnce();
       for (const answer of answers) {
-        if (!answer?.id) continue;
-        const marker = writeAnswerMarker(cwd, answer);
-        console.log(`tg-bridge: answer ${answer.id} -> answers/ + marker ${marker ?? "(dup)"}`);
+        if (answer?.id) console.log(`tg-bridge: answer ${answer.id} confirmed by durable marker boundary`);
       }
     } catch (error) {
       console.error("tg-bridge: poll error", error instanceof Error ? error.message : error);

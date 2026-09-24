@@ -21,9 +21,9 @@
  * never blocks ask.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { findActiveCtoRun, hasRwPrimary } from "@andvl1/omp-workflows-core";
+import { hasRwPrimary, type CtoClaimScope } from "@andvl1/omp-workflows-core";
 
 export type ChannelMode = "telegram" | "http" | null;
 
@@ -53,12 +53,17 @@ export function clearChannelCache(): void {
 
 export { isBidirectionalChannel } from "./adapters/registry.js";
 
+export type AskRedirectClaimResolver = (ctx: unknown, cwd: string) => CtoClaimScope | undefined;
+
 /**
- * `tool_call` hook: block the `ask` tool only for the CTO run owned by the
- * originating host session. A missing session identity is intentionally
- * fail-open: a global "latest active run" is never a valid routing source.
+ * `tool_call` hook: block the `ask` tool only when the bundle supplies the
+ * exact current CTO claim for the originating host session. A resolver is
+ * required so this module cannot infer authority from a latest active run,
+ * raw model fields, or persisted `owner_session` data.
  */
-export function createAskRedirectGate(): (
+export function createAskRedirectGate(
+  resolveClaim?: AskRedirectClaimResolver,
+): (
   event: { toolName?: string },
   ctx: { cwd: string; session_id?: string; sessionId?: string },
 ) => { block: boolean; reason: string } | undefined {
@@ -66,17 +71,16 @@ export function createAskRedirectGate(): (
     try {
       if (event?.toolName !== "ask") return undefined;
       if (!hasRwPrimary(ctx.cwd)) return undefined;
-      const sessionId = ctx.session_id ?? ctx.sessionId;
-      if (!sessionId) return undefined;
-      const active = findActiveCtoRun(ctx.cwd, { sessionId });
-      if (!active || active.state.owner_session !== sessionId) return undefined;
+      const claim = resolveClaim?.(ctx, ctx.cwd);
+      if (!claim) return undefined;
       return {
         block: true,
         reason:
           "messenger-mode: a bidirectional messenger channel is active in this owned CTO run. Do NOT use ask — " +
-          `write the question as an escalation to \`.work-state/cto/${active.runId}/outbox/<escId>.json\` ` +
+          `write the question as an escalation to \`.work-state/cto/${claim.run_id}/outbox/<escId>.json\` ` +
           "(level question/decision, timeoutMs + default); the answer will land in " +
-          `\`.work-state/cto/${active.runId}/answers/<escId>.json\` and you pick it up at the next checkpoint.`,
+          `\`.work-state/cto/${claim.run_id}/answers/<escId>.json\`. Use the real \`read\` tool on that exact file at reconciliation; ` +
+          "only a dispatcher-recorded pre-send rejection is automatically retryable, while ambiguous delivery keeps the original files for explicit reconciliation.",
       };
     } catch {
       return undefined;

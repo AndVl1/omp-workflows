@@ -12,6 +12,7 @@ import {
   type CanonicalRunTarget,
   type StatePublication,
 } from "./state.js";
+import { parseCtoState } from "../cto/state.js";
 import { beginLifecycleTransaction, commitLifecycleTransaction, type LifecycleFileContent } from "./lifecycle-journal.js";
 import { LifecycleError, lifecyclePayloadHash, selectRunCandidate } from "./run-lifecycle.js";
 import type { RunSelectionInput, RunSelectionResult } from "./run-lifecycle.js";
@@ -27,6 +28,7 @@ import type {
   TeamState,
   TrustedExecutionContext,
   WorktreeExecutionClaim,
+  CtoReleaseProvenance,
 } from "./types.js";
 
 const WORK_STATE = ".work-state";
@@ -37,12 +39,11 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 
 type RunControlMutation<T> = (control: RunControl) => { commit: true; value: T; control?: RunControl } | { commit: false; value: T; control?: RunControl };
 
-function controlPath(cwd: string): string {
+export function controlPath(cwd: string): string {
   return join(resolve(cwd, WORK_STATE), CONTROL_FILE);
 }
-
 function defaultControl(): RunControl {
-  return { schema: 2, revision: 0, runs: {}, selections: {}, execution_claim: null, prepare_receipts: {}, selection_snapshots: {} };
+  return { schema: 2, revision: 0, runs: {}, selections: {}, execution_claim: null, cto_releases: {}, prepare_receipts: {}, selection_snapshots: {} };
 }
 
 function validRunId(runId: string): boolean {
@@ -113,6 +114,203 @@ function assertReceiptBinding(cwd: string, control: RunControl, requestId: strin
   }
 }
 
+function ctoReleaseReceiptShape(value: string): boolean {
+  return /^omp-cto-(session-shutdown|session-replacement|terminal)-[a-f0-9]{64}$/i.test(value);
+}
+
+function isCtoReleaseProvenance(value: unknown, runId?: string): value is CtoReleaseProvenance {
+  if (!isRecord(value) || value.schema !== 2) return false;
+  if (typeof value.run_id !== "string" || !value.run_id || (runId !== undefined && value.run_id !== runId)) return false;
+  if (typeof value.branch !== "string" || !value.branch
+    || typeof value.ownership_epoch !== "string" || !value.ownership_epoch
+    || typeof value.coordinator_session_id !== "string" || !value.coordinator_session_id
+    || !Array.isArray(value.worker_ids) || value.worker_ids.some((workerId) => typeof workerId !== "string" || !workerId)
+    || !Array.isArray(value.pending_worker_ids) || value.pending_worker_ids.some((workerId) => typeof workerId !== "string" || !workerId)
+    || !Number.isInteger(value.ledger_revision) || (value.ledger_revision as number) < 0
+    || typeof value.issuance_token !== "string" || !value.issuance_token
+    || typeof value.released_at !== "string" || !value.released_at
+    || !["session-shutdown", "session-replacement", "terminal"].includes(String(value.reason))
+    || typeof value.release_receipt !== "string" || !ctoReleaseReceiptShape(value.release_receipt)
+    || !/^[a-f0-9]{64}$/i.test(String(value.snapshot_hash))
+    || !/^[a-f0-9]{64}$/i.test(String(value.current_snapshot_hash))) return false;
+  if (value.coordinator_process_id !== undefined
+    && (!Number.isInteger(value.coordinator_process_id) || (value.coordinator_process_id as number) <= 0)) return false;
+  return true;
+}
+
+function assertCtoReleaseProvenanceMap(value: unknown): asserts value is Record<string, CtoReleaseProvenance> {
+  if (!isRecord(value)) throw new LifecycleError("recovery_required", "run-control cto_releases is malformed", { next_action: "repair or recover the lifecycle control plane before mutating" });
+  for (const [runId, receipt] of Object.entries(value)) {
+    if (!/^[A-Za-z0-9._-]+$/.test(runId) || !isCtoReleaseProvenance(receipt, runId)) {
+      throw new LifecycleError("recovery_required", `run-control CTO release provenance for '${runId}' is invalid`, { run_id: runId, next_action: "repair or recover the lifecycle control plane before mutating" });
+    }
+  }
+}
+function ctoStateImage(cwd: string, runId: string): { raw: string; value: Record<string, unknown> } | null {
+  const path = join(resolve(cwd), WORK_STATE, "cto", runId, "state.json");
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return isRecord(parsed) ? { raw, value: parsed } : null;
+  } catch {
+    return null;
+  }
+}
+
+function ctoStateIsTerminal(value: Record<string, unknown>): boolean {
+  const pause = isRecord(value.pause) ? value.pause.kind : undefined;
+  if (pause === "done" || pause === "failed") return true;
+  if (value.standby === true) return false;
+  if (isRecord(value.integration) && value.integration.status === "done" && Array.isArray(value.teams)) {
+    return value.teams.every((team) => isRecord(team) && (team.status === "done" || team.status === "failed"));
+  }
+  return false;
+}
+
+function ctoReleaseReceiptForClaim(claim: WorktreeExecutionClaim, provenance: CtoReleaseProvenance): string {
+  const binding = [
+    provenance.issuance_token,
+    provenance.reason,
+    provenance.run_id,
+    provenance.branch,
+    provenance.ownership_epoch,
+    provenance.coordinator_session_id,
+    provenance.coordinator_process_id ?? "",
+    provenance.worker_ids.join("\u0000"),
+    provenance.snapshot_hash,
+  ].join("\u0001");
+  return `omp-cto-${provenance.reason}-${createHash("sha256").update(binding).digest("hex")}`;
+}
+
+function sameWorkerIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((workerId, index) => workerId === right[index]);
+}
+
+function managedCtoReleaseIssues(
+  cwd: string,
+  claim: WorktreeExecutionClaim,
+  provenance: unknown,
+  options: { requireSnapshotCas: boolean; allowStateChanges: boolean; requireReleasedClaim?: boolean },
+): string[] {
+  const issues: string[] = [];
+  if (!isCtoReleaseProvenance(provenance, claim.run_id)) return ["managed CTO release provenance is malformed"];
+  const record = provenance;
+  const image = ctoStateImage(cwd, claim.run_id);
+  if (!image) return ["managed CTO release state is unreadable"];
+  const value = image.value;
+  if (value.schema !== 2 || value.id !== claim.run_id || typeof value.branch !== "string" || !value.branch) {
+    issues.push("managed CTO release state identity is invalid");
+  } else if (record.branch !== value.branch) {
+    issues.push("managed CTO release branch does not match the current CTO state");
+  }
+  if (claim.token !== record.issuance_token) issues.push("managed CTO release token does not match its issuance proof");
+  if (record.ownership_epoch !== claim.ownership_epoch) issues.push("managed CTO release epoch does not match the released claim");
+  if (record.coordinator_session_id !== claim.coordinator_session_id) issues.push("managed CTO release session does not match the released claim");
+  if ((record.coordinator_process_id ?? undefined) !== (claim.coordinator_process_id ?? undefined)) {
+    issues.push("managed CTO release process does not match the released claim");
+  }
+  const expectedWorkers = options.requireSnapshotCas ? record.worker_ids : record.pending_worker_ids;
+  if (!sameWorkerIds(expectedWorkers, claim.worker_ids)) {
+    issues.push("managed CTO release pending reservation does not match the released claim");
+  }
+  const currentSnapshot = createHash("sha256").update(image.raw).digest("hex");
+  if (options.requireSnapshotCas && record.snapshot_hash !== currentSnapshot) {
+    issues.push("managed CTO release snapshot CAS does not match the state under lock");
+  }
+  if (record.current_snapshot_hash !== currentSnapshot) {
+    issues.push(options.allowStateChanges
+      ? "managed CTO release current state witness is stale or tampered"
+      : "managed CTO release state changed unexpectedly");
+  }
+  if (claim.release_receipt !== undefined && claim.release_receipt !== record.release_receipt) {
+    issues.push("managed CTO release receipt does not match the released claim");
+  }
+  if (options.requireReleasedClaim !== false && claim.released_at === null) issues.push("managed CTO release provenance requires a released claim");
+  if (claim.released_at && record.released_at !== claim.released_at) {
+    issues.push("managed CTO release timestamp does not match the released claim");
+  }
+  return issues;
+}
+
+function assertManagedCtoRelease(
+  cwd: string,
+  claim: WorktreeExecutionClaim,
+  provenance: unknown,
+  options: { requireSnapshotCas: boolean; allowStateChanges: boolean; requireReleasedClaim?: boolean },
+): asserts provenance is CtoReleaseProvenance {
+  const issues = managedCtoReleaseIssues(cwd, claim, provenance, options);
+  if (issues.length > 0) {
+    throw new LifecycleError("recovery_required", `managed CTO release provenance is invalid: ${issues.join("; ")}`, { run_id: claim.run_id, next_action: "reconcile the persisted CTO release before resuming" });
+  }
+  const record = provenance as CtoReleaseProvenance;
+  if (record.release_receipt !== ctoReleaseReceiptForClaim(claim, record)) {
+    throw new LifecycleError("recovery_required", "managed CTO release receipt was not issued by its exact original claim token", { run_id: claim.run_id, next_action: "reconcile the persisted CTO release before resuming" });
+  }
+}
+function assertStoredCtoRelease(cwd: string, runId: string, provenance: unknown): asserts provenance is CtoReleaseProvenance {
+  if (!isCtoReleaseProvenance(provenance, runId)) {
+    throw new LifecycleError("recovery_required", `managed CTO release for '${runId}' is malformed`, { run_id: runId, next_action: "reconcile the persisted CTO release before resuming" });
+  }
+  const image = ctoStateImage(cwd, runId);
+  if (!image || image.value.schema !== 2 || image.value.id !== runId || typeof image.value.branch !== "string" || !image.value.branch) {
+    throw new LifecycleError("recovery_required", `managed CTO release for '${runId}' has no readable canonical state`, { run_id: runId, next_action: "repair the CTO state before resuming" });
+  }
+  if (provenance.branch !== image.value.branch) {
+    throw new LifecycleError("run_context_mismatch", `managed CTO release for '${runId}' belongs to branch '${provenance.branch}'`, { run_id: runId, branch: provenance.branch });
+  }
+  const currentSnapshot = createHash("sha256").update(image.raw).digest("hex");
+  if (provenance.current_snapshot_hash !== currentSnapshot) {
+    throw new LifecycleError("recovery_required", `managed CTO release for '${runId}' has an unacknowledged state change`, { run_id: runId, next_action: "reconcile the persisted CTO release before resuming" });
+  }
+  if (provenance.release_receipt !== ctoReleaseReceiptForClaim({ token: provenance.issuance_token } as WorktreeExecutionClaim, provenance)) {
+    throw new LifecycleError("recovery_required", `managed CTO release for '${runId}' has an invalid issuance receipt`, { run_id: runId, next_action: "reconcile the persisted CTO release before resuming" });
+  }
+}
+function assertResumedCtoRelease(
+  cwd: string,
+  claim: WorktreeExecutionClaim,
+  provenance: unknown,
+): asserts provenance is CtoReleaseProvenance {
+  if (claim.owner_kind !== "cto" || !isCtoReleaseProvenance(provenance, claim.run_id)) {
+    throw new LifecycleError("recovery_required", `managed CTO release for '${claim.run_id}' is malformed`, { run_id: claim.run_id, next_action: "reconcile the managed CTO release before resuming" });
+  }
+  if (claim.release_receipt !== provenance.release_receipt) {
+    throw new LifecycleError("recovery_required", "resumed CTO claim does not carry its original release receipt", { run_id: claim.run_id, next_action: "reconcile the managed CTO release before resuming" });
+  }
+  if (!sameWorkerIds(provenance.pending_worker_ids, claim.worker_ids)) {
+    throw new LifecycleError("recovery_required", "resumed CTO claim does not match the mutable reservation ledger", { run_id: claim.run_id, next_action: "reconcile the managed CTO reservation ledger before resuming" });
+  }
+  assertStoredCtoRelease(cwd, claim.run_id, provenance);
+}
+function assertResumedCtoReleaseMatchesStored(
+  stored: CtoReleaseProvenance,
+  supplied: CtoReleaseProvenance,
+): void {
+  const matchesStoredIssuance = stored.schema === supplied.schema
+    && stored.run_id === supplied.run_id
+    && stored.branch === supplied.branch
+    && stored.ownership_epoch === supplied.ownership_epoch
+    && stored.coordinator_session_id === supplied.coordinator_session_id
+    && (stored.coordinator_process_id ?? undefined) === (supplied.coordinator_process_id ?? undefined)
+    && sameWorkerIds(stored.worker_ids, supplied.worker_ids)
+    && sameWorkerIds(stored.pending_worker_ids, supplied.pending_worker_ids)
+    && stored.ledger_revision === supplied.ledger_revision
+    && stored.issuance_token === supplied.issuance_token
+    && stored.released_at === supplied.released_at
+    && stored.reason === supplied.reason
+    && stored.release_receipt === supplied.release_receipt
+    && stored.snapshot_hash === supplied.snapshot_hash;
+  if (!matchesStoredIssuance) {
+    throw new LifecycleError("recovery_required", "resumed CTO release provenance does not match its stored issuance or reservation ledger", { run_id: stored.run_id, next_action: "reconcile the persisted managed CTO release before releasing" });
+  }
+}
+
+
 function readControlRaw(cwd: string): RunControl {
   const path = controlPath(cwd);
   if (!existsSync(path)) return defaultControl();
@@ -126,10 +324,12 @@ function readControlRaw(cwd: string): RunControl {
   const value = parsed as Partial<RunControl>;
   const revision = value.revision;
   if (value.schema !== 2 || !Number.isInteger(revision) || (revision as number) < 0
-    || !isRecord(value.runs) || !isRecord(value.selections) || !isRecord(value.prepare_receipts) || !isRecord(value.selection_snapshots)) {
+    || !isRecord(value.runs) || !isRecord(value.selections) || (value.cto_releases !== undefined && !isRecord(value.cto_releases))
+    || !isRecord(value.prepare_receipts) || !isRecord(value.selection_snapshots)) {
     throw new LifecycleError("recovery_required", "run-control.json has an unknown schema or incomplete fields", { next_action: "recover lifecycle transaction before mutating" });
   }
-  const control = { ...defaultControl(), ...value, schema: 2 } as RunControl;
+  const control = { ...defaultControl(), ...value, schema: 2, cto_releases: value.cto_releases ?? {} } as RunControl;
+  assertCtoReleaseProvenanceMap(control.cto_releases);
   for (const [requestId, receipt] of Object.entries(value.prepare_receipts)) {
     assertReceiptBinding(cwd, control, requestId, receipt);
   }
@@ -454,9 +654,28 @@ function terminalOutstandingDispatches(previous: TeamState, runId: string, owner
   );
 }
 
+function ctoStateHasOutstandingDispatches(cwd: string, runId: string): boolean | null {
+  const path = join(resolve(cwd, WORK_STATE), "cto", runId, "state.json");
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!isRecord(parsed) || parsed.schema !== 2 || parsed.id !== runId) return null;
+    const pending = parsed.pending;
+    if (isRecord(pending) && ["authorized", "running", "pending", "transport_reconnect"].includes(String(pending.status))) return true;
+    const completion = parsed.completion_envelope;
+    if (isRecord(completion) && completion.outcome === "pending") return true;
+    const childJoin = parsed.child_join;
+    if (isRecord(childJoin) && ["planned", "authorized", "pending", "conflict"].includes(String(childJoin.state))) return true;
+    const childJoins = parsed.child_joins;
+    if (Array.isArray(childJoins) && childJoins.some((join) => isRecord(join) && ["planned", "authorized", "pending", "conflict"].includes(String(join.state)))) return true;
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    return null;
+  }
+}
+
 function hasOutstandingDispatches(cwd: string, runId: string, ownerKind: "workflow" | "cto" = "workflow"): boolean | null {
-  // CTO ids are a separate slug namespace and have no ordinary run state.
-  if (ownerKind === "cto") return false;
+  if (ownerKind === "cto") return ctoStateHasOutstandingDispatches(cwd, runId);
   try {
     const path = runStatePath(cwd, runId);
     const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
@@ -618,8 +837,173 @@ export function acquireExecutionClaim(cwd: string, input: { run_id: string; cont
     return { claim, idempotent: false };
   });
 }
+export interface CtoClaimPublication {
+  run_id: string;
+  branch: string;
+  context: TrustedExecutionContext;
+  state_content?: string;
+  worker_ids?: string[];
+  /** Exact state image observed before ingress; checked again under lock. */
+  state_snapshot?: {
+    branch: string;
+    terminal: boolean;
+    owner_session?: string;
+  };
+  /** Required only when attaching a claimless legacy state image. */
+  legacy_owner_session_id?: string;
+}
 
-export function releaseExecutionClaim(cwd: string, input: { run_id: string; token: string; receipt?: string }): void {
+function expectedCtoStatePath(cwd: string, runId: string): string {
+  ensureClaimId(runId, "cto");
+  return join(resolve(cwd, WORK_STATE), "cto", runId, "state.json");
+}
+
+function validateCtoStatePublication(runId: string, content: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    throw new LifecycleError("run_state_invalid", `CTO state publication is unreadable: ${(error as Error).message}`, { run_id: runId });
+  }
+  if (!isRecord(parsed) || parsed.schema !== 2 || parsed.id !== runId || typeof parsed.task !== "string" || typeof parsed.branch !== "string") {
+    throw new LifecycleError("run_state_invalid", "CTO state publication has an invalid canonical identity", { run_id: runId });
+  }
+  const validation = parseCtoState(parsed, runId);
+  if (!validation.ok) {
+    throw new LifecycleError("run_state_invalid", `CTO state publication is invalid: ${validation.error}`, { run_id: runId });
+  }
+  return parsed;
+}
+
+/**
+ * Atomically publish a CTO state image with its common worktree claim. The
+ * target is derived from the CTO namespace and the payload carries the exact
+ * id/schema, so this is not a generic file writer.
+ */
+export function publishCtoClaim(cwd: string, input: CtoClaimPublication): ClaimResult {
+  ensureClaimId(input.run_id, "cto");
+  if (input.context.worktree !== cwd || input.context.branch !== input.branch) {
+    throw new LifecycleError("run_context_mismatch", "trusted execution context does not match the CTO publication", { run_id: input.run_id, branch: input.branch });
+  }
+  if (input.state_content !== undefined) validateCtoStatePublication(input.run_id, input.state_content);
+  return withWorkspaceTransaction(cwd, () => {
+    const beforeControl = controlContent(cwd);
+    const control = readControlRaw(cwd);
+    const statePath = expectedCtoStatePath(cwd, input.run_id);
+    const beforeState = readLifecycleFileContent(statePath);
+    if (beforeState === null && input.state_content === undefined) {
+      throw new LifecycleError("run_not_found", `CTO run '${input.run_id}' is missing`, { run_id: input.run_id });
+    }
+    const stateText = beforeState === null
+      ? input.state_content!
+      : typeof beforeState === "string" ? beforeState : Buffer.from(beforeState.data, "base64").toString("utf8");
+    let stateValue: Record<string, unknown>;
+    try {
+      stateValue = validateCtoStatePublication(input.run_id, stateText);
+    } catch (error) {
+      if (beforeState !== null) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new LifecycleError("recovery_required", `CTO run '${input.run_id}' state is invalid: ${message}`, { run_id: input.run_id });
+      }
+      throw error;
+    }
+    const expected = input.state_snapshot;
+    if (!expected || expected.branch !== input.branch || typeof expected.branch !== "string" || !expected.branch) {
+      throw new LifecycleError("run_state_invalid", "CTO publication requires an exact state snapshot", { run_id: input.run_id });
+    }
+    const stateBranch = typeof stateValue.branch === "string" ? stateValue.branch : undefined;
+    if (stateBranch !== expected.branch || stateBranch !== input.branch) {
+      throw new LifecycleError("run_context_mismatch", `CTO run '${input.run_id}' belongs to a different branch`, { run_id: input.run_id, branch: stateBranch });
+    }
+    if (ctoStateIsTerminal(stateValue) !== expected.terminal) {
+      throw new LifecycleError("run_state_invalid", `CTO run '${input.run_id}' changed terminal state during acquisition`, { run_id: input.run_id });
+    }
+    if (expected.owner_session !== undefined && stateValue.owner_session !== expected.owner_session) {
+      throw new LifecycleError("run_busy", `CTO run '${input.run_id}' is owned by another legacy session`, { run_id: input.run_id });
+    }
+    const currentValue: unknown = control.execution_claim;
+    if (currentValue !== null) assertExecutionClaim(currentValue);
+    const current = currentValue;
+    if (current && current.owner_kind !== "cto") throw claimBusyError(current);
+    if (current && current.run_id !== input.run_id) {
+      throw new LifecycleError("run_busy", `worktree execution is owned by run '${current.run_id}'`, { run_id: current.run_id, next_action: "resume or reconcile the existing run" });
+    }
+    if (current && current.run_id === input.run_id && current.coordinator_session_id === input.context.session_id && !current.released_at) {
+      return { claim: current, idempotent: true };
+    }
+    if (current && !current.released_at && claimBusy(current, input.context)) {
+      throw new LifecycleError("run_busy", `coordinator for CTO run '${input.run_id}' is still live`, { run_id: input.run_id, next_action: "wait for a release receipt or reconcile the owner" });
+    }
+    let pendingWorkers = input.worker_ids ?? current?.worker_ids ?? [];
+    let resumedReleaseReceipt: string | undefined;
+    if (current?.released_at) {
+      const release = control.cto_releases[input.run_id];
+      if (!release) {
+        throw new LifecycleError("recovery_required", `CTO run '${input.run_id}' has an unmanaged release tombstone`, { run_id: input.run_id, next_action: "verify the coordinator release before resuming" });
+      }
+      if (current.token === release.issuance_token) {
+        assertManagedCtoRelease(cwd, current, release, { requireSnapshotCas: false, allowStateChanges: true });
+      } else {
+        assertResumedCtoRelease(cwd, current, release);
+      }
+      pendingWorkers = release.pending_worker_ids;
+      resumedReleaseReceipt = release.release_receipt;
+    } else if (!current && beforeState !== null) {
+      const release = control.cto_releases[input.run_id];
+      if (release) {
+        assertStoredCtoRelease(cwd, input.run_id, release);
+        pendingWorkers = release.pending_worker_ids;
+        resumedReleaseReceipt = release.release_receipt;
+      } else if (
+        !input.legacy_owner_session_id
+        || typeof stateValue.owner_session !== "string"
+        || stateValue.owner_session !== input.legacy_owner_session_id
+        || stateValue.owner_session !== input.context.session_id
+      ) {
+        throw new LifecycleError("run_busy", `claimless legacy CTO run '${input.run_id}' has no trusted owner proof`, { run_id: input.run_id, next_action: "resume with the original authenticated host session or reconcile the legacy run" });
+      }
+    }
+    const claim: WorktreeExecutionClaim = {
+      token: randomUUID(),
+      owner_kind: "cto",
+      run_id: input.run_id,
+      coordinator_session_id: input.context.session_id,
+      ...(input.context.process_id ? { coordinator_process_id: input.context.process_id } : {}),
+      ownership_epoch: randomUUID(),
+      worker_ids: [...new Set(pendingWorkers)],
+      released_at: null,
+      ...(resumedReleaseReceipt ? { release_receipt: resumedReleaseReceipt } : {}),
+    };
+    const nextControl: RunControl = { ...control, revision: control.revision + 1, execution_claim: claim };
+    const after: Record<string, LifecycleFileContent> = {
+      [controlPath(cwd)]: `${JSON.stringify(nextControl, null, 2)}\n`,
+    };
+    if (beforeState === null && input.state_content !== undefined) after[statePath] = input.state_content.endsWith("\n") ? input.state_content : `${input.state_content}\n`;
+    const transaction = beginLifecycleTransaction({
+      cwd,
+      operation: "claim",
+      before: { [controlPath(cwd)]: beforeControl, [statePath]: beforeState },
+      after,
+    });
+    commitLifecycleTransaction(cwd, transaction.transaction_id);
+    return { claim, idempotent: false };
+  });
+}
+
+
+export interface ExecutionClaimReleaseOptions {
+  run_id: string;
+  token: string;
+  receipt?: string;
+  /**
+   * Domain adapters set this after independently checking their state. The
+   * engine still verifies the claim token and canonical control record.
+   */
+  retain_reservation?: boolean;
+  cto_release?: CtoReleaseProvenance;
+}
+
+export function releaseExecutionClaim(cwd: string, input: ExecutionClaimReleaseOptions): void {
   if (!input.token) throw new LifecycleError("run_busy", "execution claim release requires the trusted ownership token", { run_id: input.run_id });
   withWorkspaceTransaction(cwd, () => {
     const before = controlContent(cwd);
@@ -628,14 +1012,283 @@ export function releaseExecutionClaim(cwd: string, input: { run_id: string; toke
     ensureClaimId(input.run_id, claim?.owner_kind ?? "workflow");
     if (!claim || claim.run_id !== input.run_id) return;
     if (claim.token !== input.token) throw new LifecycleError("run_busy", "execution claim token does not match", { run_id: input.run_id });
+    const existingRelease = claim.owner_kind === "cto" ? control.cto_releases[claim.run_id] : undefined;
+    if (claim.owner_kind === "cto") {
+      if (!input.cto_release || input.receipt !== input.cto_release.release_receipt) {
+        throw new LifecycleError("run_state_invalid", "managed CTO claim release requires its exact host-issued provenance", { run_id: claim.run_id });
+      }
+      if (existingRelease && claim.token !== existingRelease.issuance_token) {
+        assertResumedCtoRelease(cwd, claim, input.cto_release);
+        assertResumedCtoReleaseMatchesStored(existingRelease, input.cto_release);
+      } else {
+        assertManagedCtoRelease(cwd, claim, input.cto_release, { requireSnapshotCas: true, allowStateChanges: false, requireReleasedClaim: false });
+      }
+    }
+    const releasedAt = new Date().toISOString();
+    const release = claim.owner_kind === "cto" ? input.cto_release : undefined;
     const released = {
       ...claim,
-      released_at: new Date().toISOString(),
+      released_at: releasedAt,
       ...(input.receipt ? { release_receipt: input.receipt } : {}),
     };
     const outstanding = hasOutstandingDispatches(cwd, claim.run_id, claim.owner_kind);
     if (outstanding === null) throw new LifecycleError("recovery_required", "cannot release execution claim while canonical worker state is unreadable", { run_id: claim.run_id, next_action: "repair or reconcile the canonical run before releasing ownership" });
-    writeControlTransaction(cwd, before, { ...control, revision: control.revision + 1, execution_claim: (claim.worker_ids.length > 0 || outstanding) ? released : null }, "claim");
+    const keepReservation = claim.worker_ids.length > 0 || outstanding || input.retain_reservation === true;
+    const preserveOriginalRelease = Boolean(
+      release
+      && existingRelease
+      && existingRelease.issuance_token === release.issuance_token
+      && claim.token !== release.issuance_token,
+    );
+    const persistedRelease = release
+      ? (preserveOriginalRelease
+        ? { ...existingRelease!, current_snapshot_hash: release.current_snapshot_hash }
+        : { ...release, released_at: releasedAt })
+      : undefined;
+    const nextControl: RunControl = {
+      ...control,
+      revision: control.revision + 1,
+      execution_claim: keepReservation ? released : null,
+      ...(persistedRelease
+        ? { cto_releases: { ...control.cto_releases, [claim.run_id]: persistedRelease } }
+        : {}),
+    };
+    writeControlTransaction(cwd, before, nextControl, "claim");
+  });
+}
+
+type CtoWorkerSlot = {
+  worker_id: string;
+  tool_call_id: string;
+  index: number;
+  ownership_epoch?: string;
+};
+
+/**
+ * CTO worker ids are private opaque reservation identities. The ownership
+ * epoch is embedded so a new dispatch can never inherit an older slot's
+ * terminal witness; the tool-call id and slot index remain available only to
+ * the locked reservation/settlement checks below.
+ */
+function parseCtoWorkerSlot(workerId: string): CtoWorkerSlot | undefined {
+  if (!workerId.startsWith("cto:")) return undefined;
+  const firstSeparator = workerId.indexOf(":", 4);
+  const lastSeparator = workerId.lastIndexOf(":");
+  if (lastSeparator <= 4) return undefined;
+  const indexText = workerId.slice(lastSeparator + 1);
+  if (!/^(0|[1-9][0-9]*)$/.test(indexText)) return undefined;
+  const index = Number(indexText);
+  if (!Number.isSafeInteger(index)) return undefined;
+  if (firstSeparator === lastSeparator) {
+    const toolCallId = workerId.slice(4, lastSeparator);
+    return toolCallId ? { worker_id: workerId, tool_call_id: toolCallId, index } : undefined;
+  }
+  if (firstSeparator < 5 || firstSeparator >= lastSeparator) return undefined;
+  const ownership_epoch = workerId.slice(4, firstSeparator);
+  const toolCallId = workerId.slice(firstSeparator + 1, lastSeparator);
+  if (!ownership_epoch || !toolCallId) return undefined;
+  return { worker_id: workerId, ownership_epoch, tool_call_id: toolCallId, index };
+}
+
+function assertCtoWorkerIdsForCurrentEpoch(
+  claim: WorktreeExecutionClaim,
+  workerIds: readonly string[],
+  runId: string,
+): void {
+  const seen = new Set<string>();
+  for (const workerId of workerIds) {
+    if (seen.has(workerId)) {
+      throw new LifecycleError("run_busy", "duplicate CTO worker slot admission", { run_id: runId });
+    }
+    seen.add(workerId);
+    const parsed = parseCtoWorkerSlot(workerId);
+    if (!parsed || (parsed.ownership_epoch !== undefined && parsed.ownership_epoch !== claim.ownership_epoch)) {
+      throw new LifecycleError("run_state_invalid", "CTO worker reservation identity is not authorized for the current ownership epoch", { run_id: runId });
+    }
+  }
+  const currentSlots = claim.worker_ids.map(parseCtoWorkerSlot);
+  if (currentSlots.some((slot) => slot === undefined)) {
+    throw new LifecycleError("recovery_required", "CTO reservation ledger contains an invalid worker slot identity", { run_id: runId, next_action: "reconcile the managed CTO reservation ledger before dispatching" });
+  }
+  const incomingSlots: CtoWorkerSlot[] = [];
+  for (const workerId of workerIds) {
+    const parsed = parseCtoWorkerSlot(workerId);
+    if (!parsed) {
+      throw new LifecycleError("run_state_invalid", "CTO worker reservation identity is malformed", { run_id: runId });
+    }
+    incomingSlots.push(parsed);
+  }
+  for (const incoming of incomingSlots) {
+    if (currentSlots.some((current) =>
+      current !== undefined
+      && current.tool_call_id === incoming.tool_call_id
+      && current.index === incoming.index
+    )) {
+      throw new LifecycleError("run_busy", "CTO worker slot is already pending for this tool call", { run_id: runId });
+    }
+  }
+}
+
+/** Add native child reservations without changing coordinator ownership. */
+export function reserveExecutionClaimWorkers(cwd: string, input: { run_id: string; token: string; worker_ids: string[] }): void {
+  if (!input.token || !Array.isArray(input.worker_ids) || input.worker_ids.some((workerId) => typeof workerId !== "string" || !workerId)) {
+    throw new LifecycleError("run_state_invalid", "execution worker reservation is malformed", { run_id: input.run_id });
+  }
+  withWorkspaceTransaction(cwd, () => {
+    const before = controlContent(cwd);
+    const control = readControlRaw(cwd);
+    const claim = control.execution_claim;
+    if (!claim || claim.run_id !== input.run_id || claim.token !== input.token || claim.released_at !== null) {
+      throw new LifecycleError("run_busy", "execution claim is not the current live owner", { run_id: input.run_id });
+    }
+    if (claim.owner_kind === "cto") assertCtoWorkerIdsForCurrentEpoch(claim, input.worker_ids, input.run_id);
+    const nextWorkerIds = [...new Set([...claim.worker_ids, ...input.worker_ids])];
+    if (nextWorkerIds.length === claim.worker_ids.length) return;
+    if (claim.owner_kind === "cto") {
+      const release = control.cto_releases[input.run_id];
+      if (release && !sameWorkerIds(release.pending_worker_ids, claim.worker_ids)) {
+        throw new LifecycleError("recovery_required", "CTO reservation ledger does not match the live claim before resume", { run_id: input.run_id, next_action: "reconcile the persisted CTO reservation ledger before adding workers" });
+      }
+      const nextRelease = release
+        ? { ...release, pending_worker_ids: nextWorkerIds, ledger_revision: release.ledger_revision + 1 }
+        : undefined;
+      writeControlTransaction(
+        cwd,
+        before,
+        {
+          ...control,
+          revision: control.revision + 1,
+          execution_claim: { ...claim, worker_ids: nextWorkerIds },
+          ...(nextRelease ? { cto_releases: { ...control.cto_releases, [input.run_id]: nextRelease } } : {}),
+        },
+        "claim",
+      );
+      return;
+    }
+    const nextClaim: WorktreeExecutionClaim = { ...claim, worker_ids: nextWorkerIds };
+    writeControlTransaction(cwd, before, { ...control, revision: control.revision + 1, execution_claim: nextClaim }, "claim");
+  });
+}
+
+/** Remove only settled native reservations; stale tokens cannot mutate claims. */
+export function settleExecutionClaimWorkers(cwd: string, input: { run_id: string; token: string; worker_ids: string[] }): void {
+  if (!input.token || !Array.isArray(input.worker_ids)) {
+    throw new LifecycleError("run_state_invalid", "execution worker settlement is malformed", { run_id: input.run_id });
+  }
+  withWorkspaceTransaction(cwd, () => {
+    const before = controlContent(cwd);
+    const control = readControlRaw(cwd);
+    const claim = control.execution_claim;
+    if (!claim || claim.run_id !== input.run_id || claim.token !== input.token) return;
+    const settled = new Set(input.worker_ids);
+    const remaining = claim.worker_ids.filter((workerId) => !settled.has(workerId));
+    if (remaining.length === claim.worker_ids.length) return;
+    let nextRelease: CtoReleaseProvenance | undefined;
+    if (claim.owner_kind === "cto") {
+      const release = control.cto_releases[input.run_id];
+      if (release && !sameWorkerIds(release.pending_worker_ids, claim.worker_ids)) {
+        throw new LifecycleError("recovery_required", "CTO reservation ledger does not match the live claim before settlement", { run_id: input.run_id, next_action: "reconcile the persisted CTO reservation ledger before settling workers" });
+      }
+      if (release) {
+        nextRelease = {
+          ...release,
+          pending_worker_ids: remaining,
+          ledger_revision: release.ledger_revision + 1,
+        };
+      }
+    }
+    const nextClaim = remaining.length > 0
+      ? { ...claim, worker_ids: remaining }
+      : claim.released_at === null
+        ? { ...claim, worker_ids: [] }
+        : null;
+    writeControlTransaction(
+      cwd,
+      before,
+      {
+        ...control,
+        revision: control.revision + 1,
+        execution_claim: nextClaim,
+        ...(nextRelease ? { cto_releases: { ...control.cto_releases, [input.run_id]: nextRelease } } : {}),
+      },
+      "claim",
+    );
+  });
+}
+
+/**
+ * Settle CTO reservations from the durable host tool-call/slot identity.
+ * Unlike ordinary dispatch reconciliation this path does not require a
+ * `/do-work` origin record, and it survives coordinator handover because the
+ * current claim token is read under the workspace lock.
+ */
+export function settleCtoExecutionClaimWorkersByToolCall(
+  cwd: string,
+  input: { run_id: string; tool_call_id: string; token: string; ownership_epoch: string; worker_ids: string[] },
+): void {
+  if (
+    !input.run_id
+    || !input.tool_call_id
+    || !input.token
+    || !input.ownership_epoch
+    || !Array.isArray(input.worker_ids)
+    || input.worker_ids.length === 0
+  ) {
+    throw new LifecycleError("run_state_invalid", "CTO tool-call settlement provenance is malformed", { run_id: input.run_id });
+  }
+  const slots: CtoWorkerSlot[] = [];
+  for (const workerId of input.worker_ids) {
+    const parsed = parseCtoWorkerSlot(workerId);
+    if (
+      !parsed
+      || parsed.tool_call_id !== input.tool_call_id
+      || parsed.ownership_epoch !== undefined && parsed.ownership_epoch !== input.ownership_epoch
+      || slots.some((slot) => slot.tool_call_id === parsed.tool_call_id && slot.index === parsed.index)
+    ) {
+      throw new LifecycleError("run_state_invalid", "CTO tool-call settlement worker slots do not match the host tool call", { run_id: input.run_id });
+    }
+    slots.push(parsed);
+  }
+  withWorkspaceTransaction(cwd, () => {
+    const before = controlContent(cwd);
+    const control = readControlRaw(cwd);
+    const claim = control.execution_claim;
+    if (!claim || claim.owner_kind !== "cto" || claim.run_id !== input.run_id) return;
+    const release = control.cto_releases[claim.run_id];
+    if (release && !sameWorkerIds(release.pending_worker_ids, claim.worker_ids)) {
+      throw new LifecycleError("recovery_required", "CTO reservation ledger does not match the current claim before settlement", { run_id: claim.run_id, next_action: "reconcile the managed CTO release before settling workers" });
+    }
+    const currentIssuance = claim.token === input.token
+      && claim.ownership_epoch === input.ownership_epoch
+      && claim.released_at === null;
+    const historicalIssuance = !!release
+      && claim.release_receipt === release.release_receipt
+      && release.issuance_token === input.token
+      && release.ownership_epoch === input.ownership_epoch
+      && input.worker_ids.every((workerId) => release.worker_ids.includes(workerId));
+    if (!currentIssuance && !historicalIssuance) {
+      throw new LifecycleError("run_busy", "CTO tool-call settlement provenance is stale or not privately issued", { run_id: claim.run_id });
+    }
+    if (input.worker_ids.some((workerId) => !claim.worker_ids.includes(workerId))) return;
+    const settled = new Set(input.worker_ids);
+    const remaining = claim.worker_ids.filter((workerId) => !settled.has(workerId));
+    const nextClaim = remaining.length > 0
+      ? { ...claim, worker_ids: remaining }
+      : claim.released_at === null ? { ...claim, worker_ids: [] } : null;
+    const nextRelease = release
+      ? {
+        ...release,
+        pending_worker_ids: remaining,
+        ledger_revision: release.ledger_revision + 1,
+      }
+      : undefined;
+    const nextControl: RunControl = {
+      ...control,
+      revision: control.revision + 1,
+      execution_claim: nextClaim,
+      ...(nextRelease ? { cto_releases: { ...control.cto_releases, [claim.run_id]: nextRelease } } : {}),
+    };
+    writeControlTransaction(cwd, before, nextControl, "claim");
   });
 }
 
@@ -654,6 +1307,24 @@ export function handoverExecutionClaim(cwd: string, input: { run_id: string; con
     }
     if (current.token !== input.token) {
       throw new LifecycleError("run_busy", "execution claim token does not match", { run_id: input.run_id });
+    }
+    if (current.owner_kind === "cto") {
+      const image = ctoStateImage(cwd, input.run_id);
+      if (!image || image.value.schema !== 2 || image.value.id !== input.run_id || image.value.branch !== input.context.branch) {
+        throw new LifecycleError("run_context_mismatch", `CTO run '${input.run_id}' branch or state is unavailable`, { run_id: input.run_id, branch: input.context.branch });
+      }
+      if (current.released_at) {
+        const release = control.cto_releases[input.run_id];
+        if (!release) throw new LifecycleError("recovery_required", `CTO run '${input.run_id}' has no managed release provenance`, { run_id: input.run_id });
+        if (current.token === release.issuance_token) {
+          assertManagedCtoRelease(cwd, current, release, { requireSnapshotCas: false, allowStateChanges: true });
+        } else {
+          assertResumedCtoRelease(cwd, current, release);
+        }
+        if (input.release_receipt && input.release_receipt !== release.release_receipt) {
+          throw new LifecycleError("run_busy", "CTO handover receipt does not match the managed release", { run_id: input.run_id });
+        }
+      }
     }
     if (!current.released_at && claimBusy(current, input.context)) {
       throw new LifecycleError("run_busy", `coordinator for run '${input.run_id}' is still live`, { run_id: input.run_id, next_action: "wait for a release receipt or reconcile the owner" });

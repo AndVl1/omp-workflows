@@ -434,6 +434,15 @@ test("captured host admits ordinary no-run writes while preserving session and s
 		sessionManager: { getCwd: () => plainRoot(), getSessionId: () => hostContext.session_id },
 	};
 	assert.equal(hasBlock(mismatchedContext, join(root, "src", "mismatched.ts")), true, "mismatched manager cwd remains fail-closed");
+	const contradictoryCwdContext = {
+		cwd: plainRoot(),
+		sessionManager: hostContext.sessionManager,
+	};
+	assert.equal(
+		hasBlock(contradictoryCwdContext, join(root, "src", "contradictory-cwd.ts")),
+		true,
+		"explicit cwd contradicting the captured manager remains fail-closed",
+	);
 
 	host.fireSessionStart({
 		...hostContext,

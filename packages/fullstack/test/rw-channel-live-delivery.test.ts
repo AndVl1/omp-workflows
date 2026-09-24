@@ -13,12 +13,14 @@
  *   A. a live tg-bridge lock must NOT suppress a non-telegram RW adapter's
  *      inbound polling (the live gap — bridge ownership is telegram
  *      specific by contract),
- *   B. exactly-once delivery + admitted-dedup on duplicate normalized text
- *      + durable processed evidence,
+ *   B. one accepted same-run task + admitted-dedup on duplicate normalized
+ *      text + durable processed evidence,
  *   C. empty-text inbound moves to inbound/rejected/ with a durable record,
- *   D. answers follow up via the SAME RW channel (delivered once),
+ *   D. foreign answers are excluded while same-run answers are delivered once,
  *   E. RO channels are never wired or polled for inbound,
- *   F. legacy single-adapter configs are unchanged and never fan out.
+ *   F. legacy single-adapter configs are unchanged and never fan out,
+ *   G. an RW transport stays durable and quiet without an exact claim,
+ *   H. an ambiguous wake retains durable work without a duplicate callback or ACK.
  *
  * Delivery is interval-driven (50ms dispatcher ticks), so assertions use a
  * waitFor polling helper. stop() is always called and the scratch root is
@@ -30,7 +32,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readCtoState } from "@andvl1/omp-workflows-core";
+import { newCtoState, readCtoState, writeCtoState } from "@andvl1/omp-workflows-core";
 import {
   createChannelSet,
   createEscalationAdapter,
@@ -97,6 +99,29 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, msg: string)
   }
 }
 
+/** Write a canonical temporary CTO run state for an exact dispatcher claim. */
+function writeCtoFixture(root: string, runId: string, task = "Live delivery test"): string {
+  const createdAt = new Date().toISOString();
+  writeCtoState(
+    newCtoState({
+      id: runId,
+      task,
+      branch: "main",
+      autonomous: true,
+      plan: { id: runId, task, teams: [], created_at: createdAt },
+    }),
+    root,
+  );
+  return runId;
+}
+
+function claimBinding(runId: string): { session_id: string; getClaim: () => { run_id: string; ownership_epoch: string } } {
+  return {
+    session_id: "live-test-session",
+    getClaim: () => ({ run_id: runId, ownership_epoch: "live-test-epoch" }),
+  };
+}
+
 /**
  * Mirror index.ts session_start: write `.omp/escalation.json`, resolve the
  * channel set, start the channel dispatcher at 50ms, record onTask/onAnswer
@@ -105,9 +130,23 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, msg: string)
 function startLiveDispatcher(
   root: string,
   config: unknown,
-  opts: { direction?: "rw" | "ro" } = {},
-): { stop: () => void; channelSet: ChannelSet; tasks: InboxTask[]; answers: Array<{ id: string; answer: string }> } {
+  opts: {
+    direction?: "rw" | "ro";
+    runId?: string;
+    binding?: boolean;
+    onTask?: (task: InboxTask) => void;
+    onAnswer?: (answer: { id: string; answer: string }) => void;
+  } = {},
+): {
+  stop: () => void;
+  channelSet: ChannelSet;
+  runId: string;
+  tasks: InboxTask[];
+  answers: Array<{ id: string; answer: string }>;
+} {
   const expected = opts.direction ?? "rw";
+  const runId = opts.runId ?? "run-live";
+  writeCtoFixture(root, runId);
   withConfig(root, config);
   const channelSet = createChannelSet(root);
   assert.equal(channelSet.profile.direction, expected, `resolved channel profile direction is ${expected}`);
@@ -120,10 +159,11 @@ function startLiveDispatcher(
   const tasks: InboxTask[] = [];
   const answers: Array<{ id: string; answer: string }> = [];
   const stop = startChannelDispatcher(root, channelSet, 50, {
-    onTask: (t) => tasks.push(t),
-    onAnswer: (a) => answers.push(a),
+    ...(opts.binding === false ? {} : { binding: claimBinding(runId) }),
+    onTask: opts.onTask ?? ((t) => tasks.push(t)),
+    onAnswer: opts.onAnswer ?? ((a) => answers.push(a)),
   });
-  return { stop, channelSet, tasks, answers };
+  return { stop, channelSet, runId, tasks, answers };
 }
 
 const RW_CHANNEL = (dir: string): unknown => ({
@@ -138,13 +178,14 @@ test("A: persisted mock RW channel delivers inbound despite a live tg-bridge loc
     // configured alongside.
     writeBridgeLock(root);
     const dir = "rw";
-    const { stop, tasks } = startLiveDispatcher(root, RW_CHANNEL(dir));
+    const { stop, runId, tasks } = startLiveDispatcher(root, RW_CHANNEL(dir));
     try {
       dropFile(join(root, dir, "inbound"), "task-1.json", {
         id: "t1",
         text: "live resident task via persisted RW channel",
         at: new Date().toISOString(),
         by: "second-process",
+        runId,
       });
       await waitFor(
         () => tasks.length === 1,
@@ -152,9 +193,9 @@ test("A: persisted mock RW channel delivers inbound despite a live tg-bridge loc
         "onTask fired for the persisted RW channel despite a live bridge lock (bridge gate must not suppress non-telegram adapters)",
       );
       assert.equal(tasks[0]?.text, "live resident task via persisted RW channel");
-      // Durable inbox file under the resolved run.
-      const runId = readdirSync(join(root, ".work-state", "cto"))[0]!;
-      assert.ok(existsSync(join(root, ".work-state", "cto", runId, "inbox", "t1.json")), "task filed durably in the run inbox");
+      assert.equal(tasks[0]?.runId, runId, "accepted task is routed to the exact claimed run");
+      // Durable inbox file under the exact claimed run.
+      assert.ok(existsSync(join(root, ".work-state", "cto", runId, "inbox", "t1.json")), "task filed durably in the claimed run inbox");
       // Transport file consumed to processed/.
       assert.ok(existsSync(join(root, dir, "inbound", "processed", "task-1.json")), "transport file moved to inbound/processed");
       // One admitted wave in run state.
@@ -169,11 +210,11 @@ test("A: persisted mock RW channel delivers inbound despite a live tg-bridge loc
   }
 });
 
-test("B: inbound delivered exactly once; duplicate normalized text never re-delivered; durable processed evidence", async () => {
+test("B: inbound is delivered once; duplicate normalized text is not re-delivered; durable processed evidence", async () => {
   const root = mkdtempSync(join(tmpdir(), "rw-live-dedup-"));
   try {
     const dir = "rw";
-    const { stop, tasks } = startLiveDispatcher(root, RW_CHANNEL(dir));
+    const { stop, runId, tasks } = startLiveDispatcher(root, RW_CHANNEL(dir));
     try {
       const text = "exactly-once duplicate probe";
       dropFile(join(root, dir, "inbound"), "task-1.json", {
@@ -181,6 +222,7 @@ test("B: inbound delivered exactly once; duplicate normalized text never re-deli
         text,
         at: new Date().toISOString(),
         by: "second-process",
+        runId,
       });
       await waitFor(() => tasks.length === 1, 3000, "first inbound task delivered once");
       assert.equal(tasks[0]?.text, text);
@@ -190,6 +232,7 @@ test("B: inbound delivered exactly once; duplicate normalized text never re-deli
         text,
         at: new Date().toISOString(),
         by: "second-process",
+        runId,
       });
       await sleep(1000);
       assert.equal(tasks.length, 1, "duplicate normalized text never re-delivered");
@@ -197,7 +240,6 @@ test("B: inbound delivered exactly once; duplicate normalized text never re-deli
       assert.ok(existsSync(join(root, dir, "inbound", "processed", "task-1.json")), "task-1 consumed to processed/");
       assert.ok(existsSync(join(root, dir, "inbound", "processed", "task-2.json")), "task-2 consumed to processed/");
       // Admitted-dedup quarantine record + one wave in run state.
-      const runId = readdirSync(join(root, ".work-state", "cto"))[0]!;
       const state = readCtoState(runId, root);
       assert.equal(state?.inbox_quarantine?.[sha256Hex(text)]?.status, "admitted", "quarantine status is admitted");
       assert.equal(state?.wave_history?.length, 1, "exactly one wave admitted");
@@ -214,13 +256,14 @@ test("C: empty-text inbound moves to inbound/rejected/ with a durable record; no
   const root = mkdtempSync(join(tmpdir(), "rw-live-reject-"));
   try {
     const dir = "rw";
-    const { stop, tasks } = startLiveDispatcher(root, RW_CHANNEL(dir));
+    const { stop, runId, tasks } = startLiveDispatcher(root, RW_CHANNEL(dir));
     try {
       dropFile(join(root, dir, "inbound"), "bad-1.json", {
         id: "bad1",
         text: "   ",
         at: new Date().toISOString(),
         by: "second-process",
+        runId,
       });
       await waitFor(() => existsSync(join(root, dir, "inbound", "rejected", "bad-1.json")), 3000, "empty inbound moved to rejected/");
       const record = JSON.parse(readFileSync(join(root, dir, "inbound", "rejected", "bad-1.json.json"), "utf8")) as {
@@ -242,20 +285,34 @@ test("C: empty-text inbound moves to inbound/rejected/ with a durable record; no
   }
 });
 
-test("D: answer follow-up delivered via the same RW channel, exactly once", async () => {
+test("D: answer follow-up is delivered once via the same RW channel", async () => {
   const root = mkdtempSync(join(tmpdir(), "rw-live-answer-"));
   try {
     const dir = "rw";
-    const { stop, answers } = startLiveDispatcher(root, RW_CHANNEL(dir));
+    const { stop, runId, answers } = startLiveDispatcher(root, RW_CHANNEL(dir));
     try {
+      dropFile(join(root, dir, "answers"), "foreign.json", {
+        id: "foreign-run/team-a/q1",
+        answer: "foreign answer",
+        at: new Date().toISOString(),
+        by: "user-1",
+      });
+      await waitFor(
+        () => existsSync(join(root, dir, "answers", "processed", "foreign.json")),
+        3000,
+        "foreign answer consumed without waking the claimed run",
+      );
+      assert.equal(answers.length, 0, "foreign answer never wakes this run");
+
+      const answerId = `${runId}/team-a/q1`;
       dropFile(join(root, dir, "answers"), "ans-1.json", {
-        id: "run-x/team-a/q1",
+        id: answerId,
         answer: "yes",
         at: new Date().toISOString(),
         by: "user-1",
       });
       await waitFor(() => answers.length === 1, 3000, "onAnswer fired once via the RW channel");
-      assert.equal(answers[0]?.id, "run-x/team-a/q1");
+      assert.equal(answers[0]?.id, answerId);
       assert.equal(answers[0]?.answer, "yes");
       assert.ok(existsSync(join(root, dir, "answers", "processed", "ans-1.json")), "answer file consumed to answers/processed/");
       await sleep(500);
@@ -305,17 +362,21 @@ test("F: legacy single-adapter config unchanged — mock rw preserved, no fan-ou
     withConfig(root, config);
     const adapter = createEscalationAdapter(loadEscalationConfig(root)!, root);
     assert.ok(adapter instanceof MockEscalationAdapter, "legacy config builds the mock adapter");
+    const runId = writeCtoFixture(root, "run-legacy");
     const tasks: InboxTask[] = [];
     // Legacy single-adapter dispatcher (the adapter-direct path): the mock's
-    // rw inbound surface is wired and polled as before — unchanged by the
-    // channel-set world.
-    const stop = startDispatcher(root, adapter, 50, { onTask: (t) => tasks.push(t) });
+    // rw inbound surface is wired and polled with the exact claim binding.
+    const stop = startDispatcher(root, adapter, 50, {
+      binding: claimBinding(runId),
+      onTask: (t) => tasks.push(t),
+    });
     try {
       dropFile(join(root, "legacy", "inbound"), "task-1.json", {
         id: "t1",
         text: "legacy task",
         at: new Date().toISOString(),
         by: "second-process",
+        runId,
       });
       await waitFor(() => tasks.length === 1, 3000, "legacy single-adapter dispatcher delivers inbound once");
       await sleep(500);
@@ -323,6 +384,67 @@ test("F: legacy single-adapter config unchanged — mock rw preserved, no fan-ou
       assert.ok(existsSync(join(root, "legacy", "inbound", "processed", "task-1.json")), "legacy transport file consumed");
       // No fan-out: only .omp, .work-state and the legacy persisted dir exist.
       assert.deepEqual(readdirSync(root).sort(), [".omp", ".work-state", "legacy"], "no other adapter dirs created under the root");
+    } finally {
+      stop();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("G: RW inbound remains durable and quiet without an exact dispatcher claim", async () => {
+  const root = mkdtempSync(join(tmpdir(), "rw-live-no-claim-"));
+  try {
+    const dir = "rw";
+    const { stop, runId, tasks } = startLiveDispatcher(root, RW_CHANNEL(dir), { binding: false });
+    try {
+      dropFile(join(root, dir, "inbound"), "task-1.json", {
+        id: "t1",
+        text: "unclaimed task",
+        at: new Date().toISOString(),
+        by: "second-process",
+        runId,
+      });
+      await sleep(500);
+      assert.equal(tasks.length, 0, "no exact claim means no wake");
+      assert.ok(existsSync(join(root, dir, "inbound", "task-1.json")), "unclaimed transport input remains durable");
+      assert.equal(existsSync(join(root, dir, "inbound", "processed")), false, "unclaimed input is not consumed");
+      assert.equal(existsSync(join(root, dir, "inbound", "rejected")), false, "unclaimed input is not quarantined");
+      assert.equal(readCtoState(runId, root)?.wave_history?.length, 0, "unclaimed input admits no wave");
+    } finally {
+      stop();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("H: ambiguous wake keeps admitted work without duplicate callback or ACK", async () => {
+  const root = mkdtempSync(join(tmpdir(), "rw-live-ambiguous-"));
+  try {
+    const dir = "rw";
+    let calls = 0;
+    const { stop, runId } = startLiveDispatcher(root, RW_CHANNEL(dir), {
+      onTask: () => {
+        calls += 1;
+        throw new Error("host send outcome is unknown");
+      },
+    });
+    try {
+      dropFile(join(root, dir, "inbound"), "ambiguous.json", {
+        id: "t-ambiguous",
+        text: "ambiguous host wake",
+        at: new Date().toISOString(),
+        by: "second-process",
+        runId,
+      });
+      await waitFor(() => calls === 1, 3000, "ambiguous wake attempted once");
+      await sleep(500);
+      assert.equal(calls, 1, "ambiguous work is not accepted twice");
+      assert.ok(existsSync(join(root, dir, "inbound", "processed", "ambiguous.json")), "transport input is consumed after durable admission");
+      assert.ok(existsSync(join(root, ".work-state", "cto", runId, "inbox", "t-ambiguous.json")), "admitted work remains durable in the run inbox");
+      assert.equal(readCtoState(runId, root)?.wave_history?.length, 1, "ambiguous wake admits one wave");
+      assert.equal(existsSync(join(root, ".work-state", "cto", runId, "outbox")), false, "ambiguous wake emits no admission ACK");
     } finally {
       stop();
     }

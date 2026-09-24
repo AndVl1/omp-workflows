@@ -13,9 +13,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  newCtoState,
   type Escalation,
   type EscalationAdapter,
   readAnswers,
+  writeCtoState,
 } from "@andvl1/omp-workflows-core";
 import { HttpEscalationAdapter } from "../src/adapters/http.js";
 import {
@@ -24,8 +26,6 @@ import {
 import {
   handleInboxTask,
   pollInbox,
-  resolveInboxRunId,
-  ensureStandbyRun,
   inboxDir,
   isBridgeAlive,
   bridgeLockPath,
@@ -38,6 +38,7 @@ import {
   MAX_INBOX_TEXT_LENGTH,
   sha256Hex,
   createChannelSet,
+  InboxWakeRejectedError,
 } from "../src/adapters/registry.js";
 import {
   loadEscalationConfig,
@@ -60,6 +61,28 @@ function sampleEscalation(overrides: Partial<Escalation> = {}): Escalation {
     timeoutMs: 3_600_000,
     ...overrides,
   };
+}
+
+function claimBinding(runId: string): { session_id: string; getClaim: () => { run_id: string; ownership_epoch: string } } {
+  return {
+    session_id: "test-session",
+    getClaim: () => ({ run_id: runId, ownership_epoch: "test-epoch" }),
+  };
+}
+
+function writeCtoFixture(root: string, runId: string, task = "Test task"): string {
+  const createdAt = new Date().toISOString();
+  writeCtoState(
+    newCtoState({
+      id: runId,
+      task,
+      branch: "main",
+      autonomous: true,
+      plan: { id: runId, task, teams: [], created_at: createdAt },
+    }),
+    root,
+  );
+  return runId;
 }
 
 test("adapters: HTTP send posts sanitized JSON and reports ok", async () => {
@@ -400,23 +423,136 @@ test("adapters: telegram pollOnce keeps the offset on answer persistence failure
   }
 });
 
-test("adapters: handleInboxTask files a task under the active run and is idempotent", () => {
+test("adapters: telegram marker failure keeps the update pending until marker persistence succeeds", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-tg-marker-"));
+  try {
+    let getUpdatesCalls = 0;
+    let markerAttempts = 0;
+    const fetchImpl = (async (url: unknown) => {
+      const method = String(url).split("/").pop();
+      if (method === "sendMessage") {
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { status: 200 });
+      }
+      if (method === "getUpdates") {
+        getUpdatesCalls += 1;
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            result: [
+              { update_id: 1, message: { message_id: 100, text: "rest", reply_to_message: { message_id: 7 }, chat: { id: 100 }, from: { id: 100 } } },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected method: ${method}`);
+    }) as typeof fetch;
+
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl });
+    await adapter.send(sampleEscalation());
+    adapter.setAnswerMarkerHandler(() => {
+      markerAttempts += 1;
+      if (markerAttempts === 1) throw new Error("marker storage unavailable");
+    });
+
+    await assert.rejects(() => adapter.pollOnce(), /marker storage unavailable/);
+    assert.equal(getUpdatesCalls, 1);
+    const answers = await adapter.pollOnce();
+    assert.equal(getUpdatesCalls, 2, "the failed marker round leaves the Telegram update retryable");
+    assert.equal(answers.length, 1);
+    assert.equal(markerAttempts, 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: telegram pollOnce returns prior answers when a later marker fails and retries the failed update", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-tg-partial-"));
+  try {
+    let getUpdatesCalls = 0;
+    const offsets: number[] = [];
+    const markerIds: string[] = [];
+    const firstUpdate = {
+      update_id: 1,
+      callback_query: {
+        id: "q1",
+        from: { id: 100 },
+        message: { message_id: 11, chat: { id: 100 } },
+        data: "run-1/team-a/clarify/1::rest",
+      },
+    };
+    const secondUpdate = {
+      update_id: 2,
+      callback_query: {
+        id: "q2",
+        from: { id: 100 },
+        message: { message_id: 12, chat: { id: 100 } },
+        data: "run-1/team-a/clarify/2::grpc",
+      },
+    };
+    const fetchImpl = (async (url: unknown, init: unknown) => {
+      const method = String(url).split("/").pop();
+      if (method === "getUpdates") {
+        const rawBody = init && typeof init === "object" && "body" in init ? init.body : undefined;
+        if (typeof rawBody !== "string") throw new Error("missing getUpdates request body");
+        const parsed: unknown = JSON.parse(rawBody);
+        const offset =
+          parsed && typeof parsed === "object" && "offset" in parsed && typeof parsed.offset === "number" ? parsed.offset : -1;
+        offsets.push(offset);
+        getUpdatesCalls += 1;
+        const result = getUpdatesCalls === 1 ? [firstUpdate, secondUpdate] : [secondUpdate];
+        return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+      }
+      throw new Error(`unexpected method: ${method}`);
+    }) as typeof fetch;
+
+    const adapter = new TelegramEscalationAdapter({ token: "t", chatId: "100", cwd: root, fetchImpl });
+    adapter.setAnswerMarkerHandler((answer) => {
+      markerIds.push(answer.id);
+      if (markerIds.length === 2) throw new Error("marker storage unavailable");
+    });
+
+    const firstAnswers = await adapter.pollOnce();
+    assert.equal(firstAnswers.length, 1, "the successful first answer is returned despite the later failure");
+    assert.equal(firstAnswers[0]?.id, "run-1/team-a/clarify/1");
+    assert.equal(firstAnswers[0]?.answer, "rest");
+    assert.deepEqual(offsets, [0], "the first round starts at the initial offset");
+    assert.deepEqual(markerIds, ["run-1/team-a/clarify/1", "run-1/team-a/clarify/2"]);
+    assert.equal(readAnswers("run-1", root).length, 2, "the failed marker does not undo canonical answer persistence");
+
+    const recovered = await adapter.pollOnce();
+    assert.deepEqual(offsets, [0, 2], "the next round starts at the failed update's offset");
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0]?.id, "run-1/team-a/clarify/2");
+    assert.equal(recovered[0]?.answer, "grpc");
+    assert.deepEqual(markerIds, [
+      "run-1/team-a/clarify/1",
+      "run-1/team-a/clarify/2",
+      "run-1/team-a/clarify/2",
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: handleInboxTask requires an explicit run and is idempotent", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-inbox-"));
   try {
-    // No active run -> a standby run is created.
-    const runId = resolveInboxRunId(root);
-    assert.ok(runId.startsWith("standby-"), "standby run created when none active");
-    assert.ok(existsSync(join(root, ".work-state", "cto", runId, "state.json")), "standby state persisted");
+    const at = new Date().toISOString();
+    const unbound = handleInboxTask(root, { id: "unbound", text: "No implicit run", at }, () => {
+      throw new Error("unbound task must not wake");
+    });
+    assert.equal(unbound, null, "unbound task is rejected without a run binding");
+    assert.equal(existsSync(join(root, ".work-state")), false, "unbound task does not create run authority");
 
+    const runId = writeCtoFixture(root, "run-explicit");
     const tasks: Array<{ id: string; text: string; at: string; runId?: string }> = [];
-    const path = handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, (t) => tasks.push(t));
+    const path = handleInboxTask(root, { id: "t1", text: "Do the thing", at, runId }, (t) => tasks.push(t));
     assert.ok(path, "task filed");
     assert.equal(tasks.length, 1, "onTask called once");
     assert.equal(tasks[0]?.runId, runId);
 
     // Same task id again -> dropped (wx), onTask NOT re-invoked: the first
     // write wins and wakes; duplicates are at-most-once.
-    const again = handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, (t) => tasks.push(t));
+    const again = handleInboxTask(root, { id: "t1", text: "Do the thing", at, runId }, (t) => tasks.push(t));
     assert.equal(again, null, "duplicate task id dropped");
     assert.equal(tasks.length, 1, "onTask not re-invoked for duplicates");
 
@@ -427,21 +563,182 @@ test("adapters: handleInboxTask files a task under the active run and is idempot
   }
 });
 
-test("adapters: pollInbox ingests local .omp/inbox drop files", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-drop-"));
+test("adapters: run inbox keeps distinct ids that sanitize to one filename and rejects same-id conflicts", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-inbox-collision-"));
   try {
+    const runId = writeCtoFixture(root, "run-collision");
+    const first = handleInboxTask(root, { id: "a:b", text: "first", at: new Date().toISOString(), runId }, () => undefined);
+    const second = handleInboxTask(root, { id: "a-b", text: "second", at: new Date().toISOString(), runId }, () => undefined);
+    assert.ok(first && second && first !== second);
+    assert.equal(JSON.parse(readFileSync(first, "utf8")).id, "a:b");
+    assert.equal(JSON.parse(readFileSync(second, "utf8")).id, "a-b");
+
+    assert.throws(
+      () => handleInboxTask(root, { id: "a:b", text: "changed", at: new Date().toISOString(), runId }, () => undefined),
+      (error: unknown) => error instanceof InboxWakeRejectedError && /conflicting content or kind/.test(error.message),
+    );
+    assert.equal(JSON.parse(readFileSync(first, "utf8")).text, "first", "the original task remains authoritative");
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { status?: string; reason?: string }>;
+    };
+    const conflict = Object.values(state.inbox_quarantine ?? {}).find((entry) => entry.reason?.includes("conflicting content"));
+    assert.equal(conflict?.status, "rejected", "same-id conflict is durably rejected");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: same transport id text/kind conflicts fail closed before wake and preserve accepted hashes", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-inbox-identity-"));
+  try {
+    const runId = writeCtoFixture(root, "run-identity");
+    let wakes = 0;
+    const at = new Date().toISOString();
+    handleInboxTask(
+      root,
+      { id: "same-id", kind: "task", text: "same body", at, runId },
+      () => {
+        wakes += 1;
+      },
+    );
+    assert.throws(
+      () => handleInboxTask(root, { id: "same-id", kind: "answer", text: "same body", at, runId }, () => { wakes += 1; }),
+      (error: unknown) => error instanceof InboxWakeRejectedError && /conflicting content or kind/.test(error.message),
+    );
+    assert.equal(wakes, 1, "a changed marker kind never reaches the host callback");
+
+    const runState = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { status?: string; reason?: string }>;
+    };
+    assert.equal(runState.inbox_quarantine?.[sha256Hex("same body")]?.status, "admitted");
+    assert.equal(
+      readdirSync(inboxDir(runId, root)).filter((name) => name.endsWith(".json")).length,
+      1,
+      "the original task remains the only durable run-inbox source",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+
+  const dedupRoot = mkdtempSync(join(tmpdir(), "cto-inbox-hash-identity-"));
+  try {
+    const runId = writeCtoFixture(dedupRoot, "run-hash-identity");
+    const at = new Date().toISOString();
+    handleInboxTask(dedupRoot, { id: "A", text: "alpha", at, runId }, () => undefined);
+    handleInboxTask(dedupRoot, { id: "B", text: "beta", at, runId }, () => undefined);
+    assert.throws(
+      () => handleInboxTask(dedupRoot, { id: "A", text: "beta", at, runId }, () => undefined),
+      (error: unknown) => error instanceof InboxWakeRejectedError && /conflicting content or kind/.test(error.message),
+    );
+    const state = JSON.parse(readFileSync(join(dedupRoot, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { id?: string; status?: string; reason?: string }>;
+    };
+    assert.equal(state.inbox_quarantine?.[sha256Hex("beta")]?.id, "B", "the accepted beta hash remains owned by B");
+    assert.equal(state.inbox_quarantine?.[sha256Hex("beta")]?.status, "admitted", "the accepted beta hash remains admitted");
+  } finally {
+    rmSync(dedupRoot, { recursive: true, force: true });
+  }
+});
+test("adapters: absent task callback refuses before filing", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-inbox-no-callback-"));
+  try {
+    const runId = writeCtoFixture(root, "run-no-task-callback");
+    assert.throws(
+      () => handleInboxTask(root, { id: "t1", text: "must not wake", at: new Date().toISOString(), runId }),
+      (error: unknown) => error instanceof InboxWakeRejectedError && /no onTask callback/.test(error.message),
+    );
+    assert.equal(existsSync(inboxDir(runId, root)), false, "missing callback does not file an admitted task");
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+      inbox_quarantine?: Record<string, { status?: string; reason?: string }>;
+    };
+    const refusal = Object.values(state.inbox_quarantine ?? {}).find((entry) => entry.reason?.includes("no onTask callback"));
+    assert.equal(refusal?.status, "rejected", "missing callback is durably rejected");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: absent answer callback keeps the canonical answer and retry marker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-answer-no-callback-"));
+  try {
+    const runId = writeCtoFixture(root, "run-no-answer-callback");
     const drop = join(root, ".omp", "inbox");
     mkdirSync(drop, { recursive: true });
-    writeFileSync(join(drop, "task-a.json"), JSON.stringify({ id: "local-a", text: "Task from local drop" }));
+    const answerId = `${runId}/team-a/q1`;
+    writeFileSync(
+      join(drop, "answer.json"),
+      JSON.stringify({ kind: "answer", id: answerId, text: "yes", by: "telegram-bridge" }),
+    );
 
-    const tasks: Array<{ id: string; text: string; at: string; runId?: string }> = [];
-    await pollInbox(root, null, (t) => tasks.push(t));
+    await pollInbox(root, null, undefined, undefined, claimBinding(runId));
+
+    const marker = JSON.parse(readFileSync(join(drop, "answer.json"), "utf8")) as {
+      delivery_status?: string;
+      delivery_reason?: string;
+    };
+    assert.equal(marker.delivery_status, "pre-send-rejected", "missing callback is not accepted");
+    assert.match(marker.delivery_reason ?? "", /no host callback/);
+    assert.equal(existsSync(join(drop, "processed", "answer.json")), false, "the original marker remains retryable");
+    const canonical = JSON.parse(
+      readFileSync(join(root, ".work-state", "cto", runId, "answers", `${runId}-team-a-q1.json`), "utf8"),
+    ) as { answer?: string; delivery_status?: string };
+    assert.equal(canonical.answer, "yes");
+    assert.equal(canonical.delivery_status, "pre-send-rejected");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("adapters: pollInbox ingests local .omp/inbox drop files only after an exact claim", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-drop-"));
+  try {
+    const runId = writeCtoFixture(root, "run-drop");
+    const drop = join(root, ".omp", "inbox");
+    mkdirSync(drop, { recursive: true });
+    writeFileSync(join(drop, "task-a.json"), JSON.stringify({ id: "local-a", kind: "task", text: "Task from local drop" }));
+
+    const tasks: Array<{ id: string; text: string; at: string; kind?: string; runId?: string }> = [];
+    await pollInbox(root, null, (t) => tasks.push(t), undefined, claimBinding(runId));
 
     assert.equal(tasks.length, 1, "drop task ingested");
     assert.equal(tasks[0]?.text, "Task from local drop");
-    assert.ok(tasks[0]?.runId?.startsWith("standby-"), "filed under a standby run");
+    assert.equal(tasks[0]?.kind, "task", "local-drop marker kind reaches the host callback");
+    assert.equal(tasks[0]?.runId, runId, "task is routed to the exact claimed run");
     assert.ok(existsSync(join(drop, "processed", "task-a.json")), "drop file moved to processed");
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: typed stale claim stays fail-closed, retains source, and surfaces recovery", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-drop-stale-claim-"));
+  const diagnostics: string[] = [];
+  const originalError = console.error;
+  try {
+    const runId = writeCtoFixture(root, "run-stale-claim");
+    const drop = join(root, ".omp", "inbox");
+    mkdirSync(drop, { recursive: true });
+    writeFileSync(join(drop, "stale.json"), JSON.stringify({ id: "stale-task", text: "keep this source" }));
+    console.error = (...args: unknown[]) => {
+      diagnostics.push(args.map(String).join(" "));
+    };
+    const staleBinding = {
+      session_id: "stale-session",
+      getClaim(): never {
+        throw Object.assign(new Error("bound CTO claim ownership epoch is stale"), {
+          code: "run_busy" as const,
+          next_action: "reconcile the previous CTO session before continuing",
+        });
+      },
+    };
+    await pollInbox(root, null, () => {
+      throw new Error("stale claim must not wake a task");
+    }, undefined, staleBinding);
+    assert.equal(existsSync(join(root, ".omp", "inbox", "stale.json")), true, "stale claim leaves the source durable");
+    assert.ok(
+      diagnostics.some((message) => message.includes("run_busy") && message.includes("reconcile the previous CTO session")),
+      "typed stale-claim recovery action is surfaced",
+    );
+  } finally {
+    console.error = originalError;
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -449,7 +746,7 @@ test("adapters: pollInbox ingests local .omp/inbox drop files", async () => {
 test("adapters: pollInbox rejects empty and oversized drop files to drop/rejected/ with quarantine records", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-drop-reject-"));
   try {
-    const runId = resolveInboxRunId(root); // standby run first so state is readable
+    const runId = writeCtoFixture(root, "run-drop-reject");
     const drop = join(root, ".omp", "inbox");
     mkdirSync(drop, { recursive: true });
     writeFileSync(join(drop, "empty.json"), JSON.stringify({ id: "e1", text: "   " }));
@@ -457,7 +754,7 @@ test("adapters: pollInbox rejects empty and oversized drop files to drop/rejecte
     writeFileSync(join(drop, "valid.json"), JSON.stringify({ id: "v1", text: "Do the thing" }));
 
     const tasks: Array<{ id: string; text: string }> = [];
-    await pollInbox(root, null, (t) => tasks.push(t));
+    await pollInbox(root, null, (t) => tasks.push(t), undefined, claimBinding(runId));
 
     // The valid file still processes as today:
     assert.equal(tasks.length, 1, "only the valid task woke");
@@ -595,21 +892,65 @@ test("adapters: drainOutbox RO-only — succeeding sink → archived sent:true (
 test("adapters: pollInbox wakes on a new escalation answer (user-initiated)", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-answer-wake-"));
   try {
+    const runId = writeCtoFixture(root, "run-1");
+    const binding = claimBinding(runId);
     const answers: Array<{ id: string; answer: string }> = [];
     // Stub adapter exposing only pollOnce (telegram-like).
     const stub = {
       kind: "telegram",
       pollOnce: async () => [{ id: "run-1/team-a/q1", answer: "use grpc" }],
-    } as unknown as import("../src/adapters/telegram.js").TelegramEscalationAdapter;
+    } as unknown as TelegramEscalationAdapter;
 
-    await pollInbox(root, stub, undefined, (a) => answers.push(a));
+    await pollInbox(root, stub, undefined, (a) => answers.push(a), binding);
     assert.equal(answers.length, 1, "answer wake fired");
     assert.equal(answers[0]?.id, "run-1/team-a/q1");
     assert.equal(answers[0]?.answer, "use grpc");
 
     // Same answer again -> deduped (no re-wake).
-    await pollInbox(root, stub, undefined, (a) => answers.push(a));
+    await pollInbox(root, stub, undefined, (a) => answers.push(a), binding);
     assert.equal(answers.length, 1, "duplicate answer not re-woken");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: an unsafe canonical answer target is refused without waking or consuming the source", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-answer-unsafe-"));
+  try {
+    const runId = writeCtoFixture(root, "run-answer-unsafe");
+    const dir = join(root, "rw");
+    const adapter = new MockEscalationAdapter({ persisted: { dir } });
+    adapter.injectAnswer("../unsafe", "answer", "mock");
+    const answers: Array<{ id: string; answer: string }> = [];
+
+    await pollInbox(root, adapter, undefined, (answer) => answers.push(answer), claimBinding(runId));
+
+    assert.deepEqual(answers, [], "an unsafe target cannot produce a success wake");
+    assert.equal(existsSync(join(dir, "answers", "ans-1.json")), true, "the invalid source remains recoverable");
+    assert.equal(existsSync(join(dir, "answers", "processed", "ans-1.json")), false, "the invalid source is not archived");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: canonical persistence reports an actionable error for an unsafe id", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-answer-unsafe-error-"));
+  try {
+    const runId = writeCtoFixture(root, "run-answer-unsafe-error");
+    let persist: ((answer: { id: string; answer: string }) => void) | undefined;
+    const adapter = {
+      kind: "mock",
+      setAnswerPersistenceHandler: (handler: (answer: { id: string; answer: string }) => void) => {
+        persist = handler;
+      },
+      pollOnce: async () => [],
+    } as unknown as TelegramEscalationAdapter;
+
+    await pollInbox(root, adapter, undefined, undefined, claimBinding(runId));
+    assert.ok(persist, "registry installs the optional persistence boundary");
+    assert.throws(
+      () => persist!({ id: "../unsafe", answer: "answer" }),
+      /unsafe id\/path/,
+      "invalid canonical targets fail closed with recovery guidance",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -637,6 +978,8 @@ test("adapters: bridge lock — alive while pid lives, stale after exit", () => 
 test("adapters: pollInbox skips telegram polling while the bridge is alive", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-bridge-"));
   try {
+    const runId = writeCtoFixture(root, "run-bridge");
+    const binding = claimBinding(runId);
     let polls = 0;
     const stub = {
       kind: "telegram",
@@ -644,13 +987,13 @@ test("adapters: pollInbox skips telegram polling while the bridge is alive", asy
         polls += 1;
         return [];
       },
-    } as unknown as import("../src/adapters/telegram.js").TelegramEscalationAdapter;
+    } as unknown as TelegramEscalationAdapter;
 
-    await pollInbox(root, stub, undefined, undefined);
+    await pollInbox(root, stub, undefined, undefined, binding);
     assert.equal(polls, 1, "no bridge -> session polls telegram");
 
     writeBridgeLock(root);
-    await pollInbox(root, stub, undefined, undefined);
+    await pollInbox(root, stub, undefined, undefined, binding);
     assert.equal(polls, 1, "bridge alive -> session must NOT poll telegram");
     clearBridgeLock(root);
   } finally {
@@ -661,6 +1004,8 @@ test("adapters: pollInbox skips telegram polling while the bridge is alive", asy
 test("adapters: pollInbox — persisted mock RW adapter polls through a live tg-bridge lock and delivers the inbound task exactly once", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-mock-lock-"));
   const dir = join(root, "rw");
+  const runId = writeCtoFixture(root, "run-mock-lock");
+  const binding = claimBinding(runId);
   const tasks: Array<{ id: string; text: string }> = [];
   try {
     const adapter = new MockEscalationAdapter({ persisted: { dir } });
@@ -679,24 +1024,25 @@ test("adapters: pollInbox — persisted mock RW adapter polls through a live tg-
       JSON.stringify({ id: "task-1", text: "bridge-lock mock task", at: new Date().toISOString(), by: "second-process" }),
     );
 
-    await pollInbox(root, adapter, undefined, undefined);
+    await pollInbox(root, adapter, undefined, undefined, binding);
 
     assert.equal(tasks.length, 1, "live tg-bridge lock must not suppress a non-telegram RW adapter");
     assert.equal(tasks[0]?.text, "bridge-lock mock task");
     assert.ok(existsSync(join(inbound, "processed", "task-1.json")), "inbound task consumed (moved to processed)");
 
     // Next tick: nothing new to drain — delivered exactly once.
-    await pollInbox(root, adapter, undefined, undefined);
+    await pollInbox(root, adapter, undefined, undefined, binding);
     assert.equal(tasks.length, 1, "inbound task delivered exactly once");
   } finally {
     clearBridgeLock(root);
     rmSync(root, { recursive: true, force: true });
   }
 });
-
 test("adapters: pollInbox — send-only adapter (no pollOnce) is never polled", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-sendonly-"));
   try {
+    const runId = writeCtoFixture(root, "run-sendonly");
+    const binding = claimBinding(runId);
     const stub = {
       kind: "http",
       send: async () => ({ sent: true }),
@@ -704,9 +1050,9 @@ test("adapters: pollInbox — send-only adapter (no pollOnce) is never polled", 
     const tasks: Array<{ id: string; text: string }> = [];
     const answers: Array<{ id: string; answer: string }> = [];
     // Two ticks: resolves without throwing, and delivers nothing (RO/send-only
-    // adapters remain non-pollable — legacy behavior unchanged).
-    await pollInbox(root, stub, (t) => tasks.push(t), (a) => answers.push(a));
-    await pollInbox(root, stub, (t) => tasks.push(t), (a) => answers.push(a));
+    // adapters remain non-pollable).
+    await pollInbox(root, stub, (t) => tasks.push(t), (a) => answers.push(a), binding);
+    await pollInbox(root, stub, (t) => tasks.push(t), (a) => answers.push(a), binding);
     assert.equal(tasks.length, 0, "send-only adapter delivers no inbound tasks");
     assert.equal(answers.length, 0, "send-only adapter delivers no answers");
   } finally {
@@ -717,14 +1063,15 @@ test("adapters: pollInbox — send-only adapter (no pollOnce) is never polled", 
 test("adapters: pollInbox wakes [CTO-ANSWER] from a bridge answer marker", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-ansmark-"));
   try {
+    const runId = writeCtoFixture(root, "run-1");
     const drop = join(root, ".omp", "inbox");
     mkdirSync(drop, { recursive: true });
     writeFileSync(
       join(drop, "esc-1.json"),
-      JSON.stringify({ kind: "answer", id: "run-1/team-a/q1", text: "use grpc", by: "telegram-bridge" }),
+      JSON.stringify({ kind: "answer", id: `${runId}/team-a/q1`, text: "use grpc", by: "telegram-bridge" }),
     );
     const answers: Array<{ id: string; answer: string }> = [];
-    await pollInbox(root, null, undefined, (a) => answers.push(a));
+    await pollInbox(root, null, undefined, (a) => answers.push(a), claimBinding(runId));
     assert.equal(answers.length, 1, "answer marker woke the session");
     assert.equal(answers[0]?.answer, "use grpc");
     assert.ok(existsSync(join(drop, "processed", "esc-1.json")), "marker moved to processed");
@@ -732,6 +1079,7 @@ test("adapters: pollInbox wakes [CTO-ANSWER] from a bridge answer marker", async
     rmSync(root, { recursive: true, force: true });
   }
 });
+
 
 
 test("adapters: consumer transport registers and builds like a built-in", () => {
@@ -798,47 +1146,34 @@ test("adapters: telegram sendPlainText posts plain text without markup", async (
   }
 });
 
-test("adapters: handleInboxTask propagates a failing wake and retries it", () => {
+test("adapters: handleInboxTask retains an ambiguous wake send without retrying", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-inbox-wake-"));
   try {
-    const runId = resolveInboxRunId(root);
+    const runId = writeCtoFixture(root, "run-wake");
     let calls = 0;
     const onTask = () => {
       calls += 1;
-      if (calls === 1) throw new Error("wake failed (transport down)");
+      throw new Error("wake result unknown after host invocation");
     };
-    // First attempt: the file is written, then the wake throws — the
-    // exception must reach the transport (not be hidden as a null result)
-    // and the just-created file is removed so the next poll retries with a
-    // fresh write instead of hitting a wx collision (which would skip the
-    // wake and lose the update).
-    assert.throws(
-      () => handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, onTask),
-      /wake failed/,
-    );
-    assert.equal(
-      readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json")).length,
-      0,
-      "failed-wake file removed for a clean retry",
-    );
-    // Retry: no wx collision — the file is written fresh and the wake fires
-    // again until it succeeds.
-    const path = handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, onTask);
-    assert.ok(path, "retry writes the file");
-    assert.equal(calls, 2, "wake retried until it succeeds");
-    assert.equal(
-      readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json")).length,
-      1,
-      "exactly one inbox file after the successful retry",
-    );
+    const task = { id: "t1", text: "Do the thing", at: new Date().toISOString(), runId };
+    const path = handleInboxTask(root, task, onTask);
+    assert.ok(path, "ambiguous wake still returns the durable inbox file");
+    assert.equal(calls, 1, "host wake is invoked once");
+    assert.equal(existsSync(path!), true, "ambiguous wake retains durable task");
+
+    const retry = handleInboxTask(root, task, onTask);
+    assert.equal(retry, null, "durable task is not retried as a new admission");
+    assert.equal(calls, 1, "ambiguous wake is not repeated");
+    assert.equal(readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json")).length, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("adapters: pollInbox keeps the drop file and retries the wake on callback failure", async () => {
+test("adapters: pollInbox processes a task after an ambiguous wake and does not retry", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-drop-retry-"));
   try {
+    const runId = writeCtoFixture(root, "run-drop-retry");
     const drop = join(root, ".omp", "inbox");
     mkdirSync(drop, { recursive: true });
     writeFileSync(join(drop, "task-a.json"), JSON.stringify({ id: "local-a", text: "Task from local drop" }));
@@ -846,17 +1181,16 @@ test("adapters: pollInbox keeps the drop file and retries the wake on callback f
     let calls = 0;
     const onTask = () => {
       calls += 1;
-      if (calls === 1) throw new Error("wake failed");
+      throw new Error("wake result unknown");
     };
 
-    await pollInbox(root, null, onTask);
-    assert.equal(calls, 1, "first wake attempt fails");
-    assert.equal(existsSync(join(drop, "processed", "task-a.json")), false, "drop file kept in place for retry");
+    await pollInbox(root, null, onTask, undefined, claimBinding(runId));
+    assert.equal(calls, 1, "wake attempted once");
+    assert.ok(existsSync(join(drop, "processed", "task-a.json")), "ambiguous task is retained as processed durable work");
 
-    // Next tick: the wake succeeds and the drop file is finally processed.
-    await pollInbox(root, null, onTask);
-    assert.equal(calls, 2, "wake retried on the next tick");
-    assert.ok(existsSync(join(drop, "processed", "task-a.json")), "drop file moved to processed after a successful wake");
+    // Next tick: processed source is not woken a second time.
+    await pollInbox(root, null, onTask, undefined, claimBinding(runId));
+    assert.equal(calls, 1, "ambiguous wake is not retried");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -865,6 +1199,8 @@ test("adapters: pollInbox keeps the drop file and retries the wake on callback f
 test("adapters: dispatcher tick never overlaps (one drain+poll pass at a time)", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-tick-"));
   try {
+    const runId = writeCtoFixture(root, "run-overlap");
+    const binding = claimBinding(runId);
     let active = 0;
     let maxActive = 0;
     let polls = 0;
@@ -880,11 +1216,11 @@ test("adapters: dispatcher tick never overlaps (one drain+poll pass at a time)",
         polls += 1;
         return [];
       },
-    } as unknown as import("../src/adapters/telegram.js").TelegramEscalationAdapter;
+    } as unknown as TelegramEscalationAdapter;
 
     // Interval (40ms) is much shorter than a poll pass (120ms): without the
     // no-overlap guard ticks would pile up and poll concurrently.
-    const stop = startDispatcher(root, stub, 40);
+    const stop = startDispatcher(root, stub, 40, { binding });
     await new Promise((resolve) => setTimeout(resolve, 550));
     stop();
 
@@ -894,25 +1230,26 @@ test("adapters: dispatcher tick never overlaps (one drain+poll pass at a time)",
     rmSync(root, { recursive: true, force: true });
   }
 });
-
 test("adapters: answer dedupe is scoped per root, not global", async () => {
   const rootA = mkdtempSync(join(tmpdir(), "cto-dedupe-a-"));
   const rootB = mkdtempSync(join(tmpdir(), "cto-dedupe-b-"));
   try {
     const answersA: Array<{ id: string; answer: string }> = [];
+    writeCtoFixture(rootA, "run-1");
+    writeCtoFixture(rootB, "run-1");
     const answersB: Array<{ id: string; answer: string }> = [];
     const stub = {
       kind: "telegram",
       pollOnce: async () => [{ id: "run-1/team-a/q1", answer: "use grpc" }],
-    } as unknown as import("../src/adapters/telegram.js").TelegramEscalationAdapter;
+    } as unknown as TelegramEscalationAdapter;
 
-    await pollInbox(rootA, stub, undefined, (a) => answersA.push(a));
+    await pollInbox(rootA, stub, undefined, (a) => answersA.push(a), claimBinding("run-1"));
     // The same esc id in a DIFFERENT cwd must still wake (no global dedupe).
-    await pollInbox(rootB, stub, undefined, (a) => answersB.push(a));
+    await pollInbox(rootB, stub, undefined, (a) => answersB.push(a), claimBinding("run-1"));
     assert.equal(answersA.length, 1);
     assert.equal(answersB.length, 1, "different cwd wakes independently");
     // The same root still dedupes (contract preserved).
-    await pollInbox(rootA, stub, undefined, (a) => answersA.push(a));
+    await pollInbox(rootA, stub, undefined, (a) => answersA.push(a), claimBinding("run-1"));
     assert.equal(answersA.length, 1, "same root still dedupes");
   } finally {
     rmSync(rootA, { recursive: true, force: true });
@@ -920,32 +1257,18 @@ test("adapters: answer dedupe is scoped per root, not global", async () => {
   }
 });
 
-test("adapters: ensureStandbyRun reuses an existing active standby run", () => {
-  const root = mkdtempSync(join(tmpdir(), "cto-standby-reuse-"));
+test("adapters: unbound inbox task never creates a run", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-no-run-"));
   try {
-    const first = resolveInboxRunId(root);
-    assert.ok(first.startsWith("standby-"), "standby run created when none active");
-    // The direct standby writer must emit a CANONICAL schema-2 state, not a
-    // partial one: missing fields would leave the file non-canonical until a
-    // later canonicalizeState write.
-    const standbyRaw = JSON.parse(readFileSync(join(root, ".work-state", "cto", first, "state.json"), "utf8")) as Record<string, unknown>;
-    assert.equal(standbyRaw.schema, 2, "standby state declares schema 2");
-    for (const field of ["budget", "leases", "decisions", "inbox_quarantine"] as const) {
-      assert.ok(standbyRaw[field] !== undefined, `standby state carries canonical field ${field}`);
-    }
-    assert.deepEqual(standbyRaw.leases, {}, "leases default shape");
-    assert.deepEqual(standbyRaw.decisions, [], "decisions default shape");
-    assert.deepEqual(standbyRaw.inbox_quarantine, {}, "inbox_quarantine default shape");
-    // A direct call must not mint a second run with a fresh inbox: tasks
-    // filed by the bridge before /cto starts must land in the SAME standby
-    // inbox, otherwise the command would start a second run and miss them.
-    const again = ensureStandbyRun(root);
-    assert.equal(again, first, "existing active standby run reused");
-    assert.equal(
-      readdirSync(inboxDir(first, root)).filter((n) => n.endsWith(".json")).length,
-      0,
-      "no second run dir with an empty inbox",
+    const result = handleInboxTask(
+      root,
+      { id: "t1", text: "No implicit run", at: new Date().toISOString() },
+      () => {
+        throw new Error("unbound task must not wake");
+      },
     );
+    assert.equal(result, null, "no explicit run binding means no admission");
+    assert.equal(existsSync(join(root, ".work-state", "cto")), false, "no run state is minted by the inbox path");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -956,6 +1279,8 @@ test("adapters: only one dispatcher owns a cwd across live sessions", async () =
   let secondStop: (() => void) | undefined;
   let thirdStop: (() => void) | undefined;
   try {
+    const runId = writeCtoFixture(root, "run-owner");
+    const binding = claimBinding(runId);
     let firstPolls = 0;
     let secondPolls = 0;
     const tasks = [
@@ -986,9 +1311,11 @@ test("adapters: only one dispatcher owns a cwd across live sessions", async () =
     };
 
     firstStop = startDispatcher(root, makeAdapter(() => (firstPolls += 1)), 5, {
+      binding,
       onTask: (task) => firstReceived.push(task.text),
     });
     secondStop = startDispatcher(root, makeAdapter(() => (secondPolls += 1)), 5, {
+      binding,
       onTask: (task) => secondReceived.push(task.text),
     });
     await Promise.resolve();
@@ -997,7 +1324,7 @@ test("adapters: only one dispatcher owns a cwd across live sessions", async () =
     firstStop?.();
 
     let thirdPolls = 0;
-    thirdStop = startDispatcher(root, makeAdapter(() => (thirdPolls += 1)), 5);
+    thirdStop = startDispatcher(root, makeAdapter(() => (thirdPolls += 1)), 5, { binding });
     await Promise.resolve();
     await Promise.resolve();
 
@@ -1024,6 +1351,8 @@ test("adapters: stale dispatcher lease is reclaimed", async () => {
       JSON.stringify({ pid: process.pid, token: "stale", startedAt: staleAt, heartbeatAt: staleAt }),
     );
 
+    const runId = writeCtoFixture(root, "run-stale");
+    const binding = claimBinding(runId);
     let polls = 0;
     stop = startDispatcher(
       root,
@@ -1037,6 +1366,7 @@ test("adapters: stale dispatcher lease is reclaimed", async () => {
         },
       } as unknown as TelegramEscalationAdapter,
       5,
+      { binding },
     );
     await Promise.resolve();
     await Promise.resolve();
@@ -1049,10 +1379,94 @@ test("adapters: stale dispatcher lease is reclaimed", async () => {
   }
 });
 
+test("adapters: a fresh dispatcher lease retries one proven pre-send rejection", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-dispatch-lease-retry-"));
+  let firstStop: (() => void) | undefined;
+  let secondStop: (() => void) | undefined;
+  try {
+    const runId = writeCtoFixture(root, "run-lease-retry");
+    const binding = claimBinding(runId);
+    const answer = { id: `${runId}/team-a/q1`, answer: "yes" };
+    let delivered = false;
+    let wakeCalls = 0;
+    const makeAdapter = () =>
+      ({
+        kind: "mock",
+        send: async () => ({ sent: false }),
+        cancel: async () => undefined,
+        pollOnce: async () => {
+          if (delivered) return [];
+          delivered = true;
+          return [answer];
+        },
+      }) as unknown as TelegramEscalationAdapter;
+
+    firstStop = startDispatcher(root, makeAdapter(), 100_000, {
+      binding,
+      onAnswer: () => {
+        wakeCalls += 1;
+        throw new InboxWakeRejectedError("pre-send refusal");
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    firstStop();
+    firstStop = undefined;
+
+    secondStop = startDispatcher(root, makeAdapter(), 100_000, {
+      binding,
+      onAnswer: () => {
+        wakeCalls += 1;
+        return "accepted";
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    secondStop();
+    secondStop = undefined;
+
+    assert.equal(wakeCalls, 2, "the second lease gets one retry while the first lease remains at-most-once");
+    assert.equal(existsSync(join(root, ".omp", "inbox", "processed")), true, "the retry marker is finalized after the fresh lease accepts");
+  } finally {
+    secondStop?.();
+    firstStop?.();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("adapters: repeated pre-send refusal reuses an exact retry marker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-dispatch-marker-collision-"));
+  try {
+    const runId = writeCtoFixture(root, "run-marker-collision");
+    const answer = { id: `${runId}/team-a/q1`, answer: "yes" };
+    const binding = claimBinding(runId);
+    const adapter = {
+      kind: "mock",
+      pollOnce: async () => [answer],
+    } as unknown as TelegramEscalationAdapter;
+    let wakeCalls = 0;
+    const rejectWake = () => {
+      wakeCalls += 1;
+      throw new InboxWakeRejectedError("pre-send refusal");
+    };
+
+    await pollInbox(root, adapter, undefined, rejectWake, binding, "lease-one");
+    await pollInbox(root, adapter, undefined, rejectWake, binding, "lease-two");
+
+    const drop = join(root, ".omp", "inbox");
+    const markers = readdirSync(drop).filter((name) => name.startsWith("answer-retry-") && name.endsWith(".json"));
+    assert.equal(wakeCalls, 2, "a fresh lease may retry the proven refusal");
+    assert.equal(markers.length, 1, "same answer content does not create duplicate retry markers");
+    const marker = JSON.parse(readFileSync(join(drop, markers[0]!), "utf8")) as { id?: string; text?: string; delivery_status?: string };
+    assert.equal(marker.id, answer.id);
+    assert.equal(marker.text, answer.answer);
+    assert.equal(marker.delivery_status, "pre-send-rejected");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ── cto-safety (br-zps.4, br-zps.6) ──────────────────────────────────────────
-import { readFileSync } from "node:fs";
 import { MockEscalationAdapter } from "../src/adapters/mock.js";
-import { MAX_INBOX_TEXT_LENGTH, sha256Hex } from "../src/adapters/registry.js";
 
 test("cto-safety: mock adapter round-trips send → injectAnswer → pollOnce", async () => {
   const adapter = new MockEscalationAdapter();
@@ -1139,11 +1553,11 @@ test("cto-safety: mock is creatable via registry config like a built-in", () => 
 test("cto-safety: quarantine dedups identical text across ids", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-q-dedup-"));
   try {
-    const runId = resolveInboxRunId(root);
+    const runId = writeCtoFixture(root, "run-q-dedup");
     const at = new Date().toISOString();
-    const first = handleInboxTask(root, { id: "t1", text: "Ship the fix", at }, () => undefined);
+    const first = handleInboxTask(root, { id: "t1", text: "Ship the fix", at, runId }, () => undefined);
     assert.ok(first, "first filing writes the file");
-    const second = handleInboxTask(root, { id: "t2", text: "Ship the fix", at }, () => undefined);
+    const second = handleInboxTask(root, { id: "t2", text: "Ship the fix", at, runId }, () => undefined);
     assert.equal(second, null, "duplicate text dropped without a second file or wake");
 
     assert.equal(
@@ -1165,14 +1579,14 @@ test("cto-safety: quarantine dedups identical text across ids", () => {
 test("cto-safety: quarantine rejects empty and oversized text without filing", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-q-reject-"));
   try {
-    const runId = resolveInboxRunId(root);
+    const runId = writeCtoFixture(root, "run-q-reject");
     const at = new Date().toISOString();
 
-    const empty = handleInboxTask(root, { id: "t-empty", text: "   ", at }, () => undefined);
+    const empty = handleInboxTask(root, { id: "t-empty", text: "   ", at, runId }, () => undefined);
     assert.equal(empty, null, "whitespace-only text rejected");
-    const oversized = handleInboxTask(root, { id: "t-big", text: "x".repeat(MAX_INBOX_TEXT_LENGTH + 1), at }, () => undefined);
+    const oversized = handleInboxTask(root, { id: "t-big", text: "x".repeat(MAX_INBOX_TEXT_LENGTH + 1), at, runId }, () => undefined);
     assert.equal(oversized, null, "oversized text rejected");
-    const boundary = handleInboxTask(root, { id: "t-max", text: "x".repeat(MAX_INBOX_TEXT_LENGTH), at }, () => undefined);
+    const boundary = handleInboxTask(root, { id: "t-max", text: "x".repeat(MAX_INBOX_TEXT_LENGTH), at, runId }, () => undefined);
     assert.ok(boundary, "text at exactly MAX_INBOX_TEXT_LENGTH is accepted");
 
     assert.equal(
@@ -1196,8 +1610,8 @@ test("cto-safety: quarantine rejects empty and oversized text without filing", (
 test("cto-safety: quarantine record becomes admitted after a successful filing", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-q-admit-"));
   try {
-    const runId = resolveInboxRunId(root);
-    handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, () => undefined);
+    const runId = writeCtoFixture(root, "run-q-admit");
+    handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString(), runId }, () => undefined);
     const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
       inbox_quarantine?: Record<string, { status?: string }>;
     };
@@ -1208,41 +1622,28 @@ test("cto-safety: quarantine record becomes admitted after a successful filing",
   }
 });
 
-test("cto-safety: quarantine reverts to quarantined on wake failure so retries pass dedup", () => {
+test("cto-safety: quarantine keeps an ambiguous wake durable without retry", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-q-wake-"));
   try {
-    const runId = resolveInboxRunId(root);
+    const runId = writeCtoFixture(root, "run-q-wake");
     let calls = 0;
     const onTask = () => {
       calls += 1;
-      if (calls === 1) throw new Error("wake failed (transport down)");
+      throw new Error("wake result unknown after host invocation");
     };
-    assert.throws(
-      () => handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, onTask),
-      /wake failed/,
-    );
-    // The record was reverted so the retry is NOT deduped as a duplicate.
-    const afterFail = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
+    const task = { id: "t1", text: "Do the thing", at: new Date().toISOString(), runId };
+    const path = handleInboxTask(root, task, onTask);
+    assert.ok(path, "ambiguous wake retains durable work");
+    assert.equal(calls, 1, "host wake invoked once");
+    assert.equal(existsSync(path!), true, "inbox file remains durable");
+    const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
       inbox_quarantine?: Record<string, { status?: string }>;
     };
-    assert.equal(
-      afterFail.inbox_quarantine?.[sha256Hex("Do the thing")]?.status,
-      "quarantined",
-      "record reverted after a failed wake",
-    );
-    assert.equal(
-      readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json")).length,
-      0,
-      "failed-wake file removed for a clean retry",
-    );
-    // Retry: the record being "quarantined" lets it proceed; final status admitted.
-    const path = handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, onTask);
-    assert.ok(path, "retry writes the file");
-    assert.equal(calls, 2, "wake retried until it succeeds");
-    const afterRetry = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
-      inbox_quarantine?: Record<string, { status?: string }>;
-    };
-    assert.equal(afterRetry.inbox_quarantine?.[sha256Hex("Do the thing")]?.status, "admitted", "final record admitted");
+    assert.equal(state.inbox_quarantine?.[sha256Hex("Do the thing")]?.status, "admitted");
+
+    const retry = handleInboxTask(root, task, onTask);
+    assert.equal(retry, null, "ambiguous work is not retried as a new admission");
+    assert.equal(calls, 1, "host wake is not repeated");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1251,14 +1652,14 @@ test("cto-safety: quarantine reverts to quarantined on wake failure so retries p
 test("cto-safety: quarantine keeps inbox text as data — filed JSON is exactly { ...task, runId }", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-q-data-"));
   try {
-    const runId = resolveInboxRunId(root);
-    const task = { id: "t1", text: "rm -rf / && echo injected", at: new Date().toISOString(), by: "telegram" };
+    const runId = writeCtoFixture(root, "run-q-data");
+    const task = { id: "t1", text: "rm -rf / && echo injected", at: new Date().toISOString(), by: "telegram", runId };
     const path = handleInboxTask(root, task, () => undefined);
     assert.ok(path, "task filed");
     const parsed = JSON.parse(readFileSync(path!, "utf8")) as Record<string, unknown>;
     assert.deepEqual(
       parsed,
-      { ...task, runId },
+      task,
       "filed task carries exactly the task fields + runId — text is data, never executed",
     );
     // The source channel is recorded on the quarantine record, not executed.

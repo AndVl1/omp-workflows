@@ -2,11 +2,31 @@ import { isAbsolute, resolve } from "node:path";
 
 import { hasStrictOrchestratorState } from "./gates/orchestrator-write.js";
 import { assertCtoSliceDispatchable, parseCtoSliceMarker } from "./cto/slice-gate.js";
-import { readCtoState } from "./cto/state.js";
-import { readRunState, type DispatchOrigin } from "./engine/run-store.js";
+import { isCtoRunTerminal, readCtoState } from "./cto/state.js";
+import { readRunControlNoRecovery, readRunState, reserveExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
+type ManagedCtoGrantAuthority = {
+  run_id: string;
+  token: string;
+  ownership_epoch: string;
+  coordinator_session_id: string;
+  coordinator_process_id?: number;
+};
+type LegacyCtoGrantAuthority = {
+  legacy: true;
+  run_id: string;
+  coordinator_session_id: string;
+  coordinator: SessionSnapshot;
+  namespaceKey: string;
+  origin: object;
+  current: LegacyAuthorityCurrentResolver;
+};
+type CtoGrantAuthority = ManagedCtoGrantAuthority | LegacyCtoGrantAuthority;
+type LegacyAuthorityCurrentResolver = (origin: object, cwd: string, runId: string, sessionId: string) => boolean;
+type LegacyAuthorityResolver = (ctx: unknown, cwd: string, runId: string | undefined) => object | undefined;
+
 
 const REGISTRY_SYMBOL = Symbol.for("omp-workflows.native-worker-authority");
-const REGISTRY_VERSION = 2 as const;
+const REGISTRY_VERSION = 3 as const;
 const LIFECYCLE_CHANNEL = "task:subagent:lifecycle";
 
 type NativeActor = "worker" | "lead";
@@ -36,13 +56,6 @@ type SessionSnapshot = {
   cwd: string;
   header: SessionHeaderLike;
 };
-
-type TaskItem = {
-  agent?: unknown;
-  task?: unknown;
-  [key: string]: unknown;
-};
-
 type StartedLifecycle = {
   id: string;
   parentToolCallId: string;
@@ -51,6 +64,11 @@ type StartedLifecycle = {
   sessionFile: string;
 };
 
+type TaskItem = {
+  agent?: unknown;
+  task?: unknown;
+  [key: string]: unknown;
+};
 type Candidate = {
   key: string;
   slotKey: string;
@@ -60,6 +78,9 @@ type Candidate = {
   parentActor: ParentActor;
   parentToolCallId: string;
   runId: string;
+  ctoRunId?: string;
+  ctoAuthority?: CtoGrantAuthority;
+  ctoWorkerId?: string;
   input: unknown;
   inputShape: string;
   item: TaskItem;
@@ -67,8 +88,8 @@ type Candidate = {
   expectedAgent?: string;
   ctoSlice?: { runId: string; sliceId: string };
   dispatchOrigin?: DispatchOrigin;
-  executionShape?: string;
   lifecycle?: StartedLifecycle;
+  executionShape?: string;
 };
 
 type Grant = {
@@ -80,6 +101,9 @@ type Grant = {
   parentActor: ParentActor;
   parentToolCallId: string;
   runId: string;
+  ctoRunId?: string;
+  ctoAuthority?: CtoGrantAuthority;
+  ctoWorkerId?: string;
   index: number;
   agent: string;
   sessionFile: string;
@@ -87,6 +111,30 @@ type Grant = {
   actor: NativeActor;
   ctoSlice?: { runId: string; sliceId: string };
   dispatchOrigin?: DispatchOrigin;
+};
+
+/**
+ * A revoked grant no longer authorizes new dispatches. This sparse witness
+ * retains only the already-started child's limited continuation and the exact
+ * terminal lifecycle proof needed to settle its original CTO reservation
+ * after a coordinator handover.
+ */
+type SettlementWitness = {
+  slotKey: string;
+  owner: symbol;
+  namespaceKey: string;
+  cwd: string;
+  parentSessionFile: string;
+  parentToolCallId: string;
+  runId: string;
+  ctoAuthority: CtoGrantAuthority;
+  ctoWorkerId: string;
+  index: number;
+  lifecycleId: string;
+  sessionFile: string;
+  childManager?: SessionManagerLike;
+  childSessionId?: string;
+  actor: NativeActor;
 };
 
 type Binding = {
@@ -103,6 +151,7 @@ type OwnerState = {
   candidates: Set<Candidate>;
   grants: Set<Grant>;
   bindings: Set<Binding>;
+  settlements: Set<SettlementWitness>;
 };
 
 type Registry = {
@@ -113,6 +162,7 @@ type Registry = {
   candidates: Map<string, Candidate>;
   grants: Map<string, Grant>;
   bindings: Map<string, Binding>;
+  settlements: Map<string, SettlementWitness>;
   generations: Map<string, number>;
 };
 
@@ -139,7 +189,7 @@ export type NativeWorkerAuthority = {
     actor: ParentActor,
     runId: string | undefined,
     dispatchOrigins?: readonly DispatchOrigin[],
-  ): void;
+  ): boolean;
   resolve(ctx: unknown, cwd: string, selectedRunId?: string): NativeWorkerResolution | undefined;
   observeSessionStart(ctx: unknown): void;
   observeSessionShutdown(ctx: unknown): void;
@@ -162,6 +212,7 @@ function isRegistry(value: unknown): value is Registry {
     && candidate.candidates instanceof Map
     && candidate.grants instanceof Map
     && candidate.bindings instanceof Map
+    && candidate.settlements instanceof Map
     && candidate.generations instanceof Map;
 }
 
@@ -183,6 +234,7 @@ function getRegistry(create: boolean): Registry | undefined {
     candidates: new Map(),
     grants: new Map(),
     bindings: new Map(),
+    settlements: new Map(),
     generations: new Map(),
   };
   try {
@@ -202,7 +254,7 @@ function getRegistry(create: boolean): Registry | undefined {
 function ownerState(registry: Registry, owner: symbol): OwnerState {
   const current = registry.owners.get(owner);
   if (current) return current;
-  const state: OwnerState = { candidates: new Set(), grants: new Set(), bindings: new Set() };
+  const state: OwnerState = { candidates: new Set(), grants: new Set(), bindings: new Set(), settlements: new Set() };
   registry.owners.set(owner, state);
   return state;
 }
@@ -357,7 +409,43 @@ function removeBinding(registry: Registry, binding: Binding): void {
   ownerFor(registry, binding.owner)?.bindings.delete(binding);
 }
 
-function revokeGrant(registry: Registry, grant: Grant): void {
+function settlementKey(grant: Grant): string {
+  return `${grant.slotKey}\u0000${grant.lifecycleId}\u0000${grant.sessionFile}`;
+}
+
+function retainSettlementWitness(registry: Registry, grant: Grant): void {
+  if (!grant.ctoAuthority || !grant.ctoWorkerId || !grant.lifecycleId) return;
+  const bindings = [...registry.bindings.values()].filter((binding) => binding.grant === grant);
+  const childBinding = bindings.length === 1 ? bindings[0] : undefined;
+  const key = settlementKey(grant);
+  const witness: SettlementWitness = {
+    slotKey: grant.slotKey,
+    owner: grant.owner,
+    namespaceKey: grant.namespaceKey,
+    cwd: grant.parent.cwd,
+    parentSessionFile: grant.parent.sessionFile,
+    parentToolCallId: grant.parentToolCallId,
+    runId: grant.ctoAuthority.run_id,
+    ctoAuthority: grant.ctoAuthority,
+    ctoWorkerId: grant.ctoWorkerId,
+    index: grant.index,
+    lifecycleId: grant.lifecycleId,
+    sessionFile: grant.sessionFile,
+    ...(childBinding ? { childManager: childBinding.manager, childSessionId: childBinding.sessionId } : {}),
+    actor: grant.actor,
+  };
+  registry.settlements.set(key, witness);
+  ownerFor(registry, grant.owner)?.settlements.add(witness);
+}
+
+function removeSettlementWitness(registry: Registry, witness: SettlementWitness): void {
+  const key = `${witness.slotKey}\u0000${witness.lifecycleId}\u0000${witness.sessionFile}`;
+  if (registry.settlements.get(key) === witness) registry.settlements.delete(key);
+  ownerFor(registry, witness.owner)?.settlements.delete(witness);
+}
+
+function revokeGrant(registry: Registry, grant: Grant, retainSettlement = false): void {
+  if (retainSettlement) retainSettlementWitness(registry, grant);
   const current = registry.grants.get(grant.slotKey);
   if (current === grant) registry.grants.delete(grant.slotKey);
   ownerFor(registry, grant.owner)?.grants.delete(grant);
@@ -377,6 +465,9 @@ function slotKey(parentSessionId: string, toolCallId: string, index: number, tok
 
 function candidateKey(parentSessionId: string, toolCallId: string, token: string): string {
   return `${parentSessionId}\u0000${toolCallId}\u0000${token}`;
+}
+function ctoWorkerId(toolCallId: string, ownershipEpoch: string, index: number): string {
+  return `cto:${ownershipEpoch}:${toolCallId}:${index}`;
 }
 
 function lifecyclePayload(value: unknown): StartedLifecycle | undefined {
@@ -417,9 +508,6 @@ function dispatchOriginCurrent(origin: DispatchOrigin, expectedToolCallId?: stri
   if (!identity) return false;
   if (origin.slot_id !== undefined && identity.slot_id !== origin.slot_id) return false;
   if (origin.task_id !== undefined && identity.task_id !== origin.task_id) return false;
-  if (identity.dispatch_id !== origin.dispatch_id || identity.run_id !== origin.run_id) return false;
-  if (identity.capability_id !== capability.capability_id || identity.stage_cursor !== issued.stage_cursor) return false;
-  if (identity.capability_epoch !== issued.cursor_epoch || identity.slot_id !== origin.slot_id || identity.task_id !== origin.task_id) return false;
   return true;
 }
 
@@ -434,26 +522,158 @@ function leadSliceCurrent(grant: Grant): boolean {
   }).ok;
 }
 
+function currentCtoAuthority(
+  cwd: string,
+  runId: string | undefined,
+  coordinator: SessionSnapshot,
+  coordinatorNamespace: string,
+  legacyOrigin?: object,
+  legacyAuthorityCurrent?: LegacyAuthorityCurrentResolver,
+): CtoGrantAuthority | undefined {
+  const sessionId = coordinator.sessionId;
+  if (
+    !runId
+    || !/^[A-Za-z0-9._-]+$/.test(runId)
+    || runId === "."
+    || runId === ".."
+    || !sessionId
+    || coordinator.cwd !== resolve(cwd)
+  ) return undefined;
+  try {
+    const control = readRunControlNoRecovery(cwd);
+    const claim = control.execution_claim;
+    if (
+      claim
+      && claim.owner_kind === "cto"
+      && claim.run_id === runId
+      && claim.released_at === null
+      && claim.coordinator_session_id === sessionId
+    ) {
+      return {
+        run_id: claim.run_id,
+        token: claim.token,
+        ownership_epoch: claim.ownership_epoch,
+        coordinator_session_id: claim.coordinator_session_id,
+        ...(claim.coordinator_process_id === undefined ? {} : { coordinator_process_id: claim.coordinator_process_id }),
+      };
+    }
+    if (
+      !legacyOrigin
+      || !legacyAuthorityCurrent
+      || claim !== null
+      || Object.prototype.hasOwnProperty.call(control.cto_releases, runId)
+      || !snapshotStillCurrent(coordinator)
+    ) return undefined;
+    const state = readCtoState(runId, cwd);
+    if (!state || state.id !== runId || isCtoRunTerminal(state) || state.owner_session !== sessionId) return undefined;
+    return {
+      legacy: true,
+      run_id: runId,
+      coordinator_session_id: sessionId,
+      coordinator,
+      namespaceKey: coordinatorNamespace,
+      origin: legacyOrigin,
+      current: legacyAuthorityCurrent,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function ctoAuthorityCurrent(
+  grant: Grant,
+  allowHistorical: boolean,
+): boolean {
+  const authority = grant.ctoAuthority;
+  if (!authority) return false;
+  const legacyCoordinator = "legacy" in authority ? authority.coordinator : undefined;
+  const authorityCwd = legacyCoordinator?.cwd ?? grant.parent.cwd;
+  let control;
+  try {
+    control = readRunControlNoRecovery(authorityCwd);
+  } catch {
+    return false;
+  }
+  if ("legacy" in authority) {
+    let originCurrent = false;
+    try {
+      originCurrent = !!authority.origin
+        && snapshotStillCurrent(authority.coordinator)
+        && authority.coordinator.sessionId === authority.coordinator_session_id
+        && authority.coordinator.cwd === grant.parent.cwd
+        && authority.namespaceKey === grant.namespaceKey
+        && authority.current(authority.origin, authority.coordinator.cwd, authority.run_id, authority.coordinator_session_id);
+    } catch {
+      originCurrent = false;
+    }
+    if (
+      !originCurrent
+      || control.execution_claim !== null
+      || Object.prototype.hasOwnProperty.call(control.cto_releases, authority.run_id)
+    ) return false;
+    const state = readCtoState(authority.run_id, authorityCwd);
+    return !!state
+      && state.id === authority.run_id
+      && !isCtoRunTerminal(state)
+      && state.owner_session === authority.coordinator_session_id;
+  }
+  const claim = control.execution_claim;
+  if (
+    claim
+    && claim.owner_kind === "cto"
+    && claim.run_id === authority.run_id
+    && claim.token === authority.token
+    && claim.ownership_epoch === authority.ownership_epoch
+    && claim.coordinator_session_id === authority.coordinator_session_id
+    && (claim.coordinator_process_id ?? undefined) === (authority.coordinator_process_id ?? undefined)
+    && claim.released_at === null
+  ) return true;
+  if (!allowHistorical || !grant.ctoWorkerId || !claim || claim.owner_kind !== "cto" || claim.run_id !== authority.run_id) return false;
+  const release = control.cto_releases[authority.run_id];
+  if (
+    !release
+    || release.issuance_token !== authority.token
+    || claim.release_receipt !== release.release_receipt
+    || !claim.worker_ids.includes(grant.ctoWorkerId)
+    || !release.pending_worker_ids.includes(grant.ctoWorkerId)
+  ) return false;
+  return true;
+}
+
 function grantCanonicalCurrent(grant: Grant): boolean {
   if (grant.dispatchOrigin && !dispatchOriginCurrent(grant.dispatchOrigin, grant.parentToolCallId)) return false;
-  if (grant.ctoSlice) return leadSliceCurrent(grant);
+  if (grant.ctoAuthority) return ctoAuthorityCurrent(grant, true) && (!grant.ctoSlice || leadSliceCurrent(grant));
+  if (grant.ctoSlice || grant.ctoRunId) return false;
   return hasStrictOrchestratorState(grant.parent.cwd, grant.runId);
 }
 
 
-function lifecycleTerminal(value: unknown): { id?: string; parentToolCallId?: string; index?: number; sessionFile?: string } | undefined {
+function lifecycleTerminal(value: unknown): {
+  id: string;
+  parentToolCallId: string;
+  index: number;
+  sessionFile: string;
+} | undefined {
   if (!value || typeof value !== "object") return undefined;
   const payload = value as Record<string, unknown>;
+  if (
+    typeof payload.id !== "string" || payload.id.length === 0
+    || typeof payload.parentToolCallId !== "string" || payload.parentToolCallId.length === 0
+    || typeof payload.index !== "number" || !Number.isInteger(payload.index) || payload.index < 0
+    || typeof payload.sessionFile !== "string" || payload.sessionFile.length === 0 || !isAbsolute(payload.sessionFile)
+  ) return undefined;
   return {
-    ...(typeof payload.id === "string" ? { id: payload.id } : {}),
-    ...(typeof payload.parentToolCallId === "string" ? { parentToolCallId: payload.parentToolCallId } : {}),
-    ...(typeof payload.index === "number" && Number.isInteger(payload.index) ? { index: payload.index } : {}),
-    ...(typeof payload.sessionFile === "string" && isAbsolute(payload.sessionFile) ? { sessionFile: resolve(payload.sessionFile) } : {}),
+    id: payload.id,
+    parentToolCallId: payload.parentToolCallId,
+    index: payload.index,
+    sessionFile: resolve(payload.sessionFile),
   };
 }
 
 export type NativeWorkerAuthorityOptions = {
   bundleLabel?: string;
+  legacyAuthority?: LegacyAuthorityResolver;
+  legacyAuthorityCurrent?: LegacyAuthorityCurrentResolver;
 };
 
 export function createNativeWorkerAuthority(
@@ -464,6 +684,8 @@ export function createNativeWorkerAuthority(
     ? options.bundleLabel
     : "omp-workflows";
   const registry = getRegistry(true);
+  const legacyAuthorityCurrent = options.legacyAuthorityCurrent;
+  const legacyAuthority = options.legacyAuthority;
   const owner = Symbol("native-worker-authority-owner");
   if (registry) ownerState(registry, owner);
   const token = registry ? ownerToken(registry, owner) : "0";
@@ -489,6 +711,11 @@ export function createNativeWorkerAuthority(
       parentActor: candidate.parentActor,
       parentToolCallId: candidate.parentToolCallId,
       runId: candidate.runId,
+      ...(candidate.ctoRunId ? { ctoRunId: candidate.ctoRunId } : {}),
+      ...(candidate.ctoAuthority ? {
+        ctoAuthority: candidate.ctoAuthority,
+        ...(candidate.ctoWorkerId ? { ctoWorkerId: candidate.ctoWorkerId } : {}),
+      } : {}),
       index: candidate.index,
       agent: candidate.lifecycle.agent,
       sessionFile: candidate.lifecycle.sessionFile,
@@ -547,12 +774,49 @@ export function createNativeWorkerAuthority(
     }
     if (status !== "completed" && status !== "failed" && status !== "aborted") return;
     const terminal = lifecycleTerminal(value);
-    if (!terminal?.id) return;
-    for (const grant of [...registry.grants.values()]) {
-      if (grant.owner === owner && terminal.id === grant.lifecycleId) revokeGrant(registry, grant);
+    if (!terminal) return;
+    const grants = [...registry.grants.values()].filter((grant) =>
+      grant.owner === owner
+      && grant.lifecycleId === terminal.id
+      && grant.parentToolCallId === terminal.parentToolCallId
+      && grant.index === terminal.index
+      && grant.sessionFile === terminal.sessionFile
+    );
+    const witnesses = [...registry.settlements.values()].filter((witness) =>
+      witness.owner === owner
+      && witness.lifecycleId === terminal.id
+      && witness.parentToolCallId === terminal.parentToolCallId
+      && witness.index === terminal.index
+      && witness.sessionFile === terminal.sessionFile
+    );
+    if (grants.length + witnesses.length !== 1) return;
+    const grant = grants[0];
+    const witness = witnesses[0];
+    const authority = grant?.ctoAuthority ?? witness?.ctoAuthority;
+    const workerId = grant?.ctoWorkerId ?? witness?.ctoWorkerId;
+    if (authority && workerId && !("legacy" in authority)) {
+      try {
+        settleCtoExecutionClaimWorkersByToolCall(grant?.parent.cwd ?? witness!.cwd, {
+          run_id: authority.run_id,
+          tool_call_id: grant?.parentToolCallId ?? witness!.parentToolCallId,
+          token: authority.token,
+          ownership_epoch: authority.ownership_epoch,
+          worker_ids: [workerId],
+        });
+      } catch {
+        return;
+      }
     }
+    if (grant) revokeGrant(registry, grant);
+    if (witness) removeSettlementWitness(registry, witness);
     for (const candidate of [...registry.candidates.values()]) {
-      if (candidate.owner === owner && candidate.lifecycle?.id === terminal.id) removeCandidate(registry, candidate);
+      if (
+        candidate.owner === owner
+        && candidate.lifecycle?.id === terminal.id
+        && candidate.parentToolCallId === terminal.parentToolCallId
+        && candidate.index === terminal.index
+        && candidate.lifecycle.sessionFile === terminal.sessionFile
+      ) removeCandidate(registry, candidate);
     }
   };
 
@@ -582,21 +846,33 @@ export function createNativeWorkerAuthority(
     observeToolExecutionStart: handleExecutionStart,
     observeToolExecutionEnd: handleExecutionEnd,
     admitTaskCall(ctx, event, actor, runId, dispatchOrigins) {
-      if (!registry || event.toolName !== "task" || !event.toolCallId || (actor !== "orchestrator" && actor !== "lead")) return;
+      if (!registry || event.toolName !== "task" || !event.toolCallId || (actor !== "orchestrator" && actor !== "lead")) return false;
       ownerState(registry, owner);
       const inputShape = structuralShape(event.input);
       const items = taskItems(event.input);
       const parent = readSnapshot(ctx);
-      if (!inputShape || !items || !parent) return;
-      const allLeadItems = actor === "orchestrator" && items.every((item) => {
+      if (!inputShape || !items || !parent) return false;
+      const leadMarkers = items.map((item) => parseCtoSliceMarker(typeof item.task === "string" ? item.task : ""));
+      const allLeadItems = actor === "orchestrator" && items.every((item, index) => {
         const agent = typeof item.agent === "string" ? item.agent : "";
-        return (agent === "team-lead" || agent === "omp-team-lead")
-          && !!parseCtoSliceMarker(typeof item.task === "string" ? item.task : "");
+        const marker = leadMarkers[index];
+        return (agent === "team-lead" || agent === "omp-team-lead") && !!marker;
       });
-      if (!runId && !allLeadItems) return;
-
+      const leadItemsHaveMarkers = items.every((item, index) => {
+        const agent = typeof item.agent === "string" ? item.agent : "";
+        return (agent !== "team-lead" && agent !== "omp-team-lead") || !!leadMarkers[index];
+      });
+      if (!leadItemsHaveMarkers || runId && (!/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === "..")) return false;
+      if (!runId && !allLeadItems) return false;
+      const markerRunIds = leadMarkers.filter((marker): marker is { runId: string; sliceId: string } => !!marker).map((marker) => marker.runId);
+      const authorityRunId = runId ?? markerRunIds[0];
       let parentBinding: Binding | undefined;
       if (actor === "lead") {
+        // A lead runs in its own session, so coordinator-session lookup cannot
+        // authenticate this call. Inherit only the original grant's live
+        // authority after checking its manager/session binding and current
+        // token/epoch; historical worker completion is intentionally not
+        // sufficient to arm a new nested dispatch.
         parentBinding = registry.bindings.get(parent.sessionFile);
         const parentGrant = parentBinding?.grant;
         if (
@@ -608,8 +884,10 @@ export function createNativeWorkerAuthority(
           || parentGrant.actor !== "lead"
           || !snapshotStillCurrent(parentGrant.parent)
           || !grantCanonicalCurrent(parentGrant)
+          || !parentGrant.ctoAuthority
+          || !ctoAuthorityCurrent(parentGrant, false)
           || !parentGrant.ctoSlice
-        ) return;
+        ) return false;
         const everyMarkerMatches = items.every((item) => {
           const text = typeof item.task === "string" ? item.task : "";
           const marker = parseCtoSliceMarker(text);
@@ -617,10 +895,49 @@ export function createNativeWorkerAuthority(
             && marker.runId === parentBinding!.grant.ctoSlice!.runId
             && marker.sliceId === parentBinding!.grant.ctoSlice!.sliceId;
         });
-        if (!everyMarkerMatches) return;
+        if (!everyMarkerMatches) return false;
       }
       const inheritedCtoSlice = actor === "lead" ? parentBinding?.grant.ctoSlice : undefined;
-
+      const inheritedCtoAuthority = actor === "lead" ? parentBinding?.grant.ctoAuthority : undefined;
+      // Coordinator admission is authenticated by the current claim session;
+      // lead admission above is authenticated by the inherited live grant.
+      let legacyOrigin: object | undefined;
+      if (actor === "orchestrator" && legacyAuthority) {
+        try {
+          legacyOrigin = legacyAuthority(ctx, parent.cwd, authorityRunId);
+        } catch {
+          legacyOrigin = undefined;
+        }
+      }
+      const parentCtoAuthority = actor === "orchestrator"
+        ? currentCtoAuthority(
+          parent.cwd,
+          authorityRunId,
+          parent,
+          namespaceKey(bundleLabel, parent.cwd),
+          legacyOrigin,
+          legacyAuthorityCurrent,
+        )
+        : undefined;
+      const ctoAuthority = inheritedCtoAuthority ?? parentCtoAuthority;
+      const requestedCtoState = runId ? readCtoState(runId, parent.cwd) : undefined;
+      if (
+        markerRunIds.length > 0
+        && (!ctoAuthority || markerRunIds.some((markerRunId) => markerRunId !== ctoAuthority.run_id))
+      ) return false;
+      if (requestedCtoState && (!ctoAuthority || ctoAuthority.run_id !== runId)) return false;
+      if (allLeadItems && (!ctoAuthority || ctoAuthority.run_id !== authorityRunId)) return false;
+      if (ctoAuthority && !("legacy" in ctoAuthority)) {
+        try {
+          reserveExecutionClaimWorkers(parent.cwd, {
+            run_id: ctoAuthority.run_id,
+            token: ctoAuthority.token,
+            worker_ids: items.map((_item, index) => ctoWorkerId(event.toolCallId!, ctoAuthority.ownership_epoch, index)),
+          });
+        } catch {
+          return false;
+        }
+      }
       for (const candidate of [...registry.candidates.values()]) {
         if (candidate.owner === owner && sameParentSnapshot(candidate.parent, parent) && candidate.parentToolCallId === event.toolCallId) {
           removeCandidate(registry, candidate);
@@ -633,7 +950,13 @@ export function createNativeWorkerAuthority(
         const leadCandidate = actor === "orchestrator"
           && !!marker
           && (expectedAgent === "team-lead" || expectedAgent === "omp-team-lead");
+        const candidateRunId = ctoAuthority?.run_id
+          ?? inheritedCtoSlice?.runId
+          ?? (leadCandidate ? marker!.runId : runId);
         const dispatchOrigin = dispatchOrigins?.[index];
+        const workerId = ctoAuthority && !("legacy" in ctoAuthority)
+          ? ctoWorkerId(event.toolCallId!, ctoAuthority.ownership_epoch, index)
+          : undefined;
         const candidate: Candidate = {
           key: `${candidateKey(parent.sessionId, event.toolCallId!, token)}\u0000${index}`,
           slotKey: slotKey(parent.sessionId, event.toolCallId!, index, token),
@@ -642,7 +965,12 @@ export function createNativeWorkerAuthority(
           parent,
           parentActor: actor,
           parentToolCallId: event.toolCallId!,
-          runId: inheritedCtoSlice?.runId ?? (leadCandidate ? marker!.runId : runId!),
+          runId: candidateRunId!,
+          ...(ctoAuthority ? {
+            ctoRunId: ctoAuthority.run_id,
+            ctoAuthority,
+            ...(workerId ? { ctoWorkerId: workerId } : {}),
+          } : {}),
           input: event.input,
           inputShape,
           item,
@@ -654,6 +982,7 @@ export function createNativeWorkerAuthority(
         registry.candidates.set(candidate.key, candidate);
         ownerFor(registry, owner)?.candidates.add(candidate);
       });
+      return true;
     },
 
     resolve(ctx, cwd, selectedRunId) {
@@ -671,7 +1000,26 @@ export function createNativeWorkerAuthority(
           .filter((candidate) => candidate.sessionFile === current.sessionFile && candidate.namespaceKey === currentNamespace)
           .sort((left, right) => right.generation - left.generation);
         grant = candidates[0];
-        if (!grant) return undefined;
+        if (!grant) {
+          const witnesses = [...registry.settlements.values()].filter((witness) =>
+            witness.sessionFile === current.sessionFile && witness.namespaceKey === currentNamespace,
+          );
+          if (witnesses.length !== 1) return undefined;
+          const witness = witnesses[0]!;
+          if (
+            !snapshotStillCurrent(current)
+            || (selectedRunId !== undefined && selectedRunId !== witness.runId)
+            || (current.header.parentSession !== undefined && current.header.parentSession !== witness.parentSessionFile)
+            || witness.lifecycleId === current.sessionId
+            || !witness.childManager
+            || witness.childManager !== current.manager
+            || witness.childSessionId !== current.sessionId
+          ) return undefined;
+          // A settlement witness grants only the already-started child's
+          // continuation. It never recreates a binding or nested dispatch
+          // authority for the revoked parent/lead.
+          return { actor: witness.actor, kind: "cto", runId: witness.runId };
+        }
         if (
           (current.header.parentSession !== undefined && current.header.parentSession !== grant.parent.sessionFile)
           || grant.lifecycleId === current.sessionId
@@ -711,10 +1059,16 @@ export function createNativeWorkerAuthority(
         || (current.header.parentSession !== undefined && current.header.parentSession !== grant.parent.sessionFile)
         || grant.lifecycleId === current.sessionId
       ) {
-        revokeGrant(registry, grant);
+        // A stale wave/claim revokes dispatch authority but preserves the
+        // exact started child settlement witness for its terminal event.
+        revokeGrant(registry, grant, true);
         return undefined;
       }
-      return { actor: grant.actor, kind: grant.ctoSlice ? "cto" : "workflow", runId: grant.runId };
+      return {
+        actor: grant.actor,
+        kind: grant.ctoAuthority || grant.ctoSlice || grant.ctoRunId ? "cto" : "workflow",
+        runId: grant.ctoAuthority?.run_id ?? grant.ctoSlice?.runId ?? grant.ctoRunId ?? grant.runId,
+      };
     },
 
     observeSessionStart(ctx) {
@@ -731,7 +1085,7 @@ export function createNativeWorkerAuthority(
           || parent.cwd !== current.cwd
           || headless);
       for (const grant of [...registry.grants.values()]) {
-        if (grant.owner === owner && replacedOrHeadless(grant.parent)) revokeGrant(registry, grant);
+        if (grant.owner === owner && replacedOrHeadless(grant.parent)) revokeGrant(registry, grant, true);
       }
       for (const candidate of [...registry.candidates.values()]) {
         if (candidate.owner === owner && replacedOrHeadless(candidate.parent)) removeCandidate(registry, candidate);
@@ -745,19 +1099,19 @@ export function createNativeWorkerAuthority(
       if (!snapshot) return;
       const state = current.owners.get(owner);
       if (!state) return;
+      for (const grant of [...state.grants]) {
+        if (sameParentSnapshot(grant.parent, snapshot)) revokeGrant(current, grant, true);
+      }
       for (const candidate of [...state.candidates]) {
         if (sameParentSnapshot(candidate.parent, snapshot)) removeCandidate(current, candidate);
       }
-      for (const grant of [...state.grants]) {
-        if (sameParentSnapshot(grant.parent, snapshot)) revokeGrant(current, grant);
-      }
       for (const binding of [...state.bindings]) {
         if (!sameBindingSnapshot(binding, snapshot)) continue;
-        if (current.grants.get(binding.grant.slotKey) === binding.grant) revokeGrant(current, binding.grant);
+        if (current.grants.get(binding.grant.slotKey) === binding.grant) revokeGrant(current, binding.grant, true);
         else removeBinding(current, binding);
       }
-    },
 
+    },
     teardown() {
       const current = getRegistry(false);
       if (!current) return;
@@ -766,6 +1120,7 @@ export function createNativeWorkerAuthority(
       for (const candidate of [...state.candidates]) removeCandidate(current, candidate);
       for (const binding of [...state.bindings]) removeBinding(current, binding);
       for (const grant of [...state.grants]) revokeGrant(current, grant);
+      for (const witness of [...state.settlements]) removeSettlementWitness(current, witness);
       current.owners.delete(owner);
     },
   };
