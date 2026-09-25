@@ -164,8 +164,7 @@ export function renderChannelSection(cwd: string): string {
       "- Inbound tasks/answers arrive via this channel — `[CTO-INBOX]` messages are USER COMMANDS.",
       "- NEVER use the `ask` tool — it is blocked while this channel is active.",
       "- Blocking waits park the team (`background_wait`); everything else continues.",
-      "- In standby: tasks arrive as `[CTO-INBOX]` messages — treat each as a USER COMMAND to the",
-      "  main-session CTO: fold it into the run (amend discipline) and return to standby after the wave.",
+      "- In standby: tasks arrive as `[CTO-INBOX]` messages — apply the terminal-request precedence in the lifecycle contract first; only ordinary tasks are folded into the run (amend discipline) and followed by return to standby.",
     ].join("\n");
   }
   if (profile.direction === "ro") {
@@ -220,9 +219,11 @@ export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}):
     "   key off its exact state.",
     "   **This `autonomous: true` is ENGINE-CREATED — standby has NO user task, so there is nothing to",
     "   classify.** The standby state therefore carries NO `classification` field (model-first: a",
-    "   classification exists only when a task was classified). It is not a PHASE-0 decision; each",
-    "   inbox task that arrives is classified by YOU (type, complexity, confidence, autonomous) on",
-    "   wake, exactly like a `/cto <task>` invocation.",
+    "   classification exists only when a task was classified). It is not a PHASE-0 decision; on wake, first",
+    "   apply terminal-request precedence: an unmistakable explicit request to end this resident run itself",
+    "   follows the terminal branch and is not classified, amended, spawned, or started as a new wave. Every",
+    "   other inbox task is classified by YOU (type, complexity, confidence, autonomous) on wake, exactly",
+    "   like a `/cto <task>` invocation.",
     "2. On every wake, read the exact run state with `cto_state(operation: \"read\", run_id: <exact-run-id>)`.",
     "   Read this run's `answers/*.json` and escalation records directly from its namespace before applying retry rules.",
     "   A dispatcher-created `.omp/inbox/answer-retry-<sanitized-id>-<sanitized-epoch>.json` marker authorizes one retry only",
@@ -236,16 +237,20 @@ export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}):
     "- A `[CTO-INBOX]` user message (injected by the messenger dispatcher), or",
     "- files in `.work-state/cto/<id>/inbox/*.json` ({ id, text, at, by }).",
     "`[CTO-INBOX]` messages ARE USER COMMANDS — direct instructions to you, the main-session CTO:",
-    "no new session, no subagent dispatch. On EACH wake: treat the payload as a `/cto <task>` command",
+    "first apply the terminal-request precedence above; only otherwise treat the payload as a `/cto <task>` command",
     "and fold it into THIS run (amend discipline: re-plan, spawn leads in parallel, integration covers",
-    "ALL teams). Multiple tasks = multiple sequential waves; do not merge them into one team.",
+    "ALL teams). Multiple ordinary tasks = multiple sequential waves; do not merge them into one team.",
+    "A terminal request is not a classification, amend, lead-dispatch, or new-wave trigger; apply the shared",
+    "lifecycle termination contract instead.",
     "",
     "### After each wave",
     "Stay on-line when a wave completes — you remain the CTO of this session. Close the wave",
     "(integration + summary), keep the run active, and return to standby: yield and wait for the",
-    "next `[CTO-INBOX]` task (or `inbox/` file) to fold in.",
-    "**The run id NEVER changes across follow-up waves.** Every inbox task is a NEW wave in the SAME",
-    "canonical state. Read the exact state with `cto_state(operation: \"read\")`, then commit the",
+    "next `[CTO-INBOX]` task (or `inbox/` file) to fold in, unless the user explicitly requests ending",
+    "the resident run itself; that request follows the terminal branch, not a new wave.",
+    "**The run id NEVER changes across follow-up waves.** Every ordinary inbox task is a NEW wave in the SAME",
+    "canonical state. An explicit terminal request is not a wave; follow the lifecycle termination contract",
+    "instead. Read the exact state with `cto_state(operation: \"read\")`, then commit the",
     "updated `wave_history`, `active_wave_id`, per-slice classification, workflow, and DoD metadata",
     "with `cto_state(operation: \"commit\", expected_state_revision: <revision>, state: <candidate>)`.",
     "Never use Write, Edit, or Bash for canonical CTO state. Close the wave (status `done`|`failed` +",
@@ -258,6 +263,7 @@ export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}):
     "  on second failure dispatch the workers directly (single-worker slices skip the lead from the start).",
     "",
     renderChannelSection(cwd),
+    persistenceContract(opts, false),
     "",
     "Begin: use `cto_state(operation: \"read\")` for the pre-acquired standby run, read the registry, yield.",
   ].join("\n");
@@ -277,12 +283,22 @@ export interface CtoPromptOptions {
   runId?: string;
 }
 
-/** Persistence contract lines shared by the CTO task/amend prompts. */
-function persistenceContract(opts: CtoPromptOptions): string {
-  const sessionLine = opts.sessionId ? `\`session: ${opts.sessionId}\`` : "`session: <your current omp session id>`";
+/** Persistence and lifecycle contract shared by the CTO standby/task/amend prompts. */
+function persistenceContract(opts: CtoPromptOptions, includeClassification = true): string {
+  const sessionLine = opts.sessionId ? `\`session: ${opts.sessionId}\``
+    : "`session: <your current omp session id>`";
   const runLine = opts.runId
     ? `\`id: ${opts.runId}\` — this exact pre-acquired id is authoritative; never create another CTO run`
     : "`id: <the exact canonical CTO id acquired by the registered /cto ingress>`";
+  const classificationLines = includeClassification
+    ? [
+      "The PHASE-0 classification is a structured state decision:",
+      "`classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>,",
+      "\"autonomous_reason\": ... }`. `classification.autonomous` is the AUTHORITY; the legacy",
+      "top-level `autonomous` line is read-compat only. The `autonomous` value is YOUR model decision,",
+      "never the mechanical hint.",
+    ]
+    : [];
   return [
     "### State persistence (mandatory)",
     "The registered `/cto` ingress has already acquired and published the minimal canonical state and",
@@ -292,13 +308,26 @@ function persistenceContract(opts: CtoPromptOptions): string {
     "canonical CTO state only through the registered `cto_state` tool: read the exact run first, then",
     "commit the full schema-2 candidate with the exact `state_revision` returned by read. Never use",
     "Write, Edit, or Bash on `.work-state/cto/<id>/state.json`.",
-    "The PHASE-0 classification is a structured state decision:",
-    "`classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>,",
-    "\"autonomous_reason\": ... }`. `classification.autonomous` is the AUTHORITY; the legacy",
-    "top-level `autonomous` line is read-compat only. The `autonomous` value is YOUR model decision,",
-    "never the mechanical hint. Keep session ownership and exact run identity fields unchanged:",
+    ...classificationLines,
+    "Keep exact run identity fields unchanged; the rendered session label is caller context only:",
     runLine,
     sessionLine,
+    "`session` identifies the current caller only; never use it to replace the engine-owned `owner_session`. Preserve the freshly read `owner_session` exactly, including when a standby wake is handled from another session.",
+    "### Resident lifecycle",
+    "Before any standby wake, inbox, or amend task is routed, check for an unmistakable user request to end this resident run itself. Such a request takes precedence over normal task classification/new-wave routing: do not classify, amend, spawn leads, or start a wave for it. This does not include a completed wave, incidental `done` wording, or ordinary wave-close instructions. Settle genuine pending work first, then follow the terminal branch below.",
+    "For a resident run, normal wave completion closes only the wave: settle integration, mark the wave",
+    "`done`|`failed` with `finished_at`, clear `active_wave_id`, keep the run active in standby, and wait for the next task.",
+    "Wave closure is not run termination, and `pause.kind: \"none\"` remains nonterminal.",
+    "Only an explicit user request to end the resident run may terminate it. First settle all genuine",
+    "pending work (including workers, reservations, and barriers); never bypass guards or fabricate",
+    "completion. Then read the exact run fresh, commit the full schema-2 candidate with the read's",
+    "`state_revision`, preserve engine-owned `id`/run identity, `owner_session` ownership, and the `standby` marker, and set",
+    "`pause` exactly to `{ kind: \"done\", reason: <actual user-requested basis> }`.",
+    "Never use `completed` as a terminal value. Inspect the actual commit result before announcing",
+    "termination: only `ok: true` with `transition: \"terminal\"` and returned `state.pause.kind: \"done\"`",
+    "proves success. A rejected or failed commit is not success; do not silently substitute `none`.",
+    "After that successful terminal commit, use its receipt and returned terminal state; do not require",
+    "an additional authenticated read after the claim is released.",
     "",
   ].join("\n");
 }
@@ -486,11 +515,13 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "   the spec); one worker per `task` call. Big specs at heavy context are exactly where subagents",
     "   stall.",
     "",
-    "### After the wave",
     "When integration completes and the summary is written, close ONLY the current wave: set its",
     "`wave_history` record status to `done`|`failed` with `finished_at`, and clear `active_wave_id`.",
     "Keep the resident CTO run active with the SAME run id; return to standby — stay on-line, yield,",
-    "and await the next task (`[CTO-INBOX]` message or `inbox/` file), folding it in as an amend that",
+    "and await the next task (`[CTO-INBOX]` message or `inbox/` file). Before routing that task as an",
+    "amend/new wave, apply the terminal-request precedence in the lifecycle contract: an unmistakable",
+    "request to end this resident run itself is terminal (not a completed-wave or incidental `done`",
+    "message) and must not be classified, amended, or spawned; otherwise fold it in as an amend that",
     "appends a NEW wave record to the same `state.json`.",
     "",
     "Begin: decompose the task into a TeamPlan, persist it, and spawn the first leads.",
@@ -749,7 +780,7 @@ export function buildAmendPrompt(
 ): string {
   const teamsLine = active.state.teams.map((t) => `${t.id}:${t.status}`).join(", ");
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
-  const sessionMeta = opts.sessionId ? `Session: \`${opts.sessionId}\` (state field: \`owner_session\`)\n` : "";
+  const sessionMeta = opts.sessionId ? `Session: \`${opts.sessionId}\` (caller context; preserve state field: \`owner_session\`)\n` : "";
 
   return [
     "/cto AMEND — a new task arrived while a CTO run is ACTIVE.",
@@ -767,6 +798,9 @@ export function buildAmendPrompt(
     "and `delivery_session_id` authorizes exactly one retry under the current claim. Canonical status",
     "alone is not replay authority. `unknown/in-flight/legacy/accepted` answer artifacts remain advisory/recovery;",
     "never blind replay them. Transport-only markers do not authorize a retry.",
+    "",
+    "### Terminal request precedence",
+    "If the incoming user command unmistakably asks to end this resident run itself — not merely close a completed wave and not incidental `done` wording — use the terminal branch in the shared lifecycle contract before treating it as a new task. Settle genuine pending work first; do not classify, amend, spawn leads, or start a wave for that request. For every other command, continue the PHASE-0 classification and amend flow.",
     "",
     "### New task (fold into the SAME run)",
     issueMeta + sessionMeta,
@@ -809,7 +843,8 @@ export function buildAmendPrompt(
     "6. **Escalations** of the new teams use the same ladder (worker -> lead -> you -> user); you never spawn",
     "   a second orchestrator.",
     `7. **Inbox check**: read \`.work-state/cto/${active.runId}/inbox/*.json\` for tasks that arrived while`,
-    "   no session was listening; fold each in as its own wave.",
+    "   no session was listening; apply terminal-request precedence from the lifecycle contract to each payload first, and fold",
+    "   only other tasks in as their own wave. A terminal request is not a classification, amend, or lead-dispatch trigger.",
     "",
     "### LECTURE_RESEARCH slices (URL-first, research-only, human-gated)",
     "A slice classified `LECTURE_RESEARCH` (one public video/playlist URL + natural-language prompt) resolves deterministically to the",
