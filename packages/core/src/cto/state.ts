@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSy
 import { randomUUID } from "node:crypto";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { recordStageTransition } from "../observability/hooks.js";
+import { withWorkspaceTransaction } from "../engine/state.js";
 import type { ModelClassification } from "../engine/run.js";
 import {
   type CtoState,
@@ -22,7 +23,72 @@ import {
   type WaveRecord,
 } from "./types.js";
 import { validateTypedControlPlane } from "../engine/workflow-contract.js";
-import type { ControlPlaneProvenance, WorkIdentity } from "../engine/types.js";
+import type { ControlPlaneProvenance, WorkIdentity, WorktreeExecutionClaim } from "../engine/types.js";
+
+/**
+ * A read witness is deliberately private to the in-memory object. It is a
+ * byte-exact CAS value, never an actor credential or an authorization proof.
+ */
+const ctoStateSnapshots = new WeakMap<object, string>();
+const ctoTerminalTransitionProofs = new WeakMap<object, CtoTerminalTransitionProof>();
+const ctoTerminalTransitionSettlers = new WeakMap<object, () => void>();
+let ctoTerminalTransitionHook: CtoTerminalTransitionHook | undefined;
+
+export interface CtoTerminalTransitionProof {
+  readonly run_id: string;
+  readonly token: string;
+  readonly ownership_epoch: string;
+  readonly coordinator_session_id: string;
+  readonly coordinator_process_id?: number;
+  readonly branch: string;
+}
+function serializeCtoState(state: CtoState): string {
+  return `${JSON.stringify(state, null, 2)}\n`;
+}
+
+/** @internal — the package barrel intentionally does not export this witness. */
+export function ctoStateSnapshot(state: CtoState): string | undefined {
+  return ctoStateSnapshots.get(state);
+}
+
+type CtoTerminalTransitionPhase = "before" | "after";
+type CtoTerminalTransitionHook = (
+  state: CtoState,
+  root: string,
+  proof: CtoTerminalTransitionProof | undefined,
+  phase: CtoTerminalTransitionPhase,
+) => boolean;
+
+/** Bind the originating coordinator proof to the in-memory state operation. */
+export function bindCtoTerminalTransition(
+  state: CtoState,
+  claim: WorktreeExecutionClaim,
+  onSettled?: () => void,
+): void {
+  ctoTerminalTransitionProofs.set(state, {
+    run_id: claim.run_id,
+    token: claim.token,
+    ownership_epoch: claim.ownership_epoch,
+    coordinator_session_id: claim.coordinator_session_id,
+    ...(claim.coordinator_process_id ? { coordinator_process_id: claim.coordinator_process_id } : {}),
+    branch: state.branch,
+  });
+  // Engine-published in-memory states do not come from readCtoState. Their
+  // publication bytes are the originating witness until the first durable
+  // write succeeds; existing read witnesses are never replaced.
+  if (!ctoStateSnapshots.has(state)) ctoStateSnapshots.set(state, serializeCtoState(state));
+  if (onSettled) ctoTerminalTransitionSettlers.set(state, onSettled);
+}
+
+/**
+ * The lifecycle adapter installs this narrow callback so terminal claim
+ * settlement is driven by an actual persisted CTO transition. Keeping the
+ * callback here avoids making state writers depend on the run-store module
+ * (which would introduce an engine/domain import cycle).
+ */
+export function registerCtoTerminalTransitionHook(hook: CtoTerminalTransitionHook | undefined): void {
+  ctoTerminalTransitionHook = hook;
+}
 
 export function ctoStateDir(runId: string, root: string): string {
   if (!runId || runId === "." || runId === ".." || !/^[A-Za-z0-9._-]+$/.test(runId)) throw new Error("unsafe CTO run id");
@@ -170,6 +236,152 @@ export function migrateCtoState(raw: Record<string, unknown>): CtoState {
   return state as unknown as CtoState;
 }
 
+type CtoStateRecord = Record<string, unknown>;
+
+export type CtoStateValidation =
+  | { ok: true; state: CtoState }
+  | { ok: false; error: string };
+
+const CTO_STATE_KEYS: Record<string, true> = {
+  schema: true,
+  id: true,
+  task: true,
+  branch: true,
+  autonomous: true,
+  classification: true,
+  plan: true,
+  teams: true,
+  integration: true,
+  amended_at: true,
+  standby: true,
+  owner_session: true,
+  pause: true,
+  updated_at: true,
+  budget: true,
+  leases: true,
+  decisions: true,
+  inbox_quarantine: true,
+  health: true,
+  scheduler: true,
+  wave_history: true,
+  active_wave_id: true,
+  channel_profile: true,
+  completion_intent: true,
+  checkpoint_policy: true,
+  roster_policy: true,
+  roster_selection: true,
+  roster_selections: true,
+  work_identity: true,
+  pending: true,
+  child_join: true,
+  child_joins: true,
+  completion_envelope: true,
+  migration: true,
+  control_plane_provenance: true,
+  control_plane_status: true,
+};
+function isCtoStateRecord(value: unknown): value is CtoStateRecord {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function nonEmptyStateString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Validate the supported canonical CTO image before terminality is inspected.
+ * Legacy images may omit schema-2 additive fields, but they still need the
+ * complete identity/lifecycle shape; a partial terminal-looking object is
+ * corrupt, not an inactive legacy run.
+ */
+export function parseCtoState(
+  raw: unknown,
+  expectedId?: string,
+  options: { strict?: boolean } = {},
+): CtoStateValidation {
+  if (!isCtoStateRecord(raw)) return { ok: false, error: "CTO state must be a JSON object" };
+  const state = migrateCtoState(raw);
+  const issues: string[] = [];
+  const typedValidation = validateTypedControlPlane(raw);
+  if (!typedValidation.ok) {
+    issues.push(...typedValidation.issues.map((issue) => `${issue.path} ${issue.message}`));
+  }
+  if (options.strict) {
+    for (const key of Object.keys(raw)) {
+      if (!Object.prototype.hasOwnProperty.call(CTO_STATE_KEYS, key)) issues.push(`$.${key} is not a supported CTO state field`);
+    }
+    if (raw.schema !== 2) issues.push("$.schema must be 2 for model state commits");
+  }
+  if (state.schema !== 2) issues.push("$.schema must be 2");
+  if (!nonEmptyStateString(state.id) || !/^[A-Za-z0-9._-]+$/.test(state.id) || state.id === "." || state.id === "..") {
+    issues.push("$.id must be a safe non-empty CTO run id");
+  }
+  if (expectedId !== undefined && state.id !== expectedId) issues.push(`$.id must equal '${expectedId}'`);
+  if (!nonEmptyStateString(state.task)) issues.push("$.task must be a non-empty string");
+  if (!nonEmptyStateString(state.branch)) issues.push("$.branch must be a non-empty string");
+  if (typeof state.autonomous !== "boolean") issues.push("$.autonomous must be a boolean");
+  if (!isCtoStateRecord(state.plan)) {
+    issues.push("$.plan must be an object");
+  } else {
+    if (state.plan.id !== state.id) issues.push("$.plan.id must equal $.id");
+    if (!nonEmptyStateString(state.plan.task)) issues.push("$.plan.task must be a non-empty string");
+    if (!nonEmptyStateString(state.plan.created_at)) issues.push("$.plan.created_at must be a non-empty string");
+    if (!Array.isArray(state.plan.teams)) issues.push("$.plan.teams must be an array");
+    else state.plan.teams.forEach((team, index) => {
+      if (!isCtoStateRecord(team)
+        || !nonEmptyStateString(team.team)
+        || !Array.isArray(team.scope)
+        || team.scope.some((scope) => !nonEmptyStateString(scope))
+        || !nonEmptyStateString(team.slice)
+        || !nonEmptyStateString(team.profile)
+        || !["same_branch", "separate_worktree"].includes(String(team.worktree))
+        || !Array.isArray(team.depends_on)
+        || team.depends_on.some((dependency) => !nonEmptyStateString(dependency))) {
+        issues.push(`$.plan.teams[${index}] has an invalid team plan entry`);
+      }
+    });
+  }
+  if (!Array.isArray(state.teams)) {
+    issues.push("$.teams must be an array");
+  } else {
+    state.teams.forEach((team, index) => {
+      if (!isCtoStateRecord(team)
+        || !nonEmptyStateString(team.id)
+        || !["pending", "in_progress", "parked", "done", "failed"].includes(String(team.status))
+        || !isCtoStateRecord(team.escalations)) {
+        issues.push(`$.teams[${index}] has an invalid team state`);
+      }
+    });
+  }
+  if (!isCtoStateRecord(state.integration)
+    || !["pending", "in_progress", "done", "failed"].includes(String(state.integration.status))) {
+    issues.push("$.integration has an invalid status");
+  }
+  if (state.pause !== undefined && (
+    !isCtoStateRecord(state.pause)
+    || !["none", "background_wait", "user_checkpoint", "needs_human", "failed", "done"].includes(String(state.pause.kind))
+    || typeof state.pause.reason !== "string"
+  )) issues.push("$.pause has an invalid shape");
+  if (!nonEmptyStateString(state.updated_at)) issues.push("$.updated_at must be a non-empty string");
+  if (state.classification !== undefined && (
+    !isCtoStateRecord(state.classification)
+    || !nonEmptyStateString(state.classification.type)
+    || !nonEmptyStateString(state.classification.complexity)
+    || !nonEmptyStateString(state.classification.confidence)
+    || typeof state.classification.autonomous !== "boolean"
+  )) issues.push("$.classification has an invalid shape");
+  if (state.owner_session !== undefined && !nonEmptyStateString(state.owner_session)) issues.push("$.owner_session must be a non-empty string");
+  if (state.standby !== undefined && typeof state.standby !== "boolean") issues.push("$.standby must be a boolean");
+  if (issues.length > 0) return { ok: false, error: issues.join("; ") };
+  return { ok: true, state };
+}
+
+export function validateCtoStateCandidate(raw: unknown, expectedId?: string): CtoState {
+  const result = parseCtoState(raw, expectedId, { strict: true });
+  if (!result.ok) throw new Error(result.error);
+  return result.state;
+}
+
 /**
  * Canonicalize a run's state on disk (architecture 3.1/3.3): read →
  * migrate → re-write via writeCtoState ONLY when the stored state is not
@@ -196,8 +408,12 @@ export function canonicalizeState(runId: string, root: string): CtoState {
 
 export function readCtoState(runId: string, root: string): CtoState | null {
   try {
-    const raw = JSON.parse(readFileSync(ctoStatePath(runId, root), "utf8")) as Record<string, unknown>;
-    return migrateCtoState(raw);
+    const rawText = readFileSync(ctoStatePath(runId, root), "utf8");
+    const raw: unknown = JSON.parse(rawText);
+    const parsed = parseCtoState(raw, runId);
+    if (!parsed.ok) return null;
+    ctoStateSnapshots.set(parsed.state, rawText);
+    return parsed.state;
   } catch {
     return null;
   }
@@ -206,22 +422,83 @@ export function readCtoState(runId: string, root: string): CtoState | null {
 export function writeCtoState(state: CtoState, root: string): string {
   const path = ctoStatePath(state.id, root);
   const dir = ctoStateDir(state.id, root);
-  mkdirSync(dir, { recursive: true });
-  state.updated_at = new Date().toISOString();
-  const serialized = JSON.stringify(state, null, 2);
-  const tempPath = join(dir, `.state.${randomUUID()}.tmp`);
-  try {
-    writeFileSync(tempPath, serialized);
-    renameSync(tempPath, path);
-  } catch (error) {
+  return withWorkspaceTransaction(root, () => {
+    mkdirSync(dir, { recursive: true });
+    let before: string | null;
     try {
-      unlinkSync(tempPath);
-    } catch {
-      // Best-effort cleanup must not hide the original I/O error.
+      before = readFileSync(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") before = null;
+      else throw error;
     }
-    throw error;
-  }
-  return path;
+    const witness = ctoStateSnapshots.get(state);
+    if (before === null) {
+      if (witness !== undefined) {
+        throw new Error("CTO state write is stale: the originating state snapshot is no longer present");
+      }
+    } else {
+      if (witness === undefined) {
+        throw new Error("CTO state write requires an original read snapshot for an existing state");
+      }
+      if (witness !== before) {
+        throw new Error("CTO state write is stale: the canonical state changed after the originating read");
+      }
+    }
+
+    let previous: CtoState | null = null;
+    let previousReadable = false;
+    if (before !== null) {
+      try {
+        const parsed = parseCtoState(JSON.parse(before), state.id);
+        if (parsed.ok) {
+          previous = parsed.state;
+          previousReadable = true;
+        }
+      } catch {
+        // A corrupt prior image cannot prove a terminal transition.
+      }
+    }
+    const wasTerminal = previous ? isCtoRunTerminal(previous) : false;
+    const terminalCandidate = isCtoRunTerminal(state);
+    const terminalTransition = terminalCandidate && (!previousReadable || !wasTerminal);
+    const terminalProof = ctoTerminalTransitionProofs.get(state);
+    if (terminalTransition) {
+      if (!terminalProof || !ctoTerminalTransitionHook) {
+        throw new Error("CTO terminal transition requires the authenticated engine transaction");
+      }
+      // The hook owns the state+control lifecycle journal. No state rename is
+      // attempted here: a separate rename followed by claim release would
+      // expose a terminal state with live control when release fails.
+      state.updated_at = new Date().toISOString();
+      if (!ctoTerminalTransitionHook(state, root, terminalProof, "before")) {
+        throw new Error("CTO terminal transition was not committed by the lifecycle engine");
+      }
+      try {
+        ctoStateSnapshots.set(state, readFileSync(path, "utf8"));
+      } catch {
+        ctoStateSnapshots.delete(state);
+      }
+      ctoTerminalTransitionSettlers.get(state)?.();
+      return path;
+    }
+
+    state.updated_at = new Date().toISOString();
+    const serialized = serializeCtoState(state);
+    const tempPath = join(dir, `.state.${randomUUID()}.tmp`);
+    try {
+      writeFileSync(tempPath, serialized);
+      renameSync(tempPath, path);
+    } catch (error) {
+      try {
+        unlinkSync(tempPath);
+      } catch {
+        // Best-effort cleanup must not hide the original I/O error.
+      }
+      throw error;
+    }
+    ctoStateSnapshots.set(state, serialized);
+    return path;
+  });
 }
 
 /**

@@ -23,11 +23,14 @@ import { join } from "node:path";
 import { loadProfile, profileHash, registerWorkflowProfiles } from "../src/engine/profile.js";
 import { advanceCursor, createCapability, type IssuedCapability } from "../src/engine/durable.js";
 import { isRootCauseDocumented } from "../src/engine/dod.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+
+import { runTarget } from "../src/engine/run-store.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 
-const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
+const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
+const RUN_ID = "88888888-8888-4888-8888-888888888888";
+
 
 const PROBE_PROFILE: Profile = {
   name: "root-cause-gate-probe",
@@ -48,10 +51,11 @@ function initGit(root: string): void {
 
 function advanceAuthOf(issued: IssuedCapability) {
   return {
+    run_id: RUN_ID,
+    branch: issued.state.issued_for!.branch,
     token: issued.advance_token,
     capability_id: issued.capability_id,
     run_key: issued.state.issued_for!.run_key,
-    branch: issued.state.issued_for!.branch,
     workflow: issued.state.issued_for!.workflow,
     profile_hash: issued.state.issued_for!.profile_hash,
     stage_cursor: issued.state.issued_for!.stage_cursor,
@@ -65,7 +69,7 @@ function setupStage(root: string): { issued: IssuedCapability; artifactsDir: str
   assert.ok(profile);
   const persistedHash = profileHash(profile);
   const issued = createCapability({
-    run_key: "feat/probe",
+    run_key: RUN_ID,
     branch: "feat/probe",
     workflow: "root-cause-gate-probe",
     profile_hash: persistedHash,
@@ -73,10 +77,16 @@ function setupStage(root: string): { issued: IssuedCapability; artifactsDir: str
     kind: "none",
     expected_roster: [],
   });
-  writeStateBootstrap(root, {
-    schema: 1,
+  const target = runTarget(root, RUN_ID);
+  mkdirSync(target.stateDir!, { recursive: true });
+  const artifactsDir = target.artifactsDir!;
+  writeFileSync(target.statePath!, JSON.stringify({
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
+    lifecycle_status: "active",
+    title: "root cause gate regression",
     branch: "feat/probe",
-    run_key: "feat/probe",
     classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "root-cause-gate-probe" },
     task: "root cause gate regression",
     workflow_override: false,
@@ -91,14 +101,12 @@ function setupStage(root: string): { issued: IssuedCapability; artifactsDir: str
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
-  }, { featureSlug: "probe" });
-  const artifactsDir = join(root, ".work-state", "features", "probe", "artifacts");
+  }, null, 2) + "\n");
   mkdirSync(artifactsDir, { recursive: true });
   return { issued, artifactsDir };
 }
-
 function persistedStageCursor(root: string): string {
-  const statePath = join(root, ".work-state", "features", "probe", "state.json");
+  const statePath = join(root, ".work-state", "runs", RUN_ID, "state.json");
   return (JSON.parse(readFileSync(statePath, "utf8")) as TeamState).stage_cursor;
 }
 
@@ -118,7 +126,7 @@ test("schema-conforming diagnosis passes root_cause_documented through workflow 
       proposed_fix: "hash file contents",
       verification_checklist: ["touch file, digest stays stable"],
     });
-    const advanced = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "diagnosis documented" });
+    const advanced = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "diagnosis documented" }, { runId: RUN_ID });
     assert.equal(advanced.ok, true, advanced.ok ? "advance accepted" : advanced.error);
     if (advanced.ok) assert.equal(advanced.state.stage_cursor, "wrap");
   } finally {
@@ -143,7 +151,7 @@ test("invalid diagnosis rejects workflow advance with the exact gate reason", ()
       initGit(root);
       const { issued, artifactsDir } = setupStage(root);
       writeDiagnosis(artifactsDir, diagnosis);
-      const blocked = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "diagnosis documented" });
+      const blocked = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "diagnosis documented" }, { runId: RUN_ID });
       assert.equal(blocked.ok, false, "an invalid diagnosis must block the advance");
       if (!blocked.ok) assert.match(blocked.error, expected);
       assert.equal(persistedStageCursor(root), "diagnose", "a blocked advance never moves the cursor");
@@ -159,7 +167,7 @@ test("diagnosis missing the explanation field fails at the schema contract first
     initGit(root);
     const { issued, artifactsDir } = setupStage(root);
     writeDiagnosis(artifactsDir, { root_cause: "digest drift" });
-    const blocked = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "diagnosis documented" });
+    const blocked = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "diagnosis documented" }, { runId: RUN_ID });
     assert.equal(blocked.ok, false);
     if (!blocked.ok) assert.match(blocked.error, /produced artifact 'diagnosis' violates its contract: \$\.explanation: .*required field 'explanation' is missing/);
   } finally {

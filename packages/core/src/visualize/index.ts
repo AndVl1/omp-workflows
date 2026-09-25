@@ -17,9 +17,9 @@
  *   rendered-page link check); markdown.ts exports the same name (snapshot
  *   link-graph check) — the ambiguous name is resolved here, never via
  *   `export *` collisions;
- * - session discovery comes from the shared report/session-source module
- *   (architecture-2), re-exported here as the discovery seam the command
- *   consumes (`listSessions` + source entry types).
+ * - canonical run/revision sources come from report/canonical-source.ts;
+ *   callers must resolve an explicit run id (and optional revision) before
+ *   building snapshots. Legacy feature/CTO discovery is not a fallback.
  *
  * Everything here is read-only projection: no engine hooks, no agents, no
  * canonical-state mutation, no network.
@@ -97,10 +97,16 @@ export {
   type VisualizePublishStatus,
 } from "./writer.js";
 export {
+  listCanonicalRunSources,
+  resolveCanonicalRunSource,
+  type CanonicalReportSelector,
+  type CanonicalRunReportListEntry,
+  type CanonicalRunReportSource,
+} from "../report/canonical-source.js";
+export {
   listCtoSources,
-  listDoWorkSources,
-  listSessions,
+  resolveCtoSource,
   type CtoSessionSource,
-  type DoWorkSessionSource,
-  type SessionSourceEntry,
+  type ResolvedCto,
+  type SessionSourceStatus,
 } from "../report/session-source.js";

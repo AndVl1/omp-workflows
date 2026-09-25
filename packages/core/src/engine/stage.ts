@@ -9,8 +9,9 @@
  *   - `bash`         -> deterministic shell step
  *   - `none`         -> skip
  *
- * The orchestrator hands every `task` call its `consumes` artifact content;
- * the agent gathers its own context outside this layer.
+ * The orchestrator hands every `task` call its required `consumes` content and
+ * any present `optional_consumes` content; the agent gathers its own context
+ * outside this layer.
  *
  * v0.7.0: stages that ship code (currently `implementation` and
  * `review_fixes`) go through the `validationGate` after the subagent
@@ -23,8 +24,11 @@
 import { buildDispatchMarker, dispatchTaskId } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { dirname } from "node:path";
-import { persistReturnedArtifacts, readArtifact, writeArtifact } from "./artifacts.js";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { persistReturnedArtifacts, readArtifact, readArtifactInput, writeArtifact } from "./artifacts.js";
+import { validateProducedArtifact } from "./artifact-contract.js";
+import { validateTypedDoD } from "../gates/dod-backstop.js";
 import { resolveConfig } from "./config.js";
 import { type ScopeFlags } from "./scope.js";
 import { evaluatePredicate } from "./predicate.js";
@@ -32,6 +36,7 @@ import { namespacedArtifactId, sanitizeSlot } from "./fan-in.js";
 import { PRD_SOURCE_ARTIFACT_IDS, validateProductPrdDocument, writeProductPrdDocument } from "./product-prd.js";
 import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
 import type {
+  CapturedDispatchContext,
   DispatchSlot,
   Profile,
   RosterPolicy,
@@ -78,9 +83,12 @@ export interface StageContext {
   }) => Promise<OrchestratorResult | void> | OrchestratorResult | void;
   onStageStart?: (stageId: string) => void;
   onStageComplete?: (stageId: string, status: StageOutcome["status"]) => void;
+  captured?: CapturedDispatchContext;
   /** Present when strict durable execution is armed. */
   durable?: {
-    authorize: (role: string, agent: string) => { ok: true; dispatchId: string } | { ok: false; error: string };
+    /** Resolve and hash every canonical input before native dispatch. */
+    readInputs?: (stageId: string) => { ok: true; inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> } | { ok: false; error: string };
+    authorize: (role: string, agent: string) => { ok: true; dispatchId: string; captured?: CapturedDispatchContext } | { ok: false; error: string };
     complete: (dispatchId: string, output: string, outcome: "succeeded" | "failed", artifactIds?: string[]) => { ok: true } | { ok: false; error: string };
     pending?: (dispatchId: string, reason?: "provider_running" | "awaiting_result" | "transport_reconnect", providerRef?: string) => { ok: true } | { ok: false; error: string };
     advance: (evidence: string) => { ok: true; handoff?: { capability_id: string; dispatch_token: string; advance_token: string; cursor_epoch: string } } | { ok: false; error: string };
@@ -178,6 +186,7 @@ interface SingleSpawnPayload {
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
+
 
 function contentText(value: unknown): string {
   if (!isObject(value) || !Array.isArray(value.content)) return "";
@@ -385,16 +394,20 @@ export async function runStage(
   }
 
   const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+  const optionalInputRead = readOptionalStageInputs(stage, ctx.state, ctx.artifactsDir);
+  if (!optionalInputRead.ok) {
+    return { stageId: stage.id, status: "failed", note: optionalInputRead.error, artifacts: produces };
+  }
   try {
     ctx.log(`stage ${stage.id}: ${stage.title}`);
     ctx.onStageStart?.(stage.id);
     switch (stage.type) {
       case "orchestrator":
-        return await runOrchestrator(stage, ctx, produces);
+        return await runOrchestrator(stage, ctx, produces, optionalInputRead.inputs);
       case "single":
-        return await runSingle(stage, ctx, produces);
+        return await runSingle(stage, ctx, produces, optionalInputRead.inputs);
       case "consilium":
-        return await runConsilium(stage, ctx, produces);
+        return await runConsilium(stage, ctx, produces, optionalInputRead.inputs);
       case "document":
         return await runProductPrdRender(stage, ctx, produces);
       case "bash":
@@ -413,13 +426,18 @@ export async function runStage(
   }
 }
 
-async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
+async function runOrchestrator(
+  stage: StageDef,
+  ctx: StageContext,
+  produces: string[],
+  optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
+): Promise<StageOutcome> {
   ctx.log(`  orchestrator: ${stage.produces?.toString() ?? "none"}`);
   if (ctx.orchestrate) {
     try {
       const result = await ctx.orchestrate({
         stage,
-        prompt: buildStagePrompt(stage, ctx, "orchestrator"),
+        prompt: buildStagePrompt(stage, ctx, "orchestrator", false, optionalInputContents),
         cwd: ctx.cwd,
         artifactsDir: ctx.artifactsDir,
         state: ctx.state,
@@ -441,6 +459,127 @@ async function runOrchestrator(stage: StageDef, ctx: StageContext, produces: str
   return validateProduced(stage, ctx, [], "orchestrator stage (inline)");
 }
 
+export type RequiredStageInputRead =
+  | { ok: true; inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> }
+  | { ok: false; error: string };
+
+export type OptionalStageInputRead =
+  | { ok: true; inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }>; absent: string[] }
+  | { ok: false; error: string };
+
+export type StageInputRead =
+  | {
+    ok: true;
+    requiredInputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
+    optionalInputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }>;
+    optionalAbsent: string[];
+  }
+  | { ok: false; error: string };
+
+/**
+ * Read the canonical JSON inputs for a stage before any provider dispatch.
+ * The manifest is persisted in TeamState when the durable callback is used;
+ * this pure reader only resolves safe paths and verifies declared hashes.
+ */
+function readRequiredStageInputContents(stage: StageDef, state: TeamState, artifactsDir: string): RequiredStageInputRead {
+  const persisted = state.required_inputs?.[stage.id];
+  const baseManifest: Array<{ artifact_id: string; path: string; sha256?: string }> = persisted && persisted.length > 0
+    ? persisted
+    : (stage.consumes ?? []).map((artifact_id) => ({ artifact_id, path: `${artifact_id}.json` }));
+  const decisionManifest: Array<{ artifact_id: string; path: string; sha256?: string }> = (state.decisions ?? [])
+    .filter((decision) => Boolean(decision.artifact_id))
+    .map((decision) => ({ artifact_id: decision.artifact_id!, path: `${decision.artifact_id}.json` }));
+  const manifest = Array.from(new Map([...baseManifest, ...decisionManifest].map((input) => [`${input.artifact_id}:${input.path}`, input])).values());
+  const root = resolve(artifactsDir);
+  const inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> = [];
+  for (const input of manifest) {
+    if (!input.artifact_id || !input.path || isAbsolute(input.path) || input.path.includes("\\") || input.path.split("/").some((segment) => segment === ".." || segment === "")) {
+      return { ok: false, error: `recovery_required: unsafe required input path for ${input.artifact_id}` };
+    }
+    const path = resolve(root, input.path);
+    const rel = relative(root, path);
+    if (!rel || rel === ".." || rel.startsWith("../") || isAbsolute(rel)) return { ok: false, error: `recovery_required: required input ${input.artifact_id} escapes artifacts directory` };
+    let content: string;
+    try {
+      content = readFileSync(path, "utf8");
+    } catch (error) {
+      return { ok: false, error: `recovery_required: required input ${input.artifact_id} is unreadable: ${(error as Error).message}` };
+    }
+    try {
+      JSON.parse(content);
+    } catch (error) {
+      return { ok: false, error: `recovery_required: required input ${input.artifact_id} is not valid JSON: ${(error as Error).message}` };
+    }
+    const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
+    if (input.sha256 && input.sha256 !== sha256) return { ok: false, error: `recovery_required: required input ${input.artifact_id} hash does not match its persisted manifest` };
+    inputs.push({ artifact_id: input.artifact_id, path: input.path, sha256, content });
+  }
+  return { ok: true, inputs };
+}
+
+/**
+ * Read required and optional stage inputs in one boundary call. Optional
+ * contents are returned to callers that render prompts/contracts; required
+ * callers can project only `requiredInputs` without changing receipts.
+ */
+export function readStageInputs(stage: StageDef, state: TeamState, artifactsDir: string): StageInputRead {
+  const required = readRequiredStageInputContents(stage, state, artifactsDir);
+  if (!required.ok) return required;
+  const optional = readOptionalStageInputs(stage, state, artifactsDir);
+  if (!optional.ok) return optional;
+  return {
+    ok: true,
+    requiredInputs: required.inputs,
+    optionalInputs: optional.inputs,
+    optionalAbsent: optional.absent,
+  };
+}
+
+/**
+ * Read only the required projection while also preflighting all declared
+ * optional inputs. Optional contents never enter the returned list or receipt.
+ */
+export function readRequiredStageInputs(stage: StageDef, state: TeamState, artifactsDir: string): RequiredStageInputRead {
+  const read = readStageInputs(stage, state, artifactsDir);
+  if (!read.ok) return read;
+  return { ok: true, inputs: read.requiredInputs };
+}
+
+/**
+ * Read optional stage inputs without collapsing a present invalid target into
+ * absence. Persisted required manifests take precedence over optional metadata.
+ */
+export function readOptionalStageInputs(stage: StageDef, state: TeamState, artifactsDir: string): OptionalStageInputRead {
+  const persisted = state.required_inputs?.[stage.id];
+  const persistedRequired = [
+    ...(Array.isArray(persisted) ? persisted.map((input) => input.artifact_id) : []),
+    ...(state.decisions ?? []).flatMap((decision) => decision.artifact_id ? [decision.artifact_id] : []),
+  ];
+  const requiredIds = new Set(persistedRequired);
+  const inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> = [];
+  const absent: string[] = [];
+  for (const id of stage.optional_consumes ?? []) {
+    if (requiredIds.has(id)) continue;
+    const read = readArtifactInput(artifactsDir, id);
+    if (read.status === "absent") {
+      absent.push(id);
+      continue;
+    }
+    if (read.status === "invalid") {
+      return { ok: false, error: `recovery_required: optional input ${id} is invalid: ${read.error}` };
+    }
+    const validated = validateProducedArtifact(id, read.value);
+    if (!validated.ok) {
+      return {
+        ok: false,
+        error: `recovery_required: optional input ${id} violates its artifact contract: ${validated.issues.map((issue) => `${issue.field}: ${issue.message}`).join("; ")}`,
+      };
+    }
+    const sha256 = createHash("sha256").update(read.content, "utf8").digest("hex");
+    inputs.push({ artifact_id: id, path: read.path, sha256, content: read.content });
+  }
+  return { ok: true, inputs, absent };
+}
 function persistTaskArtifacts(ctx: StageContext, result: TaskResult): { ids: string[]; error?: string } {
   try {
     return { ids: persistReturnedArtifacts(ctx.artifactsDir, result.artifacts ?? {}) };
@@ -465,11 +604,115 @@ function taskEvidence(result: TaskResult, outcome: "succeeded" | "failed"): stri
   return result.output.trim() || result.error?.trim() || (outcome === "failed" ? "task failed" : "task completed");
 }
 
-async function runSingle(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  const slot = resolveStageDispatchSlots(stage, ctx)[0];
+interface QaDoDSnapshot {
+  path: string;
+  raw: string | null;
+  reason?: string;
+}
+
+interface QaDoDOwnership {
+  currentSlot: string;
+  ownerSlot: string;
+  writable: boolean;
+  orchestrator: boolean;
+  orchestratorOwner: boolean;
+  standaloneOrchestrator: boolean;
+}
+
+
+const QA_DOD_ITEM_CONTRACT = [
+  "Root value is an object with an `items` array.",
+  "Each item is an object with non-empty string `criterion`, non-empty string `verify_method`, and `status` equal to `pending` or `met`.",
+  "`id` is optional but, when present, must be a non-empty string; `evidence` is optional but must be a string when present. A `met` item requires nonblank evidence.",
+].join("\n");
+
+function readQaDoDSnapshot(ctx: StageContext): QaDoDSnapshot {
+  const input = readArtifactInput(ctx.artifactsDir, "dod");
+  const path = resolve(ctx.artifactsDir, input.path);
+  if (input.status === "absent") {
+    return { path, raw: null, reason: `canonical DoD sidecar is unavailable at ${path}` };
+  }
+  if (input.status === "invalid") {
+    return { path, raw: null, reason: `canonical DoD sidecar is unreadable or malformed at ${path}: ${input.error}` };
+  }
+  const typed = validateTypedDoD(input.value);
+  if (!typed.ok) {
+    return { path, raw: input.content, reason: `canonical DoD sidecar is not typed DoD: ${typed.error}` };
+  }
+  return { path, raw: input.content };
+}
+
+function renderQaDoDContract(snapshot: QaDoDSnapshot, ownership: QaDoDOwnership): string {
+  const current = snapshot.raw === null
+    ? `DoD content is unavailable. Reason: ${snapshot.reason ?? "unknown read failure"}. Do not fabricate criteria or close items.`
+    : [
+      "### Exact current DoD JSON",
+      "```json",
+      snapshot.raw,
+      "```",
+      snapshot.reason ? `Typed-item validation note: ${snapshot.reason}` : "The current JSON satisfies validateTypedDoD.",
+    ].join("\n");
+  const ownershipRule = ownership.orchestrator
+    ? ownership.orchestratorOwner
+      ? ownership.standaloneOrchestrator
+        ? "Shared DoD ownership: this standalone QA orchestrator is the owner; designate exactly one child in stable child order as the sole writer. Keep every other child read-only/evidence-only; do not transfer ownership based on completion, resume, or timing."
+        : `Shared DoD ownership: orchestration slot '${ownership.currentSlot}' is the first resolved QA slot and owns coordination. Designate exactly one child in stable child order as the sole writer; keep every other child read-only/evidence-only. Do not transfer ownership based on completion, resume, or timing.`
+      : `Shared DoD ownership: slot '${ownership.ownerSlot}' is the sole writer. This orchestration slot ('${ownership.currentSlot}') is a non-owner and MUST designate NO writer; it and all its children are strictly read-only/evidence-only. Do not transfer ownership based on completion, resume, or timing.`
+    : ownership.writable
+      ? `Shared DoD ownership: slot '${ownership.currentSlot}' is the sole writer (the first resolved QA slot '${ownership.ownerSlot}'). You may edit the sidecar, but close only with your own actual criterion-specific evidence, explicitly report every remaining pending item, and never wait for, rerun, or replace a peer.`
+      : `Shared DoD ownership: slot '${ownership.ownerSlot}' is the sole writer. This slot ('${ownership.currentSlot}') is strictly read-only: do not edit or write dod.json, do not wait for or rerun peers, and return observed evidence plus proposed criterion updates only. Ownership never transfers when the first slot is already completed or on resume.`;
+  const writeRule = ownership.orchestrator
+    ? ownership.orchestratorOwner
+      ? "Do not edit dod.json directly; designate exactly one child writer in stable child order and keep every other child read-only."
+      : "Do not edit dod.json directly; this non-owner orchestration slot must designate no child writer, and it plus all children remain read-only."
+    : ownership.writable
+      ? "Write and verify the declared qa_tests artifact and the shared DoD sidecar when available."
+      : "Do not write the shared DoD sidecar; return evidence and proposed updates to the designated writer.";
+  return [
+    "## Shared DoD sidecar contract (qa_tests)",
+    `Canonical expected shared sidecar path: ${snapshot.path}`,
+    "The DoD is shared mutable authored state, not a declared QA output or required-input receipt, and MUST NOT be added to workflow_complete artifact_ids.",
+    "### Source-backed typed DoD item contract",
+    QA_DOD_ITEM_CONTRACT,
+    ownershipRule,
+    current,
+    "Inspect every pending item against actual QA evidence and that item's criterion and verify_method. Move pending→met only with nonblank criterion-specific evidence. If evidence is insufficient, keep the item pending; never blanket-mark items met.",
+    "Never delete or rewrite unrelated criteria, verification methods, fields, metadata, or contributions or regress a met item. Preserve an empty items array exactly when it is empty; append a QA-owned item only when genuinely needed and only with a newly chosen non-empty id.",
+    writeRule,
+    "Return a closure summary with dod_updated, closed item IDs plus evidence references, and pending item IDs. Pending is valid; the later dod_complete gate remains authoritative.",
+  ].join("\n");
+}
+
+
+function hasCompletedDispatchForSlot(state: TeamState, stageId: string, slot: DispatchSlot): boolean {
+  return (state.dispatch_capability?.dispatches ?? []).some((record) => {
+    if (record.status !== "succeeded") return false;
+    const identityStage = record.work_identity?.stage_id;
+    if (identityStage && identityStage !== stageId) return false;
+    return record.work_identity?.slot_id === slot.slot
+      || record.work_identity?.slot_id === slot.slot_id
+      || record.role === slot.slot
+      || record.role === slot.role;
+  });
+}
+
+async function runSingle(
+  stage: StageDef,
+  ctx: StageContext,
+  produces: string[],
+  optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
+): Promise<StageOutcome> {
+  const resolvedSlots = resolveStageDispatchSlots(stage, ctx);
+  const slot = resolvedSlots[0];
   if (!slot) return { stageId: stage.id, status: "failed", note: "single stage missing role", artifacts: [] };
   const agent = ctx.agent(slot.role);
-  const task = buildStagePrompt(stage, ctx, slot.slot);
+  const inputRead = ctx.durable?.readInputs?.(stage.id);
+  if (inputRead && !inputRead.ok) return { stageId: stage.id, status: "failed", note: inputRead.error, artifacts: produces };
+  if (hasCompletedDispatchForSlot(ctx.state, stage.id, slot)) {
+    ctx.log("  single: " + slot.slot + " already succeeded; reusing terminal dispatch");
+    return validateProduced(stage, ctx, produces, "reused succeeded dispatch");
+  }
+  const task = buildStagePrompt(stage, ctx, slot.slot, false, optionalInputContents, resolvedSlots);
   ctx.log(`  single: ${agent} (slot=${slot.slot}, role=${slot.role})`);
   const authorized = ctx.durable?.authorize(slot.slot, agent);
   if (authorized && !authorized.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${authorized.error}`, artifacts: produces };
@@ -497,15 +740,6 @@ async function runSingle(stage: StageDef, ctx: StageContext, produces: string[])
   if (result.exitCode !== 0) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
   return validateProduced(stage, ctx, produces, `${agent} returned exit 0`);
 }
-
-/**
- * Executable `document` stage (shipped renderer: product-prd): the engine
- * itself — not an agent — renders the declared document from the stage's
- * declared sources and persists both the markdown document and the typed
- * artifact. Like bash stages this is deterministic engine work: no agent
- * dispatch and no durable dispatch records — the stage completes through
- * the normal produced-artifact validation and advance flow.
- */
 async function runProductPrdRender(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
   const contract = stage.document;
   if (!contract) {
@@ -566,12 +800,19 @@ function pairConsiliumResults(roster: DispatchSlot[], tasks: Array<{ name?: stri
   return { ok: true, paired: roster.map((slot) => ({ slot, result: bySlot.get(slot.slot)! })) };
 }
 
-async function runConsilium(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
-  const roster = resolveStageDispatchSlots(stage, ctx);
-  if (roster.length === 0) return { stageId: stage.id, status: "failed", note: "consilium stage resolved to an empty roster", artifacts: produces };
+async function runConsilium(
+  stage: StageDef,
+  ctx: StageContext,
+  produces: string[],
+  optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
+): Promise<StageOutcome> {
+  const resolvedRoster = resolveStageDispatchSlots(stage, ctx);
+  const roster = resolvedRoster.filter((slot) => !hasCompletedDispatchForSlot(ctx.state, stage.id, slot));
+  if (roster.length === 0) return validateProduced(stage, ctx, produces, "reused succeeded dispatches");
   const multiSlot = roster.length > 1;
   ctx.log(`  consilium: ${roster.map((slot) => slot.slot).join(", ")}${multiSlot ? " (slot-scoped artifacts)" : ""}`);
-  const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot) }));
+  const inputRead = ctx.durable?.readInputs?.(stage.id);
+  const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot, optionalInputContents, resolvedRoster) }));
   const authorized = ctx.durable ? roster.map((slot, i) => ctx.durable!.authorize(slot.slot, tasks[i]!.agent)) : [];
   const denied = authorized.find((a) => !a.ok);
   if (denied && !denied.ok) {
@@ -774,7 +1015,14 @@ function validateProducedMultiSlot(
   return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
 }
 
-function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string, slotScoped = false): string {
+function buildStagePrompt(
+  stage: StageDef,
+  ctx: StageContext,
+  role: string,
+  slotScoped: boolean,
+  optionalInputContents: Array<{ artifact_id: string; path: string; sha256: string; content: string }>,
+  resolvedSlotRoster?: DispatchSlot[],
+): string {
   const consumes = stage.consumes ?? [];
   const reads = consumes
     .map((id) => {
@@ -783,21 +1031,50 @@ function buildStagePrompt(stage: StageDef, ctx: StageContext, role: string, slot
     })
     .filter((x): x is string => x !== null);
 
+  const optionalReads = optionalInputContents.map((input) => `### Optional input: ${input.artifact_id}
+sha256: ${input.sha256}
+\`\`\`json
+${input.content}
+\`\`\``);
   const readsBlock = reads.length > 0 ? `\n\n## Reads from prior stages\n${reads.join("\n\n")}` : "";
+  const optionalReadsBlock = optionalReads.length > 0
+    ? `\n\n## Optional context (present inputs only; never satisfies required inputs)\n${optionalReads.join("\n\n")}`
+    : "";
   const rawProduces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
   const produces = slotScoped
     ? rawProduces.map((id) => `${id}-${sanitizeSlot(role)}.json`).join(", ")
     : rawProduces.join(", ") || "(none)";
-  const roleHint = isOrchestratorRole(role)
+  const resolvedSlots = resolvedSlotRoster ?? (stage.type === "single" || stage.type === "consilium"
+    ? resolveStageDispatchSlots(stage, ctx)
+    : []);
+  const currentDispatchSlot = resolvedSlots.find((slot) => slot.slot === role);
+  const semanticRole = currentDispatchSlot?.role ?? role;
+  const orchestratorRole = isOrchestratorRole(semanticRole);
+  const roleHint = orchestratorRole
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
+  let qaDoDContract = "";
+  if (stage.id === "qa_tests") {
+    const ownerSlot = resolvedSlots[0]?.slot ?? role;
+    const standaloneOrchestrator = orchestratorRole && resolvedSlots.length === 0;
+    const ownership: QaDoDOwnership = {
+      currentSlot: role,
+      ownerSlot,
+      writable: !orchestratorRole && role === ownerSlot,
+      orchestrator: orchestratorRole,
+      orchestratorOwner: orchestratorRole && (standaloneOrchestrator || role === ownerSlot),
+      standaloneOrchestrator,
+    };
+    const snapshot = readQaDoDSnapshot(ctx);
+    qaDoDContract = `\n\n${renderQaDoDContract(snapshot, ownership)}`;
+  }
   const capability = ctx.state.dispatch_capability;
   const markerCapabilityId = capability?.capability_id;
   const markerTaskId = markerCapabilityId
     ? dispatchTaskId(markerCapabilityId, capability.issued_for?.run_key ?? ctx.state.run_key ?? ctx.state.branch, capability.issued_for?.branch ?? ctx.state.branch, capability.issued_for?.workflow ?? ctx.state.classification.workflow, stage.id, role)
     : undefined;
   const dispatchMarker = stage.type === "single" || stage.type === "consilium"
-    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolveStageDispatchSlots(stage, ctx).map((slot) => slot.slot), role, ctx.state.cursor_epoch ?? stage.id, markerCapabilityId, role, markerTaskId)
+    ? buildDispatchMarker(ctx.state.run_key ?? ctx.state.branch, stage, resolvedSlots.map((slot) => slot.slot), role, ctx.state.cursor_epoch ?? stage.id, markerCapabilityId, role, markerTaskId)
     : "";
   const durableBinding = dispatchMarker
     ? `run_key=${ctx.state.run_key ?? ctx.state.branch} branch=${ctx.state.branch} workflow=${ctx.state.classification.workflow} profile_hash=${ctx.state.profile_hash ?? ""} stage_cursor=${stage.id} cursor_epoch=${ctx.state.cursor_epoch ?? ""}`
@@ -822,10 +1099,12 @@ ${ctx.state.task}
 ### Stage instructions
 ${stage.prompt ?? "Follow the stage title and produce the declared artifact from the task and prior artifacts."}
 
+${qaDoDContract}
+
 ### Your job
 Execute this stage. Write your typed artifact to ${ctx.artifactsDir}/${slotScoped ? "<id>-<slot>.json" : "<id>.json"} matching the engine's schema (the engine reads only JSON, not prose).${slotScoped ? " This is a parallel consilium slot: write ONLY your own slot-scoped files (other slots write theirs). The engine deterministically synthesizes the shared artifacts at advance." : ""}
 
-Produces: ${produces}${readsBlock}
+Produces: ${produces}${readsBlock}${optionalReadsBlock}
 
 ### Rule
 ${roleHint}

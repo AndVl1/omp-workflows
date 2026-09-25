@@ -41,7 +41,7 @@ import {
   type VisualizationSnapshot,
 } from "../src/visualize/types.js";
 import { buildSessionSnapshots } from "../src/visualize/snapshot.js";
-import { resolveDoWorkSource } from "../src/report/session-source.js";
+import { canonicalSourceFor } from "./fixtures/canonical-source.js";
 import {
   FIXED_GENERATED_AT,
   buildExpectedBugFixSession,
@@ -377,7 +377,7 @@ test("links: real canonical inputs → snapshots → manifest → pages → zero
 
     materialize(cwd, spec.input);
     materialize(cwd, bugfix.input);
-    const entries = [resolveDoWorkSource(cwd, spec.input.id), resolveDoWorkSource(cwd, bugfix.input.id)];
+    const entries = [canonicalSourceFor(cwd, spec.input), canonicalSourceFor(cwd, bugfix.input)];
     const sessions = buildSessionSnapshots(cwd, entries, FIXED_GENERATED_AT);
     assert.equal(sessions.length, 2);
     assert.equal(sessions[0].identity.id, "visualize", "deterministic session order (updated_at desc)");

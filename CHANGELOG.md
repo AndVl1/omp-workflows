@@ -2,6 +2,12 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [Unreleased]
+### Changed
+- **Breaking run-lifecycle cutover** — ordinary workflow state/API now use schema-2 canonical identity (`run_id = run_key = WorkIdentity.run_id`) and explicit `new`/`resume`/`rework`; existing runs resolve by human-readable name or read-only list (UUID remains technical). Branch is routing/compatibility context rather than run identity, so foreign-branch `resume`/`rework` is rejected. `workflow_prepare` emits committed transition receipts, while the transaction journal and lock/CAS protect state, artifact, and observability publication; execution claims and coordinator handover preserve worker/evidence identity and fail closed on busy or unknown ownership.
+- **Canonical consumers and legacy recovery** — legacy state and `continuation` are explicit import-only inputs; incompatible schema/API returns `migration_required`, and interrupted migration recovers transactionally or fails closed with `recovery_required`/`run_busy`. Before canonical commit only staging is rolled back; after commit recovery is forward repair that preserves canonical mapping. Fullstack/internal commands, status/report, run-scoped observability, and viewer use canonical run/revision readers; `/session-report` and `/workflow-view` require canonical selection and return explicit migration/unavailable guidance instead of legacy fallback. Ordinary runs have no archive command; deleting markers or manually editing canonical state is unsupported.
+
+
 ## [0.28.4] — 2026-09-04
 ### Fixed
 - **CTO state identity guidance** — `/cto` now explicitly distinguishes canonical CTO `CtoState.id` in `.work-state/cto/<id>/state.json` from `/do-work` `TeamState.run_key`, and requires CTO slice markers to use the canonical CTO run identity. Added a regression guard for the state-family boundary.

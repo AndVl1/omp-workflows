@@ -13,10 +13,10 @@
  * core wave/state APIs in a plain node process — no omp binary, no network,
  * no credentials, no LLM.
  *
- * Usage: node --import tsx cto-process-dispatcher.ts --root <scratch> --evidence <evidencePath> --interval-ms <ms>
+ * Usage: node --import tsx cto-process-dispatcher.ts --root <scratch> --evidence <evidencePath> --interval-ms <ms> [--run-id <id>] [--session-id <id>] [--lease-only]
  *
  * Protocol (append-only JSONL on the evidence file):
- *   {"t":"start", at}                                     after channel set creation
+ *   {"t":"start", at, runId, ownershipEpoch, sessionId, branch} after exact ingress/claim
  *   {"t":"wake", at, task:{id,text,by,runId,waveId}}      one per admitted task
  *   {"t":"answer", id, answer}                            escalation answers (none in this E2E)
  *   {"t":"wave-start", runId, waveId, taskId}
@@ -25,6 +25,8 @@
  *   {"t":"wave-done", runId, waveId, taskId, slices:[{slice,worktree,branch,commit}]}
  *   {"t":"wave-error", taskId, error}                     executor failure — the wake must never die
  *   {"t":"lease-busy", at}                                live foreign lease -> exit code 3
+ *   {"t":"lease-ready", at, sessionId}                    claim-free lease holder is ready
+ *   {"t":"shutdown", runId, ownershipEpoch}                    managed suspension before exit
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -38,11 +40,16 @@ import {
   queueCtoDelivery,
   registerEscalationAdapter,
   startChannelDispatcher,
+  startDispatcher,
+  type DispatcherBinding,
   type InboxTask,
 } from '../../../fullstack/src/adapters/registry.js';
 import { MockEscalationAdapter } from '../../../fullstack/src/adapters/mock.js';
-import { findActiveCtoRun } from '../../../core/src/commands/cto.js';
+import { acquireCtoIngress, suspendCtoSession } from '../../../core/src/cto/run.js';
 import { finishWave, readCtoState, writeCtoState } from '../../../core/src/cto/state.js';
+import { createWorkflowSessionController } from '../../../core/src/engine/host-controller.js';
+import { resolveActiveBranch } from '../../../core/src/engine/state.js';
+import type { TrustedExecutionContext } from '../../../core/src/engine/types.js';
 import { resolveWorkflow } from '../../../core/src/engine/profile.js';
 
 /** Identity on EVERY git command (the scratch repo has no user config). */
@@ -62,8 +69,11 @@ function arg(name: string): string | null {
 const root = arg('--root');
 const evidencePath = arg('--evidence');
 const intervalMs = Number(arg('--interval-ms') ?? '1000');
+const requestedRunId = arg('--run-id');
+const leaseOnly = process.argv.includes('--lease-only');
+const sessionId = arg('--session-id') ?? `process-e2e:${resolve(root ?? process.cwd())}`;
 if (!root || !evidencePath) {
-  process.stderr.write('usage: cto-process-dispatcher.ts --root <scratch> --evidence <path> --interval-ms <ms>\n');
+  process.stderr.write('usage: cto-process-dispatcher.ts --root <scratch> --evidence <path> --interval-ms <ms> [--run-id <id>] [--session-id <id>] [--lease-only]\n');
   process.exit(2);
 }
 
@@ -82,14 +92,11 @@ function git(cwd: string, args: string[]): string {
 
 // ── Channel set ────────────────────────────────────────────────────────────
 //
-// The registry registers the "mock" transport at import. createChannelSet
-// matches channel entries BY ADAPTER KIND (channels.find(c => c.adapter ===
-// kind)), so two channels with adapter "mock" would BOTH build from the
-// FIRST entry — the RO audit sink would share the control dir and RO-only
-// assertions would be meaningless. A distinct transport kind is exactly how
-// production wires a second channel (e.g. telegram RW + http RO): register
-// "mock-ro" through the exported consumer seam and build the persisted mock
-// the same way the built-in factory does.
+// Explicit `channels[]` profiles bind their adapter configuration by profile
+// id, not by adapter kind. Distinct ids therefore keep the control and audit
+// directories isolated even when two profiles share a transport. This fixture
+// registers `mock-ro` as a separate kind to make the read-only adapter profile
+// explicit while preserving the persisted mock behavior.
 registerEscalationAdapter('mock-ro', (config, cwd) => {
   const mock = config.mock as { persisted?: boolean; dir?: string } | undefined;
   if (mock?.persisted === true) {
@@ -99,7 +106,65 @@ registerEscalationAdapter('mock-ro', (config, cwd) => {
 });
 
 const channelSet = createChannelSet(root);
-record({ t: 'start', at: new Date().toISOString() });
+
+function ownsCurrentDispatcherLease(): boolean {
+  try {
+    const raw = JSON.parse(readFileSync(dispatcherLockPath(root), 'utf8')) as { pid?: number };
+    return raw.pid === process.pid;
+  } catch {
+    return false;
+  }
+}
+
+function runLeaseOnly(): void {
+  const dispatcherBinding: DispatcherBinding = {
+    session_id: sessionId,
+    getClaim: () => undefined,
+  };
+  const stop = startDispatcher(root, channelSet.primary, intervalMs, { binding: dispatcherBinding });
+  if (!ownsCurrentDispatcherLease()) {
+    stop();
+    record({ t: 'lease-busy', at: new Date().toISOString(), sessionId });
+    process.exit(3);
+  }
+  record({ t: 'lease-ready', at: new Date().toISOString(), sessionId });
+
+  let stopping = false;
+  const shutdown = (): void => {
+    if (stopping) return;
+    stopping = true;
+    try {
+      stop();
+      record({ t: 'lease-release', at: new Date().toISOString(), sessionId });
+      process.exit(0);
+    } catch (error) {
+      record({
+        t: 'lease-release-error',
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      process.exit(1);
+    }
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
+
+function runNormal(): void {
+  const branch = resolveActiveBranch(root);
+  const executionContext: TrustedExecutionContext = {
+    session_id: sessionId,
+    caller: 'host',
+    process_id: process.pid,
+    worktree: root,
+    branch,
+    authority: 'coordinator',
+  };
+  const controller = createWorkflowSessionController({ cwd: root, context: executionContext });
+  const dispatcherBinding: DispatcherBinding = {
+    session_id: executionContext.session_id,
+    getClaim: () => controller.activeCtoClaim(),
+  };
 
 // ── Wave executor (deterministic resident simulation, no LLM) ──────────────
 
@@ -268,41 +333,69 @@ const onAnswer = (answer: { id: string; answer: string }): void => {
   record({ t: 'answer', id: answer.id, answer: answer.answer });
 };
 
-// Replicate the production session_start resident wiring: when the resolved
-// profile is RW AND an active CTO run exists, queue the online-ACK delivery
-// (drained by the dispatcher's immediate first tick).
-if (channelSet.profile.direction === 'rw') {
-  const active = findActiveCtoRun(root);
-  if (active) {
-    queueCtoDelivery(root, active.runId, {
-      id: `${active.runId}/system/ack/${Date.now()}`,
+  // Start the dispatcher while the controller is still unbound. The lease is
+  // the first ownership boundary: a live foreign lease exits before CTO
+  // ingress can publish a standby run or claim.
+  const stop = startChannelDispatcher(root, channelSet, intervalMs, {
+    binding: dispatcherBinding,
+    onTask,
+    onAnswer,
+  });
+  if (!ownsCurrentDispatcherLease()) {
+    stop();
+    record({ t: 'lease-busy', at: new Date().toISOString(), sessionId });
+    process.exit(3);
+  }
+
+  // Only the lease owner may publish/bind the real core CTO claim. A failed
+  // acquisition must release this process's dispatcher lease before surfacing.
+  const ingress = (() => {
+    try {
+      return acquireCtoIngress({
+        cwd: root,
+        branch,
+        task: '',
+        controller,
+        ...(requestedRunId ? { run_id: requestedRunId } : {}),
+      });
+    } catch (error) {
+      stop();
+      throw error;
+    }
+  })();
+  const exactClaim = controller.activeCtoClaim();
+  if (
+    !exactClaim
+    || exactClaim.run_id !== ingress.run_id
+    || exactClaim.ownership_epoch !== ingress.claim.claim.ownership_epoch
+  ) {
+    stop();
+    throw new Error(`CTO ingress did not produce an active exact claim for run ${ingress.run_id}`);
+  }
+
+  let onlineAckId: string | undefined;
+  if (channelSet.profile.direction === 'rw') {
+    onlineAckId = `${exactClaim.run_id}/system/ack/${Date.now()}`;
+    queueCtoDelivery(root, exactClaim.run_id, {
+      id: onlineAckId,
       level: 'question',
       title: 'CTO online',
       body: 'resident standby',
       intent: 'ack',
     });
   }
-}
+  record({
+    t: 'start',
+    at: new Date().toISOString(),
+    runId: exactClaim.run_id,
+    ownershipEpoch: exactClaim.ownership_epoch,
+    sessionId: executionContext.session_id,
+    branch: executionContext.branch,
+    ...(onlineAckId ? { onlineAckId } : {}),
+  });
 
-const stop = startChannelDispatcher(root, channelSet, intervalMs, { onTask, onAnswer });
-
-// Fail-closed lease verification: after start, the lock file must name OUR
-// pid. When a LIVE foreign lease exists the claim returns null and the loop
-// returns a no-op stop — detect it and exit 3 so the test can assert the
-// single-dispatcher-per-root contract.
-let leaseHeld = false;
-try {
-  const raw = JSON.parse(readFileSync(dispatcherLockPath(root), 'utf8')) as { pid?: number };
-  leaseHeld = raw.pid === process.pid;
-} catch {
-  leaseHeld = false;
-}
-if (!leaseHeld) {
-  record({ t: 'lease-busy', at: new Date().toISOString() });
-  process.exit(3);
-}
-
-// SIGTERM/SIGINT: release the lease via the stop function and exit 0.
+// SIGTERM/SIGINT: release the dispatcher lease, then perform the managed CTO
+// suspension before this child tears down its controller/process identity.
 let stopping = false;
 const shutdown = (): void => {
   if (stopping) return;
@@ -316,10 +409,24 @@ const shutdown = (): void => {
   }
   try {
     stop();
-  } catch {
-    // best-effort release; the heartbeat TTL handles crashed owners
+    suspendCtoSession(controller, 'session-shutdown');
+    record({ t: 'shutdown', runId: exactClaim.run_id, ownershipEpoch: exactClaim.ownership_epoch });
+  } catch (error) {
+    record({
+      t: 'shutdown-error',
+      runId: exactClaim.run_id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    process.exit(1);
   }
   process.exit(0);
 };
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+}
+
+if (leaseOnly) {
+  runLeaseOnly();
+} else {
+  runNormal();
+}

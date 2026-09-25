@@ -5,7 +5,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import * as http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,7 +13,9 @@ import { test } from 'node:test';
 
 import { WebSocket } from 'ws';
 
+import { ensureScratchPackageLinks } from '../src/cli.js';
 import { deferred } from '../src/util.js';
+import { readWorkspaceActivation } from '../src/workspace-activation.js';
 
 import { waitFor, WaitTimeoutError } from '../src/driver.js';
 import {
@@ -84,6 +86,7 @@ test('server: mintToken/safeEqual primitives', () => {
 test('server: buildOmpArgs matches the launch contract', () => {
   const args = buildOmpArgs({
     ompProfile: 'ux-e2e-test',
+    extensionPath: '/worktree/packages/fullstack',
     maxTimeSec: 1800,
     approvalMode: 'yolo',
     configPath: '/tmp/scratch/.omp/ux-e2e-overlay.json',
@@ -92,6 +95,7 @@ test('server: buildOmpArgs matches the launch contract', () => {
   });
   assert.deepEqual(args, [
     '--profile', 'ux-e2e-test',
+    '--extension', '/worktree/packages/fullstack',
     '--config', '/tmp/scratch/.omp/ux-e2e-overlay.json',
     '--session-dir', '/tmp/scratch/.omp/agent',
     '--hide-thinking',
@@ -100,6 +104,89 @@ test('server: buildOmpArgs matches the launch contract', () => {
   ]);
   assert.ok(!args.includes('-p') && !args.includes('--print'), 'never passes -p/--print');
   assert.ok(!args.includes('--no-pty'), 'never passes --no-pty');
+});
+
+test('server: scratch package links are absolute, realpath-validated, and idempotent', t => {
+  const targetsRoot = mkdtempSync(join(tmpdir(), 'ux-e2e-link-targets-'));
+  const core = join(targetsRoot, 'core');
+  const fullstack = join(targetsRoot, 'fullstack');
+  mkdirSync(core, { recursive: true });
+  mkdirSync(fullstack, { recursive: true });
+  writeFileSync(join(core, 'package.json'), JSON.stringify({ name: '@andvl1/omp-workflows-core' }));
+  writeFileSync(join(fullstack, 'package.json'), JSON.stringify({ name: '@andvl1/omp-workflows-fullstack' }));
+  const scratch = makeScratch();
+  t.after(() => {
+    rmSync(targetsRoot, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  ensureScratchPackageLinks(scratch, { core, fullstack });
+  const coreLink = join(scratch, 'node_modules', '@andvl1', 'omp-workflows-core');
+  const fullstackLink = join(scratch, 'node_modules', '@andvl1', 'omp-workflows-fullstack');
+  assert.equal(lstatSync(coreLink).isSymbolicLink(), true);
+  assert.equal(lstatSync(fullstackLink).isSymbolicLink(), true);
+  assert.equal(readlinkSync(coreLink), realpathSync(core));
+  assert.equal(readlinkSync(fullstackLink), realpathSync(fullstack));
+  assert.equal(realpathSync(coreLink), realpathSync(core));
+  assert.equal(realpathSync(fullstackLink), realpathSync(fullstack));
+
+  // A second bootstrap keeps the exact links and does not replace them.
+  ensureScratchPackageLinks(scratch, { core, fullstack });
+  assert.equal(readlinkSync(coreLink), realpathSync(core));
+  assert.equal(readlinkSync(fullstackLink), realpathSync(fullstack));
+});
+
+test('server: scratch package links refuse unrelated existing entries', t => {
+  const targetsRoot = mkdtempSync(join(tmpdir(), 'ux-e2e-link-targets-'));
+  const core = join(targetsRoot, 'core');
+  const fullstack = join(targetsRoot, 'fullstack');
+  mkdirSync(core, { recursive: true });
+  mkdirSync(fullstack, { recursive: true });
+  writeFileSync(join(core, 'package.json'), JSON.stringify({ name: '@andvl1/omp-workflows-core' }));
+  writeFileSync(join(fullstack, 'package.json'), JSON.stringify({ name: '@andvl1/omp-workflows-fullstack' }));
+  const scratch = makeScratch();
+  const linkRoot = join(scratch, 'node_modules', '@andvl1');
+  mkdirSync(linkRoot, { recursive: true });
+  const coreLink = join(linkRoot, 'omp-workflows-core');
+  writeFileSync(coreLink, 'unrelated scratch entry\n');
+  t.after(() => {
+    rmSync(targetsRoot, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  assert.throws(
+    () => ensureScratchPackageLinks(scratch, { core, fullstack }),
+    /refusing to replace scratch package entry/u,
+  );
+  assert.equal(readFileSync(coreLink, 'utf8'), 'unrelated scratch entry\n');
+});
+
+test("server: launch records explicit worktree extension and dispatch provenance", async t => {
+  const scratch = makeScratch();
+  const session = await startTestSession({ cwd: scratch, noPty: true, token: "sekret" });
+  t.after(() => session.close());
+
+  const sessionJson = JSON.parse(readFileSync(join(scratch, ".work-state", "ux-e2e", "session.json"), "utf8")) as {
+    launch: { argv: string[]; workspace_root: string | null; core_package: string | null; fullstack_package: string | null; core_link: string | null; fullstack_link: string | null; extension_path: string | null; plugin_override_path: string | null; disabled_plugins: string[]; dispatch_origin_dir: string; env: { OMP_WORKFLOWS_DISPATCH_ORIGIN_DIR: string } };
+  };
+  const activation = readWorkspaceActivation(scratch);
+  assert.ok(activation);
+  assert.equal(sessionJson.launch.workspace_root, activation.monorepoRoot);
+  assert.equal(sessionJson.launch.core_package, activation.corePackage);
+  assert.equal(sessionJson.launch.fullstack_package, activation.fullstackPackage);
+  assert.equal(sessionJson.launch.core_link, activation.coreLink);
+  assert.equal(sessionJson.launch.fullstack_link, activation.fullstackLink);
+  assert.equal(sessionJson.launch.extension_path, activation.fullstackExtension);
+  assert.equal(sessionJson.launch.plugin_override_path, activation.pluginOverridePath);
+  assert.deepEqual(sessionJson.launch.disabled_plugins, [...activation.disabledPlugins]);
+  const pluginOverride = JSON.parse(readFileSync(activation.pluginOverridePath, "utf8")) as { disabled?: string[] };
+  assert.deepEqual(pluginOverride.disabled, [...activation.disabledPlugins]);
+  const extensionIndex = sessionJson.launch.argv.indexOf("--extension");
+  assert.ok(extensionIndex >= 0);
+  assert.equal(sessionJson.launch.argv[extensionIndex + 1], activation.fullstackExtension);
+  const dispatchOriginDir = join(scratch, ".work-state", "ux-e2e", "dispatch-origin");
+  assert.equal(sessionJson.launch.dispatch_origin_dir, dispatchOriginDir);
+  assert.equal(sessionJson.launch.env.OMP_WORKFLOWS_DISPATCH_ORIGIN_DIR, dispatchOriginDir);
 });
 
 test('server: buildOmpArgs omits --profile when ompProfile is unset (default = inherit host profile)', () => {
@@ -459,6 +546,21 @@ test('server: session.json + pty metadata written', async t => {
     join(scratch, '.omp', 'ux-e2e-overlay.user.json'),
     'user_config.default_path always points at the canonical location',
   );
+});
+
+test('server: restart archives prior raw transcript instead of erasing evidence', async t => {
+  const scratch = makeScratch();
+  const first = await startTestSession({ cwd: scratch, noPty: true, token: 'first' });
+  writeFileSync(first.transcriptPath, '{"t":"o","d":"saved decision"}\n');
+  await first.close();
+
+  const second = await startTestSession({ cwd: scratch, noPty: true, token: 'second' });
+  t.after(() => second.close());
+  const sessionJson = JSON.parse(readFileSync(second.sessionJsonPath, 'utf8')) as Record<string, unknown>;
+  const previous = sessionJson.previous_transcript;
+  assert.equal(typeof previous, 'string');
+  assert.ok(previous !== null && readFileSync(previous as string, 'utf8').includes('saved decision'));
+  assert.equal(readFileSync(second.transcriptPath, 'utf8'), '', 'new session has a clean current transcript');
 });
 
 test('server: session.json records user_config.path when the user overlay file is present', async t => {

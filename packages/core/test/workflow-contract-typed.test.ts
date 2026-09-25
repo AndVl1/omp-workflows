@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { readdirSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   checkpointPolicyLegacyConflict,
   migrationCheckpointPolicy,
   migrationCompletionIntent,
+  resolveWorkflowContract,
   validateTypedControlPlane,
 } from "../src/engine/workflow-contract.js";
-import type { CheckpointPolicy } from "../src/engine/types.js";
+import { profileHash, registerWorkflowProfiles, validateProfileControlPlane } from "../src/engine/profile.js";
+import { persistCanonicalRun } from "../src/engine/run-store.js";
+import type { CheckpointPolicy, Profile, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
 
 const identity = {
   run_id: "run-1",
@@ -123,6 +129,21 @@ function validControlPlane() {
   };
 }
 
+function snapshotTree(root: string): Array<[string, string]> {
+  const files: Array<[string, string]> = [];
+  const visit = (directory: string, relative: string): void => {
+    const entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      const child = relative ? join(relative, entry.name) : entry.name;
+      if (entry.isDirectory()) visit(path, child);
+      else files.push([child, readFileSync(path).toString("base64")]);
+    }
+  };
+  visit(root, "");
+  return files;
+}
+
 test("typed control-plane fields validate as one contract", () => {
   const fixture = validControlPlane();
   assert.equal(fixture.roster_policy.prefer_distinct_agents, true);
@@ -164,6 +185,147 @@ test("unknown and malformed typed fields fail closed", () => {
   if (!rosterResult.ok) assert.ok(rosterResult.issues.some((issue) => issue.path === "$.roster_policy"));
   assert.equal(checkpointPolicyLegacyConflict(typedPolicy, true), null);
   assert.match(checkpointPolicyLegacyConflict({ ...typedPolicy, source: "migration" }, true) ?? "", /conflicts/);
+});
+
+test("stage input metadata validates safe ids, duplicates, overlap, and registration fail closed", () => {
+  const baseProfile: Profile = {
+    name: "optional-input-metadata",
+    title: "Optional input metadata",
+    description: "Profile validation fixture",
+    match: { type: ["FEATURE"] },
+    stages: [{ id: "stage", title: "Stage", type: "single", optional_consumes: ["product_spec"] }],
+  };
+  assert.deepEqual(validateProfileControlPlane(baseProfile), { ok: true });
+  assert.doesNotThrow(() => registerWorkflowProfiles([baseProfile]));
+
+  const invalidStages = [
+    { consumes: ["../unsafe"] },
+    { consumes: ["."] },
+    { optional_consumes: [".."] },
+    { optional_consumes: ["product_spec", "product_spec"] },
+    { consumes: ["review", "review"] },
+    { consumes: ["review"], optional_consumes: ["review"] },
+  ];
+  for (const [index, metadata] of invalidStages.entries()) {
+    const invalid = {
+      ...baseProfile,
+      name: `optional-input-invalid-${index}`,
+      stages: [{ ...baseProfile.stages[0], ...metadata }],
+    } as Profile;
+    const result = validateProfileControlPlane(invalid);
+    assert.equal(result.ok, false, `metadata case ${index} must be rejected`);
+    assert.throws(() => registerWorkflowProfiles([invalid]), /invalid workflow profile/);
+  }
+});
+
+test("read-only selected-run discovery exposes pathless profile stages without mutation", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-contract-pathless-profile-"));
+  const workflow = `pathless-${randomUUID()}`;
+  const runId = randomUUID();
+  const profile: Profile = {
+    name: workflow,
+    title: "Pathless profile",
+    description: "Registered profile used by the read-only contract regression.",
+    match: { type: ["FEATURE"] },
+    stages: [
+      {
+        id: "discovery",
+        title: "Discovery",
+        type: "single",
+        description: "Earlier semantic stage",
+        prompt: "Gather the context needed by the implementation stage.",
+        consumes: ["task_context"],
+        optional_consumes: ["prior_notes"],
+        produces: ["discovery_notes"],
+      },
+      { id: "implementation", title: "Implementation", type: "orchestrator" },
+    ],
+  };
+  registerWorkflowProfiles([profile]);
+  const execution: TrustedExecutionContext = {
+    session_id: `pathless-profile-${runId}`,
+    caller: "host",
+    worktree: root,
+    branch: "main",
+    authority: "coordinator",
+  };
+  const state = {
+    schema: 2,
+    run_id: runId,
+    run_key: runId,
+    lifecycle_status: "active",
+    rework_generation: 0,
+    branch: "main",
+    title: "Pathless profile discovery",
+    task: "Discover the selected run's earlier stage meaning.",
+    classification: {
+      type: "FEATURE",
+      complexity: "MEDIUM",
+      confidence: "HIGH",
+      autonomous: false,
+      workflow,
+    },
+    required_inputs: { discovery: [], implementation: [] },
+    required_input_receipts: {},
+    decisions: [],
+    workflow_override: true,
+    issue: null,
+    stage_cursor: "implementation",
+    stages: [
+      { id: "discovery", status: "done" },
+      { id: "implementation", status: "in_progress" },
+    ],
+    artifacts: { discovery_notes: "artifacts/discovery_notes.json" },
+    pause: { kind: "none", reason: "" },
+    scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null },
+    policy: { strict_orchestrator: true },
+    profile_hash: profileHash(profile),
+    updated_at: "2026-09-25T00:00:00.000Z",
+  } as TeamState;
+  try {
+    persistCanonicalRun(root, state, { context: execution });
+    const runDir = join(root, ".work-state", "runs", runId);
+    mkdirSync(join(runDir, "artifacts"), { recursive: true });
+    writeFileSync(join(runDir, "artifacts", "discovery_notes.json"), "{\"meaning\":\"earlier stage\"}\n");
+    mkdirSync(join(runDir, "revisions", "before-contract-read"), { recursive: true });
+    writeFileSync(join(runDir, "revisions", "before-contract-read", "state.json"), "immutable pre-begin revision\n");
+
+    const before = snapshotTree(join(root, ".work-state"));
+    const contract = resolveWorkflowContract(root, { runId, branch: "main" });
+    const after = snapshotTree(join(root, ".work-state"));
+
+    assert.equal(contract.profile.path, null);
+    assert.deepEqual(
+      contract.profile.stages.map(({ id, title, type }) => ({ id, title, type })),
+      [
+        { id: "discovery", title: "Discovery", type: "single" },
+        { id: "implementation", title: "Implementation", type: "orchestrator" },
+      ],
+    );
+    const earlier = contract.profile.stages[0];
+    assert.ok(earlier);
+    assert.deepEqual(earlier.consumes, ["task_context"]);
+    assert.deepEqual(earlier.optional_consumes, ["prior_notes"]);
+    assert.deepEqual(earlier.produces, ["discovery_notes"]);
+    assert.equal(typeof earlier.description, "string");
+    assert.equal(typeof earlier.prompt, "string");
+    assert.deepEqual(Object.keys(earlier).sort(), [
+      "consumes",
+      "description",
+      "id",
+      "optional_consumes",
+      "produces",
+      "prompt",
+      "title",
+      "type",
+    ]);
+    assert.deepEqual(Object.keys(contract.profile.stages[1]!).sort(), ["id", "title", "type"]);
+    assert.equal(contract.stage.id, "implementation");
+    assert.equal(contract.stage.dispatch.permitted, false, "read-only pre-begin discovery never grants dispatch authority");
+    assert.deepEqual(after, before, "contract discovery must not mutate selected canonical state or its control, revisions, or artifacts");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("completion intent and migration checkpoint policy remain orthogonal", () => {

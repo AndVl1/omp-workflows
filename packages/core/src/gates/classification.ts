@@ -2,39 +2,29 @@
  * Classification gate (P5). Replaces claude-plugin's `validate-state.sh`
  * PreToolUse(Task) hook.
  *
- * Blocks subagent launches when `.work-state/team-state.json` lacks a
- * classification, when `classification.autonomous` is missing or non-boolean
- * (fail closed — no silent default), or when the resolved `workflow` does
- * not match the Type x Complexity -> Workflow table. The autonomous flag is
- * routing/migration input only: `classification.autonomous` is preferred for
- * the legacy matrix and the top-level `autonomous` field is read only for old
- * state files. Neither field grants checkpoint permission; typed policy-bound
- * decisions do.
+ * Blocks task launches for a selected canonical workflow run when
+ * classification is missing or malformed, when `classification.autonomous`
+ * is missing or non-boolean (fail closed — no silent default), or when the
+ * resolved `workflow` does not match the Type x Complexity -> Workflow
+ * table. The autonomous flag is routing/migration input only:
+ * `classification.autonomous` is preferred for the legacy matrix and the
+ * top-level `autonomous` field is read only for old state files. Neither
+ * field grants checkpoint permission; typed policy-bound decisions do.
  *
  * Wired to `before_agent_start` so the engine catches it before the agent
  * executes.
  *
- * Gracefully degrades:
- *   - no JSON state    -> allow (legacy flow)
- *   - parse error      -> allow (transient write)
- *   - intentional override (`workflow_override: true`) -> allow, but ONLY
- *     after the model autonomy field validates: missing or non-boolean
- *     `classification.autonomous` still blocks — an explicit override can
- *     skip the workflow-mismatch check, never the fail-closed autonomy gate.
+ * Outside a selected workflow run, the gate preserves the host's existing
+ * no-active-workflow behavior and does not inspect legacy root state.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { resolve, join } from "node:path";
 import { isRegisteredWorkflow, loadProfile, matchesProfile, resolveWorkflow } from "../engine/profile.js";
+import { resolveActiveBranch, resolveCanonicalRun, type ResolvedCanonicalRun } from "../engine/state.js";
 import { monotonicGate } from "./monotonic.js";
-import { isSafeStateSegment, resolveState } from "../engine/state.js";
 import { checkpointPolicyLegacyConflict } from "../engine/workflow-contract.js";
 import { validateTypedControlPlane } from "../engine/workflow-contract.js";
-import type { Classification, Complexity, TaskType, CheckpointPolicy } from "../engine/types.js";
+import type { Classification, Complexity, TaskType, CheckpointPolicy, TeamState } from "../engine/types.js";
 
-const WORK_STATE_DIR = ".work-state";
-const ACTIVE_FEATURE = ".active-feature";
-const LEGACY_STATE = "team-state.json";
 interface AgentStartEvent {
   /** Optional agent type/name. */
   agent?: string;
@@ -42,6 +32,7 @@ interface AgentStartEvent {
 
 interface AgentStartContext {
   cwd: string;
+  run_id?: string;
 }
 
 interface ToolCallEvent {
@@ -49,53 +40,52 @@ interface ToolCallEvent {
 }
 
 /**
- * Enforce the zero-step contract at the task boundary. A workflow run that
- * has initialized `.work-state/` must persist classification before spawning
- * any subagent. Projects without workflow state retain legacy behavior.
+ * Enforce the zero-step contract at the task boundary for a selected workflow
+ * run. Projects without a selected run retain legacy behavior.
  */
 export function classificationToolGate(event: ToolCallEvent, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
   if (event.toolName !== "task") return;
-  const wsDir = resolve(ctx.cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return;
-  const active = join(wsDir, ACTIVE_FEATURE);
-  const legacy = join(wsDir, LEGACY_STATE);
-  if (!existsSync(active) && !existsSync(legacy)) return;
-  if (resolveState(ctx.cwd).invalid) {
-    return { block: true, reason: "BLOCK (P5): workflow state is malformed or unsafe; refusing task launch." };
-  }
-  if (!resolveStatePath(ctx.cwd)) {
-    return { block: true, reason: "BLOCK (P5): classification state is missing. Complete PHASE 0, write .work-state/team-state.json, then launch agents." };
-  }
-  // The complete classification contract is enforced pre-execution. The
-  // before_agent_start hook remains a reminder only (OMP cannot block there).
+  if (!ctx.run_id) return;
   const classification = classificationGate(event as unknown as AgentStartEvent, ctx);
   if (classification?.block) return classification;
   return monotonicGate(event, ctx);
 }
+
+type SelectedStateResolution =
+  | { state: TeamState }
+  | { block: true; reason: string };
+
+function resolveSelectedState(ctx: AgentStartContext): SelectedStateResolution | null {
+  const runId = ctx.run_id;
+  if (!runId) return null;
+  let resolved: ResolvedCanonicalRun | null;
+  try {
+    resolved = resolveCanonicalRun(ctx.cwd, { kind: "team", runId }, resolveActiveBranch(ctx.cwd));
+  } catch {
+    return {
+      block: true,
+      reason: "BLOCK (P5): selected canonical workflow run is invalid, unreadable, malformed, or outside its trusted state tree.",
+    };
+  }
+  if (!resolved || !resolved.state) {
+    return { block: true, reason: "BLOCK (P5): selected canonical workflow run is missing." };
+  }
+  if (resolved.isStale) {
+    return { block: true, reason: "BLOCK (P5): selected canonical workflow run is stale for the active branch." };
+  }
+  if (resolved.state.schema !== 2 || resolved.state.run_id !== runId || resolved.state.run_key !== runId) {
+    return { block: true, reason: "BLOCK (P5): selected canonical workflow run identity is invalid." };
+  }
+  return { state: resolved.state };
+}
+
 export function classificationGate(event: AgentStartEvent, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
-  const statePath = resolveStatePath(ctx.cwd);
-  if (!statePath) return;
+  const selected = resolveSelectedState(ctx);
+  if (!selected) return;
+  if ("block" in selected) return selected;
+  const state = selected.state;
 
-  let raw: string;
-  try {
-    raw = readFileSync(statePath, "utf8");
-  } catch {
-    return;
-  }
-  let state: {
-    classification?: Partial<Classification>;
-    autonomous?: boolean;
-    workflow_override?: boolean;
-    stage_cursor?: string;
-    checkpoint_policy?: CheckpointPolicy;
-  };
-  try {
-    state = JSON.parse(raw) as typeof state;
-  } catch {
-    return;
-  }
-
-  // Typed control-plane validation is deliberately first.  Legacy autonomy
+  // Typed control-plane validation is deliberately first. Legacy autonomy
   // cannot rescue malformed/unknown typed policy, intent, or decisions.
   const stateTyped = validateTypedControlPlane(state);
   const stateIssues = stateTyped.ok
@@ -122,9 +112,10 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
     }
   }
 
+
   const c = state.classification;
   if (!c?.type || !c?.complexity) {
-    return { block: true, reason: "BLOCK (P5): missing classification. Run /team so a CLASSIFICATION block is written to .work-state/team-state.json before launching agents." };
+    return { block: true, reason: "BLOCK (P5): missing classification. Run workflow_prepare for the selected canonical run before launching agents." };
   }
 
   // Resolve policy and floor before the workflow override escape hatch.  An
@@ -179,26 +170,11 @@ export function classificationGate(event: AgentStartEvent, ctx: AgentStartContex
     if (!autonomous && isRegisteredWorkflow(actual) && matchesProfile(actual, { type, complexity })) return;
     return {
       block: true,
-      reason: `BLOCK (P5): workflow '${actual}' does not match classification (type=${type} complexity=${complexity} autonomous=${autonomous} -> expected '${expected}'). Fix the workflow in team-state.json, or set workflow_override: true.`,
+      reason: `BLOCK (P5): workflow '${actual}' does not match classification (type=${type} complexity=${complexity} autonomous=${autonomous} -> expected '${expected}'). Fix the classification in the selected canonical run, or set workflow_override: true.`,
     };
   }
 }
 
-function resolveStatePath(cwd: string): string | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return null;
-  const active = join(wsDir, ".active-feature");
-  if (existsSync(active)) {
-    const slug = readFileSync(active, "utf8").trim();
-    if (isSafeStateSegment(slug)) {
-      const path = join(wsDir, "features", slug, "state.json");
-      if (existsSync(path)) return path;
-    }
-  }
-  const legacy = join(wsDir, "team-state.json");
-  if (existsSync(legacy)) return legacy;
-  return null;
-}
 
 /**
  * Resolve the routing/migration autonomy input for the P5 gate, fail-closed:

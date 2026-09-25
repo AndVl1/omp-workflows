@@ -23,13 +23,8 @@ import { renderHubHtml } from "../src/visualize/html.js";
 import { buildManifest } from "../src/visualize/manifest.js";
 import { resolveRenderConfig } from "../src/visualize/render-config.js";
 import { DEFAULT_RENDERER_IDENTITY, LEGACY_ROOT_PATH_KEY, LEGACY_SESSION_ID, sessionPagePath, type VisualizationSnapshot } from "../src/visualize/types.js";
-import {
-  listCtoSources,
-  listDoWorkSources,
-  resolveCtoSource,
-  resolveDoWorkSource,
-  type SessionSourceEntry,
-} from "../src/report/session-source.js";
+import { resolveCtoSource } from "../src/report/session-source.js";
+import { canonicalSourceFor } from "./fixtures/canonical-source.js";
 import {
   CORRUPT_JSON_SAMPLE,
   FIXED_GENERATED_AT,
@@ -79,21 +74,14 @@ function materialize(cwd: string, input: CanonicalSessionInput, extraFiles: Reco
   for (const f of input.artifacts) write(join(cwd, f.relPath), f.content);
 }
 
-/** The discovered entry for an input (exact selector; terminal md via list). */
-function entryOf(cwd: string, input: CanonicalSessionInput): SessionSourceEntry {
+/** Every snapshot test passes an explicit canonical run source. */
+function entryOf(cwd: string, input: CanonicalSessionInput) {
   if (input.kind === "cto") {
-    if (input.state.format === "markdown" && input.state.content.includes("# Summary")) {
-      const entry = listCtoSources(cwd).find((e) => e.id === input.id);
-      if (!entry) throw new Error(`terminal markdown run not discovered: ${input.id}`);
-      return entry;
-    }
-    const resolved = resolveCtoSource(cwd, input.id);
-    if (!resolved) throw new Error(`cto run not resolved: ${input.id}`);
-    return resolved;
+    const source = resolveCtoSource(cwd, input.id);
+    if (!source) throw new Error(`explicit CTO source unavailable: ${input.id}`);
+    return source;
   }
-  const resolved = resolveDoWorkSource(cwd, input.id);
-  if (!resolved) throw new Error(`do-work session not resolved: ${input.id}`);
-  return resolved;
+  return canonicalSourceFor(cwd, input);
 }
 
 const specInput = (): CanonicalSessionInput => {
@@ -481,77 +469,6 @@ test("snapshot: zero-artifact session is overview-only with a no-artifacts note"
 
 // ── 7. Legacy root: identity, staleness, excluded inputs ────────────────────
 
-test("snapshot: legacy root keeps kind/pathKey, stale provenance, and never discovers excluded inputs", () => {
-  const cwd = tmpWorkspace();
-  try {
-    const input: CanonicalSessionInput = {
-      kind: "legacy",
-      id: LEGACY_SESSION_ID,
-      pathKey: LEGACY_ROOT_PATH_KEY,
-      state: {
-        format: "json",
-        content: JSON.stringify({
-          schema: 1,
-          branch: "main",
-          classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", workflow: "standard", autonomous: false },
-          task: "Legacy do-work run.",
-          workflow_override: false,
-          issue: null,
-          stage_cursor: "summary",
-          stages: [
-            { id: "discovery", status: "done" },
-            { id: "summary", status: "done" },
-          ],
-          artifacts: {
-            discovery: ".work-state/artifacts/discovery.json",
-            summary: ".work-state/artifacts/summary.json",
-          },
-          pause: { kind: "none", reason: "" },
-          updated_at: "2026-08-19T13:00:00.000Z",
-        }),
-        updatedAt: "2026-08-19T13:00:00.000Z",
-      },
-      workflow: "standard",
-      declaredArtifacts: {
-        discovery: ".work-state/artifacts/discovery.json",
-        summary: ".work-state/artifacts/summary.json",
-      },
-      artifacts: [
-        artifact("discovery", ".work-state/artifacts/discovery.json", typedJson("discovery")),
-        artifact("summary", ".work-state/artifacts/summary.json", typedJson("summary")),
-      ],
-      excludedPaths: [".work-state/events.jsonl", ".work-state/observability/events.jsonl", "vibe-report/legacy.md"],
-      expected: { status: "complete", staleness: "stale", artifactStatuses: {} },
-    };
-    // Excluded inputs on disk must never be discovered/read — including a
-    // events.jsonl placed INSIDE the legacy artifacts dir.
-    write(join(cwd, ".work-state", "artifacts", "events.jsonl"), '{"ts":"2026-08-19T13:00:01.000Z"}');
-    write(join(cwd, ".work-state", "events.jsonl"), '{"ts":"2026-08-19T13:00:01.000Z"}');
-    write(join(cwd, "vibe-report", "legacy.md"), "# Legacy report\n");
-    materialize(cwd, input);
-    const session = buildSessionSnapshot(cwd, entryOf(cwd, input), FIXED_GENERATED_AT);
-
-    assert.equal(session.identity.kind, "legacy");
-    assert.equal(session.identity.id, LEGACY_SESSION_ID);
-    assert.equal(session.identity.pathKey, LEGACY_ROOT_PATH_KEY);
-    assert.equal(session.identity.isLegacy, true);
-    assert.equal(session.identity.title, "legacy feature worktree");
-    assert.equal(session.provenance.staleness, "stale", "updated_at later than generated_at");
-    assert.deepEqual(
-      session.artifacts.map((a) => [a.id, a.status]),
-      [
-        ["discovery", "produced"],
-        ["summary", "produced"],
-      ],
-    );
-    assert.equal(session.artifacts.some((a) => a.id.includes("events")), false);
-    assert.equal(session.source.label, ".work-state/team-state.json");
-    assert.equal(session.source.format, "json");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
 // ── 8. CTO JSON: run-local + team compatibility + validated dod_path ────────
 
 test("snapshot: CTO JSON run resolves run-local, team compatibility and dod_path artifacts", () => {
@@ -621,72 +538,6 @@ test("snapshot: CTO JSON run resolves run-local, team compatibility and dod_path
 });
 
 // ── 9. CTO markdown state: active complete / terminal degraded ──────────────
-
-test("snapshot: active markdown CTO is complete with unknown staleness; terminal is degraded with reason", () => {
-  const cwd = tmpWorkspace();
-  try {
-    const activeFiles = markdownCtoFiles({
-      task: "Coordinate a markdown-only CTO run.",
-      classificationLine: 'classification: { "type": "FEATURE", "complexity": "COMPLEX", "confidence": "MEDIUM", "autonomous": true }',
-    }).files;
-    const activeInput: CanonicalSessionInput = {
-      kind: "cto",
-      id: "cto-markdown-live",
-      pathKey: "cto-markdown-live",
-      state: {
-        format: "markdown",
-        content: activeFiles["team-plan.md"] ?? "",
-        updatedAt: undefined,
-      },
-      workflow: "cto",
-      declaredArtifacts: {},
-      artifacts: [],
-      excludedPaths: [],
-      expected: { status: "complete", staleness: "unknown", artifactStatuses: {} },
-    };
-    materialize(cwd, activeInput, activeFiles);
-    const active = buildSessionSnapshot(cwd, entryOf(cwd, activeInput), FIXED_GENERATED_AT);
-    assert.equal(active.status, "complete");
-    assert.equal(active.identity.sourceFormat, "markdown");
-    assert.equal(active.identity.task, "Coordinate a markdown-only CTO run.", "task from the markdown state heading");
-    assert.equal(active.provenance.staleness, "unknown", "markdown state carries no updated_at (mtime excluded)");
-    assert.equal(active.provenance.sourceUpdatedAt, undefined);
-    assert.deepEqual(active.artifacts, []);
-    assert.equal(active.source.label, ".work-state/cto/cto-markdown-live");
-    assert.equal(active.provenance.sourceDigest.full, digestFor(activeInput).full, "canonical state text = team-plan.md");
-
-    const terminalFiles = markdownCtoFiles({
-      task: "A finished markdown CTO run.",
-      classificationLine: 'classification: { "type": "FEATURE", "complexity": "COMPLEX", "confidence": "MEDIUM", "autonomous": false }',
-      withFinishMarker: true,
-    }).files;
-    const terminalInput: CanonicalSessionInput = {
-      kind: "cto",
-      id: "cto-markdown-done",
-      pathKey: "cto-markdown-done",
-      state: {
-        format: "markdown",
-        content: terminalFiles["summary.md"] ?? "",
-        updatedAt: undefined,
-      },
-      workflow: "cto",
-      declaredArtifacts: {},
-      artifacts: [],
-      excludedPaths: [],
-      expected: { status: "degraded", staleness: "unknown", artifactStatuses: {}, degradedReasons: ["terminal markdown CTO state: visualization-only projection"] },
-    };
-    materialize(cwd, terminalInput, terminalFiles);
-    const terminal = buildSessionSnapshot(cwd, entryOf(cwd, terminalInput), FIXED_GENERATED_AT);
-    assert.equal(terminal.status, "degraded");
-    assert.equal(terminal.identity.degraded, true);
-    assert.equal(terminal.identity.task, "A finished markdown CTO run.", "task derives from the finish-marker state");
-    assert.deepEqual(terminal.degradedReasons, ["terminal markdown CTO state: visualization-only projection"]);
-    assert.equal(terminal.provenance.staleness, "unknown");
-    assert.equal(terminal.provenance.sourceDigest.full, digestFor(terminalInput).full, "canonical state text = summary.md");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
 
 // ── 10. Unsafe ids/paths: skipped/missing with exact warnings ───────────────
 
@@ -843,15 +694,6 @@ test("snapshot: corrupt artifact peers and corrupt state degrade without abortin
     assert.equal(session.artifacts.find((a) => a.id === "corrupt")?.status, "unreadable");
     assert.equal(session.artifacts.find((a) => a.id === "fine")?.status, "produced");
 
-    // Corrupt STATE → degraded session via safe enumeration (never throws).
-    writeFileSync(join(cwd, ".work-state", "features", "broken", "state.json"), '{ "schema": 1, broken');
-    const entry = listDoWorkSources(cwd).find((e) => e.id === "broken");
-    assert.ok(entry, "corrupt state is still discoverable as an error entry");
-    const degraded = buildSessionSnapshot(cwd, entry, FIXED_GENERATED_AT);
-    assert.equal(degraded.status, "degraded");
-    assert.equal(degraded.identity.degraded, true);
-    assert.equal(degraded.identity.task, "");
-    assert.ok(degraded.degradedReasons && degraded.degradedReasons.length > 0);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -915,126 +757,6 @@ test("snapshot: undeclared extras sort lexicographically; unlisted workflows get
     const config = resolveRenderConfig("research", false);
     assert.equal(config.depthPolicy, "default");
     assert.equal(config.bodiesEnabled, false, "unlisted workflow: explicit safe default, no bodies");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-// ── 16. F3: mixed JSON feature + markdown CTO — mtime-free total order ───────
-
-test("snapshot: F3 — markdown-CTO run-local mtime never reorders; snapshot, manifest and both hubs agree on the content-derived order", () => {
-  const cwd = tmpWorkspace();
-  try {
-    const classification = 'classification: { "type": "FEATURE", "complexity": "COMPLEX", "confidence": "MEDIUM", "autonomous": true }';
-    // JSON feature with a content timestamp (state.updated_at).
-    const feature = featureSession({
-      id: "alpha",
-      pathKey: "alpha",
-      task: "Alpha JSON feature.",
-      workflow: "standard",
-      updatedAt: "2026-08-19T10:00:00.000Z",
-      stages: [{ id: "discovery", status: "done" }],
-      declared: {},
-      expected: { status: "complete", staleness: "fresh", artifactStatuses: {} },
-    });
-    // Markdown-state CTO runs (one active, two terminal): discovery labels
-    // them with run-local mtimes — internal metadata that must never order.
-    const ctoInput = (id: string, task: string, withFinishMarker: boolean): CanonicalSessionInput => {
-      const files = markdownCtoFiles({ task, classificationLine: classification, withFinishMarker }).files;
-      return {
-        kind: "cto",
-        id,
-        pathKey: id,
-        state: {
-          format: "markdown",
-          content: files[withFinishMarker ? "summary.md" : "team-plan.md"] ?? "",
-          updatedAt: undefined,
-        },
-        workflow: "cto",
-        declaredArtifacts: {},
-        artifacts: [],
-        excludedPaths: [],
-        expected: { status: withFinishMarker ? "degraded" : "complete", staleness: "unknown", artifactStatuses: {} },
-      };
-    };
-    const live = ctoInput("cto-live", "Live markdown CTO run.", false);
-    const doneA = ctoInput("cto-a", "Finished markdown CTO run A.", true);
-    const doneB = ctoInput("cto-b", "Finished markdown CTO run B.", true);
-
-    materialize(cwd, feature);
-    materialize(cwd, live, markdownCtoFiles({ task: "Live markdown CTO run.", classificationLine: classification }).files);
-    materialize(cwd, doneA, markdownCtoFiles({ task: "Finished markdown CTO run A.", classificationLine: classification, withFinishMarker: true }).files);
-    materialize(cwd, doneB, markdownCtoFiles({ task: "Finished markdown CTO run B.", classificationLine: classification, withFinishMarker: true }).files);
-
-    const entries = [resolveDoWorkSource(cwd, "alpha"), ...listCtoSources(cwd)];
-    assert.equal(entries.length, 4, "feature + three markdown CTO runs discovered");
-    const sessions = buildSessionSnapshots(cwd, entries, FIXED_GENERATED_AT);
-    assert.deepEqual(
-      sessions.map((s) => `${s.identity.kind}/${s.identity.id}`),
-      ["feature/alpha", "cto/cto-a", "cto/cto-b", "cto/cto-live"],
-      "content-timestamp feature first; markdown CTOs (no content timestamp) sort last, then kind, then id",
-    );
-
-    // The total order is stable regardless of caller input order.
-    const scrambled = buildSessionSnapshots(cwd, [...entries].reverse(), FIXED_GENERATED_AT);
-    assert.deepEqual(scrambled.map((s) => s.identity.id), sessions.map((s) => s.identity.id));
-
-    // All output surfaces agree on the same deterministic order.
-    const manifest = buildManifest(sessions, "all", { generatedAt: FIXED_GENERATED_AT });
-    assert.deepEqual(manifest.sessions.map((e) => e.id), sessions.map((s) => s.identity.id), "manifest order === snapshot order");
-    const snapshot: VisualizationSnapshot = {
-      schema: 1,
-      scope: "all",
-      generatedAt: FIXED_GENERATED_AT,
-      renderer: DEFAULT_RENDERER_IDENTITY,
-      sessions,
-      manifest,
-      warnings: [],
-    };
-    const expectedMd = sessions.map((s) => sessionPagePath(s.identity.kind, s.identity.pathKey, "md"));
-    const expectedHtml = sessions.map((s) => sessionPagePath(s.identity.kind, s.identity.pathKey, "html"));
-    const mdOrder = [...renderHubMarkdown(snapshot).matchAll(/\(([^)]+\.md)#/g)].map((m) => m[1]);
-    const htmlOrder = [...renderHubHtml(snapshot).matchAll(/href="([^"]+\.html)#/g)].map((m) => m[1]);
-    assert.deepEqual(mdOrder, expectedMd, "markdown hub lists sessions in the same order");
-    assert.deepEqual(htmlOrder, expectedHtml, "html hub lists sessions in the same order");
-
-    // Touch invariance: bump every run-local mtime with distinct future
-    // values. Discovery MUST observe the new mtimes (so this test fails
-    // before the F3 fix) — the ordering boundary must not use them.
-    const futureByRun: Record<string, Date> = {
-      "cto-live": new Date("2030-01-01T00:00:00.000Z"),
-      "cto-a": new Date("2030-02-01T00:00:00.000Z"),
-      "cto-b": new Date("2030-03-01T00:00:00.000Z"),
-    };
-    for (const [runId, future] of Object.entries(futureByRun)) {
-      const runDir = join(cwd, ".work-state", "cto", runId);
-      for (const name of readdirSync(runDir)) {
-        const p = join(runDir, name);
-        if (statSync(p).isFile()) utimesSync(p, future, future);
-      }
-    }
-    const touched = listCtoSources(cwd);
-    for (const [runId, future] of Object.entries(futureByRun)) {
-      const entry = touched.find((e) => e.id === runId);
-      assert.ok(entry, `touched run still discovered: ${runId}`);
-      assert.equal(entry.updatedAt, future.toISOString(), `discovery observes the new run-local mtime for ${runId}`);
-    }
-
-    const sessionsAfter = buildSessionSnapshots(cwd, [resolveDoWorkSource(cwd, "alpha"), ...touched], FIXED_GENERATED_AT);
-    assert.deepEqual(sessionsAfter, sessions, "mtime-only change reorders nothing and changes no model or digest");
-    const manifestAfter = buildManifest(sessionsAfter, "all", { generatedAt: FIXED_GENERATED_AT });
-    assert.deepEqual(manifestAfter, manifest, "manifest unchanged by mtime-only change");
-    const snapshotAfter: VisualizationSnapshot = { ...snapshot, sessions: sessionsAfter, manifest: manifestAfter };
-    assert.deepEqual(
-      [...renderHubMarkdown(snapshotAfter).matchAll(/\(([^)]+\.md)#/g)].map((m) => m[1]),
-      expectedMd,
-      "markdown hub order unchanged",
-    );
-    assert.deepEqual(
-      [...renderHubHtml(snapshotAfter).matchAll(/href="([^"]+\.html)#/g)].map((m) => m[1]),
-      expectedHtml,
-      "html hub order unchanged",
-    );
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

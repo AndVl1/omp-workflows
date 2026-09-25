@@ -32,6 +32,7 @@ import type { IPty } from 'node-pty';
 import { WebSocketServer, type WebSocket as WS } from 'ws';
 
 import { deferred } from './util.js';
+import { ensureWorkspaceActivation } from './workspace-activation.js';
 /** Max inbound WS frame size (defense-in-depth; the browser never needs more). */
 export const MAX_INBOUND_WS_BYTES = 64 * 1024;
 /**
@@ -92,6 +93,28 @@ function writeSessionFile(path: string, body: string): void {
   } catch {
     /* filesystem may not support chmod (e.g. some Windows volumes) — best-effort. */
   }
+}
+
+/**
+ * Preserve a non-empty transcript before a scratch session is restarted.
+ * Restarting the PTY must not erase the raw evidence needed to explain a
+ * fresh-session resume. The active transcript remains a clean append-only
+ * stream for the new session; the archive is sibling evidence, not runtime
+ * state and is never read as workflow authority.
+ */
+function archivePriorTranscript(transcriptPath: string, stateDir: string): string | null {
+  if (!existsSync(transcriptPath)) return null;
+  const previous = readFileSync(transcriptPath, 'utf8');
+  if (previous.length === 0) return null;
+  const stamp = new Date().toISOString().replace(/[^0-9]/gu, '');
+  let archivePath = join(stateDir, `transcript-${stamp}.jsonl`);
+  let suffix = 1;
+  while (existsSync(archivePath)) {
+    archivePath = join(stateDir, `transcript-${stamp}-${String(suffix)}.jsonl`);
+    suffix += 1;
+  }
+  writeSessionFile(archivePath, previous);
+  return archivePath;
 }
 
 function appendSessionFile(path: string, body: string): void {
@@ -292,6 +315,7 @@ export interface OmpLaunchConfig {
    * same models the operator uses day-to-day.
    */
   readonly ompProfile?: string;
+  readonly extensionPath?: string;
   readonly maxTimeSec: number;
   readonly approvalMode: string;
   readonly configPath: string;
@@ -352,8 +376,11 @@ export interface OmpLaunchConfig {
 export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   const maxMinutes = Math.max(1, Math.round(cfg.maxTimeSec / 60));
   const args: string[] = [];
-  if (typeof cfg.ompProfile === 'string' && cfg.ompProfile.length > 0) {
-    args.push('--profile', cfg.ompProfile);
+  if (typeof cfg.ompProfile === "string" && cfg.ompProfile.length > 0) {
+    args.push("--profile", cfg.ompProfile);
+  }
+  if (typeof cfg.extensionPath === "string" && cfg.extensionPath.length > 0) {
+    args.push("--extension", cfg.extensionPath);
   }
   if (cfg.hostConfigPath !== undefined && cfg.hostConfigPath.length > 0) {
     args.push('--config', cfg.hostConfigPath);
@@ -1038,6 +1065,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   const host = '127.0.0.1';
   const publicHost = host;
   const scratchDir = resolve(opts.cwd);
+  const activation = ensureWorkspaceActivation(scratchDir);
   const surface = opts.surface ?? 'web';
   const cols = opts.cols ?? 100;
   const rows = opts.rows ?? 30;
@@ -1059,8 +1087,12 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   const stateDir = stateDirOf(scratchDir);
   mkdirSync(stateDir, { recursive: true, mode: SESSION_DIR_MODE });
   const transcriptPath = join(stateDir, 'transcript.jsonl');
-  const sessionJsonPath = join(stateDir, 'session.json');
-  // Truncate the transcript — a fresh session starts with a clean evidence file.
+  const sessionJsonPath = join(stateDir, "session.json");
+  const dispatchOriginDir = join(stateDir, "dispatch-origin");
+  mkdirSync(dispatchOriginDir, { recursive: true, mode: SESSION_DIR_MODE });
+  const previousTranscript = archivePriorTranscript(transcriptPath, stateDir);
+  // Start each PTY with a clean current stream; the previous stream is retained
+  // next to it when a scratch session is resumed.
   writeSessionFile(transcriptPath, '');
 
   const ompVersion = await resolveOmpVersion(ompBinary);
@@ -1103,6 +1135,18 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   const userConfigDefaultPath = join(scratchDir, '.omp', 'ux-e2e-overlay.user.json');
   const userConfigPath = existsSync(userConfigDefaultPath) ? userConfigDefaultPath : null;
 
+  const launchArgs = buildOmpArgs({
+    ompProfile,
+    ...(activation !== null ? { extensionPath: activation.fullstackExtension } : {}),
+    maxTimeSec,
+    approvalMode,
+    configPath: join(scratchDir, ".omp", "ux-e2e-overlay.json"),
+    sessionDir: join(scratchDir, ".omp", "agent"),
+    userConfigDefaultPath,
+    ...(hostConfig.path !== null ? { hostConfigPath: hostConfig.path } : {}),
+    ...(userConfigPath !== null ? { userConfigPath } : {}),
+  });
+
   let ptyProc: IPty | null = null;
   let spawnError: string | null = null;
   if (opts.noPty !== true) {
@@ -1110,22 +1154,16 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     // binary may be missing on some platforms — noPty test sessions must
     // still work when the native module cannot load.
     const ptyMod = await import('node-pty');
-    const env = buildPtyEnv(process.env, opts.env, { keepProxyEnv: opts.keepProxyEnv });
-    const args = buildOmpArgs({
-      ompProfile,
-      maxTimeSec,
-      approvalMode,
-      configPath: join(scratchDir, '.omp', 'ux-e2e-overlay.json'),
-      sessionDir: join(scratchDir, '.omp', 'agent'),
-      userConfigDefaultPath,
-      ...(hostConfig.path !== null ? { hostConfigPath: hostConfig.path } : {}),
-      ...(userConfigPath !== null ? { userConfigPath } : {}),
-    });
+    const env = buildPtyEnv(
+      process.env,
+      { ...(opts.env ?? {}), OMP_WORKFLOWS_DISPATCH_ORIGIN_DIR: dispatchOriginDir },
+      { keepProxyEnv: opts.keepProxyEnv },
+    );
     try {
       // omp is spawned directly (never wrapped in a shell), which is
       // inherently rc/profile-suppressed: no shell rc files can reorder
       // PATH or print noise into the terminal.
-      ptyProc = ptyMod.spawn(ompBinary, args, { name: 'xterm-256color', cols, rows, cwd: scratchDir, env });
+      ptyProc = ptyMod.spawn(ompBinary, launchArgs, { name: 'xterm-256color', cols, rows, cwd: scratchDir, env });
     } catch (err) {
       spawnError = err instanceof Error ? err.message : String(err);
     }
@@ -1143,6 +1181,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     tty: { cols, rows, term: 'xterm-256color' },
     task_prompt: opts.taskPrompt !== null && opts.taskPrompt !== undefined ? sanitizeForJson(opts.taskPrompt) : null,
     scenario: opts.scenario ?? null,
+    previous_transcript: previousTranscript,
     surface,
     host_config: {
       path: hostConfig.path,
@@ -1151,6 +1190,20 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     user_config: {
       path: userConfigPath,
       default_path: userConfigDefaultPath,
+    },
+    launch: {
+      binary: ompBinary,
+      argv: launchArgs,
+      workspace_root: activation?.monorepoRoot ?? null,
+      core_package: activation?.corePackage ?? null,
+      fullstack_package: activation?.fullstackPackage ?? null,
+      core_link: activation?.coreLink ?? null,
+      fullstack_link: activation?.fullstackLink ?? null,
+      extension_path: activation?.fullstackExtension ?? null,
+      plugin_override_path: activation?.pluginOverridePath ?? null,
+      disabled_plugins: activation?.disabledPlugins ?? [],
+      dispatch_origin_dir: dispatchOriginDir,
+      env: { OMP_WORKFLOWS_DISPATCH_ORIGIN_DIR: dispatchOriginDir },
     },
   };
   writeSessionFile(sessionJsonPath, JSON.stringify(sessionJson, null, 2) + '\n');

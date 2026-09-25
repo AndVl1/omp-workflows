@@ -14,18 +14,16 @@
  * Fail-closed for task tool calls during an active CTO wave (static-3): the
  * marker is read ONLY from the task payload field(s) — `input.task` (string)
  * or each `input.tasks[i].task` (string); marker text anywhere else does not
- * count. A task call with no VALID marker while any run under
- * `.work-state/cto/` has an active wave is blocked with the run id, the wave
- * id and the required marker format. Standby/no-wave runs and ordinary
- * non-CTO flows keep the allow path; the marker is routing metadata only, so
- * calls that do carry a marker are decided by canonical state validation.
+ * count. A task call with no VALID marker while the exact claimed run has an
+ * active wave is blocked with that run id, the wave id and the required marker
+ * format. Standby/no-wave runs and ordinary non-CTO flows keep the allow path;
+ * the marker is routing metadata only, so calls that do carry a marker are
+ * decided by canonical state validation.
  *
  * This gate runs AFTER ctoNestingGuard (untouched, still first) and never
  * weakens the nested-CTO prohibition.
  */
 
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
 import { readDoDFile, resolveDodPath } from "../engine/dod.js";
 import { resolveWorkflow } from "../engine/profile.js";
 import type { ModelClassification } from "../engine/run.js";
@@ -330,40 +328,33 @@ function extractTaskMarkers(
   return { kind: "none" };
 }
 
+type ActiveWaveLookup =
+  | { runId: string; waveId: string }
+  | { runId: string; waveId: "<unreadable>"; unknown: true }
+  | null;
+
 /**
- * Find the active CTO wave anywhere in the workspace: scan
- * `<root>/.work-state/cto/<runId>/state.json` (guarded by existsSync;
- * unreadable/corrupt state skipped) for a run whose activeWave() is
- * non-null. Multiple active runs → the one with the latest `updated_at`,
- * breaking ties by run id. No active wave anywhere → null.
+ * Find the active CTO wave for the exact claimed run. The gate deliberately
+ * does not scan for a latest run: selection is an ingress concern and a
+ * caller without an exact claim cannot borrow another run's dispatch state.
  */
-function findActiveWave(root: string): { runId: string; waveId: string } | null {
-  const ctoDir = join(root, ".work-state", "cto");
-  if (!existsSync(ctoDir)) return null;
-  let best: { runId: string; waveId: string; updatedAt: string } | null = null;
-  for (const entry of readdirSync(ctoDir, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !isSafeCtoId(entry.name)) continue;
-    const state = readCtoState(entry.name, root);
-    if (!state) continue; // unreadable/corrupt — skip
-    const wave = activeWave(state);
-    if (!wave) continue;
-    const waveId = isSafeCtoId(wave.id) ? wave.id : "<invalid>";
-    const updatedAt = typeof state.updated_at === "string" ? state.updated_at.slice(0, 64) : "";
-    if (
-      !best ||
-      updatedAt > best.updatedAt ||
-      (updatedAt === best.updatedAt && entry.name > best.runId)
-    ) {
-      best = { runId: entry.name, waveId, updatedAt };
-    }
-  }
-  return best ? { runId: best.runId, waveId: best.waveId } : null;
+function findActiveWave(root: string, runId: string | undefined): ActiveWaveLookup {
+  if (!runId) return null;
+  const state = readCtoState(runId, root);
+  if (!state) return { runId, waveId: "<unreadable>", unknown: true };
+  const wave = activeWave(state);
+  if (!wave) return null;
+  const waveId = isSafeCtoId(wave.id) ? wave.id : "<invalid>";
+  return { runId, waveId };
 }
 
 /** Block reason for a task call whose payload carries no VALID marker. */
-function noMarkerBlockReason(active: { runId: string; waveId: string }, attempted: boolean, item: number | undefined): string {
-  const expected = `<!-- omp-cto-slice run=${active.runId} slice=<sliceId> -->`;
+function noMarkerBlockReason(active: Exclude<ActiveWaveLookup, null>, attempted: boolean, item: number | undefined): string {
   const where = item !== undefined ? ` (batch task item ${item})` : "";
+  if ("unknown" in active) {
+    return `cto slice gate: exact claimed run ${active.runId} is unreadable${where}; refusing unmarked CTO task launch`;
+  }
+  const expected = `<!-- omp-cto-slice run=${active.runId} slice=<sliceId> -->`;
   if (attempted) {
     return `cto slice gate: active wave ${active.waveId} in run ${active.runId} — task payload${where} carries a malformed CTO slice marker; expected "${expected}" (both run and slice attributes required) or fold the work into the wave`;
   }
@@ -379,13 +370,11 @@ function noMarkerBlockReason(active: { runId: string; waveId: string }, attempte
  *   `input.task` (string) for the single shape, or each `input.tasks[i].task`
  *   (string) for the batch shape. Marker text in any other field does NOT
  *   count as a valid marker.
- * - No VALID marker → fail-closed when any run under `<cwd>/.work-state/cto/`
- *   has an active wave (activeWave non-null; multiple runs → latest
- *   `updated_at`): the call blocks with the run id, the wave id and the
- *   required marker format. A payload that attempts the marker prefix but
- *   fails parseCtoSliceMarker blocks with the expected format named. No
- *   active wave anywhere (standby runs, finished waves, no .work-state/cto
- *   dir, non-CTO projects) → undefined (allow).
+ * - No VALID marker → fail-closed when the exact `ctx.cto_run_id` has an active wave:
+ *   the call blocks with the exact run id, wave id and required marker format. A
+ *   payload that attempts the marker prefix but fails parseCtoSliceMarker blocks
+ *   with the expected format named. No exact active wave (standby runs, finished
+ *   waves, missing claim, no .work-state/cto dir, non-CTO projects) → undefined.
  * - VALID marker present → the canonical CtoState for marker.runId is loaded
  *   and assertCtoSliceDispatchable decides; unreadable state with a clearly
  *   present marker blocks ("no CtoState ... cannot dispatch CTO slice").
@@ -397,7 +386,7 @@ function noMarkerBlockReason(active: { runId: string; waveId: string }, attempte
  */
 export function ctoSliceTaskGate(
   event: { toolName?: string; input?: unknown },
-  ctx: { cwd: string },
+  ctx: { cwd: string; cto_run_id?: string },
 ): { block: true; reason: string } | undefined {
   try {
     if (event?.toolName !== "task") return undefined;
@@ -406,8 +395,14 @@ export function ctoSliceTaskGate(
 
     if (parsed.kind === "single") {
       if (!parsed.marker) {
-        const active = findActiveWave(ctx.cwd);
+        const active = findActiveWave(ctx.cwd, ctx.cto_run_id);
         return active ? { block: true, reason: noMarkerBlockReason(active, parsed.attempted, undefined) } : undefined;
+      }
+      if (!ctx.cto_run_id) {
+        return { block: true, reason: `cto slice gate: marker run ${parsed.marker.runId} has no exact active CTO claim` };
+      }
+      if (parsed.marker.runId !== ctx.cto_run_id) {
+        return { block: true, reason: `cto slice gate: marker run ${parsed.marker.runId} is not the exact claimed run ${ctx.cto_run_id}` };
       }
       const state = readCtoState(parsed.marker.runId, ctx.cwd);
       if (!state) {
@@ -423,19 +418,23 @@ export function ctoSliceTaskGate(
 
     if (parsed.kind === "batch") {
       if (parsed.items.length === 0) {
-        const active = findActiveWave(ctx.cwd);
+        const active = findActiveWave(ctx.cwd, ctx.cto_run_id);
         return active ? { block: true, reason: noMarkerBlockReason(active, false, undefined) } : undefined;
       }
-      const missingIndex = parsed.items.findIndex((item) => item.marker === null);
-      const activeForMissing = missingIndex >= 0 ? findActiveWave(ctx.cwd) : null;
-      if (missingIndex >= 0 && !activeForMissing) return undefined;
       for (let index = 0; index < parsed.items.length; index += 1) {
         const item = parsed.items[index]!;
         if (!item.marker) {
-          if (activeForMissing) return { block: true, reason: noMarkerBlockReason(activeForMissing, item.attempted, index) };
+          const active = findActiveWave(ctx.cwd, ctx.cto_run_id);
+          if (active) return { block: true, reason: noMarkerBlockReason(active, item.attempted, index) };
           continue;
         }
         const marker = item.marker;
+        if (!ctx.cto_run_id) {
+          return { block: true, reason: `cto slice gate: marker run ${marker.runId} has no exact active CTO claim (batch task item ${marker.item})` };
+        }
+        if (marker.runId !== ctx.cto_run_id) {
+          return { block: true, reason: `cto slice gate: marker run ${marker.runId} is not the exact claimed run ${ctx.cto_run_id} (batch task item ${marker.item})` };
+        }
         const state = readCtoState(marker.runId, ctx.cwd);
         if (!state) {
           return {
@@ -450,16 +449,18 @@ export function ctoSliceTaskGate(
     }
 
     if (parsed.kind === "ambiguous") {
-      const active = findActiveWave(ctx.cwd);
+      const active = findActiveWave(ctx.cwd, ctx.cto_run_id);
       if (!active) return undefined;
       return {
         block: true,
-        reason: `cto slice gate: active wave ${active.waveId} in run ${active.runId} — ambiguous task payload has both task and tasks fields; provide exactly one marker-bearing shape or fold the work into the wave`,
+        reason: "unknown" in active
+          ? `cto slice gate: exact claimed run ${active.runId} is unreadable — refusing ambiguous task launch`
+          : `cto slice gate: active wave ${active.waveId} in run ${active.runId} — ambiguous task payload has both task and tasks fields; provide exactly one marker-bearing shape or fold the work into the wave`,
       };
     }
 
-    // No task payload at all — fail closed while a wave is active.
-    const active = findActiveWave(ctx.cwd);
+    // No task payload at all — fail closed while an exact CTO wave is active.
+    const active = findActiveWave(ctx.cwd, ctx.cto_run_id);
     return active ? { block: true, reason: noMarkerBlockReason(active, false, undefined) } : undefined;
   } catch {
     return { block: true, reason: "cto slice gate: malformed dispatch input or unreadable state — refusing task launch" };

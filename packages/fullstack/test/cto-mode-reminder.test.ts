@@ -13,22 +13,6 @@ import {
 const USER_MSG = { role: "user", content: [{ type: "text", text: "original user prompt" }], timestamp: 1 };
 const ASSISTANT_MSG = { role: "assistant", content: [{ type: "text", text: "thinking…" }], timestamp: 2 };
 
-test("cto-reminder: buildCtoModeReminder renders the delegation contract with run id and task", () => {
-	const text = buildCtoModeReminder({ runId: "pr-watch", task: "Watch PRs and fix findings" });
-	assert.ok(text.includes(CTO_MODE_MARKER), "marker line present");
-	assert.ok(text.includes("pr-watch"), "run id present");
-	assert.ok(text.includes("Watch PRs and fix findings"), "task present");
-	assert.ok(text.includes("DELEGATE, do not absorb"), "delegation headline");
-	assert.ok(text.includes("never code or patch yourself"), "orchestrator rule");
-	assert.ok(text.includes("escalate what you cannot decide to the CTO"), "lead rule");
-	assert.ok(text.includes("never re-delegate"), "worker rule");
-	assert.ok(
-		text.includes("task(agent=cto)") && text.includes("task(agent=@cto)"),
-		"nested CTO dispatch forbidden in the reminder",
-	);
-	assert.ok(text.includes("MAIN AGENT"), "reminder names the main-session CTO");
-	assert.ok(text.includes("returns to standby"), "reminder returns the CTO to standby");
-});
 
 test("cto-reminder: injectCtoModeReminder prepends a steering user message", () => {
 	const result = injectCtoModeReminder([USER_MSG, ASSISTANT_MSG], "REMINDER");
@@ -55,7 +39,7 @@ test("cto-reminder: injectCtoModeReminder returns undefined on unusable snapshot
 	assert.equal(injectCtoModeReminder(undefined as unknown as unknown[], "REMINDER"), undefined);
 });
 
-test("cto-reminder: resolveActiveCtoRun finds an engine-written active run", () => {
+test("cto-reminder: resolves only a claim proven by the invoking host context", () => {
 	const root = mkdtempSync(join(tmpdir(), "cto-reminder-"));
 	try {
 		const runDir = join(root, ".work-state", "cto", "run-one");
@@ -75,16 +59,38 @@ test("cto-reminder: resolveActiveCtoRun finds an engine-written active run", () 
 				updated_at: new Date().toISOString(),
 			}),
 		);
-		const run = resolveActiveCtoRun(root);
-		assert.ok(run, "active run resolved");
-		assert.equal(run!.runId, "run-one");
-		assert.equal(run!.task, "Implement OAuth");
+		const ownerManager = { getCwd: () => root, getSessionId: () => "session-owner" };
+		const ownerContext = {
+			cwd: root,
+			mode: "tui",
+			hasUI: true,
+			session_id: "session-owner",
+			sessionManager: ownerManager,
+		};
+		const claimResolver = (ctx: { cwd: string; [key: string]: unknown }) =>
+			ctx.sessionManager === ownerManager
+				&& ctx.session_id === "session-owner"
+				&& ctx.mode === "tui"
+				&& ctx.hasUI === true
+				? { run_id: "run-one", ownership_epoch: "epoch-1" }
+				: undefined;
+		const run = resolveActiveCtoRun(ownerContext, claimResolver);
+		assert.deepEqual(run, { runId: "run-one", task: "Implement OAuth" });
+		assert.equal(resolveActiveCtoRun({ cwd: root }, claimResolver), null, "cwd-only legacy lookup is denied");
+		assert.equal(
+			resolveActiveCtoRun(
+				{ ...ownerContext, session_id: "foreign-session", sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" } },
+				claimResolver,
+			),
+			null,
+			"same-cwd foreign session cannot reuse the owner reminder",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-test("cto-reminder: resolveActiveCtoRun ignores finished runs (pause done)", () => {
+test("cto-reminder: finished runs do not render even with a matching claim", () => {
 	const root = mkdtempSync(join(tmpdir(), "cto-reminder-done-"));
 	try {
 		const runDir = join(root, ".work-state", "cto", "run-done");
@@ -104,16 +110,24 @@ test("cto-reminder: resolveActiveCtoRun ignores finished runs (pause done)", () 
 				updated_at: new Date().toISOString(),
 			}),
 		);
-		assert.equal(resolveActiveCtoRun(root), null, "finished run is not active");
+		const manager = { getCwd: () => root, getSessionId: () => "session-owner" };
+		const context = { cwd: root, mode: "tui", hasUI: true, session_id: "session-owner", sessionManager: manager };
+		assert.equal(
+			resolveActiveCtoRun(context, () => ({ run_id: "run-done", ownership_epoch: "epoch-1" })),
+			null,
+			"finished run is not active",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-test("cto-reminder: resolveActiveCtoRun returns null without a runs dir", () => {
+test("cto-reminder: missing claim stays fail closed", () => {
 	const root = mkdtempSync(join(tmpdir(), "cto-reminder-none-"));
 	try {
-		assert.equal(resolveActiveCtoRun(root), null);
+		const manager = { getCwd: () => root, getSessionId: () => "session-owner" };
+		const context = { cwd: root, mode: "tui", hasUI: true, session_id: "session-owner", sessionManager: manager };
+		assert.equal(resolveActiveCtoRun(context), null);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

@@ -5,8 +5,8 @@
  * State/artifacts are authoritative; telemetry is bounded and optional.
  * Chronology uses event timestamps first, artifact mtime, state.updated_at,
  * then ordinal placement. Missing/corrupt optional inputs (telemetry, event
- * log, artifacts) produce explicit `warnings` — the only hard error is "no
- * session found", which is a caller error (nothing to report).
+ * log, artifacts) produce explicit `warnings`. Canonical selector failures and
+ * legacy selector use are surfaced as typed lifecycle errors.
  *
  * Raw events/transcripts are never embedded: telemetry carries only the
  * bounded rollup + per-kind counts, and artifact bodies are redacted and
@@ -29,21 +29,18 @@ import {
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { readDoDFileSafe, type DodSafeFileRead, resolveDodPath } from "../engine/dod.js";
+import { LifecycleError } from "../engine/run-lifecycle.js";
 import { loadProfile } from "../engine/profile.js";
 import { resolveConfig, resolveAgentForRole } from "../engine/config.js";
-import type { Profile, RoleConfig, StageDef, StageStatus, TeamState } from "../engine/types.js";
+import type { Profile, RoleConfig, StageDef, TeamState } from "../engine/types.js";
 import { assessRunHealth } from "../cto/health.js";
 import { loadTeamDefs } from "../cto/plan.js";
 import type { CtoState, RunHealth, TeamDef, TeamRunStatus } from "../cto/types.js";
-import { readObservabilityPointer } from "../observability/recorder.js";
+import { readCanonicalObservabilityPointer } from "../observability/recorder.js";
 import type { ObservabilityEvent, ObservabilityPointer } from "../observability/events.js";
 import { redactReportBody } from "./redact.js";
-import {
-  resolveCtoSource,
-  resolveDoWorkSource,
-  TEAM_ARTIFACTS_DIR,
-  WORK_STATE_DIR,
-} from "./session-source.js";
+import { resolveCanonicalRunSource, type CanonicalReportSelector } from "./canonical-source.js";
+import { resolveCtoSource, TEAM_ARTIFACTS_DIR, WORK_STATE_DIR, type ResolvedCto } from "./session-source.js";
 import type {
   BuildSessionReportOptions,
   ChronologyEvent,
@@ -55,15 +52,13 @@ import type {
   ReportTeam,
   ReportTelemetry,
   SessionEdge,
-  SessionKind,
   SessionReport,
   SessionSelector,
   StageAgentInfo,
   StageInfo,
 } from "./types.js";
 
-// Session-source layout constants and resolution live in session-source.ts
-// (single source of truth for feature/legacy/CTO discovery — architecture-2).
+// Canonical run layout constants are shared with report projections.
 const DEFAULT_MAX_ARTIFACT_BYTES = 16 * 1024;
 const MAX_EVENT_BYTES = 2 * 1024 * 1024;
 const MAX_EVENT_LINES = 5000;
@@ -79,67 +74,49 @@ interface DoWorkResolved {
   artifactsDir: string;
   isLegacy: boolean;
   isStale?: boolean;
-}
-
-interface CtoResolved {
-  id: string;
-  state: CtoState;
-  statePath: string | null;
-  runDir: string;
-  format: "json" | "markdown";
-}
-
-/** Resolve a do-work TeamState; null when not found (id probe or empty work-state). */
-function resolveDoWork(cwd: string, id?: string): DoWorkResolved | null {
-  // Delegated: deterministic feature/legacy/latest discovery with the exact
-  // report selectors lives in session-source.ts (architecture-2).
-  return resolveDoWorkSource(cwd, id);
-}
-
-/** Resolve a CTO run; null when not found (id probe or no runs). */
-function resolveCto(cwd: string, id?: string): CtoResolved | null {
-  // Delegated: deterministic JSON-first/markdown-fallback discovery with the
-  // exact report selectors lives in session-source.ts (architecture-2).
-  return resolveCtoSource(cwd, id);
-}
-
-/** Auto-detect: the newest of the best do-work state and best CTO run. */
-function guessKind(cwd: string, id?: string): SessionKind {
-  if (id) {
-    if (resolveDoWork(cwd, id)) return "do-work";
-    if (resolveCto(cwd, id)) return "cto";
-    throw new Error(`no do-work or cto session found for id "${id}" under ${resolve(cwd, WORK_STATE_DIR)}`);
-  }
-  const dw = resolveDoWork(cwd);
-  const cto = resolveCto(cwd);
-  if (dw && cto) return cto.state.updated_at > dw.state.updated_at ? "cto" : "do-work";
-  if (dw) return "do-work";
-  if (cto) return "cto";
-  throw new Error(`no do-work or cto session found under ${resolve(cwd, WORK_STATE_DIR)}`);
+  revisionId?: string;
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
+/** Build a report from one explicit canonical ordinary run/revision. */
+export function buildCanonicalRunReport(
+  cwd: string,
+  selector: CanonicalReportSelector,
+  options: BuildSessionReportOptions = {},
+): SessionReport {
+  const source = resolveCanonicalRunSource(cwd, selector);
+  const canonicalPointer = source.read.state.observability ?? readCanonicalObservabilityPointer(cwd, source.run_id, source.revision_id ?? undefined);
+  return assembleDoWork(cwd, {
+    id: source.run_id,
+    state: canonicalPointer ? { ...source.read.state, observability: canonicalPointer } : source.read.state,
+    statePath: source.statePath,
+    stateDir: dirname(source.statePath),
+    artifactsDir: source.artifactsDir,
+    isLegacy: false,
+    ...(source.revision_id ? { revisionId: source.revision_id } : {}),
+  }, options);
+}
+
+/**
+ * Legacy ordinary selectors are intentionally rejected. CTO keeps its own
+ * explicit namespace, but even CTO requires an id and never selects latest.
+ */
 export function buildSessionReport(
   cwd: string,
   selector: SessionSelector = {},
   options: BuildSessionReportOptions = {},
 ): SessionReport {
-  const kind = selector.kind ?? guessKind(cwd, selector.id);
-  if (kind === "cto") {
-    const run = resolveCto(cwd, selector.id);
-    if (!run) {
-      const id = selector.id ?? "latest";
-      throw new Error(`cto session "${id}" not found (no state.json and no markdown fallback)`);
-    }
-    return assembleCto(cwd, run, options);
+  if (selector.kind !== "cto" || !selector.id) {
+    throw new LifecycleError(
+      "migration_required",
+      "legacy session report selectors are unsupported; use buildCanonicalRunReport with an explicit run_id and optional revision_id",
+      { next_action: "select an imported canonical run and call buildCanonicalRunReport({ run_id, revision_id })" },
+    );
   }
-  const dw = resolveDoWork(cwd, selector.id);
-  if (!dw) {
-    const id = selector.id ?? "latest";
-    throw new Error(`do-work session "${id}" not found (no per-feature or legacy state.json)`);
-  }
-  return assembleDoWork(cwd, dw, options);
+  const run = resolveCtoSource(cwd, selector.id);
+  if (!run) throw new Error(`cto session "${selector.id}" not found (explicit state.json is unreadable or missing)`);
+  return assembleCto(cwd, run, options);
 }
 
 // ── Stage provenance (agents / inputs / outputs) ────────────────────────────
@@ -455,7 +432,7 @@ function doWorkEdges(state: TeamState, profile: Profile | null): SessionEdge[] {
 
 // ── CTO assembly ────────────────────────────────────────────────────────────
 
-function assembleCto(cwd: string, r: CtoResolved, options: BuildSessionReportOptions): SessionReport {
+function assembleCto(cwd: string, r: ResolvedCto, options: BuildSessionReportOptions): SessionReport {
   const warnings: string[] = [];
   const state = r.state;
   const profile = loadProfile("cto");
@@ -817,29 +794,24 @@ function finishArtifact(
 
 function artifactFilePath(cwd: string, r: DoWorkResolved, artifactId: string): string | null {
   const mapped = r.state.artifacts?.[artifactId];
-  if (mapped) return resolveArtifactPath(cwd, mapped);
+  if (mapped) return resolveArtifactPath(cwd, mapped, r);
   return join(r.artifactsDir, `${artifactId}.json`);
 }
 
 /**
- * Resolve a persisted artifact reference from `TeamState.artifacts`.
- *
- * The do-work orchestration stamps state-relative refs
- * (`features/<slug>/artifacts/<id>.json`, `artifacts/<id>.json`) rooted at
- * `.work-state` — the engine's per-feature state layout. Accepted:
- * - absolute paths — kept as-is;
- * - `.work-state/…` — cwd-relative (CTO `dod_path` / legacy-root style);
- * - any other relative form — resolved against `.work-state`.
- * References escaping `.work-state` (e.g. `../../…`) are rejected (null).
+ * Resolve a persisted artifact reference from one canonical run's state.
+ * Relative references are rooted at that run (or immutable revision), while
+ * an explicit `.work-state/…` reference remains cwd-relative. References
+ * escaping the selected run root are rejected.
  */
-function resolveArtifactPath(cwd: string, ref: string): string | null {
+function resolveArtifactPath(cwd: string, ref: string, source: DoWorkResolved): string | null {
   if (isAbsolute(ref)) return ref;
   if (ref === WORK_STATE_DIR || ref.startsWith(`${WORK_STATE_DIR}/`) || ref.startsWith(`${WORK_STATE_DIR}${sep}`)) {
     return resolve(cwd, ref);
   }
-  const wsRoot = resolve(cwd, WORK_STATE_DIR);
-  const candidate = resolve(wsRoot, ref);
-  const rel = relative(wsRoot, candidate);
+  const root = dirname(source.artifactsDir);
+  const candidate = resolve(root, ref);
+  const rel = relative(root, candidate);
   if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
   return candidate;
 }
@@ -873,40 +845,32 @@ function doWorkTelemetry(
   r: DoWorkResolved,
   warnings: string[],
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
-  const slug = r.isLegacy ? (deriveFeatureSlug(r.state.branch) ?? "default") : r.id;
-  const pointer = r.state.observability ?? readObservabilityPointer(cwd, slug);
+  const pointer = r.state.observability ?? readCanonicalObservabilityPointer(cwd, r.id, r.revisionId);
   if (!pointer) {
     warnings.push("no telemetry available for this session");
     return { telemetry: { rollup: null }, events: [] };
   }
-  return buildTelemetry(cwd, slug, pointer, warnings);
+  return buildTelemetry(cwd, pointer, warnings, r.stateDir);
 }
 
 function ctoTelemetry(
-  cwd: string,
-  r: CtoResolved,
+  _cwd: string,
+  _r: ResolvedCto,
   warnings: string[],
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
-  // CTO runs have no observability pointer of their own; the recorder is
-  // feature-scoped and falls back to "default" for CTO sessions. This is
-  // coarse session-level telemetry — flagged in the report.
-  const pointer = readObservabilityPointer(cwd, "default");
-  if (!pointer) {
-    warnings.push("no telemetry available for this CTO run (session-level events only)");
-    return { telemetry: { rollup: null }, events: [] };
-  }
-  const result = buildTelemetry(cwd, "default", pointer, warnings);
-  warnings.push("CTO telemetry is session-level (no per-run event stream); chronology falls back to state");
-  return result;
+  // CTO report assembly has no canonical per-run observability reader. Do not
+  // borrow a feature/default stream from another run.
+  warnings.push("no telemetry available for this CTO run (no canonical run stream)");
+  return { telemetry: { rollup: null }, events: [] };
 }
 
 function buildTelemetry(
-  cwd: string,
-  slug: string,
+  _cwd: string,
   pointer: ObservabilityPointer,
   warnings: string[],
+  canonicalRoot: string,
 ): { telemetry: ReportTelemetry; events: ObservabilityEvent[] } {
-  const eventsPath = resolve(cwd, WORK_STATE_DIR, "features", slug, pointer.eventsPath);
+  const eventsPath = resolve(canonicalRoot, pointer.eventsPath);
   const events = readEventsBounded(eventsPath, warnings);
   const eventCounts: Record<string, number> = {};
   for (const e of events) eventCounts[e.kind] = (eventCounts[e.kind] ?? 0) + 1;
@@ -1058,11 +1022,6 @@ function taskTitle(task: string, issue: { number: number; url?: string } | null)
   const firstLine = task.split("\n").find((l) => l.trim()) ?? task;
   const truncated = firstLine.length > 120 ? `${firstLine.slice(0, 120)}…` : firstLine;
   return issue?.number ? `#${issue.number}: ${truncated}` : truncated;
-}
-
-function deriveFeatureSlug(branch: string): string | null {
-  if (!branch) return null;
-  return branch.replace(/\//g, "-").replace(/[^a-z0-9._-]/gi, "-").toLowerCase();
 }
 
 /** Read at most `maxBytes` from the head of a file; null on any error. */

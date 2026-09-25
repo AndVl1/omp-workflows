@@ -34,6 +34,7 @@ omp plugin install @andvl1/omp-workflows-core
 # Plain npm (works the same — npm respects the registry scoping in ~/.npmrc)
 npm install @andvl1/omp-workflows-core
 npm install @andvl1/omp-workflows-fullstack
+```
 
 ### Slash command bootstrap — deterministic for both install paths
 
@@ -225,6 +226,20 @@ The complete custom-bundle recipe is in
 /do-work Review my auth changes
 /init-team
 > **Note**: `/team` remains a compatibility alias for `/do-work`; `/cto` is the sole orchestration entrypoint.
+
+### Lifecycle: new, resume, rework
+
+Наличие старого state больше не означает автоматическое продолжение. Для обычного workflow доступны явные режимы и read-only список; UUID нужен только как технический selector:
+
+```text
+/do-work --new Добавить экспорт отчётов
+/do-work --resume
+/do-work --rework Исправить результат экспорта
+/do-work --list
+```
+
+Выбор по названию или пункту списка разрешается в canonical run до мутации. Подробности про восстановление без старого чата, busy/migration/recovery UX, branch context, report и viewer см. в [`core lifecycle contract`](packages/core/README.md) и [`fullstack command guide`](packages/fullstack/README.md).
+
 1. **Walk** stages in profile order. Each by `type`:
    - `orchestrator` → inline orientation
    - `single` → one `task` call
@@ -232,9 +247,9 @@ The complete custom-bundle recipe is in
    - `bash` → deterministic shell step
    - `none` → skip
 5. **Honour** `consumes`/`produces` typed artifacts.
-6. **Honour** `gate` (block `done` until gate holds) and `checkpoint` (interactive: stop; autonomous: apply `autonomous` decision).
+6. **Honour** `gate` (block `done` until gate holds) and `checkpoint` (follow the declared typed policy; interactive answers are recorded through `workflow_checkpoint_ask`; routing/autonomy metadata never grants permission).
 7. **Loop** if `loop: { back_to, until, max_iterations }` is set.
-8. **Mirror** progress into `team-state.md`.
+8. **Mirror** progress through the selected run's canonical reader.
 
 Concretely, in v0.4.0+:
 - The `/do-work` custom-TS command (or its `/team` alias) parses the envelope and returns a prompt
@@ -410,26 +425,24 @@ identity as shown in
 
 When the engine is wired in via `registerTeamWorkflow`, it subscribes to seven OMP extension events
 (`before_agent_start`, `agent_start`, `agent_end`, `tool_call`, `tool_result`,
-`session_start`, `session_stop`) and writes a per-feature append-only event log
-to `.work-state/features/<slug>/observability/events.jsonl`. A rollup
-is computed from the log and embedded in `TeamState.observability` on
-every `writeState`.
+`session_start`, `session_stop`) and records events only for the explicitly selected
+canonical run. Live hooks use the explicit canonical run ID and write
+`.work-state/runs/<run-id>/observability/events.jsonl`; revisions are read-only immutable
+snapshots, while live hook scope remains the parent run ID.
+Feature-slug, branch-derived and `.active-feature` recorder scopes are not a runtime
+fallback and return migration guidance.
 
-The rollup is mirrored in `team-state.md` under a new `## Observability` section:
+The rollup is persisted in the selected `TeamState.observability` pointer and is consumed by
+the canonical status/report readers:
 
 ```markdown
 ## Observability
 - events: observability/events.jsonl (last id: evt-l8v3kf72-1b)
 - agent invocations: 4
-- subagents:
-  - developer-go: 1
-  - code-reviewer: 1
-  - qa: 1
-- skills:
-  - ast-index: 3
-  - omp-workflows: 2
+- subagents: developer-go (1), code-reviewer (1), qa (1)
+- skills: ast-index (3), omp-workflows (2)
 - tool calls: 47 (errors: 2)
-- duration: 1842000ms (2026-08-01T13:00:00Z → 2026-08-01T13:30:42Z)
+- duration: 1842000ms
 ```
 
 This is the source of truth for:

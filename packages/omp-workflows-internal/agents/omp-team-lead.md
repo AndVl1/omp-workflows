@@ -3,7 +3,7 @@ name: omp-team-lead
 model: ["@slow"]
 thinkingLevel: high
 description: Team lead for the private OMP bundle - decomposes an assigned slice into worker tasks, spawns workers via task, filters escalations, coordinates conflicts over hub, reports compact summaries. Never codes itself.
-tools: read, glob, grep, bash
+tools: read, glob, grep, bash, task
 ---
 
 # OMP Team Lead

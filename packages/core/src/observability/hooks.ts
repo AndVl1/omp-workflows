@@ -6,16 +6,14 @@
  * any failure is swallowed after a single console.warn so a buggy recorder
  * can never block a tool call.
  *
- * The recorder is cached per cwd; the cache survives across hook invocations
- * so the in-memory write queue can be drained deterministically by tests
- * via `flushRecorder(cwd)`. The recorder reads its own branch + active
- * feature slug from git + `.work-state/.active-feature` so it agrees with
- * the engine's notion of the "active feature".
+ * Recorder instances are scoped by the explicit canonical run id. A selected
+ * run switch drains the previous recorder before callbacks admitted for the
+ * new selection are allowed to append; late callbacks still carry their own
+ * captured run id and therefore cannot be redirected by selection changes.
  */
 
-import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { execSync } from "node:child_process";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+
 import { EventRecorder } from "./recorder.js";
 import { extractSkills } from "./skills.js";
 import type {
@@ -31,9 +29,6 @@ import type {
   PendingReason,
   WorkIdentity,
 } from "../engine/types.js";
-
-const ACTIVE_FEATURE = ".active-feature";
-const WORK_STATE_DIR = ".work-state";
 
 /** Narrow the OMP extension context to the few fields we read. */
 function ctxCwd(ctx: unknown): string | undefined {
@@ -55,35 +50,49 @@ function currentBranch(cwd: string): string {
   }
 }
 
+const recorderCache = new Map<string, EventRecorder>();
+const selectedRunByCwd = new Map<string, string | undefined>();
+const recorderRotationByCwd = new Map<string, Promise<void>>();
+
 /**
- * Resolve the active feature slug. Falls back to "default" so the recorder
- * always has a place to write.
+ * Select the canonical run for subsequent host events.
+ *
+ * Rotation is serialized per workspace. This matters because OMP dispatches
+ * callbacks synchronously but recorder writes are queued asynchronously: a B
+ * callback must not race the final A flush merely because selection changed.
  */
-function activeFeatureSlug(cwd: string): string {
-  const workState = resolve(cwd, WORK_STATE_DIR);
-  const active = resolve(workState, ACTIVE_FEATURE);
-  if (!existsSync(active)) return "default";
-  try {
-    const realRoot = realpathSync(workState);
-    const realPointer = realpathSync(active);
-    const rel = relative(realRoot, realPointer);
-    if (rel !== ACTIVE_FEATURE && (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel))) return "default";
-    const slug = readFileSync(active, "utf8").trim();
-    return /^[A-Za-z0-9._-]+$/.test(slug) ? slug : "default";
-  } catch {
-    return "default";
-  }
+export function setObservabilityRun(cwd: string, runId?: string): void {
+  const previous = selectedRunByCwd.get(cwd);
+  selectedRunByCwd.set(cwd, runId);
+  if (previous === runId) return;
+
+  const priorRotation = recorderRotationByCwd.get(cwd) ?? Promise.resolve();
+  const rotation = priorRotation.then(async () => {
+    if (!previous) return;
+    const recorder = recorderCache.get(`${cwd}|${previous}`);
+    if (recorder) await recorder.flush();
+  }).then(
+    () => undefined,
+    () => undefined,
+  );
+  recorderRotationByCwd.set(cwd, rotation);
+  void rotation.then(() => {
+    if (recorderRotationByCwd.get(cwd) === rotation) recorderRotationByCwd.delete(cwd);
+  });
 }
 
-const recorderCache = new Map<string, EventRecorder>();
-
-function getRecorder(cwd: string): EventRecorder {
-  const cached = recorderCache.get(cwd);
+function getRecorder(cwd: string, explicitRunId?: string): EventRecorder {
+  // A missing explicit scope must never inherit whichever host run happened to
+  // be selected most recently; late worker callbacks would attach to the
+  // wrong run. Host hooks resolve their immutable origin before appending.
+  const runId = explicitRunId;
+  if (!runId) throw new Error("migration_required: observability requires an explicit canonical run scope");
+  const cacheKey = `${cwd}|${runId}`;
+  const cached = recorderCache.get(cacheKey);
   if (cached) return cached;
   const branch = currentBranch(cwd);
-  const featureSlug = activeFeatureSlug(cwd);
-  const rec = new EventRecorder({ cwd, branch, featureSlug });
-  recorderCache.set(cwd, rec);
+  const rec = new EventRecorder({ cwd, branch, runId });
+  recorderCache.set(cacheKey, rec);
   return rec;
 }
 
@@ -93,8 +102,10 @@ function getRecorder(cwd: string): EventRecorder {
  * without relying on real timers.
  */
 export async function flushRecorder(cwd: string): Promise<void> {
-  const rec = recorderCache.get(cwd);
-  if (rec) await rec.flush();
+  await recorderRotationByCwd.get(cwd);
+  for (const [key, rec] of recorderCache) {
+    if (key === cwd || key.startsWith(`${cwd}|`)) await rec.flush();
+  }
 }
 
 function safeAppend(
@@ -106,7 +117,10 @@ function safeAppend(
     console.warn(`[observability] ${reason}`);
   };
   try {
-    void getRecorder(cwd).append(ev).catch(reject);
+    const rotation = recorderRotationByCwd.get(cwd) ?? Promise.resolve();
+    void rotation
+      .then(() => getRecorder(cwd, ev.runId).append(ev))
+      .catch(reject);
   } catch (error) {
     reject(error);
   }
@@ -114,10 +128,11 @@ function safeAppend(
 
 export function recordToolCallAttempt(
   cwd: string,
-  event: { toolName?: string; toolCallId?: string; input?: unknown } & Partial<ObservabilitySignalFields>,
+  event: { toolName?: string; toolCallId?: string; input?: unknown; runId?: string } & Partial<ObservabilitySignalFields>,
   decision: "allowed" | "blocked",
   reason?: string,
 ): void {
+  if (workerActor(event) === "worker") return;
   const toolName = typeof event.toolName === "string" ? event.toolName : undefined;
   if (!toolName) return;
   const { subagent, taskChars } = toolName === "task" ? subagentFromTaskInput(event.input) : {};
@@ -131,6 +146,7 @@ export function recordToolCallAttempt(
     subagentTaskChars: taskChars,
     gateDecision: decision,
     gateReason: reason,
+    ...(event.runId ? { runId: event.runId } : {}),
   });
 }
 
@@ -150,7 +166,7 @@ export function recordStageTransition(
     ts: opts.ts ?? new Date().toISOString(),
     stageId: opts.stageId,
     stageStatus: opts.stageStatus,
-    runId: opts.runId,
+    ...(opts.runId ? { runId: opts.runId } : {}),
   });
 }
 
@@ -177,7 +193,7 @@ export function recordArtifactWritten(
     artifactPath: opts.artifactPath,
     artifactBytes: opts.artifactBytes,
     artifactSha256: opts.artifactSha256,
-    runId: opts.runId,
+    ...(opts.runId ? { runId: opts.runId } : {}),
   });
 }
 
@@ -252,6 +268,20 @@ function subagentFromTaskInput(input: unknown): { subagent?: string; taskChars?:
   }
   return {};
 }
+
+function workerActor(value: unknown): string | undefined {
+  const record = recordLike(value);
+  if (!record) return undefined;
+  const actor = record.actor ?? record.origin_actor ?? record.originActor;
+  return typeof actor === "string" ? actor : undefined;
+}
+
+function isUnboundWorkerEvent(event: unknown, ctx: unknown): boolean {
+  if (workerActor(event) !== "worker" && workerActor(ctx) !== "worker") return false;
+  const context = recordLike(ctx);
+  return context?.observabilityOriginBound !== true;
+}
+
 function recordLike(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
@@ -302,6 +332,17 @@ function signalMetadata(event: unknown, ctx: unknown): ObservabilitySignalFields
   if (Array.isArray(artifactSummaries)) metadata.artifact_summaries = artifactSummaries as ObservabilityArtifactSummary[];
   const idempotencyKey = firstField(sources, "idempotency_key", "idempotencyKey");
   if (typeof idempotencyKey === "string") metadata.idempotency_key = idempotencyKey;
+
+  // The registration wrapper writes the captured run id onto the context. It
+  // must win over any event payload field: a late callback's payload may carry
+  // stale or model-supplied metadata, while the context is host-admitted.
+  const context = recordLike(ctx);
+  const state = recordLike(context?.state);
+  const contextRunId = firstField([...(context ? [context] : []), ...(state ? [state] : [])], "runId", "run_id");
+  const eventRunId = firstField([recordLike(event)].filter((value): value is Record<string, unknown> => Boolean(value)), "runId", "run_id");
+  const identityRunId = recordLike(identityValue)?.run_id;
+  const runId = contextRunId ?? eventRunId ?? identityRunId;
+  if (typeof runId === "string" && runId.length > 0) metadata.runId = runId;
   return metadata;
 }
 
@@ -323,7 +364,7 @@ export interface HookHandlers {
 export const observabilityHooks: HookHandlers = {
   onBeforeAgentStart(event, ctx) {
     const cwd = ctxCwd(ctx);
-    if (!cwd) return;
+    if (!cwd || isUnboundWorkerEvent(event, ctx)) return;
     const e = event as { systemPrompt?: string[] } | undefined;
     const skills = e?.systemPrompt ? extractSkills(e.systemPrompt) : [];
     safeAppend(cwd, {
@@ -335,7 +376,7 @@ export const observabilityHooks: HookHandlers = {
   },
   onAgentStart(event, ctx) {
     const cwd = ctxCwd(ctx);
-    if (!cwd) return;
+    if (!cwd || isUnboundWorkerEvent(event, ctx)) return;
     safeAppend(cwd, {
       ...signalMetadata(event, ctx),
       kind: "agent_start",
@@ -344,7 +385,7 @@ export const observabilityHooks: HookHandlers = {
   },
   onAgentEnd(event, ctx) {
     const cwd = ctxCwd(ctx);
-    if (!cwd) return;
+    if (!cwd || isUnboundWorkerEvent(event, ctx)) return;
     const e = event as { messages?: unknown[] } | undefined;
     safeAppend(cwd, {
       ...signalMetadata(event, ctx),
@@ -355,7 +396,7 @@ export const observabilityHooks: HookHandlers = {
   },
   onToolCall(event, ctx) {
     const cwd = ctxCwd(ctx);
-    if (!cwd) return;
+    if (!cwd || isUnboundWorkerEvent(event, ctx)) return;
     const e = event as { toolName?: string; toolCallId?: string; input?: unknown } | undefined;
     const toolName = typeof e?.toolName === "string" ? e.toolName : undefined;
     if (!toolName) return;
@@ -372,7 +413,7 @@ export const observabilityHooks: HookHandlers = {
   },
   onToolResult(event, ctx) {
     const cwd = ctxCwd(ctx);
-    if (!cwd) return;
+    if (!cwd || isUnboundWorkerEvent(event, ctx)) return;
     const e = event as { toolName?: string; toolCallId?: string; isError?: boolean } | undefined;
     if (typeof e?.toolName !== "string") return;
     safeAppend(cwd, {
@@ -386,7 +427,7 @@ export const observabilityHooks: HookHandlers = {
   },
   onSessionStart(event, ctx) {
     const cwd = ctxCwd(ctx);
-    if (!cwd) return;
+    if (!cwd || isUnboundWorkerEvent(event, ctx)) return;
     safeAppend(cwd, {
       ...signalMetadata(event, ctx),
       kind: "session_start",
@@ -396,7 +437,7 @@ export const observabilityHooks: HookHandlers = {
   },
   onSessionStop(event, ctx) {
     const cwd = ctxCwd(ctx);
-    if (!cwd) return;
+    if (!cwd || isUnboundWorkerEvent(event, ctx)) return;
     safeAppend(cwd, {
       ...signalMetadata(event, ctx),
       kind: "session_stop",

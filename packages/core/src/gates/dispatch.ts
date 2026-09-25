@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
-import { resolveState, resolveActiveBranch } from "../engine/state.js";
+import { resolveActiveBranch, resolveCanonicalRun, type ResolvedState } from "../engine/state.js";
 import { loadProfile, profileHash } from "../engine/profile.js";
+import { readRequiredStageInputs } from "../engine/stage.js";
 
 import type { StageDef } from "../engine/types.js";
+import type { WorkflowSessionController } from "../engine/host-controller.js";
 export const DISPATCH_MARKER_PREFIX = "<!-- omp-dispatch";
 const MARKER_RE = /<!--\s*omp-dispatch\s+run=([^\s]+)\s+stage=([^\s]+)\s+kind=(single|consilium)\s+cursor=([^\s]+)\s+roles=([^\s]+)(?:\s+role=([^\s]+))?(?:\s+capability=([^\s]+))?(?:\s+slot=([^\s]+))?(?:\s+task=([^\s]+))?\s*-->/;
 
@@ -61,10 +63,44 @@ export function parseDispatchMarker(text: string): DispatchMarker | null {
   };
 }
 
-export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx: { cwd: string }): { block: true; reason: string } | undefined {
+function dispatchMarkerForEvent(event: { input?: unknown }): DispatchMarker | null {
+  const input = event.input && typeof event.input === "object" && !Array.isArray(event.input) ? event.input as Record<string, unknown> : undefined;
+  const first = Array.isArray(input?.tasks) ? input.tasks[0] : input;
+  const task = first && typeof first === "object" && !Array.isArray(first) ? (first as Record<string, unknown>).task : undefined;
+  return typeof task === "string" ? parseDispatchMarker(task) : null;
+}
+
+function markerForEvent(item: Record<string, unknown>): string | undefined {
+  const marker = parseDispatchMarker(typeof item.task === "string" ? item.task : "");
+  return marker?.run;
+}
+
+function resolveDispatchTarget(cwd: string, event: { input?: unknown }, controller?: WorkflowSessionController): ResolvedState | null | undefined {
+  const branch = resolveActiveBranch(cwd);
+  const marker = dispatchMarkerForEvent(event);
+  if (!marker) {
+    if (!controller) return undefined;
+    const selectedRunId = controller.selectedRunId();
+    if (!selectedRunId) return undefined;
+    try {
+      return resolveCanonicalRun(cwd, { kind: "team", runId: selectedRunId }, branch) ?? null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return resolveCanonicalRun(cwd, { kind: "team", runId: marker.run }, branch) ?? null;
+  } catch {
+    return { state: null, statePath: null, stateDir: null, artifactsDir: null, isLegacy: false, isStale: false, invalid: true };
+  }
+}
+
+export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx: { cwd: string; controller?: WorkflowSessionController }): { block: true; reason: string } | undefined {
   if (event.toolName !== "task") return;
   const currentBranch = resolveActiveBranch(ctx.cwd);
-  const resolved = resolveState(ctx.cwd, currentBranch);
+  const resolved = resolveDispatchTarget(ctx.cwd, event, ctx.controller);
+  if (resolved === undefined) return;
+  if (!resolved) return { block: true, reason: "dispatch gate: workflow state is unavailable" };
   if (resolved.invalid) return { block: true, reason: "dispatch gate: workflow state path is invalid" };
   if (!resolved.state || !resolved.statePath) return;
   if (resolved.isStale) {
@@ -100,6 +136,13 @@ export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx:
   const persistedStage = state.stages.find((candidate) => candidate.id === state.stage_cursor);
   if (!stage || !persistedStage) return { block: true, reason: `dispatch gate: cursor '${state.stage_cursor}' has no matching stage` };
   if (persistedStage.status !== "in_progress") return { block: true, reason: "dispatch gate: current stage is not in progress" };
+  if (!resolved.artifactsDir) return { block: true, reason: "dispatch gate: recovery_required: selected run artifacts directory is unavailable" };
+  const required = readRequiredStageInputs(stage, state, resolved.artifactsDir);
+  if (!required.ok) return { block: true, reason: `dispatch gate: recovery_required: ${required.error}` };
+  const receipt = state.required_input_receipts?.[stage.id];
+  if (required.inputs.length > 0 && (!receipt || receipt.stage_id !== stage.id || receipt.capability_id !== state.dispatch_capability?.capability_id || receipt.cursor_epoch !== state.cursor_epoch || receipt.rework_generation !== (state.rework_generation ?? 0) || receipt.inputs.length !== required.inputs.length || receipt.inputs.some((input, index) => input.artifact_id !== required.inputs[index]?.artifact_id || input.sha256 !== required.inputs[index]?.sha256))) {
+    return { block: true, reason: "dispatch gate: recovery_required: required inputs must be read and hash-receipted before dispatch" };
+  }
 
   const capability = state.dispatch_capability;
   const issued = capability?.issued_for;
@@ -179,10 +222,15 @@ export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx:
     const role = marker.slot_id ?? marker.role ?? (typeof item.role === "string" ? item.role : "");
     const roster = expectedRoster.find((entry) => entry.role === role);
     const expectedTask = dispatchTaskId(capability.capability_id, issued.run_key, issued.branch, issued.workflow, issued.stage_cursor, role);
+    if (marker.task_id !== undefined && marker.task_id !== expectedTask) {
+      return {
+        block: true,
+        reason: "dispatch gate: task identity mismatch; use the complete current workflow_begin dispatch marker verbatim",
+      };
+    }
     if (
       marker.capability_id !== undefined && marker.capability_id !== capability.capability_id
       || marker.slot_id !== undefined && marker.slot_id !== role
-      || marker.task_id !== undefined && marker.task_id !== expectedTask
       || !roster
       || seenRoles.has(role)
       || agent !== roster.agent
@@ -193,6 +241,8 @@ export function dispatchGate(event: { toolName?: string; input?: unknown }, ctx:
 }
 
 export interface DispatchAuthorizationRequest {
+  run_id?: string;
+  origin_session_id?: string;
   capability_id: string;
   run_key: string;
   branch: string;
@@ -218,10 +268,13 @@ export interface DispatchAuthorizationRequest {
  */
 export function trustedDispatchRequests(
   event: { toolName?: string; toolCallId?: string; input?: unknown },
-  ctx: { cwd: string },
+  ctx: { cwd: string; session_id?: string; controller?: WorkflowSessionController },
 ): { ok: true; requests: DispatchAuthorizationRequest[] } | { ok: false; reason: string } {
   if (event.toolName !== "task") return { ok: false, reason: "dispatch gate: non-task call" };
-  const resolved = resolveState(ctx.cwd, resolveActiveBranch(ctx.cwd));
+  const trustedSessionId = ctx.session_id ?? ctx.controller?.context().session_id;
+  const resolved = resolveDispatchTarget(ctx.cwd, event, ctx.controller);
+  if (resolved === undefined) return { ok: true, requests: [] };
+  if (!resolved) return { ok: false, reason: "dispatch gate: workflow state is unavailable" };
   const state = resolved.state;
   if (!state || state.policy?.strict_orchestrator !== true) return { ok: true, requests: [] };
   const blocked = dispatchGate(event, ctx);
@@ -246,6 +299,10 @@ export function trustedDispatchRequests(
     const slotId = marker.slot_id ?? marker.role ?? (typeof item.role === "string" ? item.role : "");
     if (!slotId) return { ok: false, reason: "dispatch gate: task slot identity is missing" };
     requests.push({
+      // Canonical run_key is the run identity bound by the trusted capability;
+      // never leave the durable writer to infer a legacy target from selection.
+      run_id: issued.run_key,
+      ...(trustedSessionId ? { origin_session_id: trustedSessionId } : {}),
       capability_id: capabilityId,
       run_key: issued.run_key,
       branch: issued.branch,

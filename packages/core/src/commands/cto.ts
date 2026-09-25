@@ -7,10 +7,9 @@
  * asynchronous through an EscalationAdapter, and work continues while the
  * user answers.
  *
- * Same two-layer contract as `/do-work`: custom-TS commands have no `task`
- * surface, so this command returns a fully-formed prompt that the main agent
- * executes mechanically through its own `task`/`hub`. Consumers re-export the
- * contract through thin project-local discovery adapters.
+ * The registered command adapter acquires the exact CTO claim before rendering
+ * one of these prompts. This module contains only parsing and prompt builders;
+ * it has no exported prompt-only CommandContext entry point.
  *
  * Design: vibe-report/sub-orchestration-2026-08-04.md
  */
@@ -25,7 +24,6 @@ import { MAX_DECOMPOSITION_DEPTH, MAX_TEAMS, type CtoState } from "../cto/types.
 import type { ModelClassification } from "../engine/run.js";
 import { parseAutonomousDirective } from "./envelope.js";
 import { buildClassificationPhaseZero, buildWorkflowMatrix } from "./classification-contract.js";
-import type { CommandContext } from "./types.js";
 import { DETACHED_BRANCH, NO_GIT_BRANCH, resolveActiveBranch } from "../engine/state.js";
 
 export interface ParsedCtoEnvelope {
@@ -39,6 +37,70 @@ export interface ParsedCtoEnvelope {
   autonomyHint: boolean;
   issue: number | null;
   branch: string | null;
+}
+
+export interface ParsedCtoCommand {
+  ok: true;
+  task: string;
+  run_id?: string;
+}
+
+export interface ParsedCtoCommandFailure {
+  ok: false;
+  code: "lifecycle_request_conflict";
+  error: string;
+}
+
+export type CtoCommandParseResult = ParsedCtoCommand | ParsedCtoCommandFailure;
+
+/** Parse `/cto` options without interpreting flags after the `--` terminator. */
+
+export function parseCtoCommand(args: string): CtoCommandParseResult {
+  const tokens = [...args.matchAll(/\S+/g)].map((match) => ({ value: match[0]!, start: match.index! }));
+  let parsingOptions = true;
+  let runId: string | undefined;
+  let task = "";
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (!parsingOptions) {
+      task = args.slice(token.start).trim();
+      break;
+    }
+    if (token.value === "--") {
+      parsingOptions = false;
+      const next = tokens[index + 1];
+      task = next ? args.slice(next.start).trim() : "";
+      break;
+    }
+    if (!token.value.startsWith("--")) {
+      parsingOptions = false;
+      task = args.slice(token.start).trim();
+      break;
+    }
+    if (token.value === "--run") {
+      const next = tokens[index + 1]?.value;
+      if (!next || next === "--" || next.startsWith("--")) {
+        return { ok: false, code: "lifecycle_request_conflict", error: "--run requires an exact CTO run id" };
+      }
+      if (!/^[A-Za-z0-9._-]+$/.test(next) || next === "." || next === "..") {
+        return { ok: false, code: "lifecycle_request_conflict", error: `invalid exact CTO run id '${next}'` };
+      }
+      runId = next;
+      index += 1;
+      continue;
+    }
+    if (token.value.startsWith("--run=")) {
+      const value = token.value.slice("--run=".length).trim();
+      if (!value) return { ok: false, code: "lifecycle_request_conflict", error: "--run requires an exact CTO run id" };
+      if (!/^[A-Za-z0-9._-]+$/.test(value) || value === "." || value === "..") {
+        return { ok: false, code: "lifecycle_request_conflict", error: `invalid exact CTO run id '${value}'` };
+      }
+      runId = value;
+      continue;
+    }
+    return { ok: false, code: "lifecycle_request_conflict", error: `unknown CTO option '${token.value}'` };
+  }
+  return { ok: true, task, ...(runId ? { run_id: runId } : {}) };
 }
 
 /**
@@ -102,8 +164,7 @@ export function renderChannelSection(cwd: string): string {
       "- Inbound tasks/answers arrive via this channel — `[CTO-INBOX]` messages are USER COMMANDS.",
       "- NEVER use the `ask` tool — it is blocked while this channel is active.",
       "- Blocking waits park the team (`background_wait`); everything else continues.",
-      "- In standby: tasks arrive as `[CTO-INBOX]` messages — treat each as a USER COMMAND to the",
-      "  main-session CTO: fold it into the run (amend discipline) and return to standby after the wave.",
+      "- In standby: tasks arrive as `[CTO-INBOX]` messages — apply the terminal-request precedence in the lifecycle contract first; only ordinary tasks are folded into the run (amend discipline) and followed by return to standby.",
     ].join("\n");
   }
   if (profile.direction === "ro") {
@@ -134,7 +195,10 @@ export function renderChannelSection(cwd: string): string {
  * tasks (injected by the messenger dispatcher or dropped in
  * `.work-state/cto/<id>/inbox/`).
  */
-export function buildStandbyCtoPrompt(cwd: string): string {
+export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}): string {
+  const runLine = opts.runId
+    ? `The registered ingress already acquired run \`${opts.runId}\`; use this exact id and never scan for or create another run.`
+    : "The registered ingress already acquired the exact run id; use that id and never scan for or create another run.";
   return [
     "/cto STANDBY — CTO sub-orchestration is ON with NO task yet. Execute this contract YOURSELF, in this session.",
     "",
@@ -145,39 +209,52 @@ export function buildStandbyCtoPrompt(cwd: string): string {
     "not by text. `/cto` executes in-session; this session IS the CTO.",
     "",
     "### Standby steps",
-    "1. **Adopt or persist the standby run NOW**: inspect `.work-state/cto/*/state.json` for the latest active",
-    "   standby state (`standby: true`, `plan.task: \"standby — awaiting inbox tasks\"`). Reuse its `<id>` and",
-    "   inbox so tasks queued before this session are not lost. If none exists, write",
-    "   `.work-state/cto/standby-<id>/state.json` (schema 2, `pause.kind: \"none\"`,",
-    "   `plan.task: \"standby — awaiting inbox tasks\"`, `teams: []`, `autonomous: true`, `standby: true` — the",
-    "   standby marker keeps the run adoptable across sessions). The run must exist before waiting: inbox",
-    "   routing, amend detection and the per-turn reminder all key off its state.",
+    `1. **Continue the pre-acquired standby run NOW**: ${runLine}`,
+    "   Read the canonical state through the registered `cto_state` tool with `operation: \"read\"` and",
+    "   the exact run id; read only this run's `inbox/` directory and answer artifacts directly. The state",
+    "   and claim were published atomically before this prompt; do not write a second state directory or",
+    "   re-derive ownership from task text. If the exact state is unavailable, stop and report the typed",
+    "   lifecycle error.",
+    "   The run must exist before waiting: inbox routing, amend detection and the per-turn reminder all",
+    "   key off its exact state.",
     "   **This `autonomous: true` is ENGINE-CREATED — standby has NO user task, so there is nothing to",
     "   classify.** The standby state therefore carries NO `classification` field (model-first: a",
-    "   classification exists only when a task was classified). It is not a PHASE-0 decision; each",
-    "   inbox task that arrives is classified by YOU (type, complexity, confidence, autonomous) on",
-    "   wake, exactly like a `/cto <task>` invocation.",
-    "2. Read `.omp/teams.json` + `cto.json` profile now (not later) so the wake turn is cheap.",
-    "3. Drain the adopted run's pending inbox before yielding, then yield and WAIT.",
-    "",
+    "   classification exists only when a task was classified). It is not a PHASE-0 decision; on wake, first",
+    "   apply terminal-request precedence: an unmistakable explicit request to end this resident run itself",
+    "   follows the terminal branch and is not classified, amended, spawned, or started as a new wave. Every",
+    "   other inbox task is classified by YOU (type, complexity, confidence, autonomous) on wake, exactly",
+    "   like a `/cto <task>` invocation.",
+    "2. On every wake, read the exact run state with `cto_state(operation: \"read\", run_id: <exact-run-id>)`.",
+    "   Read this run's `answers/*.json` and escalation records directly from its namespace before applying retry rules.",
+    "   A dispatcher-created `.omp/inbox/answer-retry-<sanitized-id>-<sanitized-epoch>.json` marker authorizes one retry only",
+    "   when its canonical answer artifact has `delivery_status: \"pre-send-rejected\"` plus matching",
+    "   `delivery_run_id`, `delivery_ownership_epoch`, and `delivery_session_id`; the canonical status alone",
+    "   is never replay authority. `unknown/in-flight/legacy/accepted` answer artifacts remain advisory/recovery —",
+    "   never blind replay them.",
+    "3. Read `.omp/teams.json` + `cto.json` profile now (not later) so the wake turn is cheap.",
+    "4. Drain the exact run's pending inbox before yielding, then yield and WAIT.",
     "### Tasks arrive two ways",
     "- A `[CTO-INBOX]` user message (injected by the messenger dispatcher), or",
     "- files in `.work-state/cto/<id>/inbox/*.json` ({ id, text, at, by }).",
     "`[CTO-INBOX]` messages ARE USER COMMANDS — direct instructions to you, the main-session CTO:",
-    "no new session, no subagent dispatch. On EACH wake: treat the payload as a `/cto <task>` command",
+    "first apply the terminal-request precedence above; only otherwise treat the payload as a `/cto <task>` command",
     "and fold it into THIS run (amend discipline: re-plan, spawn leads in parallel, integration covers",
-    "ALL teams). Multiple tasks = multiple sequential waves; do not merge them into one team.",
+    "ALL teams). Multiple ordinary tasks = multiple sequential waves; do not merge them into one team.",
+    "A terminal request is not a classification, amend, lead-dispatch, or new-wave trigger; apply the shared",
+    "lifecycle termination contract instead.",
     "",
     "### After each wave",
     "Stay on-line when a wave completes — you remain the CTO of this session. Close the wave",
     "(integration + summary), keep the run active, and return to standby: yield and wait for the",
-    "next `[CTO-INBOX]` task (or `inbox/` file) to fold in.",
-    "**The run id NEVER changes across follow-up waves.** Every inbox task is a NEW wave in the SAME",
-    "state.json: append a `wave_history` record `{ id, source, source_id, task, slice_ids,",
-    "status: \"active\" }` and set `active_wave_id`; classify each incoming task PER-SLICE before any",
-    "dispatch (PHASE-0 type/complexity/confidence/autonomous + the matrix-resolved workflow + a",
-    "readable non-empty DoD — the dispatch gate enforces all of them); close the wave (status",
-    "`done`|`failed` + `finished_at`, clear `active_wave_id`) BEFORE this standby resumes.",
+    "next `[CTO-INBOX]` task (or `inbox/` file) to fold in, unless the user explicitly requests ending",
+    "the resident run itself; that request follows the terminal branch, not a new wave.",
+    "**The run id NEVER changes across follow-up waves.** Every ordinary inbox task is a NEW wave in the SAME",
+    "canonical state. An explicit terminal request is not a wave; follow the lifecycle termination contract",
+    "instead. Read the exact state with `cto_state(operation: \"read\")`, then commit the",
+    "updated `wave_history`, `active_wave_id`, per-slice classification, workflow, and DoD metadata",
+    "with `cto_state(operation: \"commit\", expected_state_revision: <revision>, state: <candidate>)`.",
+    "Never use Write, Edit, or Bash for canonical CTO state. Close the wave (status `done`|`failed` +",
+    "`finished_at`, clear `active_wave_id`) through the same revision-checked commit BEFORE standby resumes.",
     "",
     "### Your rules (abridged)",
     "- Delegate, never code. Teams: pick from the registry, one lead per team, leads spawn workers.",
@@ -186,8 +263,9 @@ export function buildStandbyCtoPrompt(cwd: string): string {
     "  on second failure dispatch the workers directly (single-worker slices skip the lead from the start).",
     "",
     renderChannelSection(cwd),
+    persistenceContract(opts, false),
     "",
-    "Begin: persist the standby run, read the registry, yield.",
+    "Begin: use `cto_state(operation: \"read\")` for the pre-acquired standby run, read the registry, yield.",
   ].join("\n");
 }
 
@@ -201,21 +279,55 @@ export interface CtoPromptOptions {
    * session cannot amend an owned run (see findActiveCtoRun).
    */
   sessionId?: string;
+  /** Exact canonical CTO id acquired before this prompt was sent. */
+  runId?: string;
 }
 
-/** Persistence contract lines shared by the CTO task/amend prompts. */
-function persistenceContract(opts: CtoPromptOptions): string {
-  const sessionLine = opts.sessionId ? `\`session: ${opts.sessionId}\`` : "`session: <your current omp session id>`";
+/** Persistence and lifecycle contract shared by the CTO standby/task/amend prompts. */
+function persistenceContract(opts: CtoPromptOptions, includeClassification = true): string {
+  const sessionLine = opts.sessionId ? `\`session: ${opts.sessionId}\``
+    : "`session: <your current omp session id>`";
+  const runLine = opts.runId
+    ? `\`id: ${opts.runId}\` — this exact pre-acquired id is authoritative; never create another CTO run`
+    : "`id: <the exact canonical CTO id acquired by the registered /cto ingress>`";
+  const classificationLines = includeClassification
+    ? [
+      "The PHASE-0 classification is a structured state decision:",
+      "`classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>,",
+      "\"autonomous_reason\": ... }`. `classification.autonomous` is the AUTHORITY; the legacy",
+      "top-level `autonomous` line is read-compat only. The `autonomous` value is YOUR model decision,",
+      "never the mechanical hint.",
+    ]
+    : [];
   return [
     "### State persistence (mandatory)",
-    "When you persist the run state (cto_discovery.md / team-plan.md / state.json), include the",
-    "classification you decided in PHASE-0 as the STRUCTURED model decision — one",
-    "`classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>,",
-    "\"autonomous_reason\": ... }` line. `classification.autonomous` is the AUTHORITY; the legacy",
-    "top-level `autonomous` line is read-compat only. The `autonomous` value is YOUR model decision,",
-    "never the mechanical hint. Also keep the metadata line below VERBATIM so session ownership",
-    "survives across sessions and is never re-derived from task text:",
+    "The registered `/cto` ingress has already acquired and published the minimal canonical state and",
+    "claim before this prompt. Continue in that exact namespace; do not search for a latest run or create",
+    "a second state directory.",
+    "Keep `cto_discovery.md`, `team-plan.md`, and `decisions.md` as supplemental artifacts, but mutate",
+    "canonical CTO state only through the registered `cto_state` tool: read the exact run first, then",
+    "commit the full schema-2 candidate with the exact `state_revision` returned by read. Never use",
+    "Write, Edit, or Bash on `.work-state/cto/<id>/state.json`.",
+    ...classificationLines,
+    "Keep exact run identity fields unchanged; the rendered session label is caller context only:",
+    runLine,
     sessionLine,
+    "`session` identifies the current caller only; never use it to replace the engine-owned `owner_session`. Preserve the freshly read `owner_session` exactly, including when a standby wake is handled from another session.",
+    "### Resident lifecycle",
+    "Before any standby wake, inbox, or amend task is routed, check for an unmistakable user request to end this resident run itself. Such a request takes precedence over normal task classification/new-wave routing: do not classify, amend, spawn leads, or start a wave for it. This does not include a completed wave, incidental `done` wording, or ordinary wave-close instructions. Settle genuine pending work first, then follow the terminal branch below.",
+    "For a resident run, normal wave completion closes only the wave: settle integration, mark the wave",
+    "`done`|`failed` with `finished_at`, clear `active_wave_id`, keep the run active in standby, and wait for the next task.",
+    "Wave closure is not run termination, and `pause.kind: \"none\"` remains nonterminal.",
+    "Only an explicit user request to end the resident run may terminate it. First settle all genuine",
+    "pending work (including workers, reservations, and barriers); never bypass guards or fabricate",
+    "completion. Then read the exact run fresh, commit the full schema-2 candidate with the read's",
+    "`state_revision`, preserve engine-owned `id`/run identity, `owner_session` ownership, and the `standby` marker, and set",
+    "`pause` exactly to `{ kind: \"done\", reason: <actual user-requested basis> }`.",
+    "Never use `completed` as a terminal value. Inspect the actual commit result before announcing",
+    "termination: only `ok: true` with `transition: \"terminal\"` and returned `state.pause.kind: \"done\"`",
+    "proves success. A rejected or failed commit is not success; do not silently substitute `none`.",
+    "After that successful terminal commit, use its receipt and returned terminal state; do not require",
+    "an additional authenticated read after the claim is released.",
     "",
   ].join("\n");
 }
@@ -234,6 +346,8 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     ? `Branch: \`${envelope.branch}\` (canonical session branch; persist this exact value)\n`
     : "Branch: (no git work tree; strict workflow transitions cannot start)\n";
   const sessionMeta = opts.sessionId ? `Session: \`${opts.sessionId}\`\n` : "";
+  const runMeta = opts.runId ? `CTO run id: \`${opts.runId}\` (already claimed; use this exact id)\n` : "";
+  const exactRunId = opts.runId ?? "<exact-run-id>";
 
   return [
     "/cto workflow — execute this prompt IN-SESSION: you are the MAIN AGENT, the resident CTO.",
@@ -250,16 +364,27 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "### Task",
     envelope.task,
     "",
-    "### Metadata",
-    issueMeta + branchMeta + sessionMeta,
+    `Before any resume/amend dispatch, read the exact run with \`cto_state(operation: "read", run_id: "${exactRunId}")\`; read that run's \`answers/*.json\` and escalation records directly from its namespace.`,
+    issueMeta + branchMeta + sessionMeta + runMeta,
+    "",
+    "### Exact-run reacquisition and answer delivery",
+    `This prompt is authorized only for the exact claimed run \`${exactRunId}\`; never scan for a latest run or infer ownership from the task marker.`,
+    `Before any resume/amend dispatch, use the registered \`cto_state(operation: "read", run_id: "${exactRunId}")\` route for canonical state; use only that exact run's scoped answer and escalation records, never a sibling-run or latest-run scan.`,
+    "Only a dispatcher-created `.omp/inbox/answer-retry-*.json` marker, together with the exact answer artifact's",
+    "`delivery_status: \"pre-send-rejected\"` and matching `delivery_run_id`, `delivery_ownership_epoch`,",
+    "and `delivery_session_id`, authorizes exactly one retry under the current claim. Canonical status",
+    "alone is not replay authority. `unknown/in-flight/legacy/accepted` answer artifacts remain advisory/recovery;",
+    "never blind replay them. Transport-only answer markers do not authorize a retry.",
+    "",
     "",
     buildClassificationPhaseZero({ label: "leading directive", value: envelope.autonomyHint }),
     "",
     buildWorkflowMatrix(),
     "",
     "### Persist the classification",
-    "Record your PHASE-0 classification in the run state as the STRUCTURED model decision, on ONE",
-    "line in cto_discovery.md / team-plan.md / state.json:",
+    "Read the exact run with `cto_state(operation: \"read\")`, merge your PHASE-0 classification into the",
+    "candidate CtoState, and commit it with the returned `state_revision`. Do not write canonical state",
+    "with Write, Edit, or Bash. The structured decision is:",
     "`classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>,",
     "\"autonomous_reason\": ... }`. `classification.autonomous` is the AUTHORITY — the legacy",
     "top-level `autonomous: <true|false>` line is read-compat only and never overrides a present",
@@ -277,20 +402,17 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "",
     "### CTO discipline (you are the orchestrator, not a coder)",
     "1. **Decompose** the task into a TeamPlan: pick teams from the registry (max 8, decomposition depth max 2),",
-    "   assign each a non-overlapping `scope` slice + task `slice`, and choose the sub-profile from the",
-    "   Workflow resolution matrix above — the SAME table as /do-work (resolveWorkflow), including REVIEW ->",
-    "   review, HOTFIX -> emergency and LECTURE_RESEARCH -> lecture-research (research-only, human-gated). Bug-fix slices run through the",
-    "   team: the lead walks debug-cycle (diagnose -> root cause -> fix -> verify; root_cause gate before",
-    "   code). Decide the git strategy per team (Q3):",
-    "   coupled tasks -> one branch with parallel teams; independent tasks -> separate worktrees.",
-    "   Persist the plan as FILES — state lives in `.work-state/cto/<id>/state.json` (schema 2) and is",
-    "   written directly by you: the canonical top-level `id` MUST equal the `<id>` directory name and",
-    "   the task marker's `run=<runId>`; use `id`, never `run_id` or `run_key`, for CTO state identity.",
-    "   This CTO state is separate from `/do-work`'s `.work-state/features/.../state.json` /",
-    "   `workflow_prepare` TeamState; never use a workflow `run_key` or branch as a CTO slice marker run id.",
+    "   Plan artifacts belong in the run's artifact namespace; canonical CTO state lives only in the",
+    "   engine-owned `.work-state/cto/<id>/state.json` and MUST be mutated through `cto_state`.",
+    "   Call `cto_state(operation: \"read\", run_id: <exactRunId>)`, preserve engine-owned identity fields,",
+    "   then call `cto_state(operation: \"commit\", run_id: <exactRunId>,",
+    "   expected_state_revision: <revision>, state: <full schema-2 candidate>)` for every state change.",
+    "   The canonical top-level `id` MUST equal the `<id>` directory name and the task marker's `run=<runId>`;",
+    "   use `id`, never `run_id` or `run_key`, for CTO state identity. Never use Write, Edit, or Bash on",
+    "   canonical state. This CTO state is separate from `/do-work`'s `.work-state/features/.../state.json`",
+    "   / `workflow_prepare` TeamState; never use a workflow `run_key` or branch as a CTO slice marker run id.",
     "   Include schema-2 additive fields (wave_history, active_wave_id, teams[].slice_id,",
-    "   teams[].classification, teams[].workflow, teams[].dod_path). There is NO TS engine call from",
-    "   this side — engine state APIs are consumer-side validation only, never tools you invoke.",
+    "   teams[].classification, teams[].workflow, teams[].dod_path).",
     "2. **Architecture first (multi-team runs)**: after the plan, run the architecture stage — spawn the",
     "   `architect` (single `task`) to produce the cross-team contract BEFORE spawning leads: api_contract",
     "   (endpoints/DTOs), file ownership per team, shared interfaces, ports/CORS. Leads consume the contract",
@@ -310,9 +432,8 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "7. **Integration**: merge worktree branches, run the integration review stage, aggregate per-team DoDs.",
     "   A failed team is isolated: re-spawn with the gate's reason, drop its scope, or escalate (R8).",
     "8. **Never code yourself.** Never patch a team's artifact by hand — re-spawn with a sharper task.",
-    "9. **Inbox check**: read `.work-state/cto/*/inbox/*.json` BEFORE decomposing — tasks may have",
-    "   arrived via the messenger while no session was listening; fold them into this run too",
-    "   (each as its own wave, amend discipline).",
+    `9. **Inbox check**: read the exact run's scoped inbox records for \`${exactRunId}\` BEFORE decomposing — tasks may have`,
+    "   arrived via the messenger while no session was listening; never scan `.work-state/cto/*` or another run's inbox.",
     "",
     "### LECTURE_RESEARCH slices (URL-first, research-only, human-gated)",
     "A slice classified `LECTURE_RESEARCH` (one public video/playlist URL + natural-language prompt) resolves deterministically to the",
@@ -331,17 +452,18 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "5. **Human approval/stop gate**: the wave ENDS at an explicit human approval checkpoint (`ask` or a",
     "   `decision` escalation with `timeoutMs` + `default`). No implementation starts before approval. No implementation, task creation, or source edits start before approval; a",
     "### Wave / slice gate contract (BEFORE any lead is spawned)",
-    "A lead/worker `task` call is MECHANICALLY BLOCKED unless the canonical CTO state in",
-    "`.work-state/cto/<id>/state.json` proves, for this run and slice: an active wave, a team mapped to",
-    "the slice, a full per-slice classification, the matrix-resolved workflow, and a readable non-empty",
-    "DoD. This gate reads ONLY the CTO `CtoState`; a `/do-work` `TeamState` from",
-    "`.work-state/features/.../state.json` is a different state family and cannot authorize CTO dispatch.",
-    "Build exactly that CTO state before the first lead spawn — in this order:",
+    "A lead/worker `task` call is MECHANICALLY BLOCKED unless `cto_state(operation: \"read\")` for the",
+    "exact run proves, for this run and slice: an active wave, a team mapped to the slice, a full per-slice",
+    "classification, the matrix-resolved workflow, and a readable non-empty DoD. This gate reads ONLY the",
+    "CTO `CtoState`; a `/do-work` `TeamState` from `.work-state/features/.../state.json` is a different",
+    "state family and cannot authorize CTO dispatch.",
+    "Build exactly that candidate before the first lead spawn — read the exact run, preserve engine-owned",
+    "identity fields, and commit with the returned `state_revision`:",
     "1. **Create the wave**: append a `wave_history` record `{ id, source, source_id, task, slice_ids,",
-    "   status: \"active\" }` to `state.json` and set `active_wave_id` to its `id`.",
-    "2. **Classify every slice (PHASE-0, per team)**: for EACH team/slice write the structured",
-    "   classification line into `state.json` `teams[].classification`: `{ \"type\": ...,",
-    "   \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>, \"autonomous_reason\": ... }`.",
+    "   status: \"active\" }` to the candidate and set `active_wave_id` to its `id`.",
+    "2. **Classify every slice (PHASE-0, per team)**: for EACH team/slice add structured",
+    "   `teams[].classification` data to the candidate: `{ \"type\": ..., \"complexity\": ...,",
+    "   \"confidence\": ..., \"autonomous\": <true|false>, \"autonomous_reason\": ... }`.",
     "3. **Resolve the workflow per slice**: `teams[].workflow` MUST equal `resolveWorkflow(type,",
     "   complexity, autonomous)` from the matrix above — never re-derive it from prose; the gate",
     "   validates it exactly.",
@@ -353,7 +475,8 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "   `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` where `<runId>` = the canonical CTO",
     "   state's top-level `id` (also the `.work-state/cto/<id>/` directory name), NEVER `run_key`,",
     "   `run_id`, a branch name, or a `/do-work` workflow state identifier; `<sliceId>` is the slice",
-    "   id assigned to that team. State is written as files (schema-2 additive fields) — never via a TS engine call.",
+    "   id assigned to that team. Commit all canonical state changes through `cto_state` with the exact",
+    "   `state_revision`; never use Write, Edit, or Bash for canonical CTO state.",
     "6. **Leads propagate**: leads MUST propagate the marker into every worker task they spawn and",
     "   follow the canonical /do-work stage discipline of the resolved workflow (stages, gates,",
     "   checkpoints, typed artifacts) mechanically.",
@@ -361,8 +484,7 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "### Failure modes to avoid",
     "- Do NOT let a worker re-delegate (rogue router) — only CTO/lead spawn.",
     "",
-    "### STRICT CTO/LEAD NON-CODING POLICY",
-    "The resident CTO and every lead are dispatchers and integrators only. They may read application code, write only canonical state/typed artifacts under `.work-state/`, and perform deterministic coordination operations.",
+    "The resident CTO and every lead are dispatchers and integrators only. They may read application code, write supplemental typed artifacts under `.work-state/`, and perform deterministic coordination operations; canonical CTO state changes go only through `cto_state`.",
     "NEVER use `write` or `edit` on application source, tests, configuration, lockfiles, or documentation. NEVER patch worker output, validation evidence, or source after a lead/worker returns. Source changes belong exclusively to worker agents.",
     "After each lead or worker return, persist the result and verify delegation evidence, required artifacts, validation/DoD, and the next legal state transition before dispatching anything else. Missing or malformed evidence blocks the wave; re-spawn or escalate instead of improvising.",
     "A lead that returns without a worker dispatch is failed. A CTO that performs implementation or review-fixes itself is a policy violation.",
@@ -393,11 +515,13 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "   the spec); one worker per `task` call. Big specs at heavy context are exactly where subagents",
     "   stall.",
     "",
-    "### After the wave",
     "When integration completes and the summary is written, close ONLY the current wave: set its",
     "`wave_history` record status to `done`|`failed` with `finished_at`, and clear `active_wave_id`.",
     "Keep the resident CTO run active with the SAME run id; return to standby — stay on-line, yield,",
-    "and await the next task (`[CTO-INBOX]` message or `inbox/` file), folding it in as an amend that",
+    "and await the next task (`[CTO-INBOX]` message or `inbox/` file). Before routing that task as an",
+    "amend/new wave, apply the terminal-request precedence in the lifecycle contract: an unmistakable",
+    "request to end this resident run itself is terminal (not a completed-wave or incidental `done`",
+    "message) and must not be classified, amended, or spawned; otherwise fold it in as an amend that",
     "appends a NEW wave record to the same `state.json`.",
     "",
     "Begin: decompose the task into a TeamPlan, persist it, and spawn the first leads.",
@@ -592,19 +716,10 @@ export function markdownCtoState(runId: string, runDir: string): CtoState | null
 }
 
 /**
- * Find the single active CTO run — state.json first (engine-written), then
- * a markdown fallback for agent-written runs (br-5ql). A run is finished
- * when its pause is done/failed, or all teams done plus integration done,
- * or (markdown) when a summary or integration-review marker exists.
- *
- * Session ownership (RC4): when a `sessionId` is provided, interactive task
- * runs that declare a DIFFERENT owner are skipped — a foreign session gets
- * a fresh contract instead of amending another session's run. Standby runs
- * (`standby: true`) remain adoptable cross-session so inbox continuity is
- * preserved, and unowned/legacy runs stay amendable (status quo).
- * Returns the latest by updated_at among the eligible runs.
- * The amend protocol (br-k19): a second `/cto` while a run is active folds
- * the new task into THAT run instead of starting a fresh orchestrator.
+ * Diagnostic compatibility helper for legacy callers and fixture inspection.
+ * It is NOT a lifecycle authority and MUST NOT acquire, resume, or amend a
+ * run. Registered `/cto` ingress uses an exact selector plus the authenticated
+ * claim/legacy-owner proof instead of "latest active" discovery.
  */
 export function findActiveCtoRun(
   cwd: string,
@@ -665,7 +780,7 @@ export function buildAmendPrompt(
 ): string {
   const teamsLine = active.state.teams.map((t) => `${t.id}:${t.status}`).join(", ");
   const issueMeta = envelope.issue ? `Issue: #${envelope.issue}\n` : "";
-  const sessionMeta = opts.sessionId ? `Session: \`${opts.sessionId}\` (state field: \`owner_session\`)\n` : "";
+  const sessionMeta = opts.sessionId ? `Session: \`${opts.sessionId}\` (caller context; preserve state field: \`owner_session\`)\n` : "";
 
   return [
     "/cto AMEND — a new task arrived while a CTO run is ACTIVE.",
@@ -674,7 +789,18 @@ export function buildAmendPrompt(
     `Run: \`${active.runId}\` (started ${active.state.plan.created_at})`,
     `Teams: ${teamsLine}`,
     `Pause: ${active.state.pause?.kind ?? "none"} — ${active.state.pause?.reason || "no reason"}`,
-    `State: \`.work-state/cto/${active.runId}/\` (state.json when engine-written, markdown otherwise) — read it BEFORE touching anything.`,
+    `State: \`.work-state/cto/${active.runId}/\` — read the canonical state with \`cto_state(operation: "read", run_id: "${active.runId}")\` before touching supplemental artifacts.`,
+    "",
+    "### Exact-run reacquisition and answer delivery",
+    `Continue only \`${active.runId}\`; read the canonical state with \`cto_state(operation: "read", run_id: "${active.runId}")\`, then read that run's \`answers/*.json\` and escalation records directly from its namespace before dispatching.`,
+    "A dispatcher-created `.omp/inbox/answer-retry-*.json` marker plus the exact answer artifact's",
+    "`delivery_status: \"pre-send-rejected\"` and matching `delivery_run_id`, `delivery_ownership_epoch`,",
+    "and `delivery_session_id` authorizes exactly one retry under the current claim. Canonical status",
+    "alone is not replay authority. `unknown/in-flight/legacy/accepted` answer artifacts remain advisory/recovery;",
+    "never blind replay them. Transport-only markers do not authorize a retry.",
+    "",
+    "### Terminal request precedence",
+    "If the incoming user command unmistakably asks to end this resident run itself — not merely close a completed wave and not incidental `done` wording — use the terminal branch in the shared lifecycle contract before treating it as a new task. Settle genuine pending work first; do not classify, amend, spawn leads, or start a wave for that request. For every other command, continue the PHASE-0 classification and amend flow.",
     "",
     "### New task (fold into the SAME run)",
     issueMeta + sessionMeta,
@@ -685,12 +811,13 @@ export function buildAmendPrompt(
     buildWorkflowMatrix(),
     "",
     "### Persist the classification",
-    "Record your PHASE-0 classification for the new task in the run state as the STRUCTURED model",
-    "decision: `classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ...,",
-    "\"autonomous\": <true|false>, \"autonomous_reason\": ... }` on ONE line in the run state files.",
-    "`classification.autonomous` is the AUTHORITY — the legacy top-level `autonomous: <true|false>`",
-    "line is read-compat only and never overrides a present classification. The persisted `autonomous`",
-    "value is YOUR model decision — never the mechanical hint.",
+    "Read the exact active run with `cto_state(operation: \"read\")`, merge the new task's PHASE-0",
+    "classification into the candidate, and commit it with the returned `state_revision`. Never write",
+    "canonical CTO state with Write, Edit, or Bash.",
+    "`classification: { \"type\": ..., \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>,",
+    "\"autonomous_reason\": ... }` is the structured decision. `classification.autonomous` is the",
+    "AUTHORITY; the legacy top-level `autonomous` line is read-compat only. The persisted value is your",
+    "model decision, never the mechanical hint.",
     "",
     persistenceContract(opts),
     "### You are still the CTO (single orchestrator, this session)",
@@ -705,8 +832,9 @@ export function buildAmendPrompt(
     "   LECTURE_RESEARCH slices resolve to the research-only, human-gated `lecture-research` profile (see below).",
     "2. **Architecture**: if the new task adds cross-team surface, run the architect for the ADDITIONAL",
     "   contract (or extend the existing architecture artifact); new leads consume it.",
-    "3. **Persist**: append the new teams to \`state.json\` and stamp \`amended_at\`; document the amend in",
-    "   \`decisions.md\` (why). Keep the metadata lines from the persistence contract above.",
+    "3. **Persist**: read the exact candidate with `cto_state(operation: \"read\")`, append the new teams",
+    "   and stamp `amended_at`, then commit with the returned `state_revision`; document the amend in",
+    "   `decisions.md` as a supplemental artifact (why). Never write canonical CTO state with Write, Edit, or Bash.",
     "4. **Integration covers ALL teams** (original + added): integration review verifies the merged result",
     "   against the (extended) contract; DoD aggregation across every team.",
     "5. **Edge cases**: run at max teams -> write the task to \`.work-state/queue.json\` for the next run;",
@@ -715,7 +843,8 @@ export function buildAmendPrompt(
     "6. **Escalations** of the new teams use the same ladder (worker -> lead -> you -> user); you never spawn",
     "   a second orchestrator.",
     `7. **Inbox check**: read \`.work-state/cto/${active.runId}/inbox/*.json\` for tasks that arrived while`,
-    "   no session was listening; fold each in as its own wave.",
+    "   no session was listening; apply terminal-request precedence from the lifecycle contract to each payload first, and fold",
+    "   only other tasks in as their own wave. A terminal request is not a classification, amend, or lead-dispatch trigger.",
     "",
     "### LECTURE_RESEARCH slices (URL-first, research-only, human-gated)",
     "A slice classified `LECTURE_RESEARCH` (one public video/playlist URL + natural-language prompt) resolves deterministically to the",
@@ -738,16 +867,17 @@ export function buildAmendPrompt(
     "   separately-classified implementation slice be created (own classification, workflow, DoD, wave).",
     "",
     "### Wave / slice gate contract (BEFORE any new lead is spawned)",
-    "The dispatch gate MECHANICALLY BLOCKS a lead/worker `task` call unless the canonical state in",
-    "`.work-state/cto/<id>/state.json` proves, for this run and slice: an active wave, a team mapped to",
-    "the slice, a full per-slice classification, the matrix-resolved workflow, and a readable non-empty",
-    "DoD. For the new task, before spawning any new lead:",
+    "The dispatch gate MECHANICALLY BLOCKS a lead/worker `task` call unless `cto_state(operation: \"read\")`",
+    "for the exact run proves, for this run and slice: an active wave, a team mapped to the slice, a full",
+    "per-slice classification, the matrix-resolved workflow, and a readable non-empty DoD. For the new",
+    "task, read the candidate, preserve engine-owned identity, and commit with the returned `state_revision`",
+    "before spawning any new lead:",
     "1. **Create the wave**: append a `wave_history` record `{ id, source, source_id, task, slice_ids,",
-    "   status: \"active\" }` to the SAME `state.json` and set `active_wave_id` to its `id` (the run id",
-    "   `<runId>` NEVER changes across amend waves).",
-    "2. **Classify every new slice (PHASE-0, per team)**: write the structured classification into",
-    "   `state.json` `teams[].classification` for each team in this wave: `{ \"type\": ...,",
-    "   \"complexity\": ..., \"confidence\": ..., \"autonomous\": <true|false>, \"autonomous_reason\": ... }`.",
+    "   status: \"active\" }` to the candidate and set `active_wave_id` to its `id` (the run id `<runId>`",
+    "   NEVER changes across amend waves).",
+    "2. **Classify every new slice (PHASE-0, per team)**: add the structured classification to each",
+    "   `teams[].classification` in the candidate: `{ \"type\": ..., \"complexity\": ..., \"confidence\": ...,",
+    "   \"autonomous\": <true|false>, \"autonomous_reason\": ... }`.",
     "3. **Resolve the workflow per slice**: `teams[].workflow` MUST equal `resolveWorkflow(type,",
     "   complexity, autonomous)` from the matrix above — never re-derive it; the gate validates it.",
     "4. **Write the DoD**: a readable non-empty per-slice DoD artifact at",
@@ -756,8 +886,8 @@ export function buildAmendPrompt(
     "   must be relative to the run root (no `..`, no absolute paths).",
     "5. **Stamp the marker on EVERY lead task**: each lead `task` input MUST carry the EXACT literal",
     "   `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` where `<runId>` = this run's persisted",
-    "   `state.json` id and `<sliceId>` = the slice id you assigned that team. State is written as files",
-    "   (schema-2 additive fields) — never via a TS engine call.",
+    "   `state.json` id and `<sliceId>` = the slice id you assigned that team. Commit canonical state changes",
+    "   through `cto_state` with the exact `state_revision`; never use Write, Edit, or Bash for canonical state.",
     "6. **Leads propagate**: leads MUST propagate the marker into every worker task and follow the",
     "   canonical /do-work stage discipline of the resolved workflow (stages, gates, checkpoints,",
     "   typed artifacts) mechanically.",
@@ -774,25 +904,3 @@ export function buildAmendPrompt(
   ].join("\n");
 }
 
-/**
- * CommandContext-style entry (legacy command surface, mirrors `teamCommand`).
- * Returns the CTO prompt; the caller feeds it to the main agent.
- * Empty args start CTO STANDBY (no task — tasks arrive via the messenger
- * inbox / [CTO-INBOX] wake).
- */
-export function ctoCommand(ctx: CommandContext): string {
-  const raw = ctx.args.trim();
-  if (!raw) {
-    ctx.ui.notify("cto: standby mode — awaiting tasks via messenger inbox", "info");
-    return buildStandbyCtoPrompt(ctx.cwd);
-  }
-  const envelope = parseEnvelope(raw, ctx.cwd);
-  if (!envelope.task) return "ERROR: empty task after stripping prefix.";
-  const active = findActiveCtoRun(ctx.cwd, { sessionId: ctx.sessionId });
-  if (active) {
-    ctx.ui.notify(`cto: amending run ${active.runId} with: ${envelope.task.slice(0, 50)}`, "info");
-    return buildAmendPrompt(envelope, ctx.cwd, active, { sessionId: ctx.sessionId });
-  }
-  ctx.ui.notify(`cto: ${envelope.task.slice(0, 60)} (decomposition pending)`, "info");
-  return buildCtoPrompt(envelope, ctx.cwd, { sessionId: ctx.sessionId });
-}

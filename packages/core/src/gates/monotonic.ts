@@ -11,11 +11,11 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
-import { isSafeStateSegment } from "../engine/state.js";
 const WORK_STATE_DIR = ".work-state";
 
 interface AgentStartContext {
   cwd: string;
+  run_id?: string;
 }
 
 interface StageEntry {
@@ -24,7 +24,7 @@ interface StageEntry {
 }
 
 export function monotonicGate(_event: unknown, ctx: AgentStartContext): { block?: boolean; reason?: string } | void {
-  const statePath = resolveStatePath(ctx.cwd);
+  const statePath = resolveStatePath(ctx.cwd, ctx.run_id);
   if (!statePath) return;
   let state: { stages?: StageEntry[] };
   try {
@@ -46,18 +46,8 @@ export function monotonicGate(_event: unknown, ctx: AgentStartContext): { block?
   }
 }
 
-function resolveStatePath(cwd: string): string | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return null;
-  const active = join(wsDir, ".active-feature");
-  if (existsSync(active)) {
-    const slug = readFileSync(active, "utf8").trim();
-    if (isSafeStateSegment(slug)) {
-      const path = join(wsDir, "features", slug, "state.json");
-      if (existsSync(path)) return path;
-    }
-  }
-  const legacy = join(wsDir, "team-state.json");
-  if (existsSync(legacy)) return legacy;
-  return null;
+function resolveStatePath(cwd: string, runId?: string): string | null {
+  if (!runId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) return null;
+  const canonical = join(resolve(cwd, WORK_STATE_DIR), "runs", runId, "state.json");
+  return existsSync(canonical) ? canonical : null;
 }

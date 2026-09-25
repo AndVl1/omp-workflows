@@ -16,6 +16,7 @@
  * `fetchImpl` is injectable for tests; defaults to global fetch.
  */
 
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import {
@@ -48,8 +49,8 @@ export interface TelegramAdapterOptions {
   allowedSenderIds?: string[];
   /**
    * Called for plain messages (not replies to a sent escalation, not
-   * callback queries). Used by the CTO inbox: a plain message to the bot is
-   * a NEW TASK for the standby CTO, routed to `.work-state/cto/<id>/inbox/`.
+   * callback queries). Used by the CTO inbox: a plain message is a NEW TASK
+   * for the exact claimed resident run, routed through the dispatcher.
    */
   onPlainMessage?: (msg: { id: string; text: string; at: string }) => void;
 }
@@ -71,6 +72,8 @@ interface TgUpdate {
   };
 }
 
+type AnswerMarkerHandler = (answer: EscalationAnswer) => void | Promise<void>;
+
 export class TelegramEscalationAdapter implements EscalationAdapter {
   readonly kind = "telegram";
   private readonly token: string;
@@ -81,6 +84,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   private readonly allowedChatIds: string[];
   private readonly allowedSenderIds: string[];
   private onPlainMessage: TelegramAdapterOptions["onPlainMessage"];
+  private answerMarkerHandler: AnswerMarkerHandler | undefined;
   private offset = 0;
   private polling = false;
   /** In-flight getUpdates round — concurrent pollOnce calls share it (one getUpdates per adapter). */
@@ -102,6 +106,15 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
   /** Set/replace the plain-message (inbox task) handler. */
   setPlainMessageHandler(handler: NonNullable<TelegramAdapterOptions["onPlainMessage"]>): void {
     this.onPlainMessage = handler;
+  }
+
+  /**
+   * Configure the standalone bridge's marker writer. The handler is invoked
+   * before a getUpdates update is acknowledged, so a marker IO failure leaves
+   * the Telegram offset unchanged and the update retryable.
+   */
+  setAnswerMarkerHandler(handler: AnswerMarkerHandler): void {
+    this.answerMarkerHandler = handler;
   }
 
   private async api(method: string, payload: Record<string, unknown>): Promise<unknown> {
@@ -134,7 +147,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       }
       const result = (await this.api("sendMessage", payload)) as { message_id: number };
       this.recordMapping(esc.id, result.message_id, esc);
-      return { sent: true, channelRef: `tg:${result.message_id}` };
+      return { sent: true, channelRef: `tg:${this.chatId}:${result.message_id}` };
     } catch (error) {
       return { sent: false, channelRef: this.failedChannelRef("sendMessage", error) };
     }
@@ -239,15 +252,27 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       // are dropped at the boundary — no answer file, no onPlainMessage wake —
       // but the offset still advances (max(update_id+1)) so Telegram does not
       // redeliver them forever. Authorized updates keep the "process first,
-      // confirm after" semantics below (a persistence failure throws before
-      // the offset moves, leaving the update queued).
+      // confirm after" semantics below; a persistence/callback failure leaves
+      // that update queued, returning earlier successful answers if present.
       if (!this.isAuthorizedUpdate(update)) {
         this.offset = Math.max(this.offset, update.update_id + 1);
         continue;
       }
-      const answer = this.answerFromUpdate(update);
-      if (answer) answers.push(this.writeAnswer(answer));
-      this.offset = Math.max(this.offset, update.update_id + 1);
+      try {
+        const answer = this.answerFromUpdate(update);
+        if (answer) {
+          const persisted = this.writeAnswer(answer);
+          if (this.answerMarkerHandler) await this.answerMarkerHandler(persisted);
+          answers.push(persisted);
+        }
+        this.offset = Math.max(this.offset, update.update_id + 1);
+      } catch (error) {
+        // Preserve earlier successful answers while leaving this update
+        // unconfirmed so the transport can redeliver it.
+        if (answers.length > 0) return answers;
+        const cause = error instanceof Error ? error.message : String(error);
+        throw new Error(`telegram update ${update.update_id} failed before confirmation: ${cause}`);
+      }
     }
     return answers;
   }
@@ -284,14 +309,34 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     }
     const message = update.message;
     if (message?.reply_to_message && typeof message.text === "string") {
-      const escId = this.escIdOfMessage(message.reply_to_message.message_id);
-      if (escId) return { id: escId, answer: message.text, at, by: "telegram:reply" };
+      const chatId = message.chat?.id;
+      if (chatId !== undefined) {
+        const escId = this.escIdOfMessage(message.reply_to_message.message_id, chatId);
+        if (escId) return { id: escId, answer: message.text, at, by: "telegram:reply" };
+      }
     }
     // Plain message (no reply target, not a callback) -> CTO inbox task.
-    if (message && typeof message.text === "string" && message.text.trim().length > 0) {
-      this.onPlainMessage?.({ id: `tg:${message.message_id}`, text: message.text, at });
+    if (message && typeof message.text === "string" && message.text.trim().length > 0 && message.chat?.id !== undefined) {
+      this.onPlainMessage?.({ id: `tg:${message.chat.id}:${message.message_id}`, text: message.text, at });
     }
     return null;
+  }
+
+  private recordAnswerConflict(answersDir: string, answer: EscalationAnswer, reason: string): void {
+    const rejectedDir = join(answersDir, "rejected");
+    const answerKey = answer.id.replace(/[^a-zA-Z0-9._-]/g, "-");
+    const suffix = createHash("sha256").update(`${answer.id}\u0000${answer.answer}`).digest("hex");
+    const path = join(rejectedDir, `${answerKey}.conflict-${suffix}.json`);
+    mkdirSync(rejectedDir, { recursive: true });
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({ id: answer.id, answer: answer.answer, reason, at: new Date().toISOString() }, null, 2),
+        { flag: "wx" },
+      );
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+    }
   }
 
   private writeAnswer(answer: EscalationAnswer): EscalationAnswer {
@@ -306,9 +351,35 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       throw new Error(`telegram: writeAnswer containment violation for answer "${answer.id}"`);
     }
     const ensuredDir = ensureAnswersDir(runId, this.cwd);
-    const fileName = answer.id.replace(/[^a-zA-Z0-9-_]/g, "-");
-    writeFileSync(join(ensuredDir, `${fileName}.json`), JSON.stringify(answer, null, 2));
-    return answer;
+    const fileName = answer.id.replace(/[^a-zA-Z0-9._-]/g, "-");
+    const suffix = createHash("sha256").update(answer.id).digest("hex");
+    const payload = JSON.stringify(answer, null, 2);
+    for (let collision = 0; ; collision += 1) {
+      const suffixPart = collision === 0 ? "" : `-${suffix}${collision === 1 ? "" : `-${collision}`}`;
+      const path = join(ensuredDir, `${fileName}${suffixPart}.json`);
+      try {
+        // Durable answer provenance is dispatcher-owned; never overwrite an
+        // existing answer/receipt when Telegram redelivers the same update.
+        writeFileSync(path, payload, { flag: "wx" });
+        return answer;
+      } catch (error) {
+        if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+        let existing: { id?: unknown; answer?: unknown };
+        try {
+          existing = JSON.parse(readFileSync(path, "utf8")) as { id?: unknown; answer?: unknown };
+        } catch (readError) {
+          throw new Error(`telegram: cannot verify existing answer file ${path}: ${readError instanceof Error ? readError.message : String(readError)}`);
+        }
+        if (existing.id === answer.id) {
+          if (existing.answer === answer.answer) return answer;
+          const reason = `telegram: answer ${answer.id} has conflicting content in ${path}`;
+          this.recordAnswerConflict(ensuredDir, answer, reason);
+          throw new Error(reason);
+        }
+        // A valid different id occupying the sanitized path is a collision,
+        // not a duplicate. The deterministic hash suffix keeps both answers.
+      }
+    }
   }
 
   // ── message_id <-> escId mapping (persisted, survives restarts) ──────────
@@ -321,7 +392,7 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     const runId = runIdOf(esc);
     const path = this.mapPath(runId);
     mkdirSync(join(this.cwd, ".work-state", "cto", runId), { recursive: true });
-    appendFileSync(path, `${JSON.stringify({ escId, messageId })}\n`);
+    appendFileSync(path, `${JSON.stringify({ escId, messageId, chatId: this.chatId })}\n`);
   }
 
   private messageIdOf(escId: string): number | null {
@@ -336,8 +407,10 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
     return null;
   }
 
-  private escIdOfMessage(messageId: number): string | null {
+  private escIdOfMessage(messageId: number, chatId: number): string | null {
     // Scan all run maps (bounded: runs under .work-state/cto/*/tg-map.jsonl).
+    // Message ids are only unique inside a Telegram chat, so the chat id is
+    // part of the persisted correlation key.
     const ctoRoot = join(this.cwd, ".work-state", "cto");
     if (!existsSync(ctoRoot)) return null;
     let runIds: string[];
@@ -351,8 +424,10 @@ export class TelegramEscalationAdapter implements EscalationAdapter {
       if (!existsSync(path)) continue;
       for (const line of readFileSync(path, "utf8").split("\n")) {
         if (!line.trim()) continue;
-        const entry = JSON.parse(line) as { escId: string; messageId: number };
-        if (entry.messageId === messageId) return entry.escId;
+        const entry = JSON.parse(line) as { escId: string; messageId: number; chatId?: string };
+        if (entry.messageId === messageId && (entry.chatId === String(chatId) || (entry.chatId === undefined && this.chatId === String(chatId)))) {
+          return entry.escId;
+        }
       }
     }
     return null;

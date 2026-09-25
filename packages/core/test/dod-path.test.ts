@@ -337,7 +337,7 @@ test("dod-path: report assembler renders both forms and fails closed on unsafe p
       { id: "gamma", status: "done", escalations: {}, dod_path: "custom-gamma" },
     ]));
 
-    const report = buildSessionReport(root, { kind: "cto" });
+    const report = buildSessionReport(root, { kind: "cto", id: "run-1" });
 
     const alpha = report.artifacts.find((a) => a.id === "dod" && a.owner === "alpha");
     assert.equal(alpha?.status, "produced");
@@ -573,7 +573,7 @@ test("dod-path: report assembler consumes the single safe read and never reopens
     writeFileSync(join(dodsDir, "dod.json"), COMPLETE_DOD);
     writeRun(root, makeState([{ id: "alpha", status: "done", escalations: {}, dod_path: ".work-state/dods/alpha" }]));
 
-    const before = buildSessionReport(root, { kind: "cto" });
+    const before = buildSessionReport(root, { kind: "cto", id: "run-1" });
     const dodBefore = before.artifacts.find((a) => a.id === "dod" && a.owner === "alpha");
     assert.equal(dodBefore?.status, "produced");
     assert.equal(dodBefore?.bytes, Buffer.byteLength(COMPLETE_DOD));
@@ -584,7 +584,7 @@ test("dod-path: report assembler consumes the single safe read and never reopens
     // never embeds the escaped body.
     rmSync(join(dodsDir, "dod.json"));
     symlinkSync(outsideFile, join(dodsDir, "dod.json"));
-    const after = buildSessionReport(root, { kind: "cto" });
+    const after = buildSessionReport(root, { kind: "cto", id: "run-1" });
     const dod = after.artifacts.find((a) => a.id === "dod" && a.owner === "alpha");
     assert.equal(dod, undefined, "a resolver-refused dod_path produces no dod artifact");
     assert.ok(
@@ -640,24 +640,35 @@ test("dod-path: snapshot renders dod from the single safe read and refuses swapp
   }
 });
 
-test("dod-path: session-stop backstop refuses a symlinked dod.json at the done-claim", () => {
+test("dod-path: session-stop backstop refuses a symlinked canonical dod.json at the done-claim", () => {
   const root = tmpRoot();
   const outsideDir = mkdtempSync(join(tmpdir(), "dod-outside-"));
+  const runId = "44444444-4444-4444-8444-444444444444";
   try {
-    const workState = join(root, ".work-state");
-    mkdirSync(join(workState, "artifacts"), { recursive: true });
-    writeFileSync(join(workState, "team-state.json"), JSON.stringify({
+    const runDir = join(root, ".work-state", "runs", runId);
+    const artifactsDir = join(runDir, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    writeFileSync(join(runDir, "state.json"), JSON.stringify({
+      schema: 2,
+      run_id: runId,
+      run_key: runId,
+      lifecycle_status: "active",
+      branch: "feature/dod-backstop",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+      task: "dod backstop",
+      workflow_override: false,
       stage_cursor: "summary",
-      pause: { kind: "done" },
-      classification: { workflow: "lightweight" },
+      stages: [{ id: "summary", status: "in_progress" }],
+      artifacts: {},
+      pause: { kind: "done", reason: "done claim" },
+      updated_at: new Date().toISOString(),
     }));
     const outsideFile = join(outsideDir, "dod.json");
     writeFileSync(outsideFile, JSON.stringify({
       items: [{ criterion: "criterion", verify_method: "run the focused check", status: "met", evidence: "observed pass" }],
     }));
-    // A dod.json symlinked outside the workspace must be refused, not followed.
-    symlinkSync(outsideFile, join(workState, "artifacts", "dod.json"));
-    const res = dodBackstop({}, { cwd: root });
+    symlinkSync(outsideFile, join(artifactsDir, "dod.json"));
+    const res = dodBackstop({}, { cwd: root, run_id: runId });
     assert.equal(res?.decision, "block");
     assert.match(res?.reason ?? "", /is a symlink/);
     assert.equal((res?.reason ?? "").includes(outsideDir), false, "outside path is never echoed");
@@ -681,7 +692,7 @@ test("dod-path: report default-dir dod is safe-read and a swapped leaf fails clo
     // Unset dod_path: the default team artifacts dir IS the canonical path.
     writeRun(root, makeState([{ id: "alpha", status: "done", escalations: {} }]));
 
-    const before = buildSessionReport(root, { kind: "cto" });
+    const before = buildSessionReport(root, { kind: "cto", id: "run-1" });
     const dodBefore = before.artifacts.find((a) => a.id === "dod" && a.owner === "alpha");
     assert.equal(dodBefore?.status, "produced");
     assert.equal(dodBefore?.bytes, Buffer.byteLength(COMPLETE_DOD));
@@ -690,7 +701,7 @@ test("dod-path: report default-dir dod is safe-read and a swapped leaf fails clo
     // through the safe read — no generic pathname fallback, no escaped body.
     rmSync(join(teamDir, "dod.json"));
     symlinkSync(outsideFile, join(teamDir, "dod.json"));
-    const after = buildSessionReport(root, { kind: "cto" });
+    const after = buildSessionReport(root, { kind: "cto", id: "run-1" });
     const dod = after.artifacts.find((a) => a.id === "dod" && a.owner === "alpha");
     assert.equal(dod, undefined, "unsafe default-dir resolution produces no DoD artifact");
     assert.ok(after.warnings.some((w) => w.startsWith("team alpha dod_path unusable:")), "unset dod_path warns like configured unsafe paths");
@@ -725,7 +736,7 @@ test("dod-path: report canonical dod replaces the generic same-id artifact and u
       { id: "gamma", status: "done", escalations: {}, dod_path: "../escape" },
     ]));
 
-    const report = buildSessionReport(root, { kind: "cto" });
+    const report = buildSessionReport(root, { kind: "cto", id: "run-1" });
     const dod = report.artifacts.find((a) => a.id === "dod" && a.owner === "beta");
     assert.equal(dod?.status, "produced");
     assert.equal(dod?.path, join(canonicalDir, "dod.json"), "canonical path wins over the generic bait");

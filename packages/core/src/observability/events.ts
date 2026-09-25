@@ -59,6 +59,7 @@ export type ObservabilityStatus = PendingState["status"] | CompletionOutcome;
  * validation cannot silently invent a second identity model.
  */
 export interface ObservabilitySignalFields {
+  runId?: string;
   work_identity?: WorkIdentity;
   capability_epoch?: string;
   policy_hash?: string;

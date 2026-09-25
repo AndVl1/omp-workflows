@@ -63,8 +63,13 @@ import {
   type ResolvedVideoSource,
   type TimestampedTranscriptSegment,
 } from "@andvl1/omp-workflows-core";
+import type { TrustedExecutionContext } from "../src/engine/types.js";
 import { dodBackstop } from "../src/gates/dod-backstop.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
+
+function executionContext(root: string, sessionId = "lecture-cto-session", branch = "main"): TrustedExecutionContext {
+  return { session_id: sessionId, caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" };
+}
 
 const COMPLEXITIES: Complexity[] = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"];
 const FLAGS: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
@@ -584,6 +589,7 @@ test("lecture-research: fresh and amend CTO prompts keep the research-only human
       defs: {
         backend: { id: "backend", name: "Backend", scope: ["backend-kotlin"], profile: "lightweight", lead: "team-lead", roster: ["backend-kotlin"] } satisfies TeamDef,
       },
+      execution: executionContext(root),
     });
     assert.equal(res.ok, true, "amend fixture: runCto starts a run in the temp root");
     if (!res.ok) return;
@@ -604,22 +610,36 @@ test("lecture-research: fresh and amend CTO prompts keep the research-only human
   }
 });
 
-test("lecture-research: DoD backstop exempts lecture-research done-claims", () => {
+test("lecture-research: DoD backstop exempts selected canonical lecture-research done-claims", () => {
   const root = mkdtempSync(join(tmpdir(), "lecture-dod-"));
+  const runId = "55555555-5555-4555-8555-555555555555";
   try {
-    const workState = join(root, ".work-state");
-    mkdirSync(workState, { recursive: true });
-    const claimingDone = { pause: { kind: "done" }, stage_cursor: "summary" };
-
-    writeFileSync(join(workState, "team-state.json"), JSON.stringify({ ...claimingDone, classification: { workflow: "lecture-research" } }));
+    const runDir = join(root, ".work-state", "runs", runId);
+    mkdirSync(runDir, { recursive: true });
+    const claimingDone = {
+      schema: 2,
+      run_id: runId,
+      run_key: runId,
+      lifecycle_status: "active",
+      branch: "feature/lecture-research",
+      task: "lecture research",
+      workflow_override: false,
+      stage_cursor: "summary",
+      stages: [{ id: "summary", status: "in_progress" }],
+      artifacts: {},
+      pause: { kind: "done", reason: "done claim" },
+      updated_at: new Date().toISOString(),
+    };
+    const statePath = join(runDir, "state.json");
+    writeFileSync(statePath, JSON.stringify({ ...claimingDone, classification: { workflow: "lecture-research" } }));
     assert.equal(
-      dodBackstop({}, { cwd: root }),
+      dodBackstop({}, { cwd: root, run_id: runId }),
       undefined,
       "lecture-research is exempt from the done-claim DoD block (research-only workflow)",
     );
 
-    writeFileSync(join(workState, "team-state.json"), JSON.stringify({ ...claimingDone, classification: { workflow: "standard" } }));
-    const blocked = dodBackstop({}, { cwd: root });
+    writeFileSync(statePath, JSON.stringify({ ...claimingDone, classification: { workflow: "standard" } }));
+    const blocked = dodBackstop({}, { cwd: root, run_id: runId });
     assert.ok(blocked, "control: a non-exempt workflow claiming done is blocked");
     if (!blocked || !("reason" in blocked)) assert.fail("blocked result carries a reason");
     assert.equal(blocked.decision, "block");

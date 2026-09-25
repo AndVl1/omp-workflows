@@ -39,6 +39,74 @@ node packages/e2e/dist/cli.js report /tmp/omp-ux-e2e-my-feature \
 
 Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
 
+## Run-lifecycle acceptance journeys
+
+The public registered `/do-work` journeys for OpenSpec run-lifecycle are data
+scenarios in `scenarios/run-lifecycle-journey.json` and
+`scenarios/run-lifecycle-resume.json`. They use this existing PTY/WS harness;
+they do not call core APIs directly and never edit canonical `.work-state`
+files.
+
+Prerequisites (local operator setup only):
+
+- Node.js 20 or newer and the repository dependencies installed.
+- A built `omp` binary available as `omp` on `PATH`, or set `OMP_BIN` to its
+  path.
+- A host omp config with usable `modelRoles` and provider credentials. Do not
+  put credentials in the scratch project, scenario files, transcripts, or
+  reports; the harness inherits the host config and records only its path and
+  a missing-config warning.
+- A local checkout with the plugin wired by `bootstrap`; use a scratch
+  directory, never this repository worktree, for branch changes.
+
+Prepare and run the A → B → C → A journey:
+
+```bash
+npm run build -w @andvl1/omp-workflows-e2e
+node packages/e2e/dist/cli.js bootstrap run-lifecycle-journey feat/run-lifecycle-a \
+  --monorepo . --workdir /tmp --force
+node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-run-lifecycle-journey \
+  --scenario packages/e2e/scenarios/run-lifecycle-journey.json \
+  --surface text --detach --max-time 90m
+```
+
+Drive the registered `/do-work` commands through the printed terminal URL (or
+`ux-e2e input`/`ux-e2e ask`), follow the task file's branch and selector steps,
+then save evidence:
+
+```bash
+node packages/e2e/dist/cli.js transcript /tmp/omp-ux-e2e-run-lifecycle-journey --follow
+node packages/e2e/dist/cli.js report /tmp/omp-ux-e2e-run-lifecycle-journey \
+  --copy-evidence
+```
+
+Prepare the resume scratch once. After session 1 reaches the saved decision,
+run `report --copy-evidence` and `ux-e2e stop`; then start **the same scratch**
+again for session 2 without its previous chat:
+
+```bash
+node packages/e2e/dist/cli.js bootstrap run-lifecycle-resume feat/run-lifecycle-resume \
+  --monorepo . --workdir /tmp --force
+node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-run-lifecycle-resume \
+  --scenario packages/e2e/scenarios/run-lifecycle-resume.json \
+  --surface text --detach --max-time 90m
+# after report + stop:
+node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-run-lifecycle-resume \
+  --scenario packages/e2e/scenarios/run-lifecycle-resume.json \
+  --surface text --detach --max-time 90m
+```
+
+Raw evidence is written automatically to
+`<scratch>/.work-state/ux-e2e/{transcript.jsonl,session.json,detach.log}`;
+`events.jsonl`/`session.jsonl` are included when the registered workflow emits
+them, and the report records the newest host omp log when available. Reports
+go to `./vibe-report/<slug>-ux-e2e-<date>.md` plus
+`<scratch>/.work-state/ux-e2e/report.json`. When a scratch session is restarted,
+the harness archives the previous raw transcript beside the current one; never
+manually edit or delete those files. A live pass is **not** implied by scenario
+loading or package tests: run these commands after core/fullstack/internal
+integration and attach the resulting transcript/report paths.
+
 ## Subcommands
 
 | Command | Purpose |

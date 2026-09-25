@@ -17,7 +17,6 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
-import { isSafeStateSegment } from "../engine/state.js";
 import { readDoDFileSafe } from "../engine/dod.js";
 const WORK_STATE_DIR = ".work-state";
 
@@ -27,6 +26,7 @@ export interface SessionStopEvent {
 
 export interface SessionStopContext {
   cwd: string;
+  run_id?: string;
 }
 
 export interface DoDItem {
@@ -157,7 +157,7 @@ export function validateTypedDoD(input: unknown): DoDValidation {
 
 export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): { decision: "block"; reason: string } | { continue: true } | void {
   if (event.stop_hook_active) return;
-  const statePath = resolveStatePath(ctx.cwd);
+  const statePath = resolveStatePath(ctx.cwd, ctx.run_id);
   if (!statePath) return;
   let state: TeamState;
   try {
@@ -219,19 +219,10 @@ export function dodBackstop(event: SessionStopEvent, ctx: SessionStopContext): {
   return { continue: true };
 }
 
-function resolveStatePath(cwd: string): string | null {
-  const wsDir = resolve(cwd, WORK_STATE_DIR);
-  if (!existsSync(wsDir)) return null;
-  const active = join(wsDir, ".active-feature");
-  if (existsSync(active)) {
-    const slug = readFileSync(active, "utf8").trim();
-    if (!isSafeStateSegment(slug)) return null;
-    const path = join(wsDir, "features", slug, "state.json");
-    if (existsSync(path)) return path;
-  }
-  const legacy = join(wsDir, "team-state.json");
-  if (existsSync(legacy)) return legacy;
-  return null;
+function resolveStatePath(cwd: string, runId?: string): string | null {
+  if (!runId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) return null;
+  const path = join(resolve(cwd, WORK_STATE_DIR), "runs", runId, "state.json");
+  return existsSync(path) ? path : null;
 }
 
 function resolveDoDPath(statePath: string): string {

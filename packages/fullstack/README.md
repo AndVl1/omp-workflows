@@ -58,6 +58,40 @@ The `commands/` adapters remain a compatibility path for runtimes that only
 discover custom-TS files from disk; same-name project files are not an override
 API.
 
+## Жизненный цикл `/do-work`
+
+Fullstack регистрирует `/do-work` и alias `/team`; они используют общий lifecycle contract core. Явные режимы имеют приоритет над интерпретацией текста, а обычная задача не становится resume только потому, что в worktree уже есть state.
+
+```text
+/do-work --new Добавить экспорт отчётов
+/do-work продолжи экспорт отчётов
+/do-work --resume
+/do-work --resume --run <run-id>
+/do-work --rework --run <run-id> Исправить результат экспорта
+/do-work --list
+/do-work --list --all-branches
+```
+
+Для new/resume/rework UUID не обязателен: можно назвать задачу или выбрать пункт показанного списка. `--run <run-id>` — точный технический selector; `/do-work --list` выводит title, branch, status, stage и стабильные `snapshot_id`/`index`, чтобы пункт можно было разрешить без угадывания. Если совпадений несколько, команда просит выбор; ошибочный явный selector не переключается на другой run. `--` завершает разбор options и позволяет передать флаги как обычный текст задачи.
+
+Успешный `workflow_prepare` возвращает видимый receipt с operation, previous/selected run, названиями, статусами и continuation point. При `run_busy` переход не выполнен и частичный новый run не показывается как созданный. Один физический worktree допускает один конфликтующий execution claim: живой или неизвестно завершённый coordinator/worker нужно сначала проверить через `workflow_status`; новый независимый run не вытесняет pending work, а resume присоединяется только к тому же run.
+
+Resume из новой host-сессии использует canonical state и required artifacts, а не историю чата: `workflow_instructions` восстанавливает задачу, classification, cursor, решения, ограничения и входы текущего этапа до следующего dispatch. `recovery_required` останавливает работу при отсутствующем или повреждённом обязательном input; сохранённый pending dispatch не дублируется и при недоступном транспорте остаётся `background_wait`/`transport_reconnect`. Rework сохраняет прежние результаты в immutable revision и переоткрывает затронутую часть, поэтому старые downstream proofs не завершают новую версию.
+
+В schema 2 ordinary `run_id`, `run_key` и `WorkIdentity.run_id` совпадают. Branch — контекст маршрутизации/проверки, не ключ запуска: новый запрос на другой ветке независим, а resume/rework на чужой ветке дают `run_context_mismatch`. Legacy state и старый `continuation` после cutover являются import-only; неизвестная schema, небезопасная ссылка или активное старое исполнение возвращают `migration_required`, `recovery_required` или `run_busy`, без legacy fallback. Lifecycle transaction восстанавливается автоматически: до canonical commit откатывается staging, после commit допустим только forward repair. Не удаляйте `.active-feature`/другие marker-файлы и не редактируйте canonical state вручную.
+
+### Canonical report и viewer
+
+Доступны оба read-only представления canonical run/revision:
+
+```text
+/session-report do-work id=<run-id> [revision=<revision-id>]
+/workflow-view do-work id=<run-id> [revision=<revision-id>]
+/workflow-view --all
+```
+
+`/session-report` пишет self-contained HTML, а `/workflow-view` — offline bundle в `.work-state/visualize`. Они читают только выбранный canonical run/revision; latest, slug и legacy state не являются fallback. Для legacy/unavailable источника команда возвращает явную `migration_required` или `canonical-unavailable` и предлагает сначала выполнить штатный import/select. Текущий viewer поддерживается для canonical reader; переработка UI/graph model остаётся отдельным будущим scope.
+
 The `agents/` and `skills/` directories are picked up by OMP's discovery automatically.
 
 ## URL-first lecture research
@@ -136,14 +170,49 @@ Provider comparisons use the dependency-light API at `@andvl1/omp-workflows-full
 | Command | Purpose |
 | --- | --- |
 | `/cto <task>` | Main-session CTO orchestration into parallel teams. |
+| `/cto --run <exact-run-id> [task]` | Reacquire one explicit CTO run; no latest-run fallback is used. |
 | `/do-work <task>` | Classification-first profile-driven workflow. |
 | `/team <task>` | Compatibility alias for `/do-work`. |
 | `/init-team` | Write `.omp/team.config.json` with detected/default stack mappings. |
 | `/interview <topic>` | Delegate structured clarification to the analyst. |
 | `/omp-model-roles` | Validate model-role configuration or delegate recommendations. |
-| `/session-report [do-work|cto] [id=<id>] [--full]` | Generate a self-contained offline HTML snapshot of one workflow session. |
+| `/session-report [do-work|cto] [id=<id>] [revision=<id>] [--full]` | Generate a self-contained offline HTML snapshot of one workflow session. |
+| `/workflow-view [do-work|cto] [id=<id>] [revision=<id>] [--all] [--full]` | Render a canonical workflow visualization bundle. |
 
-The three workflow entry points are registered directly; `/init-team`, `/interview`, `/omp-model-roles`, and `/session-report` remain custom-TS modules copied into project-local `.omp/commands/`. Most commands return prompts and do not dispatch subagents directly. `/session-report` is deterministic: it reads persisted state/artifacts, renders HTML, and writes only under `.work-state`.
+`/cto --run <exact-run-id> [task]` is the managed, explicit reacquisition path: it binds the selected CTO run to the current interactive controller and never scans for a latest run. A turn-level `session_stop` does not suspend that resident claim; verified host shutdown or replacement suspends it before the old controller/dispatcher is reset. OMP 18.2.2 replacement is a `session_switch` on the same mutable session manager, and an active claim is accepted only when the callback's interactive profile and `previousSessionFile` match the captured old session file. An independent manager, headless/worker callback, contradictory cwd/id/file/mode/UI, or stale old callback cannot release the current binding. Messenger tasks and answers remain durable under the exact current claim: write the outbox escalation, then use the real `read` tool on the exact `.work-state/cto/<run-id>/answers/<escId>.json` during reconciliation. Persisted answers are not replayed merely because an epoch changed; only a dispatcher-recorded pre-send rejection with its matching retry marker is automatically retryable on a fresh exact claim, while in-flight, unknown, accepted, or legacy delivery retains the original files and requires explicit reconciliation.
+
+The three workflow entry points are registered directly; `/init-team`, `/interview`, `/omp-model-roles`, `/session-report`, and `/workflow-view` remain custom-TS modules copied into project-local `.omp/commands/`. Most commands return prompts and do not dispatch subagents directly. `/session-report` and `/workflow-view` are deterministic read-only renderers: they require canonical selectors, read persisted state/artifacts, and write only under `.work-state`.
+
+### CTO canonical state authority
+
+The resident CTO is the sole model-visible coordinator for canonical CTO
+state. For every model-origin plan, classification, wave, progress, amendment,
+completion, terminal, or follow-up transition, it uses the registered
+`cto_state` tool:
+
+```text
+{ "operation": "read", "run_id": "<exact CTO id>" }
+→ validated CtoState + opaque state_revision
+
+{ "operation": "commit",
+  "run_id": "<same exact CTO id>",
+  "expected_state_revision": "<state_revision from read>",
+  "state": <candidate CtoState> }
+```
+
+The candidate is edited after the read and domain-validated before mutation.
+Only the authenticated bound coordinator proof (current token, epoch, and
+session) may commit, and it is checked under the lifecycle lock; `run_id` is
+not a path or ordinary UUID selector. Leads and workers return per-team
+artifacts and cannot call `cto_state`. DoDs, decisions, answers, and other
+permitted noncanonical artifacts remain ordinary files written with the usual
+artifact tools; raw `Write`/`Edit`/`Bash` cannot publish canonical state.
+
+A stale revision or claim refusal leaves state and binding unchanged; the
+coordinator re-reads and resolves a legitimate conflict, without a blind
+retry. A terminal commit releases only the exact originating managed private
+binding atomically; completion of a wave alone is not terminal. Runtime
+acceptance of this model ingress remains pending Main validation.
 
 ## Model roles
 
