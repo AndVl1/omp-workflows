@@ -350,7 +350,7 @@ export interface ReworkLifecycleRequest extends LifecycleRequestBase {
   run_id: string;
   branch: string;
   feedback: string;
-  affected_stage?: string;
+  affected_stage: string;
   selector?: LifecycleSelector;
 }
 

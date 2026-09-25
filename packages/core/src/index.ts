@@ -51,7 +51,7 @@ import { createWorkflowSessionController, ctoClaimCredentials, type WorkflowSess
 import { suspendCtoSession, finalizeCtoSession, readCtoStateForModel, commitCtoStateForModel } from "./cto/run.js";
 import { readDispatchOriginLocator, rememberDispatchOriginLocator } from "./dispatch-origin-locator.js";
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
-import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, readRunControl, readRunControlNoRecovery, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, reserveExecutionClaimWorkers, settleExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
+import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, retainSelectionSnapshot, readRunControl, readRunControlNoRecovery, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, reserveExecutionClaimWorkers, settleExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector, CtoClaimScope, RunControl } from "./engine/types.js";
 import { createNativeWorkerAuthority, type NativeWorkerResolution } from "./native-worker-authority.js";
 import type { ScopeRuntimeClassTable } from "./engine/scope.js";
@@ -2296,6 +2296,7 @@ function workflowStateSummary(cwd: string, mappingSummary?: (cwd: string) => unk
     state_path: runStatePath(cwd, runId),
     branch: state.branch,
     workflow: state.classification?.workflow,
+    profile_hash: state.profile_hash,
     stage_cursor: state.stage_cursor,
     cursor_epoch: state.cursor_epoch,
     stages: state.stages,
@@ -2333,7 +2334,7 @@ function resolveToolRunId(cwd: string, selector?: LifecycleSelector, controller?
   if (!resolved.ok) {
     const boundaryError = resolved.error as LifecycleBoundaryError;
     boundaryError.candidates = resolved.candidates;
-    if (resolved.snapshot) boundaryError.snapshot = resolved.snapshot;
+    if (resolved.snapshot) boundaryError.snapshot = retainSelectionSnapshot(cwd, resolved.snapshot);
     throw boundaryError;
   }
   return resolved.candidate.run_id;
@@ -2637,7 +2638,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_prepare",
     label: "Prepare workflow state",
-    description: "Persist an explicit new, resume, or rework lifecycle request; selectors are resolved against the captured session and revalidated under the workspace lock.",
+    description: "Persist an explicit new, resume, or rework lifecycle request; resolve every resume/rework target through read-only selectors before mutation. For rework, feedback must be mapped to a non-blank affected_stage from the selected profile before this tool is called; this field is conditionally required and whitespace is invalid. The request is revalidated under the workspace lock.",
     parameters: z.object({
       mode: z.enum(["new", "resume", "rework"]).default("new"),
       task: z.string().min(1).optional(),
@@ -2650,7 +2651,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         list_item: z.object({ snapshot_id: z.string().min(1), index: z.number().int().min(0), run_id: z.string().min(1) }).strict().optional(),
       }).strict().optional(),
       feedback: z.string().min(1).optional(),
-      affected_stage: z.string().min(1).optional(),
+      affected_stage: z.string().optional(),
       classification: classificationParameters.optional(),
       files: z.array(z.string().min(1)).optional(),
       issue: z.union([z.number().int(), z.object({ number: z.number().int(), url: z.string().optional() })]).nullable().default(null),
@@ -2677,6 +2678,19 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       const selectionMode: "resume" | "rework" | undefined = mode === "new" ? undefined : mode;
       if (mode === "new" && (!input.task || !input.classification)) {
         return toolResult({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "new workflow preparation requires task and complete classification" });
+      }
+      if (mode === "rework" && !input.affected_stage?.trim()) {
+        return lifecycleFailure(
+          "WORKFLOW_PREPARE_FAILED",
+          new LifecycleError(
+            "lifecycle_request_conflict",
+            "rework requires a non-blank affected_stage selected from the target workflow profile",
+            {
+              ...(input.run_id ? { run_id: input.run_id } : {}),
+              next_action: "call workflow_status with the exact selector, then workflow_instructions with the same selector; map feedback to profile.stages and retry workflow_prepare with affected_stage",
+            },
+          ),
+        );
       }
       if (mode === "rework" && !input.feedback) {
         return toolResult({ ok: false, code: "WORKFLOW_PREPARE_REJECTED", error: "rework requires feedback" });
@@ -2784,7 +2798,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_status",
     label: "Workflow status",
-    description: "Read one selected run's durable stage and dispatch status; an explicit selector never falls back to current selection.",
+    description: "Read one selected run's durable stage, profile hash, and dispatch status; an explicit selector never falls back to current selection.",
     parameters: selectorParameters as never,
     async execute(_id, params, _signal, _update, ctx) {
       const denied = contextError(ctx);
@@ -2803,7 +2817,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_instructions",
     label: "Workflow instructions",
-    description: "Read one selected run's structured workflow stage contract.",
+    description: "Read one selected run's structured workflow stage contract and ordered informational profile.stages metadata (including pathless registered profiles); the selector must identify the same run used for rework discovery.",
     parameters: selectorParameters as never,
     async execute(_id, params, _signal, _update, ctx) {
       const denied = contextError(ctx);

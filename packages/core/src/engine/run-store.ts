@@ -602,6 +602,11 @@ export function readSelectionSnapshot(cwd: string, snapshotId: string): RunSelec
   const snapshot = selectionSnapshots.get(resolve(cwd) + ":" + snapshotId);
   return snapshot ? structuredClone(snapshot) : undefined;
 }
+export function retainSelectionSnapshot(cwd: string, snapshot: RunSelectionSnapshot): RunSelectionSnapshot {
+  const retained = structuredClone(snapshot);
+  selectionSnapshots.set(resolve(cwd) + ":" + retained.snapshot_id, retained);
+  return structuredClone(retained);
+}
 
 export function createSelectionSnapshot(cwd: string, options: { branch?: string; includeTerminal?: boolean } = {}): RunSelectionSnapshot {
   return withWorkspaceRead(cwd, () => {

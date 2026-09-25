@@ -53,6 +53,7 @@ import {
   persistCanonicalRun,
   readRunControl,
   readRunState,
+  readRunStateNoRecovery,
   reworkCanonicalRunAtomically,
   resumeCanonicalRun,
   runTarget,
@@ -257,6 +258,19 @@ function collectReworkArtifactBindings(cwd: string, runId: string, current: Team
 }
 
 export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWorkflowState {
+  const operation: LifecycleMode = opts.mode ?? "new";
+  const requestedAffectedStage = opts.affected_stage;
+  if (operation === "rework" && (typeof requestedAffectedStage !== "string" || requestedAffectedStage.trim().length === 0)) {
+    throw new LifecycleError(
+      "lifecycle_request_conflict",
+      "rework requires an affected_stage selected from the current workflow profile",
+      {
+        ...(opts.run_id ? { run_id: opts.run_id } : {}),
+        next_action: "discover the affected stage from the selected run profile using a read-only resolver, then retry workflow_prepare with affected_stage",
+      },
+    );
+  }
+
   if (!opts.execution) throw new LifecycleError("lifecycle_request_conflict", "trusted execution context is required for workflow lifecycle mutation");
   assertTrustedExecutionContext(opts.execution);
   const activeBranch = resolveActiveBranch(opts.cwd);
@@ -266,7 +280,6 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
 
   const config = resolveConfig(opts.cwd);
   const profiles = loadAllProfiles();
-  const operation: LifecycleMode = opts.mode ?? "new";
   if ("continuation" in opts) {
     throw new LifecycleError("migration_required", "legacy continuation requests are unsupported; use explicit mode=resume or mode=rework with run_id, feedback, and affected_stage", { next_action: "replace continuation with an explicit lifecycle request" });
   }
@@ -282,7 +295,6 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
   const replayReceipt = readRunControl(opts.cwd).prepare_receipts[requestId];
   if (replayReceipt) {
     const replayClassification = operation === "new" ? newClassification : undefined;
-    const replayAffectedStage = opts.affected_stage;
     const replayRequest = {
       mode: operation,
       request_id: requestId,
@@ -291,7 +303,7 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
         ? { task: opts.task, branch: activeBranch, classification: replayClassification, files: opts.files, issue: opts.issue ?? null }
         : operation === "resume"
           ? { run_id: previousRunId!, branch: activeBranch }
-          : { run_id: previousRunId!, branch: activeBranch, feedback: opts.feedback ?? "", ...(replayAffectedStage ? { affected_stage: replayAffectedStage } : {}) }),
+          : { run_id: previousRunId!, branch: activeBranch, feedback: opts.feedback ?? "", affected_stage: requestedAffectedStage! }),
     } as LifecycleRequest;
     if (lifecyclePayloadHash(replayRequest) !== replayReceipt.payload_hash) {
       throw new LifecycleError("lifecycle_request_conflict", "request_id replayed with a different payload", { run_id: replayReceipt.selected_run_id });
@@ -315,6 +327,19 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
       operation,
       transition: replayReceipt,
     };
+  }
+  if (operation === "rework") {
+    const targetState = readRunStateNoRecovery(opts.cwd, previousRunId!, activeBranch);
+    if (targetState) {
+      if (targetState.branch !== activeBranch) {
+        throw new LifecycleError("run_context_mismatch", `run '${previousRunId!}' belongs to branch '${targetState.branch}', current branch is '${activeBranch}'`, { run_id: previousRunId!, branch: targetState.branch, next_action: `checkout '${targetState.branch}' before resume/rework` });
+      }
+      const targetProfile = profiles.find((candidate) => candidate.name === targetState.classification.workflow);
+      if (!targetProfile) throw new LifecycleError("run_state_invalid", `profile '${targetState.classification.workflow}' for run '${previousRunId!}' is unavailable`, { run_id: previousRunId! });
+      if (!targetProfile.stages.some((candidate) => candidate.id === requestedAffectedStage)) {
+        throw new LifecycleError("run_state_invalid", "rework stage '" + requestedAffectedStage + "' is not declared by workflow '" + targetProfile.name + "'", { run_id: previousRunId! });
+      }
+    }
   }
   let newProfile: Profile | undefined;
   if (operation === "new") {
@@ -344,7 +369,6 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
   let profile: Profile;
   let flags: ScopeFlags;
   let transition: PrepareRequestReceipt;
-  const requestedAffectedStage = opts.affected_stage;
   if (operation === "new") {
     classification = newClassification!;
     profile = newProfile!;
@@ -430,13 +454,13 @@ export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWork
       state = resumeCanonicalRun(opts.cwd, runId, execution, { request: resumeRequest, receipt: resumeReceipt });
       transition = resumeReceipt;
     } else {
-      const affectedStage = opts.affected_stage ?? state.stage_cursor;
+      const affectedStage = requestedAffectedStage!;
       if (!profile.stages.some((candidate) => candidate.id === affectedStage)) throw new LifecycleError("run_state_invalid", "rework stage '" + affectedStage + "' is not declared by workflow '" + profile.name + "'", { run_id: runId });
       if (!opts.feedback) throw new LifecycleError("lifecycle_request_conflict", "rework requires feedback", { run_id: runId });
       const activeDispatch = state.dispatch_capability?.dispatches?.find((dispatch) => ["authorized", "running", "pending"].includes(dispatch.status) && !dispatch.completion);
       if (activeDispatch) throw new LifecycleError("run_busy", "rework requires all dispatch workers to be reconciled", { run_id: runId });
       const feedback = opts.feedback;
-      const reworkRequest = { mode: operation, request_id: requestId, execution, run_id: runId, branch: activeBranch, feedback, ...(requestedAffectedStage ? { affected_stage: requestedAffectedStage } : {}) } as LifecycleRequest;
+      const reworkRequest = { mode: operation, request_id: requestId, execution, run_id: runId, branch: activeBranch, feedback, affected_stage: affectedStage } as LifecycleRequest;
       const reworkReceipt: PrepareRequestReceipt = {
         request_id: requestId,
         payload_hash: lifecyclePayloadHash(reworkRequest),

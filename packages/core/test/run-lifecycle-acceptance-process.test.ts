@@ -1514,7 +1514,251 @@ test("workflow_status preserves structured selector failure details", async () =
     await bus.emit("session_stop", { session_id: owner.session_id }, { cwd: root, session_id: owner.session_id });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+test("workflow read-only ambiguity retains the exact displayed snapshot across status, instructions, and rework", async () => {
+  const root = scratch("rl-readonly-selection-retain");
+  try {
+    initGit(root);
+    publishMapping(root);
+    const owner = context(root, "readonly-selection-retain");
+    const controller = createWorkflowSessionController({ cwd: root, context: owner });
+    const finish = (task: string): string => {
+      const prepared = controller.prepare({ mode: "new", task, classification: CLASSIFICATION });
+      const runId = prepared.state.run_id!;
+      updateCanonicalRun(root, runId, (state) => ({
+        ...state,
+        stages: state.stages.map((stage) => ({ ...stage, status: "done" as const })),
+        pause: { kind: "none", reason: "" },
+      }));
+      const claim = readRunControl(root).execution_claim;
+      assert.ok(claim);
+      finalizeCanonicalRun(root, runId, claim.token);
+      return runId;
+    };
+    const firstRunId = finish("readonly first");
+    const secondRunId = finish("readonly second");
+    assert.equal(controller.selectedRunId(), undefined, "completed setup leaves no selected run");
 
+    const bus = fakePi();
+    registerWorkflowTools(bus.pi as never, { cwd: root, getSessionController: () => controller });
+    await bus.emit("session_start", {}, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const statusTool = bus.tools.get("workflow_status");
+    const instructionsTool = bus.tools.get("workflow_instructions");
+    const prepareTool = bus.tools.get("workflow_prepare");
+    assert.ok(statusTool && instructionsTool && prepareTool);
+
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const statePath = join(root, ".work-state", "runs", secondRunId, "state.json");
+    const revisionsPath = join(root, ".work-state", "runs", secondRunId, "revisions");
+    const artifactsPath = join(root, ".work-state", "runs", secondRunId, "artifacts");
+    const entries = (path: string): string[] => existsSync(path) ? readdirSync(path).sort() : [];
+    const beforeReadOnly = {
+      control: readFileSync(controlPath, "utf8"),
+      state: readFileSync(statePath, "utf8"),
+      revisions: entries(revisionsPath),
+      artifacts: entries(artifactsPath),
+      runs: listRuns(root, { branch: BRANCH, includeTerminal: true }).map((candidate) => candidate.run_id),
+    };
+
+    const ambiguous = await statusTool.execute(
+      "readonly-selection-ambiguous",
+      { selector: {} },
+      undefined,
+      undefined,
+      { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id },
+    );
+    const ambiguousValue = record(ambiguous.details);
+    assert.equal(ambiguousValue.ok, false);
+    assert.equal(ambiguousValue.code, "WORKFLOW_STATUS_FAILED");
+    const ambiguousDetails = record(ambiguousValue.details);
+    assert.equal(ambiguousDetails.code, "run_selection_required");
+    assert.equal(ambiguousDetails.next_action, "повторить запрос с selector.list_item из показанного snapshot");
+    const displayed = record(ambiguousDetails.snapshot) as unknown as {
+      snapshot_id: string;
+      branch: string | null;
+      candidates: Array<{ run_id: string; task: string; title: string; branch: string; status: string; stage: string }>;
+    };
+    assert.ok(displayed.snapshot_id);
+    assert.equal(displayed.branch, BRANCH);
+    assert.deepEqual(ambiguousDetails.candidates, displayed.candidates, "boundary candidates must preserve the exact displayed list");
+    assert.deepEqual(new Set(displayed.candidates.map((candidate) => candidate.run_id)), new Set([firstRunId, secondRunId]));
+
+    const instructionsAfterAmbiguity = await instructionsTool.execute(
+      "readonly-selection-instructions-ambiguous",
+      { selector: {} },
+      undefined,
+      undefined,
+      { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id },
+    );
+    const instructionsFailure = record(instructionsAfterAmbiguity.details);
+    assert.equal(instructionsFailure.ok, false);
+    assert.equal(instructionsFailure.code, "WORKFLOW_RESOLUTION_FAILED");
+    assert.equal(record(instructionsFailure.details).code, "run_selection_required");
+
+    assert.equal(readFileSync(controlPath, "utf8"), beforeReadOnly.control, "read-only discovery must not mutate run-control");
+    assert.equal(readFileSync(statePath, "utf8"), beforeReadOnly.state, "read-only discovery must not mutate canonical state");
+    assert.deepEqual(entries(revisionsPath), beforeReadOnly.revisions, "read-only discovery must not create revisions");
+    assert.deepEqual(entries(artifactsPath), beforeReadOnly.artifacts, "read-only discovery must not mutate artifacts");
+    assert.deepEqual(listRuns(root, { branch: BRANCH, includeTerminal: true }).map((candidate) => candidate.run_id), beforeReadOnly.runs, "listing must not prepare a new run");
+
+    const selectedCandidate = displayed.candidates[1]!;
+    const listItem = {
+      snapshot_id: displayed.snapshot_id,
+      index: 1,
+      run_id: selectedCandidate.run_id,
+    };
+    const thirdRunId = finish("readonly third");
+    assert.notEqual(thirdRunId, selectedCandidate.run_id);
+
+    const statusRetry = await statusTool.execute(
+      "readonly-selection-retry-status",
+      { selector: { list_item: listItem } },
+      undefined,
+      undefined,
+      { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id },
+    );
+    const statusRetryValue = record(statusRetry.details);
+    assert.equal(statusRetryValue.ok, true, JSON.stringify(statusRetry.details));
+    assert.equal(statusRetryValue.run_id, selectedCandidate.run_id, "status must resolve the displayed item, not the reordered current list");
+
+    const instructionsRetry = await instructionsTool.execute(
+      "readonly-selection-retry-instructions",
+      { selector: { list_item: listItem } },
+      undefined,
+      undefined,
+      { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id },
+    );
+    const instructionsValue = record(instructionsRetry.details);
+    assert.equal(record(instructionsValue.state).task, selectedCandidate.task, "instructions must resolve the same displayed run");
+    assert.match(String(record(instructionsValue.state).path), new RegExp(selectedCandidate.run_id));
+
+    const rework = await prepareTool.execute(
+      "readonly-selection-rework",
+      {
+        mode: "rework",
+        selector: { list_item: listItem },
+        feedback: "revisit the selected completed run",
+        affected_stage: "implementation",
+      },
+      undefined,
+      undefined,
+      { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id },
+    );
+    const reworkValue = record(rework.details);
+    assert.equal(reworkValue.ok, true, JSON.stringify(rework.details));
+    assert.equal(record(reworkValue.state).run_id, selectedCandidate.run_id, "rework must consume the same retained snapshot item");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workflow read-only title ambiguity keeps its filtered index and rejects tampered, foreign, and stale items", async () => {
+  const root = scratch("rl-readonly-title-selection");
+  const foreignRoot = scratch("rl-readonly-foreign-selection");
+  try {
+    initGit(root);
+    publishMapping(root);
+    const owner = context(root, "readonly-title-selection");
+    const controller = createWorkflowSessionController({ cwd: root, context: owner });
+    const finish = (task: string): string => {
+      const prepared = controller.prepare({ mode: "new", task, classification: CLASSIFICATION });
+      const runId = prepared.state.run_id!;
+      updateCanonicalRun(root, runId, (state) => ({
+        ...state,
+        stages: state.stages.map((stage) => ({ ...stage, status: "done" as const })),
+        pause: { kind: "none", reason: "" },
+      }));
+      const claim = readRunControl(root).execution_claim;
+      assert.ok(claim);
+      finalizeCanonicalRun(root, runId, claim.token);
+      return runId;
+    };
+    finish("title-filter-target");
+    finish("title-filter-target");
+    const preexistingUnrelatedRunId = finish("title-filter-other");
+    assert.equal(controller.selectedRunId(), undefined);
+
+    const bus = fakePi();
+    registerWorkflowTools(bus.pi as never, { cwd: root, getSessionController: () => controller });
+    await bus.emit("session_start", {}, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const statusTool = bus.tools.get("workflow_status");
+    assert.ok(statusTool);
+    const ambiguous = await statusTool.execute(
+      "readonly-title-ambiguous",
+      { selector: { title: "title-filter-target" } },
+      undefined,
+      undefined,
+      { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id },
+    );
+    const ambiguousValue = record(ambiguous.details);
+    assert.equal(ambiguousValue.ok, false);
+    const ambiguousDetails = record(ambiguousValue.details);
+    assert.equal(ambiguousDetails.code, "run_selection_required");
+    const displayed = record(ambiguousDetails.snapshot) as unknown as {
+      snapshot_id: string;
+      candidates: Array<{ run_id: string; task: string; title: string }>;
+    };
+    assert.equal(displayed.candidates.length, 2);
+    assert.ok(
+      displayed.candidates.every((candidate) => candidate.run_id !== preexistingUnrelatedRunId),
+      "filtered snapshot must exclude the pre-existing nonmatching run",
+    );
+    assert.ok(displayed.candidates.every((candidate) => candidate.title === "title-filter-target"));
+    assert.deepEqual(ambiguousDetails.candidates, displayed.candidates, "boundary candidates must match the filtered snapshot exactly");
+    const selectedCandidate = displayed.candidates[1]!;
+    const listItem = {
+      snapshot_id: displayed.snapshot_id,
+      index: 1,
+      run_id: selectedCandidate.run_id,
+    };
+
+    const tampered = await statusTool.execute(
+      "readonly-title-tampered",
+      { selector: { list_item: { ...listItem, index: displayed.candidates.length } } },
+      undefined,
+      undefined,
+      { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id },
+    );
+    assert.equal(record(record(tampered.details).details).code, "run_not_found");
+
+    const stale = await statusTool.execute(
+      "readonly-title-stale",
+      { selector: { list_item: { ...listItem, snapshot_id: randomUUID() } } },
+      undefined,
+      undefined,
+      { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id },
+    );
+    assert.equal(record(record(stale.details).details).code, "run_selection_required");
+
+    initGit(foreignRoot);
+    publishMapping(foreignRoot);
+    const foreignOwner = context(foreignRoot, "foreign-selection");
+    const foreignController = createWorkflowSessionController({ cwd: foreignRoot, context: foreignOwner });
+    const foreignBus = fakePi();
+    registerWorkflowTools(foreignBus.pi as never, { cwd: foreignRoot, getSessionController: () => foreignController });
+    await foreignBus.emit("session_start", {}, { cwd: foreignRoot, mode: "tui", hasUI: true, session_id: foreignOwner.session_id });
+    const foreignStatus = await foreignBus.tools.get("workflow_status")!.execute(
+      "readonly-title-foreign",
+      { selector: { list_item: listItem } },
+      undefined,
+      undefined,
+      { cwd: foreignRoot, mode: "tui", hasUI: true, session_id: foreignOwner.session_id },
+    );
+    assert.equal(record(record(foreignStatus.details).details).code, "run_selection_required");
+
+    finish("title-filter-other");
+    const retry = await statusTool.execute(
+      "readonly-title-retry",
+      { selector: { list_item: listItem } },
+      undefined,
+      undefined,
+      { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id },
+    );
+    const retryValue = record(retry.details);
+    assert.equal(retryValue.ok, true, JSON.stringify(retry.details));
+    assert.equal(retryValue.run_id, selectedCandidate.run_id, "a nonmatching run must not shift the displayed filtered index");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(foreignRoot, { recursive: true, force: true });
+  }
+});
 test("workflow_prepare command intent reserves through selector errors and commits once", async () => {
   const root = scratch("rl-command-intent-boundary");
   try {

@@ -71,6 +71,23 @@ function scratch(prefix: string): string {
   mkdirSync(root, { recursive: true });
   return root;
 }
+function snapshotTree(root: string): Record<string, Buffer | null> {
+  const snapshot: Record<string, Buffer | null> = {};
+  const visit = (directory: string, prefix = ""): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const relativePath = join(prefix, entry.name);
+      const absolutePath = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        snapshot[relativePath] = null;
+        visit(absolutePath, relativePath);
+      } else {
+        snapshot[relativePath] = readFileSync(absolutePath);
+      }
+    }
+  };
+  if (existsSync(root)) visit(root);
+  return snapshot;
+}
 
 function initGit(root: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", BRANCH], { stdio: "ignore" });
@@ -1364,6 +1381,211 @@ test("workflow_prepare rework snapshots evidence and invalidates downstream outp
   }
 });
 
+test("rework requires an explicit affected stage before any lifecycle mutation", () => {
+  const root = scratch("omp-lifecycle-rework-stage-required");
+  try {
+    initGit(root);
+    const execution = context(root, "rework-stage-required");
+    const prepared = prepareWorkflowState({
+      ...prepareOptions(root, "summary rework", "rework-stage-required-new", execution),
+      classification: {
+        type: "FEATURE",
+        complexity: "COMPLEX",
+        confidence: "HIGH",
+        autonomous: false,
+        workflow: "full-feature",
+      },
+    });
+    const runId = prepared.state.run_id!;
+    const artifactBytes = {
+      exploration: Buffer.from('{"artifact":"exploration","version":1}\n', "utf8"),
+      implementation: Buffer.from('{"artifact":"implementation","version":1}\n', "utf8"),
+      review: Buffer.from('{"artifact":"review","version":1}\n', "utf8"),
+      summary: Buffer.from('{"artifact":"summary","version":1}\n', "utf8"),
+    };
+    mkdirSync(prepared.artifactsDir, { recursive: true });
+    for (const [artifactId, bytes] of Object.entries(artifactBytes)) {
+      writeFileSync(join(prepared.artifactsDir, `${artifactId}.json`), bytes);
+    }
+    updateCanonicalRun(root, runId, (current) => ({
+      ...current,
+      lifecycle_status: "complete",
+      pause: { kind: "done", reason: "completed" },
+      stage_cursor: "summary",
+      stages: current.stages.map((stage) => ({ ...stage, status: "done" as const })),
+      artifacts: Object.fromEntries(Object.keys(artifactBytes).map((artifactId) => [artifactId, `artifacts/${artifactId}.json`])),
+    }));
+
+    const statePath = runStatePath(root, runId);
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const revisionsRoot = join(root, ".work-state", "runs", runId, "revisions");
+    const beforeState = readFileSync(statePath);
+    const beforeControl = readFileSync(controlPath);
+    const beforeClaim = readRunControl(root).execution_claim;
+    const beforeArtifacts = Object.fromEntries(
+      Object.keys(artifactBytes).map((artifactId) => [artifactId, readFileSync(join(prepared.artifactsDir, `${artifactId}.json`))]),
+    );
+    assert.equal(existsSync(revisionsRoot), false);
+
+    const reworkBase = {
+      ...prepareOptions(root, "ignored task text", "rework-stage-required", execution),
+      classification: {
+        type: "FEATURE" as const,
+        complexity: "COMPLEX" as const,
+        confidence: "HIGH" as const,
+        autonomous: false,
+        workflow: "full-feature" as const,
+      },
+      mode: "rework" as const,
+      run_id: runId,
+      feedback: "repair the implementation result",
+    };
+    for (const [index, affectedStage] of [undefined, "", " \t"].entries()) {
+      const invalidRequest = {
+        ...reworkBase,
+        request_id: `rework-stage-required-${index}`,
+        ...(affectedStage === undefined ? {} : { affected_stage: affectedStage }),
+      };
+      assert.throws(
+        () => prepareWorkflowState(invalidRequest),
+        (error: unknown) =>
+          error instanceof LifecycleError
+          && error.code === "lifecycle_request_conflict"
+          && error.unchanged === true
+          && typeof error.next_action === "string"
+          && error.next_action.length > 0,
+      );
+      assert.deepEqual(readFileSync(statePath), beforeState);
+      assert.deepEqual(readFileSync(controlPath), beforeControl);
+      assert.deepEqual(readRunControl(root).execution_claim, beforeClaim);
+      for (const [artifactId, bytes] of Object.entries(beforeArtifacts)) {
+        assert.deepEqual(readFileSync(join(prepared.artifactsDir, `${artifactId}.json`)), bytes);
+      }
+      assert.equal(existsSync(revisionsRoot), false);
+    }
+
+    const explicitRequest = {
+      ...reworkBase,
+      request_id: "rework-stage-required-explicit",
+      affected_stage: "implementation",
+    };
+    const reworked = prepareWorkflowState(explicitRequest);
+    assert.equal(reworked.state.stage_cursor, "implementation");
+    assert.equal(reworked.state.stages.find((stage) => stage.id === "exploration")?.status, "done");
+    assert.equal(reworked.state.stages.find((stage) => stage.id === "implementation")?.status, "pending");
+    assert.equal(reworked.state.stages.find((stage) => stage.id === "code_review")?.status, "pending");
+    assert.equal(reworked.state.stages.find((stage) => stage.id === "summary")?.status, "pending");
+    assert.equal(reworked.state.artifacts.exploration, "artifacts/exploration.json");
+    assert.equal(reworked.state.artifacts.implementation, undefined);
+    assert.equal(reworked.state.artifacts.review, undefined);
+    assert.equal(reworked.state.artifacts.summary, undefined);
+    assert.deepEqual(readFileSync(join(prepared.artifactsDir, "exploration.json")), artifactBytes.exploration);
+    assert.equal(existsSync(join(prepared.artifactsDir, "implementation.json")), false);
+    assert.equal(existsSync(join(prepared.artifactsDir, "review.json")), false);
+    assert.equal(existsSync(join(prepared.artifactsDir, "summary.json")), false);
+
+    const afterState = readFileSync(statePath);
+    const afterControl = readFileSync(controlPath);
+    const revisionId = readdirSync(revisionsRoot)[0]!;
+    const revisionFiles = ["state.json", "manifest.json", "artifacts/exploration.json", "artifacts/implementation.json", "artifacts/review.json", "artifacts/summary.json"];
+    const afterRevisionBytes = Object.fromEntries(
+      revisionFiles.map((relativePath) => [relativePath, readFileSync(join(revisionsRoot, revisionId, relativePath))]),
+    );
+    const replayed = prepareWorkflowState(explicitRequest);
+    assert.deepEqual(replayed.transition, reworked.transition);
+    assert.deepEqual(readFileSync(statePath), afterState);
+    assert.deepEqual(readFileSync(controlPath), afterControl);
+    for (const [relativePath, bytes] of Object.entries(afterRevisionBytes)) {
+      assert.deepEqual(readFileSync(join(revisionsRoot, revisionId, relativePath)), bytes);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("invalid nonblank rework stage refuses before legacy migration mutation", () => {
+  const root = scratch("omp-lifecycle-rework-stage-preflight");
+  try {
+    initGit(root);
+    const execution = context(root, "rework-stage-preflight");
+    const prepared = prepareWorkflowState({
+      ...prepareOptions(root, "completed summary", "rework-stage-preflight-new", execution),
+      classification: {
+        type: "FEATURE",
+        complexity: "COMPLEX",
+        confidence: "HIGH",
+        autonomous: false,
+        workflow: "full-feature",
+      },
+    });
+    const runId = prepared.state.run_id!;
+    const artifactBytes = {
+      exploration: Buffer.from('{"artifact":"exploration","version":1}\n', "utf8"),
+      implementation: Buffer.from('{"artifact":"implementation","version":1}\n', "utf8"),
+      review: Buffer.from('{"artifact":"review","version":1}\n', "utf8"),
+      summary: Buffer.from('{"artifact":"summary","version":1}\n', "utf8"),
+    };
+    mkdirSync(prepared.artifactsDir, { recursive: true });
+    for (const [artifactId, bytes] of Object.entries(artifactBytes)) {
+      writeFileSync(join(prepared.artifactsDir, `${artifactId}.json`), bytes);
+    }
+    updateCanonicalRun(root, runId, (current) => ({
+      ...current,
+      lifecycle_status: "complete",
+      pause: { kind: "done", reason: "completed" },
+      stage_cursor: "summary",
+      stages: current.stages.map((stage) => ({ ...stage, status: "done" as const })),
+      artifacts: Object.fromEntries(Object.keys(artifactBytes).map((artifactId) => [artifactId, `artifacts/${artifactId}.json`])),
+    }));
+
+    const legacyRoot = join(root, ".work-state");
+    const legacyPath = join(legacyRoot, "team-state.json");
+    const legacyArtifactPath = join(legacyRoot, "artifacts", "history.json");
+    mkdirSync(dirname(legacyArtifactPath), { recursive: true });
+    const legacyState = {
+      schema: 1,
+      branch: BRANCH,
+      run_key: `${BRANCH}:root`,
+      classification: prepared.state.classification,
+      task: "pending legacy source",
+      stage_cursor: prepared.profile.stages[0]?.id ?? "exploration",
+      stages: prepared.profile.stages.map((stage) => ({ id: stage.id, status: stage.id === prepared.profile.stages[0]?.id ? "done" as const : "pending" as const })),
+      artifacts: { history: "artifacts/history.json" },
+      scope: { scope: ["worker"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "worker" },
+      pause: { kind: "none" as const, reason: "" },
+      updated_at: "2026-09-19T00:00:00.000Z",
+    };
+    const legacyStateBytes = Buffer.from(`${JSON.stringify(legacyState, null, 2)}\n`, "utf8");
+    const legacyArtifactBytes = Buffer.from('{"legacy":"preserved"}\n', "utf8");
+    writeFileSync(legacyPath, legacyStateBytes);
+    writeFileSync(legacyArtifactPath, legacyArtifactBytes);
+    assert.deepEqual(discoverLegacySources(root).sources.map((source) => source.source_id), ["legacy"]);
+
+    const beforeWorkspace = snapshotTree(legacyRoot);
+    const invalidRequest = {
+      ...prepareOptions(root, "ignored task text", "rework-stage-preflight-invalid", execution),
+      classification: {
+        type: "FEATURE" as const,
+        complexity: "COMPLEX" as const,
+        confidence: "HIGH" as const,
+        autonomous: false,
+        workflow: "full-feature" as const,
+      },
+      mode: "rework" as const,
+      run_id: runId,
+      feedback: "repair the summary result",
+      affected_stage: "not-declared",
+    };
+    assert.throws(
+      () => prepareWorkflowState(invalidRequest),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_state_invalid",
+    );
+    assert.deepEqual(snapshotTree(legacyRoot), beforeWorkspace);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
 test("prepare receipt exact replay is idempotent while changed payload and corruption fail closed", () => {
   const root = scratch("omp-lifecycle-replay");
   try {
@@ -1458,6 +1680,7 @@ test("rework snapshot uses one captured state image and fences competing writes"
       run_id: runId,
       branch: BRANCH,
       feedback: "rework after competing write",
+      affected_stage: "implementation",
     };
     const receipt: PrepareRequestReceipt = {
       request_id: request.request_id,

@@ -279,7 +279,7 @@ export function validateLifecycleRequestValue(value: unknown, path = "$"): Contr
     if (value.selector !== undefined) validateLifecycleSelectorValue(value.selector, `${path}.selector`, issues);
     if (mode === "rework") {
       requireString(value, "feedback", path, issues);
-      if (value.affected_stage !== undefined) requireString(value, "affected_stage", path, issues);
+      requireString(value, "affected_stage", path, issues);
     }
   }
   if (isRecord(value.execution) && value.execution.branch !== value.branch) add(issues, `${path}.execution.branch`, "must equal request branch");

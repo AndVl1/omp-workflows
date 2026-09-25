@@ -525,6 +525,31 @@ export interface WorkflowContractOptions {
   stageId?: string;
   maxInstructions?: number;
 }
+export interface WorkflowProfileStageContract {
+  id: string;
+  title: string;
+  type: StageDef["type"];
+  description?: string;
+  prompt?: string;
+  consumes?: string[];
+  optional_consumes?: string[];
+  produces?: StageDef["produces"];
+}
+
+function profileStagesFor(stages: StageDef[]): WorkflowProfileStageContract[] {
+  return stages.map((stage) => ({
+    id: stage.id,
+    title: stage.title,
+    type: stage.type,
+    ...(stage.description !== undefined ? { description: stage.description } : {}),
+    ...(stage.prompt !== undefined ? { prompt: stage.prompt } : {}),
+    ...(stage.consumes !== undefined ? { consumes: [...stage.consumes] } : {}),
+    ...(stage.optional_consumes !== undefined ? { optional_consumes: [...stage.optional_consumes] } : {}),
+    ...(stage.produces !== undefined
+      ? { produces: Array.isArray(stage.produces) ? [...stage.produces] : stage.produces }
+      : {}),
+  }));
+}
 
 export interface WorkflowStageContract {
   id: string;
@@ -628,7 +653,14 @@ function artifactSchemasFor(stage: StageDef): Record<string, JsonSchemaDef | nul
 
 export interface WorkflowContract {
   workflow: WorkflowName;
-  profile: { title: string; description: string; path: string | null; hash: string; source: "workflow" };
+  profile: {
+    title: string;
+    description: string;
+    path: string | null;
+    hash: string;
+    source: "workflow";
+    stages: WorkflowProfileStageContract[];
+  };
   completion_intent: CompletionIntent;
   checkpoint_policy: CheckpointPolicy | null;
   checkpoint_decision: CheckpointDecision | TypedCheckpointDecision | null;
@@ -1115,7 +1147,14 @@ function resolveWorkflowContractLocked(cwd: string, options: WorkflowContractOpt
     : hash({ source: "stateless", workflow, stage: stage.id, profileHash: pHash });
   return {
     workflow,
-    profile: { title: profile.title, description: profile.description, path, hash: pHash, source: "workflow" },
+    profile: {
+      title: profile.title,
+      description: profile.description,
+      path,
+      hash: pHash,
+      source: "workflow",
+      stages: profileStagesFor(profile.stages),
+    },
     completion_intent,
     checkpoint_policy,
     checkpoint_decision,
