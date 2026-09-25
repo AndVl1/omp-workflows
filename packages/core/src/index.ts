@@ -2824,7 +2824,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_complete",
     label: "Complete workflow dispatch",
-    description: "Record durable completion for an authorized workflow dispatch. Copy the compact profile_hash fingerprint and the handoff loop_iteration exactly from the current workflow handoff; do not abbreviate or reconstruct either.",
+    description: "Record durable completion for an authorized workflow dispatch. Use only the newest explicit `workflow_begin` handoff's `dispatch_token` as `token`; never use its `advance_token` or any pre-begin, auto-advance, or older-begin token. Copy `capability_id`, `run_key`, `branch`, `workflow`, `profile_hash`, `stage_cursor`, `cursor_epoch`, and `loop_iteration` from that handoff exactly (`profile_hash` is the compact fingerprint); do not abbreviate, reconstruct, disclose, or retry with another token.",
     parameters: z.object({
       dispatch_id: z.string().min(1),
       token: z.string().min(1),
@@ -2864,7 +2864,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_checkpoint",
     label: "Record checkpoint decision",
-    description: "Persist a typed, policy-bound decision envelope for a declared stage checkpoint. Human authorization requires a durable terminal/escalation answer proof from workflow_checkpoint_ask: copy the returned proof, decision, checkpoint_kind, and loop_iteration binding verbatim — any reconstructed or abbreviated value rejects. Legacy mode/actor fields never authorize a transition.",
+    description: "Persist a typed, policy-bound decision envelope for a declared stage checkpoint. Use only the newest explicit `workflow_begin` handoff's `advance_token` as `token`; never use its `dispatch_token` or any pre-begin, auto-advance, or older-begin token. Copy `capability_id`, `run_key`, `branch`, `workflow`, `profile_hash`, `stage_cursor`, `cursor_epoch`, and `loop_iteration` exactly; human authorization requires a durable terminal/escalation answer proof from `workflow_checkpoint_ask`: copy the returned proof, decision, checkpoint_kind, and loop_iteration binding verbatim — any reconstructed or abbreviated value rejects. Legacy mode/actor fields never authorize a transition; fail closed rather than retrying with another token or disclosing secrets.",
     parameters: z.object({
       token: z.string().min(1),
       capability_id: z.string().min(1),
@@ -2930,7 +2930,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_checkpoint_ask",
     label: "Ask human to authorize checkpoint",
-    description: "Trusted terminal ingest for the current stage checkpoint: validates the active capability and the unresolved checkpoint, asks the human at the live UI surface (terminal dialog or connected RPC client), and commits the answer through the engine's durable checkpoint ledger in one cross-process transaction (fresh-state revalidation, live-proof supersession, and the CAS commit are engine-owned). Returns the proof plus actor_provenance for the follow-up workflow_checkpoint call — copy the returned proof, decision, checkpoint_kind, and loop_iteration verbatim; never reconstruct them. The human's selection is the only source of the recorded decision — never guess or fabricate it. Fails closed without an interactive UI surface; Esc, timeout, and custom free-text answers record nothing; cancellation and any state/capability/policy transition while the dialog is open reject without persisting.",
+    description: "Trusted terminal ingest for the current stage checkpoint. Use only the newest explicit `workflow_begin` handoff's `advance_token` as `token`; never use its `dispatch_token` or any pre-begin, auto-advance, or older-begin token. This ask schema intentionally omits `profile_hash`; preserve its declared `capability_id`, `run_key`, `branch`, `workflow`, `stage_cursor`, `cursor_epoch`, and `loop_iteration` binding fields exactly, with checkpoint fields from the current stage contract. It validates the active capability and unresolved checkpoint, asks the human at the live UI surface (terminal dialog or connected RPC client), and commits the answer through the engine's durable checkpoint ledger in one cross-process transaction (fresh-state revalidation, live-proof supersession, and the CAS commit are engine-owned). Returns the proof plus actor_provenance for the follow-up `workflow_checkpoint` call — copy the returned proof, decision, checkpoint_kind, and loop_iteration verbatim; never reconstruct them. The human's selection is the only source of the recorded decision — never guess or fabricate it. Fails closed without an interactive UI surface; Esc, timeout, and custom free-text answers record nothing; cancellation and any state/capability/policy transition while the dialog is open reject without persisting. Do not retry with another token or disclose secrets.",
     parameters: z.object({
       token: z.string().min(1),
       capability_id: z.string().min(1),
@@ -3190,7 +3190,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_advance",
     label: "Advance workflow",
-    description: "Join the current stage and advance its durable cursor after all dispatches complete. Pass the handoff binding including loop_iteration verbatim; a binding replayed from a prior loop iteration rejects.",
+    description: "Join the current stage and advance its durable cursor after all dispatches complete. Use only the newest explicit `workflow_begin` handoff's `advance_token` as `token`; never use its `dispatch_token` or any pre-begin, auto-advance, or older-begin token. Copy `capability_id`, `run_key`, `branch`, `workflow`, `profile_hash`, `stage_cursor`, `cursor_epoch`, and `loop_iteration` exactly from that handoff; a binding replayed from a prior loop iteration rejects. Do not disclose secrets or retry with another token; fail closed on a swapped or stale binding.",
     parameters: z.object({
       token: z.string().min(1),
       capability_id: z.string().min(1),
