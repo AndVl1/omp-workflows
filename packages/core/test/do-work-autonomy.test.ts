@@ -29,6 +29,7 @@ import { createWorkflowSessionController } from "../src/engine/host-controller.j
 import { resolveConfig } from "../src/engine/config.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { appendCheckpointDecision, checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
+import { acquireCtoIngress, suspendCtoSession } from "../src/cto/run.js";
 import { resolveWorkflowContract } from "../src/engine/workflow-contract.js";
 import { buildDispatchMarker, dispatchTaskId, parseDispatchMarker, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
@@ -402,6 +403,71 @@ test("lifecycle write routes are exact outer exemptions while handlers retain ho
     ];
     assert.equal(controller.selectedRunId(), undefined, "positive route must begin without a preselected run");
     assert.equal(toolCall(routeEvent("xd://workflow_prepare"), trusted), undefined, "workflow_prepare outer write should reach its handler");
+    const ctoState = tools.get("cto_state");
+    assert.ok(ctoState, "registered cto_state handler is required");
+    const ctoIngress = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "generic write route CTO state",
+      controller,
+    });
+    assert.equal(toolCall(routeEvent("xd://cto_state"), trusted), undefined, "exact cto_state write should reach its registered handler");
+    const ownerRead = (await ctoState.execute(
+      "trusted-cto-route-read",
+      { operation: "read", run_id: ctoIngress.run_id },
+      undefined,
+      undefined,
+      trusted as never,
+    )).details as { ok?: boolean; operation?: string; state?: unknown; state_revision?: string; error?: string };
+    assert.equal(ownerRead.ok, true, ownerRead.error);
+    assert.equal(ownerRead.operation, "read");
+    assert.ok(ownerRead.state_revision);
+    const commitCandidate = structuredClone(ownerRead.state) as Record<string, unknown>;
+    commitCandidate.pause = { kind: "none", reason: "generic write transport regression" };
+    const ownerCommit = (await ctoState.execute(
+      "trusted-cto-route-commit",
+      {
+        operation: "commit",
+        run_id: ctoIngress.run_id,
+        expected_state_revision: ownerRead.state_revision,
+        state: commitCandidate,
+      },
+      undefined,
+      undefined,
+      trusted as never,
+    )).details as { ok?: boolean; operation?: string; transition?: string; error?: string };
+    assert.equal(ownerCommit.ok, true, ownerCommit.error);
+    assert.equal(ownerCommit.operation, "commit");
+    assert.equal(ownerCommit.transition, "state");
+    const ctoStatePath = join(root, ".work-state", "cto", ctoIngress.run_id, "state.json");
+    const committedCtoBytes = readFileSync(ctoStatePath, "utf8");
+    const committedCtoState = JSON.parse(committedCtoBytes) as { pause?: { reason?: string } };
+    assert.equal(committedCtoState.pause?.reason, "generic write transport regression");
+    const deniedCtoContexts: Array<[string, unknown]> = [
+      ["foreign", sessionContext("foreign-session", "tui", true)],
+      ["worker", sessionContext("worker-session", "print", false)],
+      ["unknown", { sessionManager: { getCwd: () => root }, mode: "tui", hasUI: true }],
+    ];
+    for (const [label, deniedContext] of deniedCtoContexts) {
+      assert.equal(toolCall(routeEvent("xd://cto_state"), deniedContext), undefined, `${label} cto_state transport must defer to controller authorization`);
+      const denied = (await ctoState.execute(
+        `${label}-cto-route-commit`,
+        {
+          operation: "commit",
+          run_id: ctoIngress.run_id,
+          expected_state_revision: ownerRead.state_revision,
+          state: commitCandidate,
+        },
+        undefined,
+        undefined,
+        deniedContext as never,
+      )).details as { ok?: boolean; code?: string };
+      assert.equal(denied.ok, false, `${label} cto_state commit must be denied`);
+      assert.equal(denied.code, "WORKFLOW_CONTEXT_REJECTED", `${label} cto_state denial must come from controller authentication`);
+      assert.equal(readFileSync(ctoStatePath, "utf8"), committedCtoBytes, `${label} cto_state denial must preserve canonical bytes`);
+    }
+    suspendCtoSession(controller, "session-shutdown");
+
     const prepare = tools.get("workflow_prepare");
     assert.ok(prepare, "workflow_prepare handler is required");
     const params = {
@@ -436,6 +502,7 @@ test("lifecycle write routes are exact outer exemptions while handlers retain ho
     }
     const deniedRoutes: Array<[string, unknown]> = [
       ["query", routeEvent("xd://workflow_prepare?mode=new")],
+      ["cto_query", routeEvent("xd://cto_state?operation=read")],
       ["suffix", routeEvent("xd://workflow_prepare/")],
       ["selector", routeEvent("xd://workflow_prepare#selector")],
       ["traversal", routeEvent("xd://workflow_prepare/../workflow_begin")],
@@ -444,6 +511,7 @@ test("lifecycle write routes are exact outer exemptions while handlers retain ho
       ["ast_edit", routeEvent("xd://ast_edit")],
       ["source", routeEvent("src/app.ts")],
       [".work-state", routeEvent(".work-state/runs/current/state.json")],
+      ["cto_state_file", routeEvent(`.work-state/cto/${ctoIngress.run_id}/state.json`)],
       ["mixed", { toolName: "write", input: { path: ["xd://workflow_prepare", "src/app.ts"], content: "{}" } }],
       ["edit", { toolName: "edit", input: { path: "xd://workflow_prepare", content: "{}" } }],
       ["bash", { toolName: "bash", input: { command: "echo route" } }],

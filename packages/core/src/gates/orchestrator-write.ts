@@ -22,6 +22,7 @@ const REGISTERED_LIFECYCLE_DEVICE_ROUTES = new Set([
   "xd://workflow_checkpoint",
   "xd://workflow_checkpoint_ask",
   "xd://workflow_advance",
+  "xd://cto_state",
 ]);
 
 type Actor = "orchestrator" | "worker" | "lead";
