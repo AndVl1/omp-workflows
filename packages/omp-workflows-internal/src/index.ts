@@ -97,7 +97,7 @@ const NAMESPACED_DESCRIPTIONS = {
 	doWorkDescription: "Run a profile-driven workflow. /omp-do-work <task>. (Alias: /omp-team.)",
 	teamDescription: "Alias for /omp-do-work. Prefer /omp-do-work in new code.",
 	ctoDescription:
-		"CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /omp-cto [--run <exact-cto-id>] <task>; /omp-cto alone starts STANDBY (tasks arrive via messenger inbox). Managed suspension preserves pending work across verified session replacement/shutdown. Runs in-session — never task(agent=cto)",
+		"CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /omp-cto [--run <exact-cto-id>] <task>; /omp-cto --recover-legacy --run <exact-cto-id> requires interactive confirmation for claimless legacy recovery. /omp-cto alone starts STANDBY (tasks arrive via messenger inbox). Managed suspension preserves pending work across verified session replacement/shutdown. Runs in-session — never task(agent=cto)",
 } as const;
 
 interface InternalSessionBinding {

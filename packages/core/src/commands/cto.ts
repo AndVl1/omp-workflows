@@ -43,6 +43,7 @@ export interface ParsedCtoCommand {
   ok: true;
   task: string;
   run_id?: string;
+  recover_legacy?: boolean;
 }
 
 export interface ParsedCtoCommandFailure {
@@ -59,6 +60,9 @@ export function parseCtoCommand(args: string): CtoCommandParseResult {
   const tokens = [...args.matchAll(/\S+/g)].map((match) => ({ value: match[0]!, start: match.index! }));
   let parsingOptions = true;
   let runId: string | undefined;
+  let runSelectorCount = 0;
+  let recoverLegacy = false;
+  let recoverLegacyCount = 0;
   let task = "";
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
@@ -77,6 +81,17 @@ export function parseCtoCommand(args: string): CtoCommandParseResult {
       task = args.slice(token.start).trim();
       break;
     }
+    if (token.value === "--recover-legacy") {
+      recoverLegacyCount += 1;
+      if (recoverLegacyCount > 1) {
+        return { ok: false, code: "lifecycle_request_conflict", error: "duplicate --recover-legacy selectors are ambiguous" };
+      }
+      recoverLegacy = true;
+      if (runSelectorCount > 1) {
+        return { ok: false, code: "lifecycle_request_conflict", error: "duplicate --run selectors are ambiguous for legacy recovery" };
+      }
+      continue;
+    }
     if (token.value === "--run") {
       const next = tokens[index + 1]?.value;
       if (!next || next === "--" || next.startsWith("--")) {
@@ -84,6 +99,10 @@ export function parseCtoCommand(args: string): CtoCommandParseResult {
       }
       if (!/^[A-Za-z0-9._-]+$/.test(next) || next === "." || next === "..") {
         return { ok: false, code: "lifecycle_request_conflict", error: `invalid exact CTO run id '${next}'` };
+      }
+      runSelectorCount += 1;
+      if (recoverLegacy && runSelectorCount > 1) {
+        return { ok: false, code: "lifecycle_request_conflict", error: "duplicate --run selectors are ambiguous for legacy recovery" };
       }
       runId = next;
       index += 1;
@@ -95,12 +114,19 @@ export function parseCtoCommand(args: string): CtoCommandParseResult {
       if (!/^[A-Za-z0-9._-]+$/.test(value) || value === "." || value === "..") {
         return { ok: false, code: "lifecycle_request_conflict", error: `invalid exact CTO run id '${value}'` };
       }
+      runSelectorCount += 1;
+      if (recoverLegacy && runSelectorCount > 1) {
+        return { ok: false, code: "lifecycle_request_conflict", error: "duplicate --run selectors are ambiguous for legacy recovery" };
+      }
       runId = value;
       continue;
     }
     return { ok: false, code: "lifecycle_request_conflict", error: `unknown CTO option '${token.value}'` };
   }
-  return { ok: true, task, ...(runId ? { run_id: runId } : {}) };
+  if (recoverLegacy && !runId) {
+    return { ok: false, code: "lifecycle_request_conflict", error: "--recover-legacy requires an exact --run selector" };
+  }
+  return { ok: true, task, ...(runId ? { run_id: runId } : {}), ...(recoverLegacy ? { recover_legacy: true } : {}) };
 }
 
 /**

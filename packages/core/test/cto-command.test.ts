@@ -11,7 +11,44 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { parseCtoEnvelope } from "@andvl1/omp-workflows-core";
+import { parseCtoCommand } from "../src/commands/cto.js";
 
+
+test("cto-cmd: legacy recovery selectors are explicit, exact, and terminator-bound", () => {
+  assert.deepEqual(parseCtoCommand("--recover-legacy --run legacy-run"), {
+    ok: true,
+    task: "",
+    run_id: "legacy-run",
+    recover_legacy: true,
+  });
+  assert.deepEqual(parseCtoCommand("--run=legacy-run --recover-legacy -- --recover-legacy --run another"), {
+    ok: true,
+    task: "--recover-legacy --run another",
+    run_id: "legacy-run",
+    recover_legacy: true,
+  });
+
+  const missingRun = parseCtoCommand("--recover-legacy");
+  assert.equal(missingRun.ok, false);
+  if (missingRun.ok) throw new Error("expected missing --run failure");
+  assert.match(missingRun.error, /requires an exact --run/);
+
+  const duplicateRecovery = parseCtoCommand("--recover-legacy --recover-legacy --run legacy-run");
+  assert.equal(duplicateRecovery.ok, false);
+  if (duplicateRecovery.ok) throw new Error("expected duplicate recovery failure");
+  assert.match(duplicateRecovery.error, /duplicate --recover-legacy/);
+
+  const duplicateRun = parseCtoCommand("--recover-legacy --run first --run second");
+  assert.equal(duplicateRun.ok, false);
+  if (duplicateRun.ok) throw new Error("expected duplicate run failure");
+  assert.match(duplicateRun.error, /duplicate --run/);
+
+  const literalRecovery = parseCtoCommand("-- --recover-legacy --run legacy-run");
+  assert.deepEqual(literalRecovery, {
+    ok: true,
+    task: "--recover-legacy --run legacy-run",
+  });
+});
 
 test("cto-cmd: natural-language directive sets the hint and stays out of the task", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-core-ru-"));

@@ -6,7 +6,7 @@
  * authenticated host-session seam.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { buildTeamPlan, validateDecompositionDepth, type PlanTeamInput } from "./plan.js";
@@ -27,6 +27,7 @@ import {
   beginLifecycleTransaction,
   commitLifecycleTransaction,
   lifecycleTransactionStatus,
+  type LifecycleFileContent,
 } from "../engine/lifecycle-journal.js";
 import { withWorkspaceReadNoRecovery, withWorkspaceTransaction } from "../engine/state.js";
 import type { ModelClassification } from "../engine/run.js";
@@ -77,6 +78,13 @@ export interface CtoIngressOptions {
   controller: WorkflowSessionController;
 }
 
+export interface CtoRecoveryResult {
+  recovery_id: string;
+  source_sha256: string;
+  raw_backup_path: string;
+  receipt_path: string;
+}
+
 export interface CtoIngressResult {
   run_id: string;
   state: CtoState;
@@ -84,6 +92,7 @@ export interface CtoIngressResult {
   statePath: string;
   created: boolean;
   standby: boolean;
+  recovery?: CtoRecoveryResult;
 }
 export interface CtoModelStateReadResult {
   state: CtoState;
@@ -704,6 +713,299 @@ function activeLegacyCtoStateIds(cwd: string): string[] {
     if (evidence.kind === "valid" && !isCtoRunTerminal(evidence.state)) ids.push(id);
   }
   return ids;
+}
+
+const LEGACY_CTO_METADATA_KEYS = ["session", "workflow", "orchestration_profile", "stage", "checkpoint", "progress"] as const;
+const LEGACY_RECOVERY_ATTESTATION = "I attest that the previous coordinator AND all workers for this run have been stopped.";
+const LEGACY_COMPLETION_RATIONALE = "Recovery metadata: the legacy completion-intent rationale was absent; no historical approval or checkpoint authorization is inferred.";
+
+type LegacyCtoRecoverySnapshot = {
+  context: TrustedExecutionContext;
+  state_bytes: Buffer;
+  state_file: LifecycleFileContent;
+  control_file: LifecycleFileContent;
+  state_content: string;
+  state: CtoState;
+  recovery_id: string;
+  source_sha256: string;
+  raw_backup_path: string;
+  receipt_path: string;
+  receipt_content: string;
+  confirmed_at: string;
+  summary: string;
+};
+
+function optionalRawFile(path: string): Buffer | null {
+  try {
+    return readFileSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function lifecycleContent(bytes: Buffer | null): LifecycleFileContent {
+  return bytes === null ? null : { encoding: "base64", data: bytes.toString("base64") };
+}
+
+function sameLifecycleContent(left: LifecycleFileContent, right: LifecycleFileContent): boolean {
+  if (left === null || right === null) return left === right;
+  const leftBytes = typeof left === "string" ? Buffer.from(left, "utf8") : Buffer.from(left.data, "base64");
+  const rightBytes = typeof right === "string" ? Buffer.from(right, "utf8") : Buffer.from(right.data, "base64");
+  return leftBytes.equals(rightBytes);
+}
+
+function sameTrustedContext(left: TrustedExecutionContext, right: TrustedExecutionContext): boolean {
+  return left.session_id === right.session_id
+    && left.caller === right.caller
+    && left.authority === right.authority
+    && left.branch === right.branch
+    && resolve(left.worktree) === resolve(right.worktree)
+    && (left.process_id ?? undefined) === (right.process_id ?? undefined);
+}
+
+function legacyRecoveryArtifactPaths(cwd: string, runId: string, recoveryId: string): { backup: string; receipt: string } {
+  const directory = join(".work-state", "cto", runId, "legacy-recovery", recoveryId);
+  return {
+    backup: join(directory, "raw-state.json"),
+    receipt: join(directory, "receipt.json"),
+  };
+}
+
+function legacyRecoveryFailure(runId: string, message: string, nextAction = "repair or explicitly reconcile the legacy CTO run"): LifecycleError {
+  return new LifecycleError("recovery_required", message, { run_id: runId, next_action: nextAction });
+}
+
+function buildLegacyRecoverySnapshot(
+  options: CtoIngressOptions,
+  context: TrustedExecutionContext,
+  stateBytes: Buffer,
+  control: RunControl,
+  confirmedAt: string,
+): LegacyCtoRecoverySnapshot {
+  const runId = options.run_id!;
+  const sourceSha256 = createHash("sha256").update(stateBytes).digest("hex");
+  const rawText = stateBytes.toString("utf8");
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(rawText);
+  } catch (error) {
+    throw legacyRecoveryFailure(runId, "legacy CTO state is not valid JSON: " + (error as Error).message);
+  }
+  if (!isRecord(decoded)) throw legacyRecoveryFailure(runId, "legacy CTO state must be a JSON object");
+  if (decoded.id !== runId) {
+    throw new LifecycleError("run_context_mismatch", "legacy CTO run identity does not match the requested run", { run_id: runId });
+  }
+  if (decoded.branch !== options.branch) {
+    throw new LifecycleError("run_context_mismatch", "legacy CTO run belongs to a different branch", { run_id: runId, branch: typeof decoded.branch === "string" ? decoded.branch : undefined });
+  }
+  if (control.execution_claim !== null) {
+    throw new LifecycleError("run_busy", "legacy CTO recovery refuses an existing worktree claim", { run_id: runId, next_action: "release or reconcile the existing claim before recovery" });
+  }
+  if (control.cto_releases[runId] !== undefined) {
+    throw legacyRecoveryFailure(runId, "legacy CTO run already has managed release provenance", "resume the managed CTO release instead of legacy recovery");
+  }
+  for (const [releaseRunId, release] of Object.entries(control.cto_releases)) {
+    if (releaseRunId !== runId && release.pending_worker_ids.length > 0) {
+      throw new LifecycleError("run_busy", "legacy CTO recovery refuses pending worker reservations in the release ledger", { run_id: releaseRunId, next_action: "settle pending workers before recovery" });
+    }
+  }
+
+  const candidate: Record<string, unknown> = { ...decoded };
+  const repairs: string[] = [];
+  const recognizedLegacyKeys: string[] = [];
+  for (const key of LEGACY_CTO_METADATA_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(decoded, key)) continue;
+    if (key === "session" && typeof decoded[key] !== "string") {
+      throw legacyRecoveryFailure(runId, "legacy session metadata has an invalid type");
+    }
+    recognizedLegacyKeys.push(key);
+    delete candidate[key];
+  }
+  if (decoded.schema === undefined || decoded.schema === 1) {
+    candidate.schema = 2;
+    repairs.push("schema");
+  }
+  if (!Object.prototype.hasOwnProperty.call(decoded, "updated_at")) {
+    candidate.updated_at = confirmedAt;
+    repairs.push("updated_at");
+  }
+  if (Object.prototype.hasOwnProperty.call(decoded, "completion_intent")) {
+    const completion = decoded.completion_intent;
+    if (isRecord(completion) && !Object.prototype.hasOwnProperty.call(completion, "rationale")) {
+      candidate.completion_intent = { ...completion, rationale: LEGACY_COMPLETION_RATIONALE };
+      repairs.push("completion_intent.rationale");
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(decoded, "owner_session") && typeof decoded.owner_session !== "string") {
+    throw legacyRecoveryFailure(runId, "canonical owner_session metadata has an invalid type");
+  }
+  if (decoded.owner_session !== context.session_id) repairs.push("owner_session");
+  candidate.owner_session = context.session_id;
+
+  let state: CtoState;
+  try {
+    state = validateCtoStateCandidate(candidate, runId);
+  } catch (error) {
+    throw legacyRecoveryFailure(runId, "legacy CTO state contains malformed or unrecognized typed fields: " + (error as Error).message);
+  }
+  if (isCtoRunTerminal(state)) {
+    throw new LifecycleError("run_terminal", "legacy CTO run is terminal", { run_id: runId });
+  }
+  if (state.leases !== undefined) {
+    if (!isRecord(state.leases)) throw legacyRecoveryFailure(runId, "legacy CTO lease ledger has an unrecognized shape");
+    if (Object.keys(state.leases).length > 0) {
+      throw new LifecycleError("run_busy", "legacy CTO recovery refuses active or unknown team lease evidence", { run_id: runId, next_action: "settle every team lease before recovery" });
+    }
+  }
+  if (hasOutstandingCtoWork(state)) {
+    throw new LifecycleError("run_busy", "legacy CTO recovery refuses pending worker or completion work", { run_id: runId, next_action: "settle pending CTO work before recovery" });
+  }
+  const finalStateContent = JSON.stringify(state, null, 2) + "\n";
+  const paths = legacyRecoveryArtifactPaths(options.cwd, runId, sourceSha256);
+  const previousOwner = typeof decoded.owner_session === "string"
+    ? decoded.owner_session
+    : typeof decoded.session === "string" ? decoded.session : "(unowned legacy run)";
+  const summary = [
+    "Recover claimless legacy CTO run '" + runId + "'.",
+    "Branch: " + context.branch + ".",
+    "Previous coordinator: " + previousOwner + ".",
+    "New coordinator: " + context.session_id + ".",
+    LEGACY_RECOVERY_ATTESTATION,
+    "The legacy state is repaired only for recognized metadata; task, checkpoint policy, completion intent, artifacts, budget, and history are preserved, while legacy strings never authorize a checkpoint.",
+  ].join("\n");
+  const receipt = {
+    schema: 1,
+    kind: "cto_legacy_recovery",
+    recovery_id: sourceSha256,
+    run_id: runId,
+    branch: context.branch,
+    previous_coordinator: previousOwner,
+    new_coordinator: context.session_id,
+    ...(context.process_id === undefined ? {} : { coordinator_process_id: context.process_id }),
+    confirmed_at: confirmedAt,
+    attestation: LEGACY_RECOVERY_ATTESTATION,
+    source_sha256: sourceSha256,
+    recovered_state_sha256: createHash("sha256").update(finalStateContent, "utf8").digest("hex"),
+    raw_backup_path: paths.backup,
+    recognized_legacy_keys: recognizedLegacyKeys,
+    repairs,
+    checkpoint_authorization: "none_inferred",
+  };
+  return {
+    context,
+    state_bytes: stateBytes,
+    state_file: lifecycleContent(stateBytes),
+    control_file: lifecycleContent(optionalRawFile(controlPath(options.cwd))),
+    state_content: finalStateContent,
+    state,
+    recovery_id: sourceSha256,
+    source_sha256: sourceSha256,
+    raw_backup_path: paths.backup,
+    receipt_path: paths.receipt,
+    receipt_content: JSON.stringify(receipt, null, 2) + "\n",
+    confirmed_at: confirmedAt,
+    summary,
+  };
+}
+
+function inspectLegacyCtoRecovery(
+  options: CtoIngressOptions,
+  context: TrustedExecutionContext,
+  confirmedAt: string,
+): LegacyCtoRecoverySnapshot {
+  return withWorkspaceReadNoRecovery(
+    options.cwd,
+    () => {
+      const statePath = ctoStatePath(options.run_id!, options.cwd);
+      const stateBytes = optionalRawFile(statePath);
+      if (stateBytes === null) throw new LifecycleError("run_not_found", "legacy CTO run '" + options.run_id + "' is missing", { run_id: options.run_id });
+      const control = readRunControlNoRecovery(options.cwd);
+      return buildLegacyRecoverySnapshot(options, context, stateBytes, control, confirmedAt);
+    },
+    () => { throw new LifecycleError("run_not_found", "legacy CTO run '" + options.run_id + "' is missing", { run_id: options.run_id }); },
+  );
+}
+
+/**
+ * Explicit host-confirmed recovery for a claimless legacy CTO state. Normal
+ * ingress deliberately does not call this path: the caller must opt in,
+ * present the exact run, and obtain an interactive attestation.
+ */
+export async function recoverLegacyCtoIngress(
+  options: CtoIngressOptions,
+  confirm: (summary: string) => Promise<boolean>,
+): Promise<CtoIngressResult | undefined> {
+  const runId = options.run_id;
+  if (typeof runId !== "string" || !/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === "..") {
+    throw new LifecycleError("lifecycle_request_conflict", "legacy CTO recovery requires an exact run_id", { run_id: runId });
+  }
+  if (typeof confirm !== "function") {
+    throw new LifecycleError("lifecycle_request_conflict", "legacy CTO recovery requires interactive host confirmation", { run_id: runId });
+  }
+  const context = assertContext(options.controller, options.cwd, options.branch);
+  if (ctoClaimCredentials(options.controller) || options.controller.activeCtoClaim()) {
+    throw new LifecycleError("run_busy", "legacy CTO recovery requires a fresh unbound coordinator", { run_id: runId });
+  }
+  const preflightAt = new Date().toISOString();
+  const preflight = inspectLegacyCtoRecovery(options, context, preflightAt);
+  if (!(await confirm(preflight.summary))) return undefined;
+  const confirmedAt = new Date().toISOString();
+  const postContext = assertContext(options.controller, options.cwd, options.branch);
+  if (!sameTrustedContext(context, postContext)) {
+    throw new LifecycleError("lifecycle_request_conflict", "trusted coordinator identity changed while legacy recovery was being confirmed", { run_id: runId, next_action: "start recovery again from the same host coordinator" });
+  }
+
+  let claimResult: ClaimResult | undefined;
+  let recoveredState: CtoState | undefined;
+  let publishedSnapshot: LegacyCtoRecoverySnapshot | undefined;
+  withWorkspaceTransaction(options.cwd, () => {
+    const lockedContext = assertContext(options.controller, options.cwd, options.branch);
+    if (!sameTrustedContext(postContext, lockedContext)) {
+      throw new LifecycleError("lifecycle_request_conflict", "trusted coordinator identity changed before the recovery transaction", { run_id: runId, next_action: "start recovery again from the same host coordinator" });
+    }
+    const current = inspectLegacyCtoRecovery(options, lockedContext, confirmedAt);
+    publishedSnapshot = current;
+    if (!current.state_bytes.equals(preflight.state_bytes)) {
+      throw new LifecycleError("lifecycle_request_conflict", "legacy CTO state changed while recovery confirmation was pending", { run_id: runId, next_action: "reread the exact legacy run and ask for confirmation again" });
+    }
+    if (!sameLifecycleContent(current.control_file, preflight.control_file)) {
+      throw new LifecycleError("lifecycle_request_conflict", "legacy CTO run-control changed while recovery confirmation was pending", { run_id: runId, next_action: "reread the exact legacy run and ask for confirmation again" });
+    }
+    claimResult = publishCtoClaim(options.cwd, {
+      run_id: runId,
+      branch: options.branch,
+      context: postContext,
+      state_content: current.state_content,
+      state_snapshot: { branch: options.branch, terminal: false, owner_session: postContext.session_id },
+      legacy_recovery: {
+        expected_state: current.state_file,
+        backup_path: current.raw_backup_path,
+        backup_content: current.state_file,
+        receipt_path: current.receipt_path,
+        receipt_content: current.receipt_content,
+      },
+    });
+    recoveredState = readCtoState(runId, options.cwd) ?? undefined;
+  });
+  if (!claimResult || !recoveredState || !publishedSnapshot) throw new LifecycleError("recovery_required", "legacy CTO recovery did not publish a state claim", { run_id: runId });
+  bindCtoClaim(options.controller, claimResult.claim);
+  rememberCtoController(options.controller, options.cwd, claimResult.claim);
+  bindCtoTerminalTransition(recoveredState, claimResult.claim, () => clearCtoClaimIfCurrent(options.controller, claimResult!.claim));
+  return {
+    run_id: runId,
+    state: recoveredState,
+    claim: claimResult,
+    statePath: ctoStatePath(runId, options.cwd),
+    created: false,
+    standby: recoveredState.standby === true,
+    recovery: {
+      recovery_id: publishedSnapshot.recovery_id,
+      source_sha256: publishedSnapshot.source_sha256,
+      raw_backup_path: publishedSnapshot.raw_backup_path,
+      receipt_path: publishedSnapshot.receipt_path,
+    },
+  };
 }
 
 function assertContext(

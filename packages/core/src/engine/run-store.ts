@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   normalizePersistedState,
   resolveActiveBranch,
@@ -856,6 +856,23 @@ export interface CtoClaimPublication {
   };
   /** Required only when attaching a claimless legacy state image. */
   legacy_owner_session_id?: string;
+  /**
+   * Explicit, user-confirmed legacy recovery. Unlike the ordinary legacy
+   * owner marker this path never steals an existing claim and publishes the
+   * repaired state, immutable raw backup, audit receipt, and fresh claim in
+   * one lifecycle transaction.
+   */
+  legacy_recovery?: {
+    /** Exact raw state image observed during the preflight read. */
+    expected_state: LifecycleFileContent;
+    /** Project-local path below `.work-state/cto/<run>/legacy-recovery/`. */
+    backup_path: string;
+    /** Byte-exact copy of `expected_state`; base64 is used for non-text bytes. */
+    backup_content: LifecycleFileContent;
+    /** Project-local audit receipt path below the same recovery directory. */
+    receipt_path: string;
+    receipt_content: string;
+  };
 }
 
 function expectedCtoStatePath(cwd: string, runId: string): string {
@@ -880,6 +897,53 @@ function validateCtoStatePublication(runId: string, content: string): Record<str
   return parsed;
 }
 
+function lifecycleContentEqual(left: LifecycleFileContent, right: LifecycleFileContent): boolean {
+  if (left === null || right === null) return left === right;
+  const leftBytes = typeof left === "string" ? Buffer.from(left, "utf8") : Buffer.from(left.data, "base64");
+  const rightBytes = typeof right === "string" ? Buffer.from(right, "utf8") : Buffer.from(right.data, "base64");
+  return leftBytes.equals(rightBytes);
+}
+
+function assertNoSymlinkRecoveryAncestors(cwd: string, path: string, runId: string): void {
+  const root = resolve(cwd);
+  const candidate = resolve(cwd, path);
+  const rootRelative = relative(root, candidate);
+  if (!rootRelative || rootRelative.startsWith("..") || isAbsolute(rootRelative)) {
+    throw new LifecycleError("run_state_invalid", "legacy recovery output escapes the trusted worktree", { run_id: runId });
+  }
+  let current = candidate;
+  for (;;) {
+    try {
+      if (lstatSync(current).isSymbolicLink()) {
+        throw new LifecycleError("recovery_required", "legacy recovery output contains a symlink ancestor", { run_id: runId });
+      }
+    } catch (error) {
+      if (error instanceof LifecycleError) throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw new LifecycleError("recovery_required", "legacy recovery output path cannot be verified", { run_id: runId });
+      }
+    }
+    if (current === root) return;
+    const parent = dirname(current);
+    const parentRelative = relative(root, parent);
+    if (parent === current || parentRelative.startsWith("..") || isAbsolute(parentRelative)) {
+      throw new LifecycleError("run_state_invalid", "legacy recovery output escapes the trusted worktree", { run_id: runId });
+    }
+    current = parent;
+  }
+}
+
+function assertLegacyRecoveryArtifactPath(cwd: string, runId: string, path: string, label: string): void {
+  const recoveryRoot = join(resolve(cwd, WORK_STATE), "cto", runId, "legacy-recovery");
+  const candidate = resolve(cwd, path);
+  const relativePath = relative(recoveryRoot, candidate);
+  if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+    throw new LifecycleError("run_state_invalid", "legacy recovery " + label + " must stay below the run recovery directory", { run_id: runId });
+  }
+  assertNoSymlinkRecoveryAncestors(cwd, path, runId);
+}
+
 /**
  * Atomically publish a CTO state image with its common worktree claim. The
  * target is derived from the CTO namespace and the payload carries the exact
@@ -896,17 +960,39 @@ export function publishCtoClaim(cwd: string, input: CtoClaimPublication): ClaimR
     const control = readControlRaw(cwd);
     const statePath = expectedCtoStatePath(cwd, input.run_id);
     const beforeState = readLifecycleFileContent(statePath);
+    const legacyRecovery = input.legacy_recovery;
+    if (legacyRecovery) {
+      if (input.state_content === undefined || beforeState === null) {
+        throw new LifecycleError("recovery_required", "legacy CTO recovery requires an existing state image", { run_id: input.run_id });
+      }
+      assertLegacyRecoveryArtifactPath(cwd, input.run_id, legacyRecovery.backup_path, "backup path");
+      assertLegacyRecoveryArtifactPath(cwd, input.run_id, legacyRecovery.receipt_path, "receipt path");
+      if (resolve(cwd, legacyRecovery.backup_path) === resolve(cwd, legacyRecovery.receipt_path)) {
+        throw new LifecycleError("run_state_invalid", "legacy recovery backup and receipt paths must differ", { run_id: input.run_id });
+      }
+      if (!lifecycleContentEqual(beforeState, legacyRecovery.expected_state)) {
+        throw new LifecycleError("lifecycle_request_conflict", "legacy CTO state changed after the recovery snapshot", { run_id: input.run_id, next_action: "reread the exact legacy run and ask for confirmation again" });
+      }
+      if (!lifecycleContentEqual(beforeState, legacyRecovery.backup_content)) {
+        throw new LifecycleError("run_state_invalid", "legacy recovery backup is not byte-identical to the source state", { run_id: input.run_id });
+      }
+      if (typeof legacyRecovery.receipt_content !== "string" || legacyRecovery.receipt_content.length === 0) {
+        throw new LifecycleError("run_state_invalid", "legacy recovery audit receipt is empty", { run_id: input.run_id });
+      }
+    }
     if (beforeState === null && input.state_content === undefined) {
       throw new LifecycleError("run_not_found", `CTO run '${input.run_id}' is missing`, { run_id: input.run_id });
     }
-    const stateText = beforeState === null
+    const stateText = legacyRecovery
       ? input.state_content!
-      : typeof beforeState === "string" ? beforeState : Buffer.from(beforeState.data, "base64").toString("utf8");
+      : beforeState === null
+        ? input.state_content!
+        : typeof beforeState === "string" ? beforeState : Buffer.from(beforeState.data, "base64").toString("utf8");
     let stateValue: Record<string, unknown>;
     try {
       stateValue = validateCtoStatePublication(input.run_id, stateText);
     } catch (error) {
-      if (beforeState !== null) {
+      if (beforeState !== null && !legacyRecovery) {
         const message = error instanceof Error ? error.message : String(error);
         throw new LifecycleError("recovery_required", `CTO run '${input.run_id}' state is invalid: ${message}`, { run_id: input.run_id });
       }
@@ -920,15 +1006,26 @@ export function publishCtoClaim(cwd: string, input: CtoClaimPublication): ClaimR
     if (stateBranch !== expected.branch || stateBranch !== input.branch) {
       throw new LifecycleError("run_context_mismatch", `CTO run '${input.run_id}' belongs to a different branch`, { run_id: input.run_id, branch: stateBranch });
     }
+    if (legacyRecovery && stateValue.owner_session !== input.context.session_id) {
+      throw new LifecycleError("run_state_invalid", "recovered CTO state owner_session must match the trusted coordinator", { run_id: input.run_id });
+    }
     if (ctoStateIsTerminal(stateValue) !== expected.terminal) {
       throw new LifecycleError("run_state_invalid", `CTO run '${input.run_id}' changed terminal state during acquisition`, { run_id: input.run_id });
     }
-    if (expected.owner_session !== undefined && stateValue.owner_session !== expected.owner_session) {
+    if (!legacyRecovery && expected.owner_session !== undefined && stateValue.owner_session !== expected.owner_session) {
       throw new LifecycleError("run_busy", `CTO run '${input.run_id}' is owned by another legacy session`, { run_id: input.run_id });
     }
     const currentValue: unknown = control.execution_claim;
     if (currentValue !== null) assertExecutionClaim(currentValue);
     const current = currentValue;
+    if (legacyRecovery) {
+      if (current) {
+        throw new LifecycleError("run_busy", "CTO legacy recovery cannot replace the existing worktree claim", { run_id: current.run_id, next_action: "release or reconcile the existing claim before recovery" });
+      }
+      if (control.cto_releases[input.run_id] !== undefined) {
+        throw new LifecycleError("recovery_required", "CTO run already has managed release provenance", { run_id: input.run_id, next_action: "resume the managed CTO release instead of legacy recovery" });
+      }
+    }
     if (current && current.owner_kind !== "cto") throw claimBusyError(current);
     if (current && current.run_id !== input.run_id) {
       throw new LifecycleError("run_busy", `worktree execution is owned by run '${current.run_id}'`, { run_id: current.run_id, next_action: "resume or reconcile the existing run" });
@@ -953,7 +1050,7 @@ export function publishCtoClaim(cwd: string, input: CtoClaimPublication): ClaimR
       }
       pendingWorkers = release.pending_worker_ids;
       resumedReleaseReceipt = release.release_receipt;
-    } else if (!current && beforeState !== null) {
+    } else if (!current && beforeState !== null && !legacyRecovery) {
       const release = control.cto_releases[input.run_id];
       if (release) {
         assertStoredCtoRelease(cwd, input.run_id, release);
@@ -981,13 +1078,32 @@ export function publishCtoClaim(cwd: string, input: CtoClaimPublication): ClaimR
     };
     const nextControl: RunControl = { ...control, revision: control.revision + 1, execution_claim: claim };
     const after: Record<string, LifecycleFileContent> = {
-      [controlPath(cwd)]: `${JSON.stringify(nextControl, null, 2)}\n`,
+      [controlPath(cwd)]: JSON.stringify(nextControl, null, 2) + "\n",
     };
-    if (beforeState === null && input.state_content !== undefined) after[statePath] = input.state_content.endsWith("\n") ? input.state_content : `${input.state_content}\n`;
+    if ((beforeState === null && input.state_content !== undefined) || legacyRecovery) {
+      after[statePath] = input.state_content!.endsWith("\n") ? input.state_content! : input.state_content! + "\n";
+    }
+    const before: Record<string, LifecycleFileContent> = { [controlPath(cwd)]: beforeControl, [statePath]: beforeState };
+    if (legacyRecovery) {
+      const backupPath = resolve(cwd, legacyRecovery.backup_path);
+      const receiptPath = resolve(cwd, legacyRecovery.receipt_path);
+      const beforeBackup = readLifecycleFileContent(backupPath);
+      const beforeReceipt = readLifecycleFileContent(receiptPath);
+      if (beforeReceipt !== null) {
+        throw new LifecycleError("recovery_required", "legacy CTO recovery receipt already exists", { run_id: input.run_id, next_action: "inspect the existing recovery receipt before retrying" });
+      }
+      if (beforeBackup !== null) {
+        throw new LifecycleError("recovery_required", "legacy CTO raw backup already exists and is immutable", { run_id: input.run_id, next_action: "preserve the original backup and reconcile it explicitly" });
+      }
+      before[backupPath] = beforeBackup;
+      before[receiptPath] = beforeReceipt;
+      after[backupPath] = legacyRecovery.backup_content;
+      after[receiptPath] = legacyRecovery.receipt_content;
+    }
     const transaction = beginLifecycleTransaction({
       cwd,
-      operation: "claim",
-      before: { [controlPath(cwd)]: beforeControl, [statePath]: beforeState },
+      operation: legacyRecovery ? "migration" : "claim",
+      before,
       after,
     });
     commitLifecycleTransaction(cwd, transaction.transaction_id);

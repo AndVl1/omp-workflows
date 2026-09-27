@@ -7,7 +7,7 @@ import {
 	parseCtoCommand,
 	parseEnvelope as parseCtoEnvelope,
 } from "./cto.js";
-import { acquireCtoIngress, suspendCtoSession, type CtoIngressResult } from "../cto/run.js";
+import { acquireCtoIngress, recoverLegacyCtoIngress, suspendCtoSession, type CtoIngressResult } from "../cto/run.js";
 import { buildDoWorkPrompt, parseWorkEnvelope, type ParsedWorkEnvelope } from "./do-work.js";
 import { parseWorkflowCommand, type WorkflowCommandMode } from "./envelope.js";
 import { createSelectionSnapshot } from "../engine/run-store.js";
@@ -27,7 +27,7 @@ function teamDescription(doWork: string): string {
 	return `Alias for /${doWork}. Prefer /${doWork} in new code.`;
 }
 function ctoDescription(cto: string): string {
-	return `CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /${cto} [--run <exact-cto-id>] <task>; /${cto} alone starts STANDBY (tasks arrive via messenger inbox). Registered ingress acquires the exact host claim before the prompt; no latest-run scan. Runs in-session — never task(agent=cto)`;
+	return `CTO sub-orchestration (main-session role): the resident CTO decomposes a task into parallel development teams. /${cto} [--run <exact-cto-id>] <task>; /${cto} --recover-legacy --run <exact-cto-id> explicitly recovers a legacy run with host confirmation; /${cto} alone starts STANDBY (tasks arrive via messenger inbox). Registered ingress acquires the exact host claim before the prompt; no latest-run scan. Runs in-session — never task(agent=cto)`;
 }
 
 export interface WorkflowCommandOptions {
@@ -95,6 +95,8 @@ type CommandInvocation = {
 	inferredMode?: Exclude<WorkflowCommandMode, "list">;
 	/** Exact CTO ingress acquired before prompt construction. */
 	ctoIngress?: CtoIngressResult;
+	/** Recovery was declined; do not emit a model prompt. */
+	skipPrompt?: boolean;
 	/** Removes this invocation's record and, if owned, its exact intent. */
 	cleanup?: () => void;
 	/** Arms the same ingress record after the exact prompt has been built. */
@@ -392,7 +394,7 @@ type BeforeCommandExecute = (
 	args: string,
 	cwd: string | undefined,
 	ctx: ExtensionCommandContext,
-) => CommandInvocation | undefined;
+) => CommandInvocation | Promise<CommandInvocation | undefined> | undefined;
 
 function registerPromptCommand(
 	pi: ExtensionAPI,
@@ -417,7 +419,9 @@ function registerPromptCommand(
 			// Resolve once and pass this exact value through both authorization and
 			// prompt construction. The context may drift while a session is active.
 			const cwd = resolveCwd(ctx);
-			const invocation = beforeExecute?.(normalizedArgs, cwd, ctx);
+			const preparedInvocation = beforeExecute?.(normalizedArgs, cwd, ctx);
+			const invocation = preparedInvocation instanceof Promise ? await preparedInvocation : preparedInvocation;
+			if (invocation?.skipPrompt) return;
 			let prompt: string;
 			try {
 				prompt = buildPrompt(
@@ -581,7 +585,7 @@ function prepareCtoCommandInvocation(
 	cwd: string | undefined,
 	ctx: ExtensionCommandContext,
 	controllerManagers: WeakMap<WorkflowSessionController, object>,
-): CommandInvocation {
+): CommandInvocation | Promise<CommandInvocation> {
 	const binding = bindCommandController(options, cwd, ctx);
 	if (!binding) throw new Error("WORKFLOW_CONTEXT_REJECTED: trusted CTO session is unavailable");
 	controllerManagers.set(binding.controller, binding.identity.manager);
@@ -606,56 +610,92 @@ function prepareCtoCommandInvocation(
 		? trackedAtAcquire
 		: undefined;
 	const context = binding.controller.context();
-	const ingress = acquireCtoIngress({
+	const finalizeIngress = (ingress: CtoIngressResult): CommandInvocation => {
+		// Compare both ownership slots before mutating either one. No host callback
+		// occurs between these reads and the exact-entry deletes below.
+		const canReplaceCurrent =
+			provenance.get(provenanceBindingKey) === predecessorAtAcquire
+			&& trackedIntentProvenance.get(provenanceBindingKey) === trackedAtAcquire
+			&& (predecessorAtAcquire === undefined || predecessor !== undefined)
+			&& (trackedAtAcquire === undefined || trackedPredecessor !== undefined);
+		let canInstallOuter = false;
+		if (canReplaceCurrent) {
+			if (predecessorAtAcquire !== undefined && provenance.get(provenanceBindingKey) === predecessorAtAcquire) {
+				provenance.delete(provenanceBindingKey);
+			}
+			if (trackedAtAcquire !== undefined && trackedIntentProvenance.get(provenanceBindingKey) === trackedAtAcquire) {
+				trackedIntentProvenance.delete(provenanceBindingKey);
+			}
+			if (predecessor && predecessor !== trackedPredecessor) cleanupIntent(predecessor);
+			if (trackedPredecessor) cleanupIntent(trackedPredecessor);
+			// cleanupIntent is controller-owned and may re-enter a registered
+			// command. Publish the outer record only if both slots stayed empty.
+			canInstallOuter =
+				provenance.get(provenanceBindingKey) === undefined
+				&& trackedIntentProvenance.get(provenanceBindingKey) === undefined;
+		}
+		const record: CommandProvenanceRecord = {
+			...binding.identity,
+			controller: binding.controller,
+			cto: { ingress },
+		};
+		if (canInstallOuter) provenance.set(provenanceBindingKey, record);
+		return {
+			ctoIngress: ingress,
+			arm: (prompt: string) => armCommandProvenance(provenance, record, cwd, ctx, prompt),
+			cleanup: () => {
+				if (provenance.get(provenanceBindingKey) === record) provenance.delete(provenanceBindingKey);
+				try {
+					suspendCtoSession(binding.controller, "session-replacement");
+				} catch {
+					// Preserve the original prompt-build/send error.
+				}
+			},
+		};
+	};
+	if (command.recover_legacy) {
+		if (ctx.hasUI !== true || typeof ctx.ui?.confirm !== "function") {
+			throw new Error("WORKFLOW_CONTEXT_REJECTED: legacy CTO recovery requires host UI confirmation");
+		}
+		if (!command.run_id) {
+			throw new Error("ERROR [lifecycle_request_conflict]: --recover-legacy requires an exact --run selector");
+		}
+		const confirm = async (summary: string): Promise<boolean> => {
+			if (ctx.hasUI !== true || typeof ctx.ui?.confirm !== "function") {
+				throw new Error("WORKFLOW_CONTEXT_REJECTED: legacy CTO recovery requires host UI confirmation");
+			}
+			const approved = await ctx.ui.confirm("Recover legacy CTO run", summary);
+			if (!approved) return false;
+			if (ctx.hasUI !== true || !controllerMatchesIdentity(binding, cwd, ctx)) {
+				throw new Error("WORKFLOW_CONTEXT_REJECTED: CTO recovery session identity drifted during confirmation");
+			}
+			let currentContext: TrustedExecutionContext;
+			try {
+				currentContext = binding.controller.context();
+			} catch {
+				throw new Error("WORKFLOW_CONTEXT_REJECTED: CTO recovery session identity drifted during confirmation");
+			}
+			if (currentContext.branch !== context.branch) {
+				throw new Error("WORKFLOW_CONTEXT_REJECTED: CTO recovery branch drifted during confirmation");
+			}
+			return true;
+		};
+		return recoverLegacyCtoIngress({
+			cwd: binding.identity.cwd,
+			branch: context.branch,
+			task: envelope.task,
+			run_id: command.run_id,
+			controller: binding.controller,
+		}, confirm).then((ingress) => ingress ? finalizeIngress(ingress) : { skipPrompt: true });
+	}
+	return finalizeIngress(acquireCtoIngress({
 		cwd: binding.identity.cwd,
 		branch: context.branch,
 		task: envelope.task,
 		...(command.run_id ? { run_id: command.run_id } : {}),
 		controller: binding.controller,
-	});
-	// Compare both ownership slots before mutating either one. No host callback
-	// occurs between these reads and the exact-entry deletes below.
-	const canReplaceCurrent =
-		provenance.get(provenanceBindingKey) === predecessorAtAcquire
-		&& trackedIntentProvenance.get(provenanceBindingKey) === trackedAtAcquire
-		&& (predecessorAtAcquire === undefined || predecessor !== undefined)
-		&& (trackedAtAcquire === undefined || trackedPredecessor !== undefined);
-	let canInstallOuter = false;
-	if (canReplaceCurrent) {
-		if (predecessorAtAcquire !== undefined && provenance.get(provenanceBindingKey) === predecessorAtAcquire) {
-			provenance.delete(provenanceBindingKey);
-		}
-		if (trackedAtAcquire !== undefined && trackedIntentProvenance.get(provenanceBindingKey) === trackedAtAcquire) {
-			trackedIntentProvenance.delete(provenanceBindingKey);
-		}
-		if (predecessor && predecessor !== trackedPredecessor) cleanupIntent(predecessor);
-		if (trackedPredecessor) cleanupIntent(trackedPredecessor);
-		// cleanupIntent is controller-owned and may re-enter a registered
-		// command. Publish the outer record only if both slots stayed empty.
-		canInstallOuter =
-			provenance.get(provenanceBindingKey) === undefined
-			&& trackedIntentProvenance.get(provenanceBindingKey) === undefined;
-	}
-	const record: CommandProvenanceRecord = {
-		...binding.identity,
-		controller: binding.controller,
-		cto: { ingress },
-	};
-	if (canInstallOuter) provenance.set(provenanceBindingKey, record);
-	return {
-		ctoIngress: ingress,
-		arm: (prompt: string) => armCommandProvenance(provenance, record, cwd, ctx, prompt),
-		cleanup: () => {
-			if (provenance.get(provenanceBindingKey) === record) provenance.delete(provenanceBindingKey);
-			try {
-				suspendCtoSession(binding.controller, "session-replacement");
-			} catch {
-				// Preserve the original prompt-build/send error.
-			}
-		},
-	};
+	}));
 }
-
 
 function prepareCommandInvocation(
 	provenance: Map<string, CommandProvenanceRecord>,

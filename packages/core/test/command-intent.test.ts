@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -7,6 +7,7 @@ import { registerWorkflowCommands } from "../src/commands/register.js";
 import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 import { LifecycleError } from "../src/engine/run-lifecycle.js";
 import type { TrustedExecutionContext } from "../src/engine/types.js";
+import { newCtoState } from "../src/cto/state.js";
 
 type CommandHandler = (args: string, ctx: unknown) => Promise<void>;
 type EventHandler = (event: unknown, ctx: unknown) => unknown;
@@ -71,6 +72,36 @@ function trustedContext(root: string, sessionId = "command-intent-session"): Tru
   };
 }
 
+function writeLegacyRecoveryFixture(root: string, runId: string): string {
+  const now = new Date().toISOString();
+  const state = newCtoState({
+    id: runId,
+    task: "legacy recovery task",
+    branch: "main",
+    autonomous: false,
+    plan: { id: runId, task: "legacy recovery task", teams: [], created_at: now },
+  });
+  const raw = structuredClone(state) as unknown as Record<string, unknown>;
+  delete raw.updated_at;
+  raw.completion_intent = {
+    mode: "complete_outcome",
+    acceptance: "dod_and_artifacts",
+    source: "migration",
+  };
+  Object.assign(raw, {
+    session: "legacy-session",
+    workflow: "legacy-workflow",
+    orchestration_profile: "legacy-profile",
+    stage: "implementation",
+    checkpoint: "none",
+    progress: { completed: 0 },
+  });
+  const runDir = join(root, ".work-state", "cto", runId);
+  mkdirSync(runDir, { recursive: true });
+  const statePath = join(runDir, "state.json");
+  writeFileSync(statePath, `${JSON.stringify(raw, null, 2)}\n`);
+  return statePath;
+}
 function lifecycleConflict(action: () => unknown): void {
   assert.throws(action, (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict");
 }
@@ -521,5 +552,172 @@ test("registered workflow prompts arm private one-shot turn provenance", async (
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(foreignRoot, { recursive: true, force: true });
+  }
+});
+
+
+test("registered namespaced CTO recovery confirms exact legacy run before emitting a prompt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "command-legacy-recovery-success-"));
+  try {
+    const runId = "legacy-recovery-command";
+    const statePath = writeLegacyRecoveryFixture(root, runId);
+    const before = readFileSync(statePath, "utf8");
+    const sessionId = "legacy-recovery-session";
+    const sessionFile = join(root, `${sessionId}.jsonl`);
+    const manager = {
+      getCwd: () => root,
+      getSessionId: () => sessionId,
+      getSessionFile: () => sessionFile,
+    };
+    const controller = createWorkflowSessionController({ cwd: root, context: trustedContext(root, sessionId) });
+    const confirmations: Array<{ title: string; summary: string }> = [];
+    const harness = commandHarness();
+    const context = {
+      cwd: root,
+      mode: "tui",
+      hasUI: true,
+      sessionManager: manager,
+      ui: {
+        notify() {},
+        async confirm(title: string, summary: string): Promise<boolean> {
+          confirmations.push({ title, summary });
+          return true;
+        },
+      },
+    };
+    registerWorkflowCommands(harness.pi as never, {
+      namespace: "legacy",
+      resolveCwd: () => root,
+      getSessionController: () => controller,
+    });
+
+    await harness.commands.get("legacy-cto")!.handler(`--recover-legacy --run ${runId}`, context);
+
+    assert.equal(confirmations.length, 1, "recovery uses one host confirmation");
+    assert.equal(confirmations[0]?.title, "Recover legacy CTO run");
+    assert.match(confirmations[0]?.summary ?? "", new RegExp(runId));
+    assert.match(confirmations[0]?.summary ?? "", /stop/i, "confirmation carries the stopped coordinator/worker attestation");
+    assert.equal(harness.prompts.length, 1, "successful recovery emits exactly one prompt");
+    assert.match(harness.prompts[0] ?? "", new RegExp(runId));
+    assert.notEqual(readFileSync(statePath, "utf8"), before, "successful recovery migrates the legacy state");
+    assert.equal(controller.activeCtoClaim()?.run_id, runId, "recovery binds the exact run to the trusted controller");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("declined or headless legacy CTO recovery emits no prompt and leaves bytes unchanged", async () => {
+  const declinedRoot = mkdtempSync(join(tmpdir(), "command-legacy-recovery-declined-"));
+  const headlessRoot = mkdtempSync(join(tmpdir(), "command-legacy-recovery-headless-"));
+  try {
+    const make = (root: string, sessionId: string, hasUI: boolean, confirm: () => Promise<boolean>) => {
+      const runId = `${sessionId}-run`;
+      const statePath = writeLegacyRecoveryFixture(root, runId);
+      const before = readFileSync(statePath, "utf8");
+      const sessionFile = join(root, `${sessionId}.jsonl`);
+      const manager = {
+        getCwd: () => root,
+        getSessionId: () => sessionId,
+        getSessionFile: () => sessionFile,
+      };
+      const controller = createWorkflowSessionController({ cwd: root, context: trustedContext(root, sessionId) });
+      const harness = commandHarness();
+      const context = {
+        cwd: root,
+        mode: hasUI ? "tui" : "print",
+        hasUI,
+        sessionManager: manager,
+        ui: {
+          notify() {},
+          confirm,
+        },
+      };
+      registerWorkflowCommands(harness.pi as never, {
+        namespace: "legacy",
+        resolveCwd: () => root,
+        getSessionController: () => controller,
+      });
+      return { before, context, harness, runId, statePath };
+    };
+
+    let declinedConfirmations = 0;
+    const declined = make(declinedRoot, "declined-session", true, async () => {
+      declinedConfirmations += 1;
+      return false;
+    });
+    await declined.harness.commands.get("legacy-cto")!.handler(`--recover-legacy --run ${declined.runId}`, declined.context);
+    assert.equal(declinedConfirmations, 1);
+    assert.equal(declined.harness.prompts.length, 0, "declined recovery does not emit a model prompt");
+    assert.equal(readFileSync(declined.statePath, "utf8"), declined.before, "decline leaves the raw legacy bytes unchanged");
+
+    let headlessConfirmations = 0;
+    const headless = make(headlessRoot, "headless-session", false, async () => {
+      headlessConfirmations += 1;
+      throw new Error("unexpected headless confirmation");
+    });
+    await assert.rejects(
+      headless.harness.commands.get("legacy-cto")!.handler(`--recover-legacy --run ${headless.runId}`, headless.context),
+      /host UI confirmation/,
+    );
+    assert.equal(headlessConfirmations, 0, "headless recovery never calls a confirmation fallback");
+    assert.equal(headless.harness.prompts.length, 0, "headless recovery does not emit a model prompt");
+    assert.equal(readFileSync(headless.statePath, "utf8"), headless.before, "headless refusal leaves raw legacy bytes unchanged");
+  } finally {
+    rmSync(declinedRoot, { recursive: true, force: true });
+    rmSync(headlessRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy CTO recovery rejects manager drift while confirmation is pending", async () => {
+  const root = mkdtempSync(join(tmpdir(), "command-legacy-recovery-drift-"));
+  try {
+    const runId = "legacy-recovery-drift";
+    const statePath = writeLegacyRecoveryFixture(root, runId);
+    const before = readFileSync(statePath, "utf8");
+    const sessionId = "legacy-drift-session";
+    let currentSessionId = sessionId;
+    let beginConfirmation!: () => void;
+    let approve!: (value: boolean) => void;
+    const confirmationStarted = new Promise<void>((resolve) => {
+      beginConfirmation = resolve;
+    });
+    const confirmationResult = new Promise<boolean>((resolve) => {
+      approve = resolve;
+    });
+    const manager = {
+      getCwd: () => root,
+      getSessionId: () => currentSessionId,
+      getSessionFile: () => join(root, `${currentSessionId}.jsonl`),
+    };
+    const controller = createWorkflowSessionController({ cwd: root, context: trustedContext(root, sessionId) });
+    const harness = commandHarness();
+    const context = {
+      cwd: root,
+      mode: "tui",
+      hasUI: true,
+      sessionManager: manager,
+      ui: {
+        notify() {},
+        async confirm(): Promise<boolean> {
+          beginConfirmation();
+          return confirmationResult;
+        },
+      },
+    };
+    registerWorkflowCommands(harness.pi as never, {
+      namespace: "legacy",
+      resolveCwd: () => root,
+      getSessionController: () => controller,
+    });
+
+    const pending = harness.commands.get("legacy-cto")!.handler(`--recover-legacy --run ${runId}`, context);
+    await confirmationStarted;
+    currentSessionId = "drifted-session";
+    approve(true);
+    await assert.rejects(pending, /identity drifted/);
+    assert.equal(harness.prompts.length, 0, "identity drift blocks prompt emission");
+    assert.equal(readFileSync(statePath, "utf8"), before, "identity drift blocks core mutation");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

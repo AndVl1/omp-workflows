@@ -77,6 +77,27 @@ settle from the persisted CTO tool-call/slot identity, independently of
 ordinary workflow dispatch origins, and terminal claim settlement happens only
 on an actual terminal CTO state transition.
 
+For a claimless legacy **JSON** run whose coordinator session is no longer
+available, use `/cto --recover-legacy --run <exact-cto-id>` (or the internal
+bundle's `/omp-cto` equivalent). This is an explicit recovery operation, not
+ordinary resume. It requires an interactive host confirmation that the previous
+coordinator **and all its workers have stopped**; missing legacy ownership
+records alone are not evidence of quiescence. Decline or headless invocation
+does not recover the run or send a CTO prompt.
+
+Recovery rechecks the authenticated session, branch and exact state/control
+bytes after confirmation. It refuses existing execution claims, managed release
+provenance for this run, pending work/leases, terminal runs, and malformed or
+unrecognized typed state. Supported legacy-only metadata is quarantined in a
+byte-exact backup; missing `updated_at` and completion-intent rationale are
+filled with new recovery metadata, never historical approval. Active waves,
+team progress and canonical plan/history remain intact. A single lifecycle
+transaction publishes the repaired state, a fresh engine-owned claim, and
+immutable `legacy-recovery/<source-sha256>/raw-state.json` plus `receipt.json`
+under the same CTO run directory. Subsequent managed handoffs use ordinary
+`--run` continuation. Do not delete old markers or hand-edit claims to bypass
+these checks; markdown-only or invalid JSON is not repaired by this command.
+
 Release provenance is a state witness, not a writable acknowledgement: after
 handoff, an unexplained canonical CTO state change makes reacquisition
 `recovery_required`; core does not rehash arbitrary suspended-state writes.
