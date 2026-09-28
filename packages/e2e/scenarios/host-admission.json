@@ -1,0 +1,30 @@
+{
+  "id": "host-admission",
+  "title": "Host admission: live доступ, причины отказов и регрессии",
+  "description": "Операторский manual-QA checklist PR #72. Запускать реальные interactive sessions без --scenario/--task; manifest описывает evidence, не заменяет фактический прогон. Отдельно различать live E2E, scratch fault fixtures и недоступное Android-окружение.",
+  "task": { "file": "host-admission-task.md" },
+  "params": {
+    "slug": "host-admission",
+    "branch": "test/host-admission",
+    "task": "проверить host admission на реальном OMP без ослабления authority"
+  },
+  "stages": [
+    { "id": "preflight", "name": "Версия, фактическая Luna model, один owner", "expect": ["gpt-6-luna|gpt-5\\.6-luna"] },
+    { "id": "idle_host", "name": "A1: обычные bash/write/edit", "expect": ["git status", "scratch-note\\.txt"] },
+    { "id": "ordinary_native", "name": "A2: ordinary workflow и native worker", "expect": ["workflow_prepare", "task", "sum"] },
+    { "id": "terminal_restart", "name": "A3: terminal, обычные tools и новая сессия", "expect": ["git status", "exit"] },
+    { "id": "cto_authority", "name": "A4: CTO exact claim и native dispatch", "expect": ["cto", "task"] },
+    { "id": "incomplete_bundle", "name": "A5: ошибка регистрации стороннего bundle", "expect": ["workflow_registration:missing_actor_resolver", "resolveTrustedToolCallActor"] },
+    { "id": "diagnostic_faults", "name": "A6: реальные tool calls с fault-fixture adapter", "expect": ["workflow_admission:", "Action:", "Report:"] },
+    { "id": "foreign_context", "name": "A7: неподтверждённый caller не получает authority", "expect": ["workflow_admission:|BLOCKED"] },
+    { "id": "state_recovery", "name": "A8: повреждённый selected run не исполняется", "expect": ["workflow_state_recovery_required|run_control_unreadable"] },
+    { "id": "internal_activation", "name": "A9: internal marked/unmarked isolation", "expect": ["git status"] }
+  ],
+  "timing": { "startupTimeoutMs": 120000, "stageTimeoutMs": 900000, "checkpointPollMs": 2000 },
+  "screenshots": { "on": ["stage_start", "stage_end", "error"] },
+  "ratings": {
+    "dimensions": ["message_clarity", "feedback_timing", "error_handling", "layout", "interactivity", "visual_rendering"],
+    "min": 1,
+    "max": 5
+  }
+}
