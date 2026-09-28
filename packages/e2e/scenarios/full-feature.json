@@ -2,6 +2,7 @@
   "id": "full-feature",
   "title": "Full workflow: discovery -> exploration -> clarify -> architecture -> implementation -> review -> manual QA",
   "description": "Runs the complete omp-workflows pipeline end-to-end in a fresh scratch project: the tester types /do-work, answers the [ask_user] clarify prompts, watches each stage, and rates the UX. Expects 6 clarify questions plus 1 architecture choice.",
+  "command": "/do-work",
   "task": { "file": "full-feature-task.md" },
   "params": {
     "slug": "my-feature",

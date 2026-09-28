@@ -4,7 +4,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -13,6 +13,7 @@ import { WebSocket } from 'ws';
 import { deferred } from '../src/util.js';
 import { AskStateTracker, TranscriptLog, waitFor, WaitTimeoutError, WsDriver } from '../src/driver.js';
 import { startTestSession } from '../src/server.js';
+import { createIsolatedRunFixture } from './fixtures/isolated-run.js';
 
 function makeDir(): string {
   return mkdtempSync(join(tmpdir(), 'ux-e2e-driver-'));
@@ -24,6 +25,22 @@ function oFrame(d: string): string {
 
 function iFrame(d: string): string {
   return JSON.stringify({ ts: '2026-08-02T00:00:00.000Z', t: 'i', d }) + '\n';
+}
+
+function readInputFrames(transcriptPath: string): string[] {
+  const inputs: string[] = [];
+  for (const line of readFileSync(transcriptPath, 'utf8').split('\n')) {
+    if (line.trim().length === 0) continue;
+    try {
+      const frame: unknown = JSON.parse(line);
+      if (frame !== null && typeof frame === 'object' && 't' in frame && frame.t === 'i' && 'd' in frame && typeof frame.d === 'string') {
+        inputs.push(frame.d);
+      }
+    } catch {
+      /* Ignore an incomplete final JSONL frame while the PTY writes. */
+    }
+  }
+  return inputs;
 }
 
 test('TranscriptLog: detectAskUser finds title + numbered options', () => {
@@ -189,36 +206,20 @@ test('TranscriptLog: refresh reads only the delta on subsequent calls', () => {
   assert.ok(last !== undefined && (last as { d: string }).d.includes('appended line'));
 });
 
-test('WsDriver: submit sends text plus newline in one input frame', async t => {
-  const dir = makeDir();
-  mkdirSync(join(dir, '.work-state', 'ux-e2e'), { recursive: true });
-  const script = join(dir, 'capture-input.sh');
-  writeFileSync(script, '#!/bin/sh\nwhile IFS= read -r line; do printf "got:%s\\n" "$line"; done\n', { mode: 0o755 });
-  const session = await startTestSession({ cwd: dir, ompBinary: script, token: 'sekret', idleMs: 2000 });
-  t.after(() => session.close());
-  if (session.pty.mode !== 'pty') {
-    t.skip('node-pty could not spawn the input capture command');
-    return;
-  }
-
-  const driver = new WsDriver({ url: session.url, transcriptPath: session.transcriptPath });
-  await driver.open();
-  await driver.submit('run command');
-  await waitFor(() => readFileSync(session.transcriptPath, 'utf8').includes('"d":"run command\\n"'), {
-    timeoutMs: 2000,
+test('WsDriver: closes a failed websocket on authentication failure', async t => {
+  const fixture = createIsolatedRunFixture();
+  const session = await startTestSession({
+    manifest: fixture.manifest,
+    sessionId: 'driver-auth',
+    noPty: true,
+    token: 'sekret',
   });
-  await driver.close();
+  t.after(async () => {
+    await session.close();
+    fixture.cleanup();
+  });
 
-  assert.ok(readFileSync(session.transcriptPath, 'utf8').includes('"d":"run command\\n"'));
-});
-
-test('WsDriver: open() closes the failed socket on auth failure', async t => {
-  const dir = makeDir();
-  mkdirSync(join(dir, '.work-state', 'ux-e2e'), { recursive: true });
-  const session = await startTestSession({ cwd: dir, noPty: true, token: 'sekret' });
-  t.after(() => session.close());
-
-  const transcriptPath = join(dir, 'transcript-fail.jsonl');
+  const transcriptPath = join(fixture.root, 'failed-auth-transcript.jsonl');
   const driver = new WsDriver({ url: session.url.replace('sekret', 'wrong-token'), transcriptPath });
   await assert.rejects(driver.open(), /401|unexpected server response/iu);
   await driver.close();

@@ -1,9 +1,10 @@
 # Task: {{task}}
 
-You are working in a fresh scratch project created by `ux-e2e bootstrap`, wired
-to the omp-workflows plugin (branch {{branch}}). The plugin ships 17 agents whose
-frontmatter declares per-class OMP model roles with standard-role fallback, and a
-`/omp-model-roles` command.
+You are working in the prepared workspace recorded by the run manifest. The
+runtime and omp-workflows plugin snapshot are fixed at `prepare` time; do not
+run bootstrap, npm link, or mutate a global installation. The plugin ships 17
+agents whose frontmatter declares per-class OMP model roles with standard-role
+fallback, and a `/omp-model-roles` command.
 
 ## Requirements
 

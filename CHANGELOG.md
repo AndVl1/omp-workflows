@@ -2,6 +2,14 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [Unreleased]
+### Added
+- Manifest-backed isolated E2E preparation, runtime/package snapshots, managed
+  native OAuth broker opt-in, provider-free isolation and live-provider workflow
+  smoke suites, restart/cleanup lifecycle, scoped redacted evidence, and root
+  `e2e:*` commands. Removed the scratch/bootstrap host-overlay launch contract.
+  See [the E2E runbook](packages/e2e/README.md) for prerequisites and limits.
+
 ## [0.29.0] — 2026-09-28
 ### Changed
 - **Breaking run-lifecycle cutover** — ordinary workflow state/API now use schema-2 canonical identity (`run_id = run_key = WorkIdentity.run_id`) and explicit `new`/`resume`/`rework`; existing runs resolve by human-readable name or read-only list (UUID remains technical). Branch is routing/compatibility context rather than run identity, so foreign-branch `resume`/`rework` is rejected. `workflow_prepare` emits committed transition receipts, while the transaction journal and lock/CAS protect state, artifact, and observability publication; execution claims and coordinator handover preserve worker/evidence identity and fail closed on busy or unknown ownership.
@@ -13,7 +21,6 @@ All notable changes to `omp-workflows` are documented here.
 - **Foreground E2E exit** — `ux-e2e start` now wakes its foreground observer on the PTY `exit` frame even when no later output arrives, closes the session, and exits instead of waiting indefinitely.
 - **Selector-only resume admission** — `workflow_prepare` now resolves the read-only selector before new-task intent handling for explicit `--run` resume, while conflicting top-level and selector IDs are rejected without mutation; no new public required field or alias was introduced.
 - **Idle branch-context refresh** — ordinary new-command ingress refreshes an idle cached host controller from the actual Git branch before intent handling; active, selected, or unknown claims retain the fail-closed branch check, so stale context is not silently migrated.
-
 
 ## [0.28.4] — 2026-09-04
 ### Fixed

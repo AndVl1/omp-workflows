@@ -1,372 +1,301 @@
 # @andvl1/omp-workflows-e2e
 
-Interactive UX E2E test framework for **omp** + **omp-workflows**. An LLM agent
-(or a human) acts as a UX tester: the framework spawns a real omp PTY session in
-a scratch project, the tester drives a workflow like a human (types `/do-work`,
-answers `[ask_user]` prompts), rates each step's UX, hunts defects, assesses the
-tested agent's output, and emits a `manual_qa`-compatible report.
-
-```
-bootstrap -> start -> (drive the terminal) -> report
-```
+Manifest-backed, process-level UX acceptance for the installed **omp** runtime and the
+current core/fullstack checkout. The harness snapshots the runtime and built package
+closure, creates a disposable Git project, launches an isolated omp PTY, and records
+run-scoped evidence. It does not install or relink the operator's plugins.
 
 ## Quick start
 
+Run from the monorepo root with Node 20+, npm, a supported installed `omp`, and the
+local package build dependencies available. Use one committed config throughout a
+run; `prepare` resolves it to a secret-free manifest. Each root script builds the E2E
+package before calling the same CLI.
+
+When invoked through `npm run`, a config value of `runtime.binary: "omp"` selects
+the installed host executable rather than npm's checkout-local
+`node_modules/.bin/omp` shim. Set an absolute binary path in the config to pin a
+specific runtime deliberately.
+
 ```bash
-# 1. Build the package
-npm run build -w @andvl1/omp-workflows-e2e
+# Provider-free isolation (no OAuth or LLM request).
+npm run e2e:prepare -- --config packages/e2e/scenarios/isolated-smoke.env.json --run isolation-01 --json
+export OMP_E2E_ROOT="${OMP_E2E_ROOT:-${TMPDIR:-/tmp}/omp-workflows-e2e}"
+MANIFEST="$OMP_E2E_ROOT/runs/isolation-01/manifest.json"
+npm run e2e:doctor -- --manifest "$MANIFEST" --json
+npm run e2e:verify -- --manifest "$MANIFEST" --suite isolation --json
 
-# 2. Bootstrap a scratch project wired to this monorepo
-node packages/e2e/dist/cli.js bootstrap my-feature feat/my-feature \
-  --monorepo . --workdir /tmp
-
-# 3. Start a session (prints a localhost URL with a session-scoped token)
-node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-my-feature \
-  --scenario packages/e2e/scenarios/full-feature.json
-
-# 4. Open the URL in a browser (web surface), or drive it over WS (text surface)
-#    Ask-state helpers:
-node packages/e2e/dist/cli.js ask /tmp/omp-ux-e2e-my-feature --list
-node packages/e2e/dist/cli.js ask /tmp/omp-ux-e2e-my-feature "1"
-#    Arbitrary command input (uses `\n`; for real PTY submit prefer `pressEnter()` / `\r` — see [Enter semantics](#enter-semantics-r-vs-n)):
-node packages/e2e/dist/cli.js input /tmp/omp-ux-e2e-my-feature "/do-work implement it"
-
-# 5. Inspect the session, then emit the report
-node packages/e2e/dist/cli.js transcript /tmp/omp-ux-e2e-my-feature --tail 40
-node packages/e2e/dist/cli.js report /tmp/omp-ux-e2e-my-feature \
-  --steps steps.json --copy-evidence
+# Real provider-backed smoke: requires the installed omp's existing OpenAI Codex
+# OAuth authorization. Explicitly opts into a shared native host auth broker.
+npm run e2e:prepare -- --config packages/e2e/scenarios/live-smoke.env.json --run live-01 --json
+LIVE_MANIFEST="$OMP_E2E_ROOT/runs/live-01/manifest.json"
+npm run e2e:auth-broker -- status --manifest "$LIVE_MANIFEST" --json
+npm run e2e:auth-broker -- ensure --manifest "$LIVE_MANIFEST" --json
+npm run e2e:doctor -- --manifest "$LIVE_MANIFEST" --json
+npm run e2e:verify -- --manifest "$LIVE_MANIFEST" --suite live-smoke --json
 ```
 
-Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
+`verify` generates a report and cleans run-owned secrets, process trees and workspace
+by default; sanitized evidence and manifest remain. On failure, `--keep-failed`
+retains the disposable workspace and sanitized evidence but still removes run-owned
+auth caches. `verify` exits nonzero when a prerequisite or acceptance check fails;
+successful cleanup cannot turn a failed smoke into a pass. The `live-smoke` scenario
+submits a bounded `/do-work` request, waits for provider-backed semantic output and
+canonical workflow state, stops that PTY, starts a second session, and checks the
+state was preserved. It does not use a real project or an existing workflow run.
 
 ## Run-lifecycle acceptance journeys
 
 The public registered `/do-work` journeys for OpenSpec run-lifecycle are described by
 `scenarios/run-lifecycle-journey.json` and
-`scenarios/run-lifecycle-resume.json`. The JSON files describe expected stages and
+`scenarios/run-lifecycle-resume.json`. These JSON files describe expected stages and
 evidence patterns; their `*-task.md` files are operator checklists, not prompts for
-the model. **Для live-приёмки запускайте harness в чистой сессии без `--scenario` и
-без `--task`; вводите каждую slash-команду вручную через terminal PTY.** They use
-the existing PTY/WS harness, do not call core APIs directly, and never edit
-canonical `.work-state` files.
+the model. **Для live-приёмки запускайте каждую journey в чистой manifest-backed
+сессии без `--scenario` и без `--task`; вводите каждую slash-команду вручную через
+terminal PTY или `e2e:input`.** They use the existing PTY/WS harness, do not call
+core APIs directly, and never ask the operator to edit canonical `.work-state` files.
 
-Prerequisites (local operator setup only):
+Use one manifest for each journey and a distinct `--session-id` for every clean
+session. Follow the manifest-based `prepare`, `doctor`, `start`, `input`, `ask`,
+`transcript`, `stop`, `report`, and `cleanup` flow in Quick start and Manual
+lifecycle below. Do not pass a scenario or checklist to the model as one prompt, and
+do not pass a scratch path to any lifecycle command.
 
-- Node.js 20 or newer and the repository dependencies installed.
-- A built `omp` binary available as `omp` on `PATH`, or set `OMP_BIN` to its
-  path.
-- A host omp config with usable `modelRoles` and provider credentials. Do not
-  put credentials in the scratch project, scenario files, transcripts, or
-  reports; the harness inherits the host config and records only its path and
-  a missing-config warning.
-- A local checkout with the plugin wired by `bootstrap`; use a scratch
-  directory, never this repository worktree, for branch changes.
-- **Scratch-only scope setup.** `bootstrap` copies the repository
-  `.omp/team.config.json`; the current map covers repository TypeScript/JSON
-  paths, not arbitrary scenario JavaScript files. Before the first
-  `workflow_prepare`, make every scenario `src/`/`test/` JavaScript path match
-  the copied scratch `scope_map` (a `**/*.js`/exact `src`/`test` mapping resolves
-  to `dev_agent: omp-engine-specialist`; a stale `packages/**/*.js` rule does
-  not cover scratch `src`). Include the same paths in `workflow_prepare.files`.
-  Resume preserves the scope persisted for the run; editing the map later does
-  not repair that run. Keep this setup in the scratch project and never repair
-  canonical `.work-state` by hand.
-- **Preflight before the first slash command.** The role overlay is configuration,
-  not proof of the active model: inspect the started session/host evidence before
-  entering `/do-work` and stop unless every live role resolves to
-  `openai-codex/gpt-6-luna` or `openai-codex/gpt-5.6-luna`. Sol/Astra resolution
-  is invalid for this acceptance.
-- **Neutral scratch ownership.** Use a branch-backed git scratch created by
-  `bootstrap`, not a detached repository checkout. Do not inherit a competing
-  project extension (for example, a monorepo `.omp/settings.json` explicit
-  internal extension together with the harness fullstack bundle): that combination
-  can produce an owner-token conflict. Keep one extension owner in the scratch.
+Prerequisites:
+
+- Node.js 20 or newer, npm, a supported installed `omp`, and the repository's local
+  package build dependencies.
+- A committed E2E config, such as
+  `scenarios/live-smoke.env.json`, supplied explicitly to `e2e:prepare`. The
+  journey JSON files are evidence/checklist metadata; they are not `--scenario`
+  inputs to the manifest CLI.
+- For provider-backed journeys, explicitly run `e2e:auth-broker ensure` and
+  `e2e:doctor` for the prepared manifest before the first slash command. Do not put
+  credentials in config fixtures, transcripts, reports, or exported evidence;
+  missing authentication must fail closed.
+- **Preflight before the first slash command.** Inspect the started session evidence,
+  not merely the configured role overlay, and stop unless every live role resolves to
+  `openai-codex/gpt-6-luna` or `openai-codex/gpt-5.6-luna`. Sol/Astra resolution is
+  invalid for this acceptance.
+- Keep each journey's manifest and session IDs together. Do not copy or modify a
+  manifest, reuse a run ID with changed inputs, or repair canonical state by hand.
 - For the missing-input fixture, use a valid bounded workflow JSON and an exact
   classification/workflow override; vague task wording may resolve to a different
   lightweight profile. Remove temporary fixture profiles and wrappers after the
-  evidence is captured; never repair canonical state manually.
+  evidence is captured.
 
-Prepare and run the A → B → C → A journey:
+### A → B → C → A journey
 
-```bash
-npm run build -w @andvl1/omp-workflows-e2e
-node packages/e2e/dist/cli.js bootstrap run-lifecycle-journey feat/run-lifecycle-a \
-  --monorepo . --workdir /tmp --force
-# Start a clean registered-command session; do not pass --scenario or --task.
-node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-run-lifecycle-journey \
-  --surface text --detach --max-time 90m
-```
-
-Drive the registered `/do-work` commands manually through the printed terminal URL
-(or `ux-e2e input`/`ux-e2e ask`), following the operator checklist in
-`run-lifecycle-journey-task.md`. Do not send that checklist or a scenario file to
-the model as one prompt. Save evidence:
+Prepare one manifest, make authentication explicit, and start a named session:
 
 ```bash
-node packages/e2e/dist/cli.js transcript /tmp/omp-ux-e2e-run-lifecycle-journey --follow
-node packages/e2e/dist/cli.js report /tmp/omp-ux-e2e-run-lifecycle-journey \
-  --copy-evidence
+export OMP_E2E_ROOT="${OMP_E2E_ROOT:-${TMPDIR:-/tmp}/omp-workflows-e2e}"
+npm run e2e:prepare -- \
+  --config packages/e2e/scenarios/live-smoke.env.json \
+  --run run-lifecycle-journey --json
+MANIFEST="$OMP_E2E_ROOT/runs/run-lifecycle-journey/manifest.json"
+npm run e2e:auth-broker -- ensure --manifest "$MANIFEST" --json
+npm run e2e:doctor -- --manifest "$MANIFEST" --json
+npm run e2e:start -- --manifest "$MANIFEST" --session-id journey \
+  --surface text --detach --json
 ```
 
-Prepare the resume scratch once. After session 1 reaches the saved decision,
-run `report --copy-evidence` and `ux-e2e stop`; then start **the same scratch**
-again for session 2 without its previous chat. Both starts are clean registered
-command sessions: omit `--scenario` and `--task`, and type the slash commands
-manually into the new terminal PTY.
+Drive the registered `/do-work` commands manually through the session, following
+`run-lifecycle-journey-task.md`: create independent A and B runs, change branch
+context for C, return to A, select by the displayed list when necessary, and verify
+the expected rework and isolation receipts. For example, submit a command with the
+manifest-selected PTY:
 
 ```bash
-node packages/e2e/dist/cli.js bootstrap run-lifecycle-resume feat/run-lifecycle-resume \
-  --monorepo . --workdir /tmp --force
-node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-run-lifecycle-resume \
-  --surface text --detach --max-time 90m
-# after report + stop:
-node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-run-lifecycle-resume \
-  --surface text --detach --max-time 90m
+npm run e2e:input -- --manifest "$MANIFEST" --session-id journey \
+  --text '/do-work --new "Экспорт отчётов A"' --json
 ```
 
-Raw evidence is written automatically to
-`<scratch>/.work-state/ux-e2e/{transcript.jsonl,session.json,detach.log}`;
-`events.jsonl`/`session.jsonl` are included when the registered workflow emits
-them, and the report records the newest host omp log when available. Reports
-go to `./vibe-report/<slug>-ux-e2e-<date>.md` plus
-`<scratch>/.work-state/ux-e2e/report.json`. When a scratch session is restarted,
-the harness archives the previous raw transcript beside the current one; never
-manually edit or delete those files. A live pass is **not** implied by scenario
-loading or package tests: run these commands after core/fullstack/internal
-integration and attach the resulting transcript/report paths.
+Repeat the checklist commands through that same session. Use `e2e:ask` for any
+pending `[ask_user]` interaction; never send the checklist or scenario JSON as the
+task. Capture only the manifest-scoped, redacted evidence:
+
+```bash
+npm run e2e:transcript -- --manifest "$MANIFEST" --session-id journey --follow
+npm run e2e:stop -- --manifest "$MANIFEST" --session-id journey --json
+npm run e2e:report -- --manifest "$MANIFEST" --session-id journey \
+  --copy-evidence --json
+npm run e2e:cleanup -- --manifest "$MANIFEST" --json
+```
+
+### Fresh-session resume journey
+
+Prepare a separate manifest for the resume journey. After the first session reaches
+the saved decision, capture its report and stop it; then start a second clean session
+against the **same manifest**, without the previous chat:
+
+```bash
+npm run e2e:prepare -- \
+  --config packages/e2e/scenarios/live-smoke.env.json \
+  --run run-lifecycle-resume --json
+RESUME_MANIFEST="$OMP_E2E_ROOT/runs/run-lifecycle-resume/manifest.json"
+npm run e2e:auth-broker -- ensure --manifest "$RESUME_MANIFEST" --json
+npm run e2e:doctor -- --manifest "$RESUME_MANIFEST" --json
+npm run e2e:start -- --manifest "$RESUME_MANIFEST" --session-id resume-1 \
+  --surface text --detach --json
+```
+
+Drive the first session through `run-lifecycle-resume-task.md` until the decision
+and required inputs are durably saved. Use `e2e:transcript`, `e2e:report
+--copy-evidence`, and `e2e:stop` with `--session-id resume-1`, then restart:
+
+```bash
+npm run e2e:transcript -- --manifest "$RESUME_MANIFEST" \
+  --session-id resume-1 --follow
+npm run e2e:report -- --manifest "$RESUME_MANIFEST" \
+  --session-id resume-1 --copy-evidence --json
+npm run e2e:stop -- --manifest "$RESUME_MANIFEST" \
+  --session-id resume-1 --json
+npm run e2e:start -- --manifest "$RESUME_MANIFEST" --session-id resume-2 \
+  --surface text --detach --json
+```
+
+The second session must resume by title/list without its previous chat and verify
+required-evidence, pending-dispatch, and terminal-history guards. The same run-owned
+workspace and canonical `.work-state` survive this restart, while session transcripts
+remain distinct. Stop and report the resumed session, then clean up the run:
+
+```bash
+npm run e2e:transcript -- --manifest "$RESUME_MANIFEST" \
+  --session-id resume-2 --follow
+npm run e2e:stop -- --manifest "$RESUME_MANIFEST" \
+  --session-id resume-2 --json
+npm run e2e:report -- --manifest "$RESUME_MANIFEST" \
+  --session-id resume-2 --copy-evidence --json
+npm run e2e:cleanup -- --manifest "$RESUME_MANIFEST" --json
+```
+
+A live pass is **not** implied by scenario loading or package tests: run these
+manifest commands after core/fullstack/internal integration and attach the resulting
+transcript/report evidence.
 
 ## Subcommands
 
-| Command | Purpose |
-|---|---|
-| `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire the plugin via `npm link` (NOT `file:` — the unpublished peer would fail with ETARGET), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
-| `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. Honours the optional user-supplied overlay at `<scratch>/.omp/ux-e2e-overlay.user.json` (see [User-supplied overlay](#user-supplied-overlay)). |
-| `stop <scratch-dir>` | SIGTERM → SIGKILL the recorded process tree (see session.json `pid`). |
-| `transcript <scratch-dir>` | Render transcript.jsonl as text; `--tail N`, `--follow`. |
-| `input <scratch-dir> <text>` | Unconditionally sends `<text>\n` in ONE `{t:'i'}` frame, without requiring a pending `[ask_user]` prompt. **Prefer `pressEnter()` (`\r`) for real omp submit** — `submit()` (`\n`) is a legacy text-mode helper; see [Enter semantics](#enter-semantics-r-vs-n). |
-| `report <scratch-dir>` | `generateReport()` → `<scratch>/.work-state/ux-e2e/report.json` + `<mdDir>/<slug>-ux-e2e-<date>.md` (default `./vibe-report`). `--steps` supplies structured ratings; `--copy-evidence` mirrors evidence files. |
+For a dedicated state location, set `OMP_E2E_ROOT` **before prepare and for every
+subsequent command**. The default is `<system temp>/omp-workflows-e2e` (on macOS the
+physical `/private/var` spelling may differ). Manifests are trusted only beneath that
+root's `runs/<run-id>/manifest.json`; do not copy one to another root or modify it.
+Unique run IDs avoid collisions. An unchanged `prepare` can reuse an existing run;
+changed inputs under the same ID are a conflict, not a silent rebuild.
 
-## Session hygiene & safe stopping
+## Manual lifecycle and restart
 
-Stop sessions **only** through `ux-e2e stop <scratch>` (or the equivalent
-`npm run e2e -- stop <scratch>`). The command reads the session PID from
-`<scratch>/.work-state/ux-e2e/session.json`, verifies that the live process
-belongs to that scratch session, then sends SIGTERM and (after the grace
-period) SIGKILL to its process tree. If the PID is stale or belongs to another
-process, stopping is refused rather than risking an unrelated session.
-
-**Never** use `pkill`, `killall`, or `kill` by a process name or pattern (for
-example `omp` or `bun`). Those commands can terminate omp sessions belonging
-to other terminals or users. `start --force` already resolves a live session
-for the requested scratch directory; manual process cleanup is not needed.
-
-When the recorded PID is no longer running, `ux-e2e stop` reports that state
-and leaves the rest of the host untouched.
-
-## Architecture
-
-- **`src/server.ts`** — `startTestSession()`: loopback-only HTTP+WS server,
-  session-scoped 256-bit token (constant-time compare), Origin (if present) /
-  Host checks, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, strict
-  CSP, per-connection rate limit, idle timer, SIGTERM → SIGKILL process-tree
-  kill, 64 KiB max frame. Closing a WS only detaches that client; the PTY stays
-  alive for reconnect until `session.close()`, idle timeout, or PTY exit. Vendored static routes
-  (`terminal.html`, `page.js`, `xterm.js`, `xterm.css`, `addon-fit.js`; query
-  strings are stripped by `pathnameOf`, so cache-busters like `?cb=1` resolve
-  to the same file). Spawns omp with up to three `--config` overlays in
-  argv order (omp merges them with later wins on conflict):
-  1. host `~/.omp/agent/config.yml` (auto-inherited — operator's modelRoles,
-     creds, models.db survive so omp boots with a real model);
-  2. `<scratch>/.omp/ux-e2e-overlay.json` (regenerated every start — session
-     bookkeeping wins over host defaults for keys it explicitly sets);
-  3. `<scratch>/.omp/ux-e2e-overlay.user.json` (operator-supplied, **opt-in** —
-     emitted only when the file exists; wins on conflict so a test run can
-     pin e.g. `modelRoles.default` without touching the host config or the
-     regenerated standard overlay; see [User-supplied overlay](#user-supplied-overlay)).
-  Every PTY output frame is appended to `transcript.jsonl` — the
-  server-side evidence backbone.
-- **`src/driver.ts`** — `TerminalDriver` seam: `WsDriver` (text mode, reads the
-  transcript) and `createPlaywrightDriver` (lazy optional `playwright`
-  dependency). `TranscriptLog` (append-only scan, O(delta) cursor) +
-  `AskStateTracker` ([ask_user] detection, double-answer guard).
-- **`src/scenario.ts`** — `loadScenario()`: JSON scenario = data; validates with
-  field names in errors, resolves `task: {file}`, expands `{{slug}} {{branch}}
-  {{task}} {{cols}} {{rows}} {{max_time}} {{feature_description}}
-  {{project_name}} {{platform_scope}}` plus scenario params. Built-in defaults
-  cover every `{{key}}` in the reference `full-feature-task.md` so the rendered
-  prompt never contains a literal `{{...}}`. Merge precedence: caller
-  `params` > `def.params` > `BUILTIN_DEFAULTS`.
-- **`src/report.ts`** — `generateReport()`: ux-e2e JSON + manual_qa-compatible
-  markdown. Defect floors: CRITICAL→1, HIGH→2, MEDIUM→3, LOW→4; ratings are
-  clamped and warnings are emitted.
-- **`src/cli.ts`** — thin `node:util parseArgs` dispatch over the seven
-  subcommands. `--detach` spawns the child with an inherited file descriptor
-  for stdout/stderr pointing at `detach.log` (no parent-side pipe — the
-  child outlives the parent without an EPIPE crash) and tails the log on
-  the 15 s startup timeout.
-
-## User-supplied overlay
-
-The harness auto-emits two `--config` overlays for every session: the host
-config (so `modelRoles` survive) and the regenerated ux-e2e overlay. Drop a
-third file at `<scratch>/.omp/ux-e2e-overlay.user.json` (any valid
-omp config.yml subset) and the harness will pass it as the **third**
-`--config` — its keys win on conflict over both the host config and the
-standard overlay, without touching either.
-
-Use it to pin the active session model without modifying the operator's
-host config or the regenerated standard overlay:
-
-```yaml
-# <scratch>/.omp/ux-e2e-overlay.user.json
-modelRoles:
-  default: minimax/MiniMax-M2.7
-  ask: minimax/MiniMax-M2.7
-  plan: minimax/MiniMax-M2.7
+```bash
+export OMP_E2E_ROOT="${OMP_E2E_ROOT:-${TMPDIR:-/tmp}/omp-workflows-e2e}"
+npm run e2e:prepare -- --config packages/e2e/scenarios/live-smoke.env.json --run manual-01 --json
+MANIFEST="$OMP_E2E_ROOT/runs/manual-01/manifest.json"
+npm run e2e:doctor -- --manifest "$MANIFEST" --json
+npm run e2e:start -- --manifest "$MANIFEST" --session-id first --surface web --detach --json
+# `start --json` returns a private connection_path, never its bearer URL.
+# On macOS/Linux, open the first session locally without printing the token:
+CONNECTION_FILE="$OMP_E2E_ROOT/runs/manual-01/private/sessions/first/connection.json"
+node -e 'const fs=require("node:fs"),cp=require("node:child_process"); const url=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).url; cp.spawn(process.platform==="darwin"?"open":"xdg-open",[url],{stdio:"ignore",detached:true}).unref()' "$CONNECTION_FILE"
+# Type /do-work <task> and submit with Enter (PTY CR, not LF).
+npm run e2e:transcript -- --manifest "$MANIFEST" --session-id first
+npm run e2e:stop -- --manifest "$MANIFEST" --session-id first --json
+npm run e2e:start -- --manifest "$MANIFEST" --session-id resumed --surface web --detach --json
+# The same run-owned workspace and canonical .work-state survive this restart;
+# transcripts and logs remain distinct per session.
+npm run e2e:stop -- --manifest "$MANIFEST" --session-id resumed --json
+npm run e2e:report -- --manifest "$MANIFEST" --copy-evidence --json
+npm run e2e:cleanup -- --manifest "$MANIFEST" --json
 ```
 
-Presence is the opt-in signal: the file is never auto-created, and the
-third `--config` is omitted entirely when the file is absent. The resolved
-path (or `null`) is recorded in `session.json` under `user_config` for
-diagnostics:
+The terminal server binds loopback, requires a session token, supports reconnect,
+and replays bounded recent output to a late web client. `e2e:input -- --manifest
+"$MANIFEST" --session-id first --text '/do-work <task>'` submits a command with
+PTY Enter. `e2e:ask` handles a pending `[ask_user]`; `e2e:transcript` renders a
+redacted session transcript. `e2e:stop` authenticates to the run-owned loopback
+session server and lets the owner verify the process receipt, stop the PTY, and
+persist the **observed** exit. An unreachable owner can only trigger a
+receipt-verified recovery stop, which fails acceptance rather than fabricating
+a clean exit; ambiguous ownership is refused. Never use `pkill`/`killall` or
+target omp by name. `e2e:cleanup` is idempotent and cannot stop the shared
+broker; inspect `--json` results rather than guessing whether a process was removed.
+An owner-requested SIGTERM may appear as raw exit code `143`/signal `0` in
+omp's PTY; the report recognizes only this observed, non-forced outcome with
+matching ownership evidence and never rewrites it to exit code `0`.
 
-```jsonc
-{
-  "user_config": {
-    "path": "/tmp/omp-ux-e2e-my-feature/.omp/ux-e2e-overlay.user.json",
-    "default_path": "/tmp/omp-ux-e2e-my-feature/.omp/ux-e2e-overlay.user.json"
-  }
-}
-```
+| CLI subcommand | Required inputs | Purpose |
+| --- | --- | --- |
+| `prepare` | `--config <file> --run <id>` | Stage consistent source snapshot, package closure, runtime and disposable project. |
+| `doctor` | `--manifest <file>` | Validate integrity, runtime capabilities, plugin signals and auth prerequisite. |
+| `start` | `--manifest <file>` | Launch a session; optional `--session-id`, `--surface web\|text`, `--detach`. |
+| `stop`, `input`, `ask`, `transcript`, `report` | `--manifest <file>` | Address the selected run/session, not a scratch path. |
+| `verify` | `--manifest <file> --suite isolation\|live-smoke` | Executable acceptance with scoped report and cleanup. |
+| `cleanup` | `--manifest <file>` | Remove only verified run-owned processes and private files. |
+| `auth-broker` | `ensure\|status\|stop --manifest <file>` | Explicitly manage the native host broker, independent of run cleanup. |
 
-Argv order (omp merges with later wins on duplicate keys):
+All commands accept `--json`; errors include a machine-readable code and a nonzero
+exit. The obsolete `bootstrap <scratch>`/`npm link`/host config overlay path is
+not supported. `--steps <json>` for `report` supplies structured manual UX ratings;
+otherwise the report is unassessed rather than a fabricated PASS.
 
-```
---config <~/.omp/agent/config.yml>             # host   — modelRoles survive
---config <scratch>/.omp/ux-e2e-overlay.json    # ux-e2e  — session bookkeeping
---config <scratch>/.omp/ux-e2e-overlay.user.json   # user — highest priority (opt-in)
-```
+## Authentication and host boundary
 
-## WS protocol
+- `auth.mode: none` is **provider-free**. The harness still starts a real omp PTY
+  with an offline model catalog and exercises plugin discovery; it does not call
+  a model. Use the committed `isolated-smoke.env.json` for this check.
+- `auth.mode: api-key-env` names provider environment variables in the config;
+  the values must exist in the launching environment. Keys never go into the
+  manifest, argv, report or exported transcript. Missing keys fail closed.
+- `auth.mode: broker` targets an explicit operator-managed loopback endpoint
+  with a bearer from the specified environment variable. Insecure/foreign
+  endpoints fail closed; this mode does not start a broker.
+- `auth.mode: native-host-broker` is **explicit opt-in** to the existing installed
+  omp OpenAI Codex (`openai-codex`) or xAI (`xai-oauth`) authorization. The manager
+  starts/reuses a single verified native broker bound to loopback for the host
+  profile and passes its URL/token through the runtime's broker environment
+  seam to isolated PTYs. It never copies the host auth DB or refresh token into
+  a run and does not execute `omp token`, login, migrate, or credential rotation.
+  The broker itself intentionally reads the host agent database and uses the
+  native protected token file. `auth-broker stop` is a separate explicit action
+  and refuses foreign listeners or live clients. Run cleanup does **not** stop it.
 
-Inbound (`browser → server`): `{t:'i', d}` input, `{t:'r', cols, rows}` resize.
-See [Enter semantics](#enter-semantics-r-vs-n) below — Enter in a PTY is
-`\r`, not `\n`.
-Outbound: `{t:'s', ok:true}` auth ack · `{t:'o', d}` PTY output ·
-`{t:'exit', code, signal?}` process exit · `{t:'err', code, message}` where
-`code ∈ {rate-limited, idle-timeout, spawn-failed, no-pty}`.
+The broker coordinates clients using **that broker**. Ordinary omp clients that
+independently read the host DB can still compete to refresh the same OAuth grant;
+cross-process refresh single-flight has **not** been verified. Do not claim that
+running broker and normal omp simultaneously is risk-free. This tradeoff applies
+only when choosing `native-host-broker`. The smoke uses current authorization; it
+must not rotate working credentials to test refresh. Provider quota/latency is
+shared with the operator's normal sessions. The pinned model in the committed
+live config must be available on that authorization; otherwise doctor/live smoke
+fails rather than silently switching providers.
 
-### Enter semantics (`\r` vs `\n`)
+## Isolation and evidence
 
-A real Enter keypress in a PTY produces **CR (0x0D, `'\r'`)**, not LF
-(0x0A, `'\n'`). In the omp TUI the editor maps `\r` to "submit current
-line"; `\n` is just a line break and does **not** submit.
+`prepare` snapshots the current working-tree source (including uncommitted edits),
+uses package manifests to build immutable content-addressed core/fullstack and
+runtime closures, and materializes writable run-private HOME, agent, XDG, temp,
+package-manager and project roots. The project has its own `e2e/<run-id>` Git
+branch. Child processes use an allowlisted environment, not the operator's
+OMP/PI config, module paths, plugin directory, current project or workflow state.
+The detached control worker has an explicit environment allowlist; only
+manifest-declared auth variables and the selected native-broker host-profile
+selectors are forwarded. Its PTY always runs with the run-private roots.
+The native runtime snapshot is checked for supported version/capabilities before
+launch. Artifact hashes and registered command observations are evidence; they do
+**not** imply omp exposes a complete native extension inventory. Changed/tampered
+artifacts or unrecognized runtime signals fail closed. Cold prepare builds and
+caches; warm prepare reuses integrity-verified cache without a new install or LLM.
 
-- `WsDriver.pressEnter()` — sends `{t:'i', d:'\r'}` (real Enter over WS).
-- `PlaywrightDriver.pressEnter()` — calls `page.keyboard.press('Enter')`
-  (real Enter via CDP; xterm forwards `'\r'` through `onData`).
-- Web toolbar **⏎ Enter** button — `window.__pressEnter()` in
-  `assets/page.js`: primary path dispatches a synthetic `KeyboardEvent`
-  (`key:'Enter'`, `keyCode:13`) on `term.textarea`; if xterm does not
-  forward `'\r'` within ~100 ms (focus lost, textarea disabled) the
-  handler falls back to `{t:'i', d:'\r'}` directly. A one-shot `onData`
-  listener guards the fallback so it never duplicates `'\r'` when the
-  primary path succeeds.
-- `WsDriver.submit(text)` (legacy) — appends `'\n'`. Retained for
-  backward compatibility with surfaces that normalised LF → CR; prefer
-  `pressEnter()` for real PTY sessions.
+Every run records a manifest, separate session transcripts/logs, ownership receipts,
+and a report under its evidence root. Text exports redact known credentials,
+connection metadata, URL tokens and provider strings; copied evidence survives
+cleanup. Binary screenshots are omitted from exports because pixels cannot be
+reliably redacted without human review. The private per-session connection file
+is not an exportable report artifact: treat its URL as a bearer secret. Report
+results are observations of the current runtime, not proof of absence of all
+host extensions. `doctor` and `verify` distinguish unsupported runtime,
+missing auth and scenario failure; do not substitute unit fixtures for live proof.
 
-Upgrade path: `/ws?token=<session-scoped-token>`. The token remains valid for
-
-## Report schema
-
-`report.json` (schema_version 1):
-
-```jsonc
-{
-  "type": "ux-e2e",
-  "schema_version": 1,
-  "verdict": "PASS" | "FAIL" | "CONDITIONAL",
-  "mode": "ui",
-  "regressions": ["…"],
-  "session": { "slug", "scratch_dir", "omp_version", "profile", "tty", "started_at", "finished_at", "task_prompt", "scenario", "transcript", "session_jsonl", "events_jsonl", "omp_log" },
-  "steps": [{ "id", "name", "order", "ratings": { "message_clarity": 1..5, … }, "defects": ["D1"], "screenshots": ["…"] }],
-  "defects": [{ "id", "severity": "CRITICAL"|"HIGH"|"MEDIUM"|"LOW", "dimension", "title", "step", "evidence": ["…"] }],
-  "agent_quality": { "rating": 1..5, "rationale", "dimensions": { "task_fidelity": … } },
-  "overall": { "score": 1..5, "summary", "recommendation": "ship"|"fix-high"|"rework" },
-  "evidence": ["transcript.jsonl", "session.json", "omp log", "screenshots"],
-  "generated_at": "…"
-}
-```
-
-## Agent-browser recipe (web surface)
-
-1. `ux-e2e start <scratch> --detach` → prints the URL (session survives).
-2. Open the URL in a browser (the token is in the URL; never share it).
-3. Drive the terminal as a human: type `/do-work <task>`. The toolbar at
-   the bottom of the page has an **⏎ Enter** button (`window.__pressEnter()`)
-   that emits a real Enter keypress — use it whenever the TUI is waiting
-   for input and you would press Enter at a real keyboard.
-4. On every `[ask_user]` block, either type the answer in the terminal or run
-   `ux-e2e ask <scratch> --list` / `ux-e2e ask <scratch> "<answer>"`.
-5. At each stage: screenshot, rate the 6 UX dimensions, log defects to a
-   `steps.json`.
-6. `ux-e2e report <scratch> --steps steps.json --copy-evidence`.
-
-## Known limitations
-
-- `[ask_user]` detection is a regex heuristic over the transcript (numbered
-  option lines after an `[ask_user]` title); calibration may be needed on the
-  first real run. Answers typed *inside* the terminal (not via `ask`) are not
-  recorded in ask-state.jsonl and are treated as "the transcript moved on".
-- Single session at a time per scratch dir (session.json live-pid guard).
-- `--detach` runs the session in a detached child whose stdout/stderr are
-  captured to `<scratch>/.work-state/ux-e2e/detach.log` via an inherited
-  file descriptor (no pipe between parent and child — the child
-  **outlives the parent** and is only stopped via `ux-e2e stop <scratch>` or
-  `--max-time` expiry). The parent surfaces the log tail on the 15 s
-  startup timeout.
-- The xterm stylesheet is served from `@xterm/xterm/css/xterm.css` (the package
-  does not ship `lib/xterm.css`).
-- The host `~/.omp/agent/config.yml` is auto-inherited as the first
-  `--config` overlay so omp boots with a model. If the host config is missing
-  or has no `modelRoles`, a WARNING is written to stderr and the resolved
-  path + warning are recorded in `session.json` under `host_config`.
-- A user-supplied overlay at `<scratch>/.omp/ux-e2e-overlay.user.json` is
-  emitted as the **third** `--config` (highest priority) so a test run can
-  pin `modelRoles` (or any other key) without touching the host config or
-  the regenerated standard overlay. Presence is the opt-in signal: the file
-  is never auto-created, and the path (or `null`) is recorded in
-  `session.json` under `user_config`. See
-  [User-supplied overlay](#user-supplied-overlay).
-    - **Batch via `ux-e2e input <scratch> "<command>"`** for arbitrary commands
-      — sends the command plus a trailing LF (`\n`). For real PTY submit
-      (omp editor maps `\r` → submit) use `pressEnter()` instead; see
-      [Enter semantics](#enter-semantics-r-vs-n).
-- **Single-PTY lifecycle** — the session holds ONE PTY for the whole run. A WS
-  disconnect (browser reload, sleep/resume, network blip, or a rate-limit
-  close) only detaches that client; reconnect with the session-scoped token
-  continues driving the same PTY. The PTY ends only on `session.close()` /
-  `ux-e2e stop`, idle timeout, or process exit.
-- **Rate-limit typing threshold (FD-RL, observed live)** — the per-connection
-  inbound rate limit is **200 messages / 1 s window** (see `RateLimiter` in
-  `src/server.ts`). puppeteer's default `page.keyboard.type` runs at
-  ~30 ms / char (~33 chars/s) which is comfortably under the limit for
-  short bursts, but long prompt bursts (e.g. a 200-char task prompt typed
-  back-to-back) can cross the rolling window and emit
-  `{t:'err',code:'rate-limited'}` and detach that client while leaving the PTY
-  alive. Recommended driver approaches:
-    - **Batch via `ux-e2e ask <scratch> "<answer>"`** for pending asks — sends
-      the answer in a single `{t:'i'}` frame and writes to `ask-state.jsonl`.
-    - **Batch via `ux-e2e input <scratch> "<command>"`** for arbitrary commands
-      — sends the command plus a trailing LF (`\n`). For real PTY submit use `pressEnter()` (`\r`); see [Enter semantics](#enter-semantics-r-vs-n).
-    - **Throttle typing** — use `delay ≥ 150 ms` per character on
-      `page.keyboard.type(...)` (200 ms was observed safe in a live run).
-    - **Send whole prompts in one frame** rather than per-char keystrokes.
-  Do not raise the limit without review; it protects the PTY from a runaway
-  client, and a disconnected client can safely reconnect.
-
-## License
-
-MIT — see the repository root LICENSE. Security/PTY patterns ported from
-`@pi-harness/web-terminal` (MIT).
+This is **process/configuration isolation, not an OS sandbox**. An installed omp
+binary or package build script executes with the host user's filesystem privileges;
+the harness cannot defend against deliberately malicious native code or general
+host filesystem access. Run only trusted revisions. The managed native broker is
+the sole intentional host OAuth interface in the live config.

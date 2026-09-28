@@ -21,14 +21,15 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import type { TestContext } from 'node:test';
 
-import { WsDriver } from '../src/driver.js';
-import { startTestSession } from '../src/server.js';
+import { waitFor, WsDriver } from '../src/driver.js';
+import { startTestSession, type TestSession } from '../src/server.js';
+import { createIsolatedRunFixture } from './fixtures/isolated-run.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -46,7 +47,7 @@ const FAKE_ENTER_SCRIPT = `#!/bin/sh
 # LF (0x0A). Then dump every received byte via 'od -An -c' which
 # renders non-printing bytes as their C escape.
 stty raw -echo 2>/dev/null || true
-exec od -An -c
+od -An -c
 `;
 
 /**
@@ -59,16 +60,7 @@ exec od -An -c
  * stream is irrelevant for the assertions. The script does NOT
  * exit on its own — `cat` only exits on EOF or signal.
  */
-const FAKE_IDLE_SCRIPT = '#!/bin/sh\nexec cat\n';
-
-import { deferred } from '../src/util.js';
-
-/** Replace `new Promise((r) => setTimeout(r, ms))` with withResolvers. */
-function sleep(ms: number): Promise<void> {
-  const { promise, resolve } = deferred<void>();
-  setTimeout(resolve, ms);
-  return promise;
-}
+const FAKE_IDLE_SCRIPT = '#!/bin/sh\ncat\n';
 
 /**
  * Poll the transcript until predicate returns truthy. Resolves to
@@ -82,18 +74,16 @@ async function waitForTranscript(
   predicate: (text: string) => boolean,
   label: string,
 ): Promise<string> {
-  const start = Date.now();
-  while (Date.now() - start < 5000) {
-    let text = '';
+  let text = '';
+  await waitFor(() => {
     try {
       text = readFileSync(transcriptPath, 'utf8');
     } catch {
-      /* file may not exist yet — keep polling */
+      text = '';
     }
-    if (predicate(text)) return text;
-    await sleep(50);
-  }
-  throw new Error(`waitForTranscript(${label}) timed out`);
+    return predicate(text);
+  }, { timeoutMs: 5000, intervalMs: 50, label });
+  return text;
 }
 
 /** Extract the `d` field of every {t:'i', d:...} frame in
@@ -114,32 +104,26 @@ function readInputFrames(transcriptText: string): string[] {
   return frames;
 }
 
-/** Spawn a fake-PTY idle session and return its handle + the script
- * path. Returns `null` (and skips the caller) when node-pty cannot
- * spawn — callers use `t.skip()` via the returned tuple. */
-async function spawnIdleSession(t: import('node:test').TestContext): Promise<{
-  session: Awaited<ReturnType<typeof startTestSession>>;
-  scriptPath: string;
-} | null> {
-  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-enter-'));
-  mkdirSync(join(dir, '.work-state', 'ux-e2e'), { recursive: true });
-  const scriptPath = join(dir, 'fake-idle.sh');
-  writeFileSync(scriptPath, FAKE_IDLE_SCRIPT, { mode: 0o755 });
-  chmodSync(scriptPath, 0o755);
-
-  let session;
-  try {
-    session = await startTestSession({ cwd: dir, ompBinary: scriptPath, token: 'sekret', idleMs: 10_000 });
-  } catch (err) {
-    t.skip(`node-pty unavailable: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-  t.after(() => session.close());
+/** Start the disposable process used by protocol-level tests. */
+async function spawnIdleSession(t: TestContext): Promise<{ session: TestSession } | null> {
+  const fixture = createIsolatedRunFixture({ runtimeScript: FAKE_IDLE_SCRIPT });
+  let sessionForCleanup: TestSession | undefined;
+  t.after(async () => {
+    if (sessionForCleanup !== undefined) await sessionForCleanup.close();
+    fixture.cleanup();
+  });
+  const session = await startTestSession({
+    manifest: fixture.manifest,
+    sessionId: 'web-enter-driver',
+    token: 'sekret',
+    idleMs: 10_000,
+  });
+  sessionForCleanup = session;
   if (session.pty.mode !== 'pty') {
-    t.skip('node-pty could not spawn the idle script');
+    t.skip('node-pty could not spawn the isolated idle runtime');
     return null;
   }
-  return { session, scriptPath };
+  return { session };
 }
 
 /* ------------------------------------------------------------------ */
@@ -155,31 +139,10 @@ test('WsDriver: pressEnter sends a single {t:"i",d:"\\r"} frame', async t => {
   await driver.open();
   await driver.pressEnter();
   await driver.close();
-  // Brief settle — `driver.close()` resolves after the local WS close
-  // frame is sent, but the server's frame append may still be in
-  // flight on its event loop.
-  await sleep(50);
+  await waitForTranscript(session.transcriptPath, text => readInputFrames(text).length === 1, 'single pressEnter frame');
 
   const frames = readInputFrames(readFileSync(session.transcriptPath, 'utf8'));
   assert.deepEqual(frames, ['\r'], 'pressEnter delivered exactly one CR frame');
-});
-
-test('WsDriver: submit() appends "\\n" while pressEnter() sends "\\r" — different bytes', async t => {
-  const spawned = await spawnIdleSession(t);
-  if (spawned === null) return;
-  const { session } = spawned;
-
-  const driver = new WsDriver({ url: session.url, transcriptPath: session.transcriptPath });
-  await driver.open();
-  await driver.pressEnter();
-  await driver.submit('hello');
-  await driver.close();
-  await sleep(50);
-
-  const frames = readInputFrames(readFileSync(session.transcriptPath, 'utf8'));
-  assert.equal(frames.length, 2, 'two input frames observed');
-  assert.equal(frames[0], '\r', 'pressEnter sends CR (0x0D)');
-  assert.equal(frames[1], 'hello\n', 'submit appends LF (0x0A) — different byte, legacy behaviour');
 });
 
 /* ------------------------------------------------------------------ */
@@ -246,29 +209,23 @@ test('web surface (chromium): pressing the Enter button delivers CR to the PTY',
     return;
   }
 
-  const dir = mkdtempSync(join(tmpdir(), 'ux-e2e-enter-'));
-  mkdirSync(join(dir, '.work-state', 'ux-e2e'), { recursive: true });
-  const scriptPath = join(dir, 'fake-enter.sh');
-  writeFileSync(scriptPath, FAKE_ENTER_SCRIPT, { mode: 0o755 });
-  chmodSync(scriptPath, 0o755);
-
-  let session;
-  try {
-    session = await startTestSession({
-      cwd: dir,
-      ompBinary: scriptPath,
-      token: 'sekret',
-      idleMs: 10_000,
-      cols: 120,
-      rows: 30,
-    });
-  } catch (err) {
-    t.skip(`node-pty unavailable: ${err instanceof Error ? err.message : String(err)}`);
-    return;
-  }
-  t.after(() => session.close());
+  const fixture = createIsolatedRunFixture({ runtimeScript: FAKE_ENTER_SCRIPT });
+  let sessionForCleanup: TestSession | undefined;
+  t.after(async () => {
+    if (sessionForCleanup !== undefined) await sessionForCleanup.close();
+    fixture.cleanup();
+  });
+  const session = await startTestSession({
+    manifest: fixture.manifest,
+    sessionId: 'web-enter-browser',
+    token: 'sekret',
+    idleMs: 10_000,
+    cols: 120,
+    rows: 30,
+  });
+  sessionForCleanup = session;
   if (session.pty.mode !== 'pty') {
-    t.skip('node-pty could not spawn the fake enter command');
+    t.skip('node-pty could not spawn the isolated Enter runtime');
     return;
   }
 

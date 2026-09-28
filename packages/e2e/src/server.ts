@@ -18,28 +18,51 @@
  *   - 64 KiB max inbound WS frame; no file API exposed.
  */
 
-import { spawn } from 'node:child_process';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { execFileSync, spawn } from 'node:child_process';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
-import { basename, join, resolve } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import type { IPty } from 'node-pty';
 import { WebSocketServer, type WebSocket as WS } from 'ws';
 
+import { verifyPackageArtifact } from './artifacts.js';
+import { verifyManifest, type ProcessReceipt, type RunManifest } from './manifest.js';
+import {
+  assertSafeRunPath,
+  acquireRunLease,
+  acquireSessionLease,
+  buildChildEnvironment,
+  ensureManifestRoots,
+  isolationReceipt,
+  isCleanSessionTermination,
+  manifestRoots,
+  readSessionRecord as readManifestSessionRecord,
+  readRunLeaseOwnership,
+  runtimeBinaryOf,
+  sessionPaths,
+  verifyRuntimeBinary,
+  writeSessionRecord,
+  type RunLease,
+  type SessionPaths,
+  type SessionTermination,
+} from './environment.js';
+import { providerRequiredForManifest, resolveLaunchAuthEnvironment, type AuthResolution } from './auth.js';
+import { probeProviderFreeRuntime, verifyRuntimeSnapshot, writeProviderFreeCatalog, type RuntimeSnapshot } from './runtime.js';
+
+
 import { deferred } from './util.js';
-import { ensureWorkspaceActivation } from './workspace-activation.js';
 /** Max inbound WS frame size (defense-in-depth; the browser never needs more). */
 export const MAX_INBOUND_WS_BYTES = 64 * 1024;
 /**
- * Proxy env vars to strip when `keepProxyEnv` is false. Both upper and
- * lower variants are listed because POSIX permits mixed-case names and
- * tools like curl/Python honour the lowercase form. Ported from
- * @pi-harness/web-terminal buildPtyEnv.
+ * Host variables which are never allowed to cross the PTY boundary. The
+ * manifest-aware launch path uses buildChildEnvironment; this compatibility
+ * helper remains deliberately restrictive for callers that exercise the
+ * PTY seam directly.
  */
 export const PROXY_ENV_KEYS = [
   'HTTP_PROXY',
@@ -52,78 +75,64 @@ export const PROXY_ENV_KEYS = [
   'no_proxy',
 ] as const;
 
+const SAFE_PTY_BASE_KEYS = new Set([
+  'CI',
+  'COLORTERM',
+  'FORCE_COLOR',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'NO_COLOR',
+  'TERM',
+  'TZ',
+]);
+
 /**
- * Build the env passed to `pty.spawn`. Merges `process.env` with caller
- * overrides, pins TERM, and (by default) deletes the proxy env vars so a
- * hostile or corporate proxy cannot MITM LLM/API calls. Pass
- * `keepProxyEnv: true` to opt out.
+ * Build a deliberately small environment for direct PTY seam callers.
+ * Manifest launches use buildChildEnvironment, which additionally pins all
+ * run roots. No host OMP/PI/config/module variables are copied here.
  */
 export function buildPtyEnv(
   baseEnv: Readonly<Record<string, string | undefined>>,
   overrides: Readonly<Record<string, string>> | undefined,
-  opts: { readonly keepProxyEnv?: boolean } = {},
+  _opts: { readonly keepProxyEnv?: boolean } = {},
 ): Record<string, string> {
-  const env: Record<string, string> = {
-    ...(baseEnv as Record<string, string>),
-    ...(overrides ?? {}),
-    TERM: 'xterm-256color',
-  };
-  if (opts.keepProxyEnv !== true) {
-    // Remove proxy vars after the spread so no source can sneak them in.
-    for (const key of PROXY_ENV_KEYS) delete env[key];
+  const env: Record<string, string> = {};
+  for (const key of SAFE_PTY_BASE_KEYS) {
+    const value = baseEnv[key];
+    if (typeof value === 'string' && value.length > 0) env[key] = value;
   }
+  for (const [key, value] of Object.entries(overrides ?? {})) {
+    if (SAFE_PTY_BASE_KEYS.has(key) && value.length > 0) env[key] = value;
+  }
+  env.TERM = 'xterm-256color';
   return env;
 }
 
-/**
- * Perm tightening for the session evidence files. The default umask is
- * 0o022, which leaves session.json + transcript.jsonl world-readable on
- * multi-user hosts — exposing the bearer token and the full PTY I/O.
- * writeFileSync({mode:0o600}) pins the mode at create time; chmodSync
- * is the belt-and-braces second pass because umask can still narrow
- * the effective bits on some platforms.
- */
+/** Session evidence stays private and must never follow a substituted symlink. */
 export const SESSION_FILE_MODE = 0o600;
 export const SESSION_DIR_MODE = 0o700;
 
-function writeSessionFile(path: string, body: string): void {
-  writeFileSync(path, body, { mode: SESSION_FILE_MODE });
+function sessionFile(path: string, body: string, root: string, append: boolean): void {
+  assertSafeRunPath(root, path, 'session evidence');
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW |
+    (append ? fsConstants.O_APPEND : fsConstants.O_EXCL);
+  const fd = openSync(path, flags, SESSION_FILE_MODE);
   try {
-    chmodSync(path, SESSION_FILE_MODE);
-  } catch {
-    /* filesystem may not support chmod (e.g. some Windows volumes) — best-effort. */
+    if (!fstatSync(fd).isFile()) throw new Error('session evidence is not a regular file');
+    fchmodSync(fd, SESSION_FILE_MODE);
+    writeSync(fd, body);
+  } finally {
+    closeSync(fd);
   }
 }
 
-/**
- * Preserve a non-empty transcript before a scratch session is restarted.
- * Restarting the PTY must not erase the raw evidence needed to explain a
- * fresh-session resume. The active transcript remains a clean append-only
- * stream for the new session; the archive is sibling evidence, not runtime
- * state and is never read as workflow authority.
- */
-function archivePriorTranscript(transcriptPath: string, stateDir: string): string | null {
-  if (!existsSync(transcriptPath)) return null;
-  const previous = readFileSync(transcriptPath, 'utf8');
-  if (previous.length === 0) return null;
-  const stamp = new Date().toISOString().replace(/[^0-9]/gu, '');
-  let archivePath = join(stateDir, `transcript-${stamp}.jsonl`);
-  let suffix = 1;
-  while (existsSync(archivePath)) {
-    archivePath = join(stateDir, `transcript-${stamp}-${String(suffix)}.jsonl`);
-    suffix += 1;
-  }
-  writeSessionFile(archivePath, previous);
-  return archivePath;
+function writeSessionFile(path: string, body: string, root: string): void {
+  sessionFile(path, body, root, false);
 }
 
-function appendSessionFile(path: string, body: string): void {
-  appendFileSync(path, body, { mode: SESSION_FILE_MODE });
-  try {
-    chmodSync(path, SESSION_FILE_MODE);
-  } catch {
-    /* best-effort. */
-  }
+function appendSessionFile(path: string, body: string, root: string): void {
+  sessionFile(path, body, root, true);
 }
 
 /**
@@ -268,32 +277,181 @@ export class IdleTimer {
 export interface KillProcessTreeOptions {
   /** Time to wait between SIGTERM and SIGKILL. Default 500ms. */
   readonly graceMs?: number;
+  /** Both a private run lease and a matching live process receipt are mandatory. */
+  readonly manifest: RunManifest;
+  readonly sessionId: string;
+  readonly receipt: ProcessReceipt;
+  readonly executablePath?: string;
+  readonly executableDigest?: string;
+  readonly argv?: readonly string[];
+  readonly cwd?: string;
+  /** Invoked after a verified SIGTERM is sent to the owned process group. */
+  readonly onSignalStarted?: () => void;
 }
 
-/**
- * Send SIGTERM to the process group `pid` (negative pid on POSIX),
- * wait `graceMs`, then SIGKILL survivors. Portable in shape; on Windows
- * `process.kill(-pid, ...)` degrades to a single-pid kill.
- */
-export async function killProcessTree(pid: number, opts: KillProcessTreeOptions = {}): Promise<void> {
-  const graceMs = opts.graceMs ?? 500;
-  if (typeof pid !== 'number' || pid <= 0) return;
+interface ProcessGroupMember {
+  readonly pid: number;
+  readonly ppid: number;
+  readonly pgid: number;
+  readonly startMarker: string;
+}
 
-  const { promise: slept, resolve: finishSleep } = deferred<void>();
-  setTimeout(finishSleep, graceMs);
+interface ProcessGroupSnapshot {
+  readonly pgid: number;
+  readonly members: readonly ProcessGroupMember[];
+}
 
+function processGroupMembers(pgid: number): ProcessGroupMember[] | null {
+  if (process.platform === 'win32' || !Number.isInteger(pgid) || pgid <= 0) return null;
   try {
-    process.kill(-pid, 'SIGTERM');
+    const raw = execFileSync('ps', ['-ax', '-o', 'pid=,ppid=,pgid=,lstart='], {
+      encoding: 'utf8',
+      env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
+      timeout: 1500,
+      maxBuffer: 1024 * 1024,
+    });
+    const members: ProcessGroupMember[] = [];
+    for (const line of raw.split('\n')) {
+      if (line.trim().length === 0) continue;
+      const fields = line.trim().split(/\s+/u);
+      if (fields.length < 8) continue;
+      const observedPid = Number(fields[0]);
+      const observedPpid = Number(fields[1]);
+      const observedPgid = Number(fields[2]);
+      if (!Number.isInteger(observedPid) || !Number.isInteger(observedPpid) || !Number.isInteger(observedPgid) || observedPgid !== pgid) continue;
+      members.push({
+        pid: observedPid,
+        ppid: observedPpid,
+        pgid: observedPgid,
+        startMarker: fields.slice(3, 8).join(' '),
+      });
+    }
+    return members;
   } catch {
-    /* ESRCH if the group is already gone — proceed to SIGKILL. */
+    return null;
+  }
+}
+function processGroupExists(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+
+function memberWasOwnedByLeader(member: ProcessGroupMember, byPid: ReadonlyMap<number, ProcessGroupMember>, leaderPid: number): boolean {
+  if (member.pid === leaderPid) return true;
+  const visited = new Set<number>();
+  let parentPid = member.ppid;
+  while (parentPid !== leaderPid) {
+    if (visited.has(parentPid)) return false;
+    visited.add(parentPid);
+    const parent = byPid.get(parentPid);
+    if (parent === undefined) return false;
+    parentPid = parent.ppid;
+  }
+  return true;
+}
+
+function snapshotProcessGroup(receipt: ProcessReceipt): ProcessGroupSnapshot {
+  if (receipt.pgid === null || receipt.pgid !== receipt.pid) throw new Error('process_identity_ambiguous');
+  const members = processGroupMembers(receipt.pgid);
+  if (members === null) throw new Error('process_identity_ambiguous');
+  const leader = members.find(member => member.pid === receipt.pid);
+  if (leader === undefined || leader.startMarker !== receipt.start_marker || leader.pgid !== receipt.pgid) {
+    throw new Error('process_identity_ambiguous');
+  }
+  const byPid = new Map(members.map(member => [member.pid, member] as const));
+  if (members.some(member => !memberWasOwnedByLeader(member, byPid, receipt.pid))) {
+    throw new Error('process_identity_ambiguous');
+  }
+  return { pgid: receipt.pgid, members };
+}
+
+function groupMatchesSnapshot(snapshot: ProcessGroupSnapshot, current: readonly ProcessGroupMember[]): boolean {
+  return current.every(member => snapshot.members.some(expected =>
+    expected.pid === member.pid &&
+    expected.pgid === member.pgid &&
+    expected.startMarker === member.startMarker));
+}
+
+
+export interface KillProcessTreeResult {
+  readonly forced: boolean;
+}
+
+/** Stop only a process group whose recorded identity still matches its live process. */
+export async function killProcessTree(pid: number, opts: KillProcessTreeOptions): Promise<KillProcessTreeResult> {
+  const runtime = await verifyRuntimeBinary(opts.manifest);
+  if (!runtime.ok ||
+    opts.receipt.executable_digest !== runtime.digest ||
+    opts.receipt.executable_digest !== opts.manifest.runtime.digest ||
+    !Number.isInteger(pid) || pid <= 0 || opts.receipt.pid !== pid ||
+    opts.receipt.pgid !== pid) {
+    throw new Error('process_identity_ambiguous');
   }
 
+  /*
+   * A dead leader cannot prove that a still-existing process group is ours:
+   * the PID and group ID may already have been reused.  A typed receipt is
+   * still sufficient to confirm that the group is gone, but never sufficient
+   * to signal an unobserved survivor.
+   */
+  if (!pidIsLive(pid)) {
+    const members = processGroupMembers(opts.receipt.pgid);
+    if (members === null || members.length > 0 || processGroupExists(opts.receipt.pgid)) throw new Error('process_identity_ambiguous');
+    return { forced: false };
+  }
+
+  const ownership = readRunLeaseOwnership(opts.manifest, opts.sessionId);
+  if (ownership === null || ownership.ownerNonce !== opts.receipt.owner_nonce ||
+    !verifyProcessReceipt(opts.receipt, opts)) {
+    throw new Error('process_identity_ambiguous');
+  }
+  const snapshot = snapshotProcessGroup(opts.receipt);
+  const graceMs = opts.graceMs ?? 500;
+  try {
+    process.kill(-snapshot.pgid, 'SIGTERM');
+    opts.onSignalStarted?.();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw new Error('process_signal_failed');
+  }
+  const { promise: slept, resolve: finishSleep } = deferred<void>();
+  setTimeout(finishSleep, graceMs);
   await slept;
 
+  const current = processGroupMembers(snapshot.pgid);
+  if (current === null) throw new Error('process_identity_ambiguous');
+  if (current.length === 0) {
+    if (processGroupExists(snapshot.pgid)) throw new Error('process_identity_ambiguous');
+    return { forced: false };
+  }
+  if (pidIsLive(pid) && (!verifyProcessReceipt(opts.receipt, opts) || !current.some(member => member.pid === pid && member.startMarker === opts.receipt.start_marker))) {
+    throw new Error('process_identity_ambiguous');
+  }
   try {
-    process.kill(-pid, 'SIGKILL');
-  } catch {
-    /* expected if the process is already dead. */
+    process.kill(-snapshot.pgid, 'SIGKILL');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw new Error('process_signal_failed');
+  }
+
+  const waitMs = Math.max(250, Math.min(graceMs, 1000));
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const { promise: poll, resolve: finishPoll } = deferred<void>();
+    setTimeout(finishPoll, 25);
+    await poll;
+    const remaining = processGroupMembers(snapshot.pgid);
+    if (remaining === null) throw new Error('process_identity_ambiguous');
+    if (remaining.length === 0) {
+      if (!processGroupExists(snapshot.pgid)) return { forced: true };
+      if (Date.now() >= deadline) throw new Error('process_still_live');
+      continue;
+    }
+    if (!groupMatchesSnapshot(snapshot, remaining)) throw new Error('process_identity_ambiguous');
+    if (Date.now() >= deadline) throw new Error('process_still_live');
   }
 }
 
@@ -302,76 +460,22 @@ export async function killProcessTree(pid: number, opts: KillProcessTreeOptions 
 /* ------------------------------------------------------------------ */
 
 export interface OmpLaunchConfig {
-  /**
-   * Optional omp profile name. When set, omp is launched with
-   * `--profile <name>`, which keeps auth, sessions, caches and
-   * `models.db` inside that profile's isolated directory.
-   *
-   * When unset, NO `--profile` flag is passed and omp inherits the
-   * default profile (`~/.omp/agent/`) — including the host's
-   * `modelRoles`, `models.db`, and credentials. This is the right
-   * default for UX testing: an explicit `ompProfile` isolates the
-   * ux-e2e run from the host's data; inheriting lets the run use the
-   * same models the operator uses day-to-day.
-   */
+  /** Optional run-owned profile name; never a host profile path. */
   readonly ompProfile?: string;
-  readonly extensionPath?: string;
+  readonly model?: string | null;
   readonly maxTimeSec: number;
   readonly approvalMode: string;
-  readonly configPath: string;
+  /** Explicit extension from the immutable fullstack artifact. */
+  readonly extensionPath: string;
+  /** Session-specific state directory inside the prepared run. */
   readonly sessionDir: string;
-  /**
-   * Optional path to the *host* `~/.omp/agent/config.yml` to load as the
-   * FIRST `--config` overlay. omp merges overlays in argv order, with
-   * later overlays overriding earlier ones for duplicate keys (verified
-   * against `omp v17.2.3 --help`: `--config=<value>  Load an extra
-   * config.yml-style overlay for this run (repeatable)`). Putting the
-   * host config FIRST and the ux-e2e overlay SECOND means:
-   *   - keys NOT touched by the overlay (most importantly `modelRoles`)
-   *     come from the host, so omp boots with a real model instead of
-   *     "No model selected";
-   *   - keys the overlay explicitly sets (e.g. session-dir-relative
-   *     scratch bits) win over the host's defaults.
-   */
-  readonly hostConfigPath?: string;
-  /**
-   * Optional path to a *user-supplied* omp config overlay emitted AFTER
-   * `configPath` (the standard ux-e2e overlay). This is the third and
-   * last `--config` in argv order, so its keys win over both the host
-   * config and the standard overlay on conflict — letting a test run
-   * pin a specific active model (`modelRoles`) without touching the
-   * operator's host config or the regenerated standard overlay.
-   *
-   * The harness only resolves this path when the file actually exists
-   * (presence is the opt-in signal); an unset/falsy value is the normal
-   * case and is recorded as `null` in `session.json` for diagnostics.
-   */
-  readonly userConfigPath?: string;
-  /**
-   * Convenience: absolute path to the canonical user-overlay file
-   * (`<scratchDir>/.omp/ux-e2e-overlay.user.json`). Exposed so the
-   * caller can decide whether to pass `userConfigPath`. Always set —
-   * its existence at runtime is what determines whether the third
-   * `--config` is emitted.
-   */
-  readonly userConfigDefaultPath: string;
 }
 
 /**
- * Build the omp argument vector. NEVER passes `-p`/`--print` and NEVER
- * `--no-pty` — the session must be a real interactive PTY.
- *
- * `--profile` is emitted only when `cfg.ompProfile` is a non-empty
- * string. With NO profile, omp inherits the host default profile
- * (`~/.omp/agent/`) — including `modelRoles`, `models.db`, and
- * credentials — so the run is model-capable out of the box. An
- * explicit `ompProfile` keeps ux-e2e data isolated; the caller picks.
- *
- * `--config` overlay order (argv order, later wins on conflict):
- *   1. `hostConfigPath` (operator's `~/.omp/agent/config.yml` when present)
- *   2. `configPath` (the regenerated ux-e2e overlay)
- *   3. `userConfigPath` (operator-supplied `<scratchDir>/.omp/ux-e2e-overlay.user.json`
- *      when present — third overlay so it overrides everything)
+ * Build the interactive omp argument vector. Runtime identity is supplied
+ * separately by startTestSession from manifest.runtime.binary; this function
+ * never emits a host config, user overlay, PATH-selected executable, or
+ * non-interactive flag.
  */
 export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   const maxMinutes = Math.max(1, Math.round(cfg.maxTimeSec / 60));
@@ -379,106 +483,18 @@ export function buildOmpArgs(cfg: OmpLaunchConfig): string[] {
   if (typeof cfg.ompProfile === "string" && cfg.ompProfile.length > 0) {
     args.push("--profile", cfg.ompProfile);
   }
-  if (typeof cfg.extensionPath === "string" && cfg.extensionPath.length > 0) {
-    args.push("--extension", cfg.extensionPath);
-  }
-  if (cfg.hostConfigPath !== undefined && cfg.hostConfigPath.length > 0) {
-    args.push('--config', cfg.hostConfigPath);
-  }
-  args.push('--config', cfg.configPath);
-  if (cfg.userConfigPath !== undefined && cfg.userConfigPath.length > 0) {
-    args.push('--config', cfg.userConfigPath);
+  if (typeof cfg.model === 'string' && cfg.model.length > 0) {
+    args.push('--model', cfg.model);
   }
   args.push(
+    '--no-extensions',
+    '--extension', cfg.extensionPath,
     '--session-dir', cfg.sessionDir,
     '--hide-thinking',
     '--max-time', `${maxMinutes}m`,
     '--approval-mode', cfg.approvalMode,
   );
   return args;
-}
-
-/**
- * Default location of the user's host omp config (the "real" ~/.omp
- * that ships API keys + modelRoles). Inherited by every ux-e2e session
- * via `--config` so omp boots with a model; without this, the
- * ux-e2e-overlay alone (which only sets session bookkeeping) has no
- * `modelRoles` and omp prints "No model selected".
- */
-export function defaultHostOmpConfigPath(): string {
-  return join(homedir(), '.omp', 'agent', 'config.yml');
-}
-
-export interface HostConfigCheck {
-  /** The host config path, when it exists AND is readable. */
-  readonly path: string | null;
-  /** Human-readable warning, or null when the config is healthy. */
-  readonly warning: string | null;
-}
-
-/**
- * Resolve the host omp config and return a warning if it is missing,
- * unreadable, or has no `modelRoles`. omp config.yml uses a small
- * subset of YAML — keys are top-level strings, values can be mappings.
- * We do a defensive key scan: any non-empty `modelRoles` value
- * (mapping, list, or string) is treated as configured; a missing or
- * empty value is the failure mode the warning calls out.
- */
-export function checkHostOmpConfig(path: string = defaultHostOmpConfigPath()): HostConfigCheck {
-  if (!existsSync(path)) {
-    return {
-      path: null,
-      warning: `host omp config not found at ${path}; omp will boot without a model. Set OMP_BIN's profile or provide ~/.omp/agent/config.yml with a 'modelRoles' block.`,
-    };
-  }
-  let body: string;
-  try {
-    body = readFileSync(path, 'utf8');
-  } catch (err) {
-    return {
-      path: null,
-      warning: `host omp config at ${path} is unreadable: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-  // Cheap YAML key check — we look for a top-level `modelRoles:` line
-  // (possibly with leading whitespace) followed by a non-empty value on
-  // the next non-empty line. This is good enough for the
-  // "operator forgot to set a model" smoke check; omp itself will
-  // emit the authoritative error if the YAML is malformed.
-  const lines = body.split('\n');
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i] ?? '';
-    if (!/^\s*modelRoles\s*:/u.test(line)) continue;
-    // Look at the RAW next lines for an indented continuation: a sibling
-    // top-level key is NOT a value, so we require the next non-empty,
-    // non-comment line to start with whitespace (or be a YAML block
-    // scalar marker like `|` / `>`).
-    for (let j = i + 1; j < lines.length; j += 1) {
-      const raw = lines[j] ?? '';
-      const trimmed = raw.trim();
-      if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
-      if (trimmed === '|' || trimmed === '>' || trimmed.startsWith('|') || trimmed.startsWith('>')) {
-        return { path, warning: null };
-      }
-      // Indented lines are the value (mapping entries, list items,
-      // or scalar strings).
-      if (/^\s+/u.test(raw)) return { path, warning: null };
-      // Unindented line = a different top-level key, modelRoles is empty.
-      return {
-        path,
-        warning: `host omp config at ${path} has 'modelRoles:' but no value follows; omp will boot without a model.`,
-      };
-    }
-    // modelRoles was the last key in the file and had no value.
-    return {
-      path,
-      warning: `host omp config at ${path} has 'modelRoles:' but no value follows; omp will boot without a model.`,
-    };
-  }
-  return {
-    path,
-    warning: `host omp config at ${path} has no 'modelRoles' key; omp will boot without a model.`,
-  };
 }
 
 
@@ -492,53 +508,113 @@ export interface ScenarioRef {
 }
 
 export interface TestSessionOptions {
-  /** PTY working directory (scratch project). Required. */
-  readonly cwd: string;
-  /** Driving surface: 'web' (xterm in browser) or 'text' (WS transcript). Default 'web'. */
+  /** Resolved, verified run manifest. Host scratch directories are rejected. */
+  readonly manifest: RunManifest;
+  /** New identity for this session; generated when omitted. */
+  readonly sessionId?: string;
+  /** Driving surface: 'web' (xterm in browser) or 'text' (WS transcript). */
   readonly surface?: 'web' | 'text';
-  /** Scenario reference stored in session.json for the report. */
   readonly scenario?: ScenarioRef | null;
-  /** Port — default 0 (ephemeral). */
   readonly port?: number;
-  /** Initial PTY cols. Default 100. */
   readonly cols?: number;
-  /** Initial PTY rows. Default 30. */
   readonly rows?: number;
-  /** Idle timeout in ms — closes the session after no inbound traffic. Default 20 min. */
   readonly idleMs?: number;
-  /** Inbound rate limit per connection. Default 200 msgs / 1000 ms. */
   readonly rateLimit?: RateLimitOptions;
-  /** omp binary. Default `$OMP_BIN` else `omp`. */
-  readonly ompBinary?: string;
-  /**
-   * omp profile name. Default: unset — omp inherits the host default
-   * profile (`~/.omp/agent/`), so `modelRoles` + credentials come from
-   * the host's real config. Pass a name to isolate the run into its
-   * own profile directory (caller-managed).
-   */
   readonly ompProfile?: string;
-  /** Session time budget in seconds. Default 1800 (30 min). */
   readonly maxTimeSec?: number;
-  /** omp approval mode. Default 'yolo'. */
   readonly approvalMode?: string;
-  /** Task prompt recorded in session.json. */
-  readonly taskPrompt?: string | null;
-  /** Extra env vars merged on top of `process.env` (TERM is forced). */
-  readonly env?: Readonly<Record<string, string>>;
-  /** Pre-minted token override (tests). Default: freshly minted. */
   readonly token?: string;
-  /**
-   * Disable the PTY entirely — the server stays up and the WS protocol
-   * works, but there is no process to drive. ONLY for server unit tests;
-   * never for real e2e runs.
-   */
+  /** Test-only transport seam; production launches always use a PTY. */
   readonly noPty?: boolean;
-  /**
-   * Keep proxy env vars (HTTP_PROXY etc.) when spawning the PTY. Default
-   * false — they are stripped to prevent a hostile or corporate proxy
-   * from MITMing LLM/API calls. Pass true to opt out.
-   */
-  readonly keepProxyEnv?: boolean;
+}
+
+export type { ProcessReceipt } from './manifest.js';
+
+interface ProcessProbe {
+  readonly pid: number;
+  readonly ppid: number;
+  readonly pgid: number;
+  readonly startMarker: string;
+  readonly command: string;
+  readonly cwd: string | null;
+}
+
+
+function digestArgv(binary: string, argv: readonly string[]): string {
+  return createHash('sha256').update(JSON.stringify([binary, ...argv])).digest('hex');
+}
+
+function probeProcess(pid: number): ProcessProbe | null {
+  if (process.platform === 'win32') return null;
+  try {
+    const raw = execFileSync('ps', ['-p', String(pid), '-o', 'pid=,ppid=,pgid=,lstart=,command='], {
+      encoding: 'utf8',
+      env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
+      timeout: 1500,
+      maxBuffer: 32 * 1024,
+    }).trim();
+    const line = raw.split('\n').find(entry => entry.trim().length > 0);
+    if (line === undefined) return null;
+    const fields = line.trim().split(/\s+/u);
+    if (fields.length < 9) return null;
+    const observedPid = Number(fields[0]);
+    const observedPpid = Number(fields[1]);
+    const observedPgid = Number(fields[2]);
+    const startMarker = fields.slice(3, 8).join(' ');
+    const command = fields.slice(8).join(' ');
+    let cwd: string | null = null;
+    try {
+      const cwdRaw = execFileSync(process.platform === 'darwin' ? '/usr/sbin/lsof' : '/usr/bin/lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
+        encoding: 'utf8',
+        env: { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C' },
+        timeout: 1500,
+        maxBuffer: 16 * 1024,
+      });
+      const cwdLine = cwdRaw.split('\n').find(entry => entry.startsWith('n'));
+      cwd = cwdLine === undefined ? null : cwdLine.slice(1);
+    } catch {
+      cwd = null;
+    }
+    if (!Number.isInteger(observedPid) || !Number.isInteger(observedPpid) || !Number.isInteger(observedPgid)) return null;
+    return { pid: observedPid, ppid: observedPpid, pgid: observedPgid, startMarker, command, cwd };
+  } catch {
+    return null;
+  }
+}
+
+function verifyProcessReceipt(receipt: ProcessReceipt, opts: KillProcessTreeOptions): boolean {
+  if (process.platform === 'win32' || receipt.pgid !== receipt.pid || !pidIsLive(receipt.pid)) return false;
+  const probe = probeProcess(receipt.pid);
+  if (probe === null || probe.pid !== receipt.pid || probe.pgid !== receipt.pgid) return false;
+  if (probe.startMarker !== receipt.start_marker) return false;
+  if (opts.executablePath !== undefined) {
+    const executable = opts.executablePath;
+    const direct = probe.command === executable || probe.command.startsWith(`${executable} `);
+    const interpreted = ['node', 'bun', 'sh', 'bash'].some(name =>
+      probe.command.startsWith(`/bin/${name} ${executable} `) ||
+      probe.command.startsWith(`/usr/bin/${name} ${executable} `) ||
+      probe.command === `/bin/${name} ${executable}` ||
+      probe.command === `/usr/bin/${name} ${executable}` ||
+      probe.command.startsWith(`${name} ${executable} `) ||
+      probe.command === `${name} ${executable}`);
+    if (!direct && !interpreted) return false;
+  }
+  if (opts.executableDigest !== undefined && receipt.executable_digest !== opts.executableDigest) return false;
+  if (opts.argv !== undefined) {
+    if (digestArgv(opts.executablePath ?? '', opts.argv) !== receipt.argv_digest) return false;
+    for (const arg of opts.argv) {
+      if (!probe.command.includes(arg)) return false;
+    }
+  }
+  if (opts.cwd !== undefined) {
+    if (probe.cwd === null) return false;
+    try {
+      if (realpathSync(probe.cwd) !== realpathSync(opts.cwd)) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Handle to a running test session. */
@@ -546,16 +622,20 @@ export interface TestSession {
   readonly host: '127.0.0.1';
   readonly publicHost: string;
   readonly port: number;
+  readonly runId: string;
+  readonly sessionId: string;
+  /** Runtime-only bearer; persisted only in private connection metadata. */
   readonly token: string;
   readonly url: string;
-  /** WebSocket path, e.g. `/ws`. The token goes in `?token=` (see `url`). */
   readonly wsPath: string;
-  readonly scratchDir: string;
   readonly transcriptPath: string;
+  readonly logPath: string;
   readonly sessionJsonPath: string;
+  readonly privateConnectionPath: string;
+  readonly readiness: Readonly<Record<string, unknown>>;
   readonly pty: { readonly pid: number | null; readonly cols: number; readonly rows: number; readonly mode: 'pty' | 'noPty' };
-  /** Stop accepting connections, kill the PTY group, close everything. */
-  readonly close: () => Promise<void>;
+  /** Stop the session; failed close options preserve non-clean evidence. */
+  readonly close: (options?: SessionCloseOptions) => Promise<void>;
 }
 
 /** One line of the server-side transcript.jsonl (evidence backbone). */
@@ -566,30 +646,65 @@ export type TranscriptFrame =
   | { readonly ts: string; readonly t: 'err'; readonly code: string; readonly message?: string };
 
 /* ------------------------------------------------------------------ */
-/* Session.json + concurrency guard                                    */
+/* Session records and ownership                                       */
 /* ------------------------------------------------------------------ */
 
 export interface SessionInfo {
+  readonly runId: string;
+  readonly sessionId: string;
   readonly pid: number | null;
   readonly startedAt: string | null;
+  readonly startMarker: string | null;
+  readonly status: string | null;
+  readonly ready: boolean;
   readonly path: string;
+  readonly transcriptPath: string;
+  readonly logPath: string;
+  readonly privateConnectionPath: string;
+  readonly process?: ProcessReceipt;
+  readonly exit_code?: number;
+  readonly exit_signal?: number;
+  readonly termination?: SessionTermination;
+  readonly readiness?: Readonly<Record<string, unknown>>;
 }
 
-/** Read `<scratch>/.work-state/ux-e2e/session.json`; null if absent/unparseable. */
-export function readSessionInfo(scratchDir: string): SessionInfo | null {
-  const p = join(scratchDir, '.work-state', 'ux-e2e', 'session.json');
-  if (!existsSync(p)) return null;
-  try {
-    const j = JSON.parse(readFileSync(p, 'utf8')) as { pid?: unknown; started_at?: unknown };
-    return {
-      pid: typeof j.pid === 'number' ? j.pid : null,
-      startedAt: typeof j.started_at === 'string' ? j.started_at : null,
-      path: p,
-    };
-  } catch {
-    return null;
-  }
+function runIdOf(manifest: RunManifest): string {
+  return manifest.run_id;
 }
+
+function generatedSessionId(): string {
+  return `session-${Date.now().toString(36)}-${randomBytes(8).toString('hex')}`;
+}
+
+/** Read the independent session record for a resolved run. */
+export function readSessionRecord(manifest: RunManifest, sessionId: string): SessionInfo | null {
+  const record = readManifestSessionRecord(manifest, sessionId);
+  if (record === null) return null;
+  const paths = sessionPaths(manifest, sessionId);
+  const pid = typeof record.pid === 'number' ? record.pid : null;
+  const startedAt = typeof record.started_at === 'string' ? record.started_at : null;
+  const startMarker = typeof record.start_marker === 'string' ? record.start_marker : null;
+  const status = typeof record.status === 'string' ? record.status : null;
+  return {
+    runId: runIdOf(manifest),
+    sessionId,
+    pid,
+    startedAt,
+    startMarker,
+    status,
+    ready: record.ready === true,
+    path: paths.record,
+    transcriptPath: paths.transcript,
+    logPath: paths.log,
+    privateConnectionPath: paths.connection,
+    ...(record.process !== undefined && typeof record.process === 'object' ? { process: record.process as ProcessReceipt } : {}),
+    ...(record.exit_code === undefined ? {} : { exit_code: record.exit_code }),
+    ...(record.exit_signal === undefined ? {} : { exit_signal: record.exit_signal }),
+    ...(record.termination === undefined ? {} : { termination: record.termination }),
+    ...(record.readiness === undefined ? {} : { readiness: record.readiness }),
+  };
+}
+
 
 /** True if the pid refers to a live process on this host. */
 export function pidIsLive(pid: number | null | undefined): boolean {
@@ -603,18 +718,24 @@ export function pidIsLive(pid: number | null | undefined): boolean {
 }
 
 /**
- * Concurrency guard: refuses to start a second session over a live one.
- * `force` allows the relaunch (the caller is responsible for cleanup).
+ * Refuse every live session. There is intentionally no force takeover:
+ * cleanup must first establish ownership and stop the selected session.
  */
-export function assertNoLiveSession(scratchDir: string, force: boolean): void {
-  const info = readSessionInfo(scratchDir);
+export function assertNoLiveSession(manifest: RunManifest, sessionId: string): void {
+  const info = readSessionRecord(manifest, sessionId);
   if (info === null) return;
   if (pidIsLive(info.pid)) {
-    if (force) return;
-    throw new Error(
-      `ux-e2e: live session found (pid ${info.pid}) at ${info.path}; stop it or pass --force to override`,
-    );
+    throw new Error(`ux-e2e: live session found (pid ${String(info.pid)}) at ${info.path}; stop it before starting another session`);
   }
+}
+
+export function assertSessionOwnership(manifest: RunManifest, sessionId: string): SessionInfo {
+  const info = readSessionRecord(manifest, sessionId);
+  if (info === null) throw new Error(`ux-e2e: session ${sessionId} has no registered record`);
+  if (info.pid === null || !pidIsLive(info.pid)) {
+    throw new Error(`ux-e2e: session ${sessionId} process is not live`);
+  }
+  return info;
 }
 
 /* ------------------------------------------------------------------ */
@@ -844,11 +965,26 @@ export type AttachResult =
   | { readonly ok: true }
   | { readonly ok: false; readonly reason: 'no-token' | 'bad-token' | 'bad-origin' | 'closed' };
 
+export interface SessionCloseOptions {
+  readonly code: number;
+  readonly signal?: number;
+  readonly status: 'failed' | 'stopped';
+  readonly reason: string;
+}
+
 interface SessionControllerOptions {
   readonly pty: IPty | null;
   readonly spawnError: string | null;
   readonly idleMs: number;
   readonly transcriptPath: string;
+  readonly runRoot: string;
+  readonly killOptions?: KillProcessTreeOptions;
+  readonly onStatus?: (
+    status: string,
+    exit?: { readonly code: number; readonly signal?: number },
+    termination?: SessionTermination,
+  ) => void;
+  readonly onClosed?: (result: { readonly ok: boolean }) => void;
 }
 
 class SessionController {
@@ -856,7 +992,18 @@ class SessionController {
   readonly #idler: IdleTimer;
   #attachedWs: WS | null = null;
   #closed = false;
-
+  #notified = false;
+  #closePromise: Promise<void> | null = null;
+  #closing = false;
+  #terminalCommitted = false;
+  #killStarted = false;
+  #observedPtyExit: { readonly code: number; readonly signal?: number } | null = null;
+  readonly #ptyExitDone = deferred<{ readonly code: number; readonly signal?: number }>();
+  #failureOverride: SessionCloseOptions | null = null;
+  #ptyReady = false;
+  #evidenceFailed = false;
+  readonly #replayOutput: string[] = [];
+  #replayLength = 0;
   constructor(opts: SessionControllerOptions) {
     this.#opts = opts;
     this.#idler = new IdleTimer({
@@ -868,11 +1015,12 @@ class SessionController {
           send(this.#attachedWs, { t: 'err', code: 'idle-timeout', message });
         }
         this.#append({ ts: new Date().toISOString(), t: 'err', code: 'idle-timeout', message });
-        void this.close();
+        void this.close({ code: 124, status: 'failed', reason: 'idle timeout' }).catch(() => undefined);
       },
     });
     opts.pty?.onData(data => this.#handlePtyData(data));
     opts.pty?.onExit(({ exitCode, signal }) => this.#handlePtyExit(exitCode, signal));
+    this.#idler.bump();
   }
 
   get closed(): boolean {
@@ -884,14 +1032,24 @@ class SessionController {
       ws.close(1001, 'session closed');
       return;
     }
+    const previous = this.#attachedWs;
+    if (previous !== null && previous !== ws) {
+      try {
+        previous.close(1000, 'replaced by newer connection');
+      } catch {
+        /* The previous socket may already be closing. */
+      }
+    }
     this.#attachedWs = ws;
     this.#idler.bump();
     send(ws, { t: 's', ok: true });
+    if (this.#replayLength > 0) {
+      send(ws, { t: 'o', d: `\u001b[2J\u001b[H${this.#replayOutput.join('')}` });
+    }
     if (this.#opts.pty === null && this.#opts.spawnError !== null) {
       send(ws, { t: 'err', code: 'spawn-failed', message: this.#opts.spawnError });
       this.#append({ ts: new Date().toISOString(), t: 'err', code: 'spawn-failed', message: this.#opts.spawnError });
-      ws.close(1000, 'spawn failed');
-      void this.close();
+      void this.close({ code: 1, status: 'failed', reason: 'spawn failed' }).catch(() => undefined);
     }
   }
 
@@ -933,30 +1091,142 @@ class SessionController {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  async close(options: SessionCloseOptions = { code: 0, status: 'stopped', reason: 'session closed' }): Promise<void> {
+    if (this.#closePromise !== null) {
+      if (options.status === 'failed' && !this.#terminalCommitted) this.#failureOverride = options;
+      return this.#closePromise;
+    }
+    if (this.#terminalCommitted) return;
+    this.#closePromise = this.#closeNow(options);
+    return this.#closePromise;
+  }
+
+  async #closeNow(options: SessionCloseOptions): Promise<void> {
+    this.#closing = true;
     this.#closed = true;
     this.#idler.fireNow();
     const ws = this.#attachedWs;
     this.#attachedWs = null;
-    if (ws !== null) {
+    let killError: unknown = null;
+    let killResult: KillProcessTreeResult = { forced: false };
+    let observed = this.#observedPtyExit;
+    if (this.#opts.pty !== null) {
       try {
-        ws.close(1001, 'session closed');
+        const killOptions = this.#opts.killOptions;
+        if (killOptions === undefined) throw new Error('process_identity_missing');
+        killResult = await killProcessTree(this.#opts.pty.pid, {
+          ...killOptions,
+          onSignalStarted: () => { this.#killStarted = true; },
+        });
+      } catch (error) {
+        killError = error;
+      }
+      observed = await this.#awaitPtyExit();
+      if (killError === null && observed === null) killError = new Error('pty_exit_unobserved');
+    }
+    const effective = this.#failureOverride ?? options;
+    const exit = observed ?? {
+      code: effective.code === 0 ? 1 : effective.code,
+      ...(effective.signal === undefined ? {} : { signal: effective.signal }),
+    };
+    const termination = this.#terminationFor(
+      effective,
+      killResult.forced,
+      observed !== null || this.#opts.pty === null,
+    );
+    const cleanStop = killError === null &&
+      effective.status === 'stopped' &&
+      isCleanSessionTermination(exit.code, exit.signal, termination, this.#opts.killOptions !== undefined);
+    const status = killError !== null ? 'stop_refused' : cleanStop ? 'stopped' : 'failed';
+    const terminal = {
+      ts: new Date().toISOString(),
+      t: 'exit',
+      code: exit.code,
+      ...(exit.signal === undefined ? {} : { signal: exit.signal }),
+    } as const;
+    this.#append(terminal);
+    if (ws !== null) {
+      send(ws, { t: 'exit', code: terminal.code, ...(terminal.signal === undefined ? {} : { signal: terminal.signal }) });
+      try {
+        ws.close(killError === null ? 1000 : 1011, effective.reason);
       } catch {
         /* ignore. */
       }
     }
-    if (this.#opts.pty !== null) await killProcessTree(this.#opts.pty.pid);
+    this.#terminalCommitted = true;
+    this.#opts.onStatus?.(status, terminal, termination);
+    this.#notifyClosed(killError === null);
+    if (killError !== null) throw killError;
+  }
+
+  #terminationFor(
+    options: SessionCloseOptions,
+    forced: boolean,
+    observed: boolean,
+  ): SessionTermination {
+    const requested: SessionTermination['requested'] = options.status === 'stopped'
+      ? 'owner'
+      : options.signal === undefined ? 'owner' : 'operator';
+    return {
+      requested,
+      requested_signal: options.signal ?? 15,
+      forced,
+      observed,
+    };
+  }
+
+  async #awaitPtyExit(timeoutMs = 2_000): Promise<{ readonly code: number; readonly signal?: number } | null> {
+    if (this.#observedPtyExit !== null) return this.#observedPtyExit;
+    const timeout = deferred<void>();
+    const timer = setTimeout(() => timeout.resolve(), timeoutMs);
+    try {
+      return await Promise.race([
+        this.#ptyExitDone.promise,
+        timeout.promise.then(() => null),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   #handlePtyData(data: string): void {
     if (this.#closed) return;
+    const replayLimit = 256 * 1024;
+    if (data.length >= replayLimit) {
+      this.#replayOutput.length = 0;
+      this.#replayOutput.push(data.slice(-replayLimit));
+      this.#replayLength = replayLimit;
+    } else {
+      this.#replayOutput.push(data);
+      this.#replayLength += data.length;
+      while (this.#replayLength > replayLimit) {
+        this.#replayLength -= this.#replayOutput.shift()!.length;
+      }
+    }
     this.#append({ ts: new Date().toISOString(), t: 'o', d: data });
+    if (!this.#ptyReady && data.length > 0) {
+      this.#ptyReady = true;
+      this.#opts.onStatus?.('running');
+    }
     if (this.#attachedWs !== null) send(this.#attachedWs, { t: 'o', d: data });
   }
 
   #handlePtyExit(exitCode: number, signal: number | undefined): void {
-    if (this.#closed) return;
+    if (this.#terminalCommitted) return;
+    const observed = { code: exitCode, ...(signal === undefined ? {} : { signal }) };
+    this.#observedPtyExit = observed;
+    this.#ptyExitDone.resolve(observed);
+    if (this.#closing) {
+      if (!this.#killStarted) {
+        this.#failureOverride = {
+          ...observed,
+          status: 'failed',
+          reason: 'pty exited before requested close',
+        };
+      }
+      return;
+    }
+    this.#closed = true;
     const frame = {
       ts: new Date().toISOString(),
       t: 'exit',
@@ -965,21 +1235,199 @@ class SessionController {
     } as const;
     this.#append(frame);
     if (this.#attachedWs !== null) {
-      send(this.#attachedWs, { t: 'exit', code: exitCode, ...(signal !== undefined ? { signal } : {}) });
+      send(this.#attachedWs, { t: 'exit', code: exitCode, ...(signal === undefined ? {} : { signal }) });
       this.#attachedWs.close(1000, 'pty exited');
     }
-    this.#closed = true;
     this.#attachedWs = null;
     this.#idler.fireNow();
+    this.#terminalCommitted = true;
+    this.#opts.onStatus?.(
+      isCleanSessionTermination(
+        exitCode,
+        signal,
+        { requested: 'none', forced: false, observed: true },
+        this.#opts.killOptions !== undefined,
+      ) && this.#ptyReady && !this.#evidenceFailed ? 'stopped' : 'failed',
+      { code: exitCode, ...(signal === undefined ? {} : { signal }) },
+      { requested: 'none', forced: false, observed: true },
+    );
+    this.#notifyClosed(true);
+  }
+
+  #notifyClosed(ok: boolean): void {
+    if (this.#notified) return;
+    this.#notified = true;
+    this.#opts.onClosed?.({ ok });
   }
 
   #append(frame: TranscriptFrame): void {
     try {
-      appendSessionFile(this.#opts.transcriptPath, JSON.stringify(frame) + '\n');
+      appendSessionFile(this.#opts.transcriptPath, JSON.stringify(frame) + '\n', this.#opts.runRoot);
     } catch {
-      /* transcript is best-effort evidence — never fatal. */
+      this.#evidenceFailed = true;
+      this.#opts.onStatus?.('failed');
+      if (!this.#closing && !this.#terminalCommitted) {
+        void this.close({ code: 1, status: 'failed', reason: 'transcript failure' }).catch(() => undefined);
+      }
     }
   }
+}
+
+export const INTERNAL_STOP_PATH = '/__ux-e2e/stop';
+
+function stopJson(res: ServerResponse, status: number, body: Readonly<Record<string, unknown>>): void {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify(body));
+}
+
+function readStopBody(req: IncomingMessage): Promise<Readonly<Record<string, unknown>> | null> {
+  const pending = deferred<Readonly<Record<string, unknown>> | null>();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let settled = false;
+  const finish = (value: Readonly<Record<string, unknown>> | null): void => {
+    if (settled) return;
+    settled = true;
+    pending.resolve(value);
+  };
+  req.on('data', chunk => {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    total += buffer.length;
+    if (total > 16 * 1024) {
+      finish(null);
+      req.resume();
+      return;
+    }
+    chunks.push(buffer);
+  });
+  req.on('error', () => finish(null));
+  req.on('end', () => {
+    if (settled) return;
+    try {
+      const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        finish(null);
+        return;
+      }
+      finish(parsed as Readonly<Record<string, unknown>>);
+    } catch {
+      finish(null);
+    }
+  });
+  return pending.promise;
+}
+
+function cleanSessionEvidence(manifest: RunManifest, sessionId: string): boolean {
+  try {
+    const record = readManifestSessionRecord(manifest, sessionId);
+    const termination = record?.termination;
+    if (
+      record === null ||
+      record.status !== 'stopped' ||
+      record.ready !== true ||
+      termination === undefined ||
+      termination.observed !== true ||
+      termination.forced !== false ||
+      record.readiness?.typed_rpc_ready !== true
+    ) return false;
+    if (!isCleanSessionTermination(record.exit_code, record.exit_signal, termination, record.process !== undefined)) return false;
+    const content = readFileSync(record.transcript_path, 'utf8');
+    const frames: Array<Record<string, unknown>> = [];
+    for (const line of content.split(/\r?\n/u)) {
+      if (line.trim().length === 0) continue;
+      const parsed: unknown = JSON.parse(line);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+      const frame = parsed as Record<string, unknown>;
+      if (typeof frame.ts !== 'string' || frame.ts.length === 0) return false;
+      if (frame.t === 'o' || frame.t === 'i') {
+        if (typeof frame.d !== 'string') return false;
+      } else if (frame.t === 'err') {
+        if (typeof frame.code !== 'string' || ('message' in frame && typeof frame.message !== 'string')) return false;
+      } else if (frame.t === 'exit') {
+        if (typeof frame.code !== 'number' || !Number.isSafeInteger(frame.code) || frame.code < 0 ||
+          ('signal' in frame && (typeof frame.signal !== 'number' || !Number.isSafeInteger(frame.signal) || frame.signal < 0))) return false;
+      } else {
+        return false;
+      }
+      frames.push(frame);
+    }
+    const exits = frames.filter(frame => frame.t === 'exit');
+    if (exits.length !== 1 || frames[frames.length - 1] !== exits[0]) return false;
+    const exit = exits[0]!;
+    const signalAllowed = !Object.prototype.hasOwnProperty.call(exit, 'signal')
+      ? record.exit_signal === undefined
+      : record.exit_signal !== undefined && exit.signal === record.exit_signal;
+    return exit.code === record.exit_code && signalAllowed;
+  } catch {
+    return false;
+  }
+}
+
+async function handleStopRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  manifest: RunManifest,
+  sessionId: string,
+  expectedToken: string,
+  expectedHost: string,
+  controller: SessionController | null,
+): Promise<void> {
+  if (req.method !== 'POST' || req.url !== INTERNAL_STOP_PATH) {
+    stopJson(res, req.method === 'POST' ? 404 : 405, { ok: false, error: 'stop_route_unavailable' });
+    return;
+  }
+  if (req.headers.host !== expectedHost || req.headers.origin !== undefined) {
+    stopJson(res, 403, { ok: false, error: 'stop_origin_rejected' });
+    return;
+  }
+  const authorization = req.headers.authorization;
+  if (
+    typeof authorization !== 'string' ||
+    !authorization.startsWith('Bearer ') ||
+    authorization.length <= 'Bearer '.length ||
+    !safeEqual(authorization.slice('Bearer '.length), expectedToken)
+  ) {
+    stopJson(res, 401, { ok: false, error: 'stop_authorization_rejected' });
+    return;
+  }
+  const contentType = req.headers['content-type'];
+  if (typeof contentType !== 'string' || !/^application\/json(?:\s*;|$)/iu.test(contentType)) {
+    stopJson(res, 400, { ok: false, error: 'stop_request_invalid' });
+    return;
+  }
+  const body = await readStopBody(req);
+  if (
+    body === null ||
+    Object.keys(body).some(key => key !== 'run_id' && key !== 'session_id') ||
+    body.run_id !== manifest.run_id ||
+    body.session_id !== sessionId
+  ) {
+    stopJson(res, 400, { ok: false, error: 'stop_identity_rejected' });
+    return;
+  }
+  if (controller === null) {
+    stopJson(res, 409, { ok: false, error: 'stop_owner_unavailable' });
+    return;
+  }
+  try {
+    await controller.close();
+  } catch {
+    stopJson(res, 409, { ok: false, error: 'stop_refused' });
+    return;
+  }
+  if (!cleanSessionEvidence(manifest, sessionId)) {
+    stopJson(res, 409, { ok: false, error: 'stop_evidence_incomplete' });
+    return;
+  }
+  const stopped = readManifestSessionRecord(manifest, sessionId);
+  stopJson(res, 200, {
+    ok: true,
+    run_id: manifest.run_id,
+    session_id: sessionId,
+    status: 'stopped',
+    exit_code: stopped?.exit_code,
+  });
 }
 
 interface AttachOptions {
@@ -1017,55 +1465,155 @@ export function attachSession(
 /* Server bootstrap                                                    */
 /* ------------------------------------------------------------------ */
 
-function deriveSlug(scratchDir: string): string {
-  const base = basename(scratchDir);
-  const PREFIX = 'omp-ux-e2e-';
-  return base.startsWith(PREFIX) ? base.slice(PREFIX.length) : base;
-}
-
-async function resolveOmpVersion(binary: string): Promise<string> {
-  try {
-    const { promise, resolve: done, reject: fail } = deferred<string>();
-    // stdin ignored: a fake test command must not block on --version.
-    const child = spawn(binary, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
-    let out = '';
-    if (child.stdout !== null) {
-      child.stdout.on('data', (chunk: Buffer) => {
-        out += chunk.toString('utf8');
-      });
-    }
-    child.on('error', err => fail(err));
-    child.on('close', code => {
-      if (code === 0) done(out);
-      else fail(new Error(`--version exited with code ${String(code)}`));
+async function resolveOmpVersion(binary: string, env: Readonly<Record<string, string>>, cwd: string): Promise<string> {
+  const { promise, resolve: done, reject: fail } = deferred<string>();
+  const child = spawn(binary, ['--version'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...env },
+    cwd,
+    timeout: 5000,
+  });
+  let out = '';
+  if (child.stdout !== null) {
+    child.stdout.on('data', (chunk: Buffer) => {
+      out += chunk.toString('utf8');
     });
-    const stdout = await promise;
-    const first = stdout.trim().split('\n')[0];
-    return first !== undefined && first.length > 0 ? first : 'unknown';
-  } catch {
-    return 'unknown';
   }
+  child.on('error', err => fail(err));
+  child.on('close', code => {
+    if (code === 0) done(out);
+    else fail(new Error(`--version exited with code ${String(code)}`));
+  });
+  const stdout = await promise;
+  const first = stdout.trim().split(/\r?\n/u)[0];
+  if (first === undefined || first.length === 0) throw new Error('runtime version probe returned no version');
+  return sanitizeForJson(first);
 }
 
-function stateDirOf(scratchDir: string): string {
-  return join(scratchDir, '.work-state', 'ux-e2e');
+function processReceiptFor(
+  pid: number,
+  manifest: RunManifest,
+  sessionId: string,
+  binary: string,
+  argv: readonly string[],
+  ownerNonce: string,
+): ProcessReceipt {
+  const probe = probeProcess(pid);
+  if (probe === null || probe.pid !== pid || probe.pgid !== pid) {
+    throw new Error('process_identity_unavailable');
+  }
+  const roots = manifestRoots(manifest);
+  const cwdRelative = relative(roots.run, roots.workspace);
+  if (cwdRelative.startsWith('..') || cwdRelative === '') {
+    throw new Error('process_cwd_outside_run');
+  }
+  return {
+    pid,
+    pgid: probe.pgid,
+    start_marker: probe.startMarker,
+    executable_digest: manifest.runtime.digest,
+    argv_digest: digestArgv(binary, argv),
+    cwd_relative: cwdRelative,
+    owner_nonce: `${runIdOf(manifest)}:${sessionId}:${ownerNonce}`,
+  };
+}
+
+function recordFor(
+  sessionId: string,
+  status: string,
+  paths: SessionPaths,
+  startedAt: string,
+  marker: string,
+  receipt: ProcessReceipt | null,
+): Record<string, unknown> {
+  return {
+    id: sessionId,
+    status,
+    start_marker: receipt?.start_marker ?? marker,
+    ...(receipt === null ? { pid: null } : { pid: receipt.pid, process: receipt }),
+    transcript_path: paths.transcript,
+    log_path: paths.log,
+    private_connection_path: paths.connection,
+    started_at: startedAt,
+    lease_marker: marker,
+  };
+}
+
+function appendLog(path: string, message: string, runRoot: string): void {
+  appendSessionFile(path, `${new Date().toISOString()} ${sanitizeForJson(message)}\n`, runRoot);
+}
+
+function runtimeSnapshotRootOf(binary: string): string {
+  let cursor = dirname(binary);
+  for (;;) {
+    if (existsSync(join(cursor, 'runtime.json'))) return cursor;
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  throw new Error('cache_integrity_failure: runtime cache metadata could not be located');
+}
+
+function verifyLaunchIntegrity(manifest: RunManifest, runtimeBinary: string) {
+  try {
+    const runtime = verifyRuntimeSnapshot(runtimeSnapshotRootOf(runtimeBinary));
+    if (runtime.binary !== runtimeBinary) {
+      throw new Error('cache_integrity_failure: runtime snapshot binary does not match manifest');
+    }
+    if (runtime.digest !== manifest.runtime.digest) {
+      throw new Error('cache_integrity_failure: runtime binary digest does not match manifest');
+    }
+    const core = verifyPackageArtifact(manifest.artifacts.core.root);
+    const fullstack = verifyPackageArtifact(manifest.artifacts.fullstack.root);
+    if (core.digest !== manifest.artifacts.core.digest || fullstack.digest !== manifest.artifacts.fullstack.digest) {
+      throw new Error('cache_integrity_failure: package artifact digest does not match manifest');
+    }
+    return runtime;
+  } catch (error) {
+    if (!(error instanceof Error)) throw new Error(String(error));
+    let code: string | null = null;
+    if ('code' in error && typeof error.code === 'string') code = error.code;
+    if (code === null || error.message.startsWith(`${code}:`)) throw error;
+    throw new Error(`${code}: ${error.message}`);
+  }
 }
 
 /**
- * Start a test session: HTTP+WS server on 127.0.0.1 + one omp PTY.
- *
- * The caller is responsible for calling `close()` on shutdown — typically
- * from a SIGINT/SIGTERM handler or a `finally` block. The returned `url`
- * embeds a 256-bit session-scoped token valid only while the session lives.
+ * Start a session from a resolved manifest. The runtime executable, cwd,
+ * roots, and auth transport are all derived from the manifest; no host PATH,
+ * config, profile, or environment overlay is consulted.
  */
 export async function startTestSession(opts: TestSessionOptions): Promise<TestSession> {
-  if (typeof opts.cwd !== 'string' || opts.cwd.length === 0) {
-    throw new Error('ux-e2e: startTestSession requires a cwd (scratch project directory)');
+  const manifest = opts.manifest;
+  if (manifest === undefined || manifest === null) throw new Error('ux-e2e: startTestSession requires a resolved manifest');
+  verifyManifest(manifest);
+  if (!['ready', 'running', 'stopped'].includes(manifest.status)) {
+    throw new Error(`ux-e2e: run is not launchable in status ${manifest.status}`);
   }
-  const host = '127.0.0.1';
-  const publicHost = host;
-  const scratchDir = resolve(opts.cwd);
-  const activation = ensureWorkspaceActivation(scratchDir);
+  const roots = ensureManifestRoots(manifest);
+  if (!existsSync(roots.workspace)) throw new Error('workspace_missing');
+  const runtimeBinary = runtimeBinaryOf(manifest);
+  const auth: AuthResolution = await resolveLaunchAuthEnvironment(manifest, {
+    providerRequired: providerRequiredForManifest(manifest),
+    requireRefreshOwnership: true,
+  });
+  const sessionId = opts.sessionId ?? generatedSessionId();
+  const paths = sessionPaths(manifest, sessionId);
+  if (readManifestSessionRecord(manifest, sessionId) !== null) {
+    throw new Error(`session_exists:${sessionId}`);
+  }
+  const lease = acquireSessionLease(manifest, sessionId);
+  let runLease: RunLease;
+  try {
+    runLease = acquireRunLease(manifest, sessionId);
+  } catch (error) {
+    lease.release();
+    throw error;
+  }
+  const releaseLeases = (): void => {
+    lease.release();
+    runLease.release();
+  };
   const surface = opts.surface ?? 'web';
   const cols = opts.cols ?? 100;
   const rows = opts.rows ?? 30;
@@ -1074,145 +1622,186 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     maxMessages: opts.rateLimit?.maxMessages ?? 200,
     windowMs: opts.rateLimit?.windowMs ?? 1000,
   };
-  const ompBinary = opts.ompBinary ?? process.env['OMP_BIN'] ?? 'omp';
-  // Default: NO --profile flag. omp inherits the host default profile
-  // (`~/.omp/agent/`) — `modelRoles`, `models.db`, credentials all
-  // resolve there. Explicit `ompProfile` keeps the run isolated; the
-  // caller opts in.
-  const ompProfile = opts.ompProfile;
   const maxTimeSec = opts.maxTimeSec ?? 1800;
   const approvalMode = opts.approvalMode ?? 'yolo';
   const token = opts.token ?? mintToken();
+  const startedAt = new Date().toISOString();
+  const launchModel = manifest.auth.mode === 'none' && manifest.model === null
+    ? 'e2e-offline/no-request'
+    : manifest.model;
+  let env: Record<string, string>;
+  let args: string[];
+  let runtimeCheck: RuntimeSnapshot;
+  try {
+    env = buildChildEnvironment(manifest, { sessionId, authEnv: auth.env, runtimeBinary });
+    args = buildOmpArgs({
+      ompProfile: opts.ompProfile,
+      model: launchModel,
+      maxTimeSec,
+      approvalMode,
+      sessionDir: paths.root,
+      extensionPath: join(manifest.artifacts.fullstack.root, 'dist', 'index.js'),
+    });
+    runtimeCheck = verifyLaunchIntegrity(manifest, runtimeBinary);
+    writeSessionFile(paths.transcript, '', roots.run);
+    writeSessionFile(paths.log, '', roots.run);
+    writeSessionRecord(manifest, sessionId, recordFor(sessionId, 'preparing', paths, startedAt, lease.marker, null));
+  } catch (error) {
+    releaseLeases();
+    throw error;
+  }
+  let runtimeVersion: string;
+  try {
+    runtimeVersion = await resolveOmpVersion(runtimeBinary, env, roots.workspace);
+  } catch (error) {
+    writeSessionRecord(manifest, sessionId, recordFor(sessionId, 'failed', paths, startedAt, lease.marker, null));
+    appendLog(paths.log, `runtime probe failed: ${error instanceof Error ? error.message : String(error)}`, roots.run);
+    releaseLeases();
+    throw new Error('unsupported_runtime');
+  }
+  if (runtimeVersion !== manifest.runtime.version &&
+    runtimeVersion !== `omp/${manifest.runtime.version}` &&
+    !runtimeVersion.endsWith(` ${manifest.runtime.version}`) &&
+    !runtimeVersion.endsWith(` v${manifest.runtime.version}`)) {
+    writeSessionRecord(manifest, sessionId, recordFor(sessionId, 'failed', paths, startedAt, lease.marker, null));
+    appendLog(paths.log, 'runtime version did not match the prepared manifest', roots.run);
+    releaseLeases();
+    throw new Error('unsupported_runtime: version mismatch');
+  }
+  let nativeCommands: readonly { readonly name: string; readonly source: string }[] = [];
+  if (opts.noPty !== true) {
+    try {
+      const extensionPath = join(manifest.artifacts.fullstack.root, 'dist', 'index.js');
+      if (!existsSync(extensionPath)) throw new Error('prepared fullstack extension entrypoint is missing');
+      const probeRoot = join(roots.tmp, 'native-readiness', sessionId);
+      const probeHome = join(probeRoot, 'home');
+      const probeAgent = join(probeRoot, 'agent');
+      mkdirSync(probeHome, { recursive: true, mode: 0o700 });
+      writeProviderFreeCatalog(probeAgent);
+      const probe = probeProviderFreeRuntime(runtimeBinary, {
+        homeRoot: probeHome,
+        agentRoot: probeAgent,
+        projectRoot: roots.workspace,
+        tmpRoot: roots.tmp,
+        extensionPath,
+        expectedCommands: ['do-work', 'cto'],
+        pathEnv: env.PATH,
+        timeoutMs: 20_000,
+      });
+      if (!probe.capabilities.supported) throw new Error('declared extension command signals were not observed from an isolated native RPC process');
+      nativeCommands = (probe.commands ?? []).filter(command => command.source === 'extension' && (command.name === 'do-work' || command.name === 'cto'));
+    } catch {
+      writeSessionRecord(manifest, sessionId, recordFor(sessionId, 'failed', paths, startedAt, lease.marker, null));
+      appendLog(paths.log, 'native extension readiness refused the prepared session', roots.run);
+      releaseLeases();
+      throw new Error('plugin_readiness_failed');
+    }
+  }
+  const readiness = {
+    runtime: {
+      binary: runtimeBinary,
+      version: runtimeVersion,
+      digest: runtimeCheck.digest,
+    },
+    model: launchModel,
+    auth: auth.redacted,
+    isolation: isolationReceipt(manifest, sessionId, env),
+    native_inventory: 'observed-only',
+    full_inventory: false,
+    native_signals: nativeCommands,
+    typed_rpc_ready: opts.noPty !== true,
+  } satisfies Readonly<Record<string, unknown>>;
 
-  const stateDir = stateDirOf(scratchDir);
-  mkdirSync(stateDir, { recursive: true, mode: SESSION_DIR_MODE });
-  const transcriptPath = join(stateDir, 'transcript.jsonl');
-  const sessionJsonPath = join(stateDir, "session.json");
-  const dispatchOriginDir = join(stateDir, "dispatch-origin");
-  mkdirSync(dispatchOriginDir, { recursive: true, mode: SESSION_DIR_MODE });
-  const previousTranscript = archivePriorTranscript(transcriptPath, stateDir);
-  // Start each PTY with a clean current stream; the previous stream is retained
-  // next to it when a scratch session is resumed.
-  writeSessionFile(transcriptPath, '');
+  let assets: VendorAssets;
+  try {
+    assets = resolveVendorAssets();
+  } catch (error) {
+    writeSessionRecord(manifest, sessionId, recordFor(sessionId, 'failed', paths, startedAt, lease.marker, null));
+    appendLog(paths.log, `asset resolution failed: ${error instanceof Error ? error.message : String(error)}`, roots.run);
+    releaseLeases();
+    throw error;
+  }
 
-  const ompVersion = await resolveOmpVersion(ompBinary);
-
+  const host = '127.0.0.1';
+  const publicHost = host;
   const httpServer: Server = createServer();
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_INBOUND_WS_BYTES });
-  // The 256-bit bearer token is session-scoped: localhost and origin checks
-  // constrain its use, and reconnects remain possible until shutdown.
-
   const { promise: listening, resolve: bound, reject: bindFailed } = deferred<void>();
   httpServer.once('error', bindFailed);
   httpServer.listen(opts.port ?? 0, host, () => bound());
-  await listening;
+  try {
+    await listening;
+  } catch (error) {
+    releaseLeases();
+    throw error;
+  }
   const addr = httpServer.address();
   if (addr === null || typeof addr === 'string') {
+    releaseLeases();
     throw new Error('ux-e2e: failed to resolve bound port');
   }
   const boundPort = addr.port;
   const origin = `http://${publicHost}:${boundPort}`;
   const wsPath = '/ws';
   const url = `http://${publicHost}:${boundPort}/?token=${encodeURIComponent(token)}`;
-  // Resolve the host omp config FIRST so the warning is in session.json
-  // (and stderr) regardless of noPty mode. omp merges `--config` overlays
-  // in argv order — putting the host config before the ux-e2e overlay
-  // means the overlay (later) wins for keys it explicitly sets, and the
-  // host's `modelRoles` (and any other untouched keys) survive. Without
-  // the host config, omp boots with "No model selected".
-  const hostConfig = checkHostOmpConfig();
-  if (hostConfig.warning !== null) {
-    process.stderr.write(`ux-e2e: WARNING: ${hostConfig.warning}\n`);
-  }
-  // Operator-supplied overlay (opt-in): present-when-exists at
-  // `<scratch>/.omp/ux-e2e-overlay.user.json`. When found, it is emitted
-  // as the THIRD `--config` (after host config and the regenerated
-  // ux-e2e overlay) so its keys win on conflict — letting a test run
-  // pin `modelRoles` (or anything else) without touching the host
-  // config or the regenerated standard overlay. Absence is the normal
-  // case: the file is never auto-created, only consulted. Resolved early
-  // so its presence is recorded in `session.json` regardless of noPty.
-  const userConfigDefaultPath = join(scratchDir, '.omp', 'ux-e2e-overlay.user.json');
-  const userConfigPath = existsSync(userConfigDefaultPath) ? userConfigDefaultPath : null;
+  writeSessionFile(paths.connection, JSON.stringify({ session_id: sessionId, token, url, ws_path: wsPath }) + '\n', roots.run);
+  appendLog(paths.log, `session ${sessionId} listening on ${boundPort}`, roots.run);
 
-  const launchArgs = buildOmpArgs({
-    ompProfile,
-    ...(activation !== null ? { extensionPath: activation.fullstackExtension } : {}),
-    maxTimeSec,
-    approvalMode,
-    configPath: join(scratchDir, ".omp", "ux-e2e-overlay.json"),
-    sessionDir: join(scratchDir, ".omp", "agent"),
-    userConfigDefaultPath,
-    ...(hostConfig.path !== null ? { hostConfigPath: hostConfig.path } : {}),
-    ...(userConfigPath !== null ? { userConfigPath } : {}),
-  });
 
   let ptyProc: IPty | null = null;
   let spawnError: string | null = null;
+  let spawnReceiptGap = false;
+  let processReceipt: ProcessReceipt | null = null;
   if (opts.noPty !== true) {
-    // node-pty is imported lazily: it is a native module whose prebuilt
-    // binary may be missing on some platforms — noPty test sessions must
-    // still work when the native module cannot load.
-    const ptyMod = await import('node-pty');
-    const env = buildPtyEnv(
-      process.env,
-      { ...(opts.env ?? {}), OMP_WORKFLOWS_DISPATCH_ORIGIN_DIR: dispatchOriginDir },
-      { keepProxyEnv: opts.keepProxyEnv },
-    );
+    // Only the explicit noPty test seam may start without a native PTY.
+    // Production must fail closed rather than advertise a running session.
     try {
-      // omp is spawned directly (never wrapped in a shell), which is
-      // inherently rc/profile-suppressed: no shell rc files can reorder
-      // PATH or print noise into the terminal.
-      ptyProc = ptyMod.spawn(ompBinary, launchArgs, { name: 'xterm-256color', cols, rows, cwd: scratchDir, env });
-    } catch (err) {
-      spawnError = err instanceof Error ? err.message : String(err);
+      const ptyMod = await import('node-pty');
+      ptyProc = ptyMod.spawn(runtimeBinary, args, {
+        name: 'xterm-256color',
+        cols,
+        rows,
+        cwd: roots.workspace,
+        env,
+      });
+      processReceipt = processReceiptFor(ptyProc.pid, manifest, sessionId, runtimeBinary, args, runLease.marker);
+    } catch (error) {
+      spawnError = error instanceof Error ? error.message : String(error);
+      spawnReceiptGap = ptyProc !== null;
+      try {
+        ptyProc?.kill();
+      } catch {
+        /* best effort; the process was not admitted without a receipt. */
+      }
+      ptyProc = null;
+      appendLog(paths.log, `spawn refused: ${spawnError}`, roots.run);
     }
   }
+  writeSessionRecord(manifest, sessionId, {
+    ...recordFor(sessionId, spawnError === null ? (opts.noPty === true ? 'running' : 'ready') : (spawnReceiptGap ? 'stop_refused' : 'failed'), paths, startedAt, lease.marker, processReceipt),
+    ready: false,
+    readiness,
+    native_signals: nativeCommands,
+  });
+  if (spawnError !== null) {
+    releaseLeases();
+    wss.close();
+    await new Promise<void>(resolveClosed => { httpServer.close(() => resolveClosed()); });
+    throw new Error(`pty_spawn_failed: ${sanitizeForJson(spawnError)}`);
+  }
 
-  const sessionJson = {
-    slug: deriveSlug(scratchDir),
-    url,
-    token,
-    wsPath,
-    pid: ptyProc?.pid ?? null,
-    started_at: new Date().toISOString(),
-    omp_version: ompVersion,
-    profile: ompProfile,
-    tty: { cols, rows, term: 'xterm-256color' },
-    task_prompt: opts.taskPrompt !== null && opts.taskPrompt !== undefined ? sanitizeForJson(opts.taskPrompt) : null,
-    scenario: opts.scenario ?? null,
-    previous_transcript: previousTranscript,
-    surface,
-    host_config: {
-      path: hostConfig.path,
-      warning: hostConfig.warning,
-    },
-    user_config: {
-      path: userConfigPath,
-      default_path: userConfigDefaultPath,
-    },
-    launch: {
-      binary: ompBinary,
-      argv: launchArgs,
-      workspace_root: activation?.monorepoRoot ?? null,
-      core_package: activation?.corePackage ?? null,
-      fullstack_package: activation?.fullstackPackage ?? null,
-      core_link: activation?.coreLink ?? null,
-      fullstack_link: activation?.fullstackLink ?? null,
-      extension_path: activation?.fullstackExtension ?? null,
-      plugin_override_path: activation?.pluginOverridePath ?? null,
-      disabled_plugins: activation?.disabledPlugins ?? [],
-      dispatch_origin_dir: dispatchOriginDir,
-      env: { OMP_WORKFLOWS_DISPATCH_ORIGIN_DIR: dispatchOriginDir },
-    },
-  };
-  writeSessionFile(sessionJsonPath, JSON.stringify(sessionJson, null, 2) + '\n');
-  // ---- HTTP: security headers + static page -------------------------
-  const assets = resolveVendorAssets();
+  let controller: SessionController | null = null;
   httpServer.on('request', (req, res) => {
     const headers = securityHeaders(publicHost, boundPort);
     for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
     const path = pathnameOf(req);
+    if (path === INTERNAL_STOP_PATH) {
+      void handleStopRequest(req, res, manifest, sessionId, token, `${publicHost}:${String(boundPort)}`, controller)
+        .catch(() => {
+          if (!res.headersSent) stopJson(res, 500, { ok: false, error: 'stop_owner_error' });
+        });
+      return;
+    }
     if (path === '/') {
       serveFile(res, assets.terminalHtml, 'text/html; charset=utf-8');
       return;
@@ -1238,9 +1827,70 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     res.end('not found');
   });
 
-  const controller = new SessionController({ pty: ptyProc, spawnError, idleMs, transcriptPath });
+  let ptyOutputSeen = false;
+  const onStatus = (
+    status: string,
+    exit?: { readonly code: number; readonly signal?: number },
+    termination?: SessionTermination,
+  ): void => {
+    if (status === 'running') ptyOutputSeen = true;
+    writeSessionRecord(manifest, sessionId, {
+      ...recordFor(sessionId, status, paths, startedAt, lease.marker, processReceipt),
+      ready: ptyOutputSeen,
+      readiness,
+      native_signals: nativeCommands,
+      ...(exit === undefined ? {} : { exit_code: exit.code, ...(exit.signal === undefined ? {} : { exit_signal: exit.signal }) }),
+      ...(termination === undefined ? {} : { termination }),
+    });
+  };
+  let transportClose: Promise<void> | null = null;
+  const closeTransport = (): Promise<void> => {
+    if (transportClose !== null) return transportClose;
+    const started = (async () => {
+      wss.clients.forEach(c => {
+        try {
+          c.close(1001, 'server shutting down');
+        } catch {
+          /* ignore. */
+        }
+      });
+      wss.close();
+      const { promise: closed, resolve: done } = deferred<void>();
+      httpServer.close(() => done());
+      await closed;
+    })();
+    transportClose = started;
+    return started;
+  };
+  controller = new SessionController({
+    pty: ptyProc,
+    spawnError,
+    idleMs,
+    transcriptPath: paths.transcript,
+    runRoot: roots.run,
+    killOptions: processReceipt === null || ptyProc === null
+      ? undefined
+      : {
+          manifest,
+          sessionId,
+          receipt: processReceipt,
+          executablePath: runtimeBinary,
+          executableDigest: manifest.runtime.digest,
+          argv: args,
+          cwd: roots.workspace,
+        },
+    onStatus,
+    onClosed: ({ ok }) => {
+      try {
+        if (ok) releaseLeases();
+      } catch {
+        /* Keep the lease for fail-closed cleanup if its record is unreadable. */
+      } finally {
+        void closeTransport().catch(() => undefined);
+      }
+    },
+  });
 
-  // ---- WS: authenticated upgrade -------------------------------------
   httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const result = attachSession(req, socket, head, wss, token, {
       origin,
@@ -1257,31 +1907,38 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
     }
   });
 
-  const close = async (): Promise<void> => {
-    wss.clients.forEach(c => {
-      try {
-        c.close(1001, 'server shutting down');
-      } catch {
-        /* ignore. */
+  let closePromise: Promise<void> | null = null;
+  const close = (options?: SessionCloseOptions): Promise<void> => {
+    if (closePromise !== null) {
+      if (options?.status === 'failed') {
+        return controller?.close(options) ?? closePromise;
       }
-    });
-    await controller.close();
-    wss.close();
-    const { promise: closed, resolve: done } = deferred<void>();
-    httpServer.close(() => done());
-    await closed;
+      return closePromise;
+    }
+    closePromise = (async () => {
+      try {
+        await controller?.close(options);
+      } finally {
+        await closeTransport();
+      }
+    })();
+    return closePromise;
   };
 
   return {
     host,
     publicHost,
     port: boundPort,
+    runId: runIdOf(manifest),
+    sessionId,
     token,
     url,
     wsPath,
-    scratchDir,
-    transcriptPath,
-    sessionJsonPath,
+    transcriptPath: paths.transcript,
+    logPath: paths.log,
+    sessionJsonPath: paths.record,
+    privateConnectionPath: paths.connection,
+    readiness,
     pty: {
       pid: ptyProc?.pid ?? null,
       cols,

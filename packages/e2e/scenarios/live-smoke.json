@@ -1,0 +1,26 @@
+{
+  "id": "live-smoke",
+  "title": "OAuth-backed workflow state and resume",
+  "description": "Submit a bounded /do-work request to the prepared isolated project and observe a real provider-backed workflow transition.",
+  "command": "/do-work",
+  "task": "[AUTONOMOUS] Create README.md with the exact text \"Isolated E2E workspace.\" in this disposable project. The acceptance criterion is that README.md contains that sentence. Do not ask for clarification.",
+  "params": {},
+  "stages": [
+    {
+      "id": "discovery",
+      "name": "Workflow discovery",
+      "expect": ["Discovery", "PHASE-0", "workflow_prepare"]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 120000,
+    "checkpointPollMs": 250
+  },
+  "screenshots": { "on": ["error"] },
+  "ratings": {
+    "dimensions": ["message_clarity", "error_handling"],
+    "min": 1,
+    "max": 5
+  }
+}

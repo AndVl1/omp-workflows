@@ -2,92 +2,45 @@
 
 ## Unreleased
 
-### Added
+### Changed
 
-- **User-supplied omp config overlay (`ux-e2e-overlay.user.json`)** —
-  a new opt-in third `--config` overlay at `<scratch>/.omp/ux-e2e-overlay.user.json`,
-  emitted by `buildOmpArgs` AFTER the host config and the regenerated ux-e2e
-  overlay (so its keys win on conflict). Lets a test run pin `modelRoles`
-  (e.g. the active session model) without touching the operator's host
-  config or the regenerated standard overlay. Presence is the opt-in
-  signal — the file is never auto-created, and the third `--config` is
-  omitted entirely when the file is absent. Resolved at `startTestSession`
-  time and recorded in `session.json` under `user_config` (path + canonical
-  default_path) for diagnostics. `OmpLaunchConfig` gains two fields:
-  `userConfigDefaultPath` (always required) and `userConfigPath?`
-  (third-overlay path, omitted when the file is absent or empty).
-  Three new unit tests in `test/server.test.ts`:
-  1. `buildOmpArgs appends user config as the THIRD --config overlay (after ux-e2e overlay)`
-  2. `buildOmpArgs omits the THIRD --config when userConfigPath is unset (no file present)`
-  3. `buildOmpArgs treats empty-string userConfigPath as unset`
-  plus one session-assertion test (`session.json records user_config.path
-  when the user overlay file is present`) that creates a temp file, runs
-  `startTestSession` in `noPty` mode, and verifies the resolved path is
-  persisted. README gains a dedicated **User-supplied overlay** section
-  (with a minimal `modelRoles` example) and the `start` subcommand row,
-  Architecture bullet, and Known limitations are updated to mention the
-  third overlay.
-- **Enter button + `pressEnter` driver method (web surface)** — the
-  terminal page (`assets/terminal.html`) now has a **⏎ Enter** button
-  (`#enter-btn`) in a dark-themed toolbar next to the status bar.
-  Clicking it calls `window.__pressEnter()` (in `assets/page.js`), which
-  dispatches a synthetic `KeyboardEvent` (`key:'Enter'`, `code:'Enter'`,
-  `keyCode:13`, `which:13`, `bubbles:true`, `cancelable:true`) on
-  `term.textarea` so xterm forwards `'\r'` through `onData` exactly as a
-  real keyboard would. A one-shot `onData` listener guards a ~100 ms
-  fallback that sends `{t:'i', d:'\r'}` directly when the primary path
-  fails (focus lost, textarea disabled) — the listener flips a flag the
-  instant xterm sees `'\r'`, so the fallback never duplicates `'\r'`.
-  Also exposed `window.__typeText(text)` for programmatic input. The
-  button is `disabled` until the WebSocket auth-acks and re-disabled on
-  process exit / disconnect.
-- **`TerminalDriver.pressEnter()` (new interface method)** —
-  `WsDriver.pressEnter()` sends `{t:'i', d:'\r'}`; `PlaywrightDriver.pressEnter()`
-  calls `page.keyboard.press('Enter')` so xterm forwards `'\r'` through
-  CDP. The new `pressEnter()` is the correct API for real PTY submit;
-  `WsDriver.submit()` (legacy) is retained for backward compat and
-  still appends `'\n'`; the comment is corrected to point at the new
-  `pressEnter()` for real PTY submit.
+- Replaced scratch `bootstrap`, `npm link`, host-config overlays and implicit
+  installed plugins with a secret-free config → resolved run manifest. `prepare`
+  snapshots working-tree sources (including uncommitted changes), builds
+  content-addressed core/fullstack dependency closures and the installed omp
+  runtime, and provisions an isolated Git workspace, HOME and agent roots.
+- All session, report and cleanup commands now address the validated manifest.
+  Sessions have separate IDs, transcripts and process receipts while preserving
+  canonical workflow state across stop/restart. Web clients can reconnect and
+  receive bounded recent PTY output. Legacy scratch commands fail with a
+  migration error rather than falling back to host inheritance.
+- Added explicit provider-free, environment API-key, external broker and
+  opt-in managed native-host-broker auth modes. The managed broker reuses the
+  installed omp's current OpenAI Codex/xAI OAuth DB without copying credentials
+  into a run; separate addressable broker lifecycle and clear refresh-ownership
+  limits are documented.
+- Added `doctor`, `verify --suite isolation|live-smoke`, `cleanup`, and root
+  `e2e:*` scripts. Verification produces scoped/redacted evidence and always
+  attempts run-owned cleanup; a failed check is never masked by cleanup.
+  Permanent regression tests cover runtime/artifact integrity, global leakage,
+  broker lifecycle, session restart, credential redaction and process ownership.
+- `prepare` now resolves `runtime.binary: "omp"` outside npm's checkout-local
+  `.bin` shims; an absolute path still pins a deliberate runtime. Default
+  session selection prefers the sole active session rather than stale stopped
+  records, and linked run-lifecycle operator recipes use manifest/session paths.
+- `stop` requests an authenticated owner-side close on loopback and retains the
+  actual PTY exit (including the owner-requested SIGTERM encoding `143/0`).
+  Unrequested, forced, unobserved or otherwise non-clean termination cannot
+  pass reporting; an unreachable owner receives receipt-checked failure
+  recovery. Detached control workers receive an explicit environment allowlist
+  while preserving the opted-in native broker profile.
 
-### Fixed
+### Security
 
-- **Enter semantics corrected in the README**
-  claimed `'\n'` is Enter and `'\r'` is literal input. A real Enter
-  keypress in a PTY produces CR (0x0D, `'\r'`); `'\n'` is just a line
-  break in the editor buffer. The new **Enter semantics** subsection
-  documents `'\r'` for submit, `'\n'` for line break, and points at
-  `pressEnter()` (driver) and the **⏎ Enter** button (web surface).
-  `WsDriver.submit()` still appends `'\n'` for backward compatibility
-  but is explicitly marked legacy.
-- WebSocket tokens are now scoped to the live session, so clients can reconnect
-- Closing or losing a WebSocket now detaches only that client instead of killing
-  the PTY. `session.close()`, idle timeout, and PTY exit retain their lifecycle
-  behavior, including process-tree cleanup and exit notification.
-- Added `ux-e2e input <scratch-dir> <text>` for arbitrary terminal commands. It
-  sends `<text>\n` as one input frame without waiting for `[ask_user]`; `\n` is
-  Enter in the omp TUI, while `\r` is literal input.
-- Hardened `ux-e2e stop` against stale or foreign `session.json` PIDs: a live
-  process must have a command line containing the requested scratch path before
-  its process tree is terminated; mismatches are refused with an error.
-- Added README guidance in **Session hygiene & safe stopping**: use only
-  `ux-e2e stop <scratch>`, never broad `pkill`/`killall`/name-pattern kills,
-  and rely on `start --force` for live-session replacement.
-- `ux-e2e start --detach` now spawns the detached child with stdout/stderr
-  redirected to `<scratch>/.work-state/ux-e2e/detach.log` via an inherited
-  file descriptor — **no pipe between parent and child** — so the detached
-  session survives the parent exiting. Previously the parent held a
-  `pipe → logStream` open (event loop never drained; parent hung for >60 s
-  after printing the URL) AND, more fatally, the parent's stdio teardown
-  closed the pipe ends the child was writing to, so the next `console.log()`
-  in the child triggered an unhandled EPIPE on its stdout and the process
-  died ~3-4 s after the parent's exit (ECONNREFUSED on the session URL).
-  Regression pinned by `test/detach.test.ts`: bootstrap → `start --detach`
-  → assert parent exits in < 10 s → assert pid alive + port listening
-  after 5.5 s → assert `ux-e2e input` round-trip — all green; the same
-  flow previously hung the parent and crashed the child.
-- README updates describing the fd-based detach mechanism in the `start`
-  row, the `src/cli.ts` architecture bullet, and the `--detach`
-  Known-limitation bullet.
+- Manifest and source-path validation, allowlisted child environment, immutable
+  cache integrity checks, private session connection records, and verified
+  process-tree stop replace best-effort scratch-path and PID matching.
+  Process isolation is not a host OS sandbox.
 
 ## 0.1.4 — 2026-08-02
 

@@ -98,7 +98,7 @@ export interface TerminalDriver {
 /* ------------------------------------------------------------------ */
 
 export interface WsDriverOptions {
-  /** WS page URL from session.json (`http://host:port/?token=...`). */
+  /** Session-scoped URL from the private connection record; never export it. */
   readonly url: string;
   /** Path of the server-side transcript.jsonl used by readScreen(). */
   readonly transcriptPath: string;
@@ -189,19 +189,11 @@ export class WsDriver implements TerminalDriver {
   }
 
   /**
-   * Send Enter to the PTY as a real Enter keypress would: '\r' (CR,
-   * 0x0D). '\n' is NOT equivalent — it inserts a line break into the
-   * editor buffer and does not submit. (The legacy `submit()` helper
-   * uses '\n' for backward compatibility with old text surfaces that
-   * normalised LF → CR; prefer `pressEnter()` on modern PTYs.)
+   * Send Enter to the PTY as a real keypress: '\r' (CR, 0x0D).
+   * '\n' inserts a line break in the editor and does not submit.
    */
   async pressEnter(): Promise<void> {
     await this.type('\r');
-  }
-
-  /** Submit text to omp as a single frame. Uses LF for backward compat. */
-  async submit(text: string): Promise<void> {
-    await this.type(text + '\n');
   }
 
   async close(): Promise<void> {
@@ -223,6 +215,129 @@ export function wsUrlFromPageUrl(pageUrl: string): string {
   const proto = u.protocol === 'https:' ? 'wss:' : 'ws:';
   const token = u.searchParams.get('token') ?? '';
   return `${proto}//${u.host}/ws?token=${encodeURIComponent(token)}`;
+}
+
+export interface SessionStopRequest {
+  readonly run_id: string;
+  readonly session_id: string;
+}
+
+export interface SessionStopOptions {
+  /** Private connection URL; the bearer query is never sent to the stop route. */
+  readonly url: string;
+  readonly token: string;
+  readonly request: SessionStopRequest;
+  readonly timeoutMs?: number;
+}
+
+export interface SessionStopResponse {
+  readonly ok: true;
+  readonly run_id: string;
+  readonly session_id: string;
+  readonly status: 'stopped';
+  readonly exit_code: 0 | 143;
+}
+
+export type SessionStopErrorKind = 'refused' | 'unavailable';
+
+/**
+ * A stop request either reached the authenticated owner and was refused, or
+ * could not obtain an owner response.  The error deliberately contains no
+ * URL, request body, or bearer value.
+ */
+export class SessionStopError extends Error {
+  readonly kind: SessionStopErrorKind;
+  readonly status: number | null;
+
+  constructor(kind: SessionStopErrorKind, status: number | null = null) {
+    super(kind === 'refused' ? 'session owner refused stop request' : 'session owner could not be reached');
+    this.name = 'SessionStopError';
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+function validStopResponse(value: unknown, request: SessionStopRequest): value is SessionStopResponse {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const body = value as Record<string, unknown>;
+  const keys = Object.keys(body).sort();
+  if (keys.length !== 5 || keys.join(',') !== 'exit_code,ok,run_id,session_id,status') return false;
+  return body.ok === true &&
+    body.run_id === request.run_id &&
+    body.session_id === request.session_id &&
+    body.status === 'stopped' &&
+    (body.exit_code === 0 || body.exit_code === 143);
+}
+
+/**
+ * Ask the session owner to close itself.  This client intentionally derives
+ * the private route from the connection origin so credentials stay solely in
+ * the Authorization header.
+ */
+export async function requestSessionStop(options: SessionStopOptions): Promise<SessionStopResponse> {
+  let endpoint: string;
+  try {
+    const connection = new URL(options.url);
+    const port = Number(connection.port);
+    if (
+      connection.protocol !== 'http:' ||
+      connection.hostname !== '127.0.0.1' ||
+      connection.username !== '' ||
+      connection.password !== '' ||
+      connection.hash !== '' ||
+      !Number.isInteger(port) ||
+      port < 1 ||
+      port > 65535
+    ) {
+      throw new Error('unsafe');
+    }
+    endpoint = `http://127.0.0.1:${String(port)}/__ux-e2e/stop`;
+  } catch {
+    throw new SessionStopError('unavailable');
+  }
+  if (options.token.length === 0 || options.request.run_id.length === 0 || options.request.session_id.length === 0) {
+    throw new SessionStopError('refused', 400);
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 5_000);
+  try {
+    let response: Response;
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${options.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(options.request),
+        redirect: 'error',
+        signal: controller.signal,
+      });
+    } catch {
+      throw new SessionStopError('unavailable');
+    }
+    if (response.status === 200) {
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        throw new SessionStopError('unavailable', response.status);
+      }
+      if (!validStopResponse(body, options.request)) throw new SessionStopError('unavailable', response.status);
+      return body;
+    }
+    try {
+      await response.body?.cancel();
+    } catch {
+      /* best effort */
+    }
+    if (response.status === 400 || response.status === 401 || response.status === 403 || response.status === 409) {
+      throw new SessionStopError('refused', response.status);
+    }
+    throw new SessionStopError('unavailable', response.status);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /* ------------------------------------------------------------------ */

@@ -1,7 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -12,16 +10,8 @@ import type { TrustedExecutionContext } from '../../core/src/engine/types.js';
 import { inboxDir, startDispatcher } from '../../fullstack/src/adapters/registry.js';
 import { WsDriver, waitFor } from '../src/driver.js';
 import { startTestSession, type TestSession } from '../src/server.js';
+import { createIsolatedRunFixture } from './fixtures/isolated-run.js';
 
-const GIT_IDENTITY = ['-c', 'user.name=Mock Inbox E2E', '-c', 'user.email=mock-inbox-e2e@example.invalid'];
-
-function git(cwd: string, args: string[]): string {
-  const result = spawnSync('git', [...GIT_IDENTITY, ...args], { cwd, encoding: 'utf8' });
-  if (result.status !== 0) {
-    throw new Error(`git ${args.join(' ')} failed (${result.status}): ${(result.stderr ?? '').trim()}`);
-  }
-  return (result.stdout ?? '').trim();
-}
 interface InboxTask {
   readonly id: string;
   readonly text: string;
@@ -125,46 +115,28 @@ class MockResidentCto {
   }
 }
 
-function writeMockOmp(path: string): void {
-  writeFileSync(
-    path,
-    `#!/bin/sh
+const MOCK_OMP_SCRIPT = String.raw`#!/bin/sh
 if [ "$1" = "--version" ]; then
-  printf 'omp-mock 1.0\\n'
+  printf 'omp-fixture 1.0\n'
   exit 0
 fi
-printf 'MOCK_READY\\n'
+printf 'MOCK_READY\n'
 while IFS= read -r line; do
-  line=$(printf '%s' "$line" | tr -d '\\r')
+  line=$(printf '%s' "$line" | tr -d '\r')
   case "$line" in
-    \\[CTO-INBOX\\]*) printf 'MOCK_INBOX_ACCEPTED:%s\\n' "$line" ;;
-    MOCK_WAVE_1_FINISHED*) printf 'MOCK_WAVE_1_FINISHED\\n' ;;
-    MOCK_WAVE_2_STARTED*) printf 'MOCK_WAVE_2_STARTED:%s\\n' "$line" ;;
-    *) printf 'MOCK_INPUT:%s\\n' "$line" ;;
+    /cto*) printf 'MOCK_STANDBY_READY\n' ;;
+    \[CTO-INBOX\]*) printf 'MOCK_INBOX_ACCEPTED:%s\n' "$line" ;;
+    MOCK_WAVE_1_FINISHED*) printf 'MOCK_WAVE_1_FINISHED\n' ;;
+    MOCK_WAVE_2_STARTED*) printf 'MOCK_WAVE_2_STARTED:%s\n' "$line" ;;
+    *) printf 'MOCK_INPUT:%s\n' "$line" ;;
   esac
 done
-`,
-  );
-  chmodSync(path, 0o755);
-}
+`;
 
-function initScratch(root: string): void {
-  mkdirSync(join(root, '.omp'), { recursive: true });
-  writeFileSync(join(root, 'README.md'), '# Mock inbox E2E scratch\n');
-  git(root, ['init', '-b', 'main']);
-  git(root, ['add', '-A']);
-  git(root, ['commit', '-m', 'initial']);
-}
 
 test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2', async t => {
-  // GIVEN: a real E2E PTY/WS session, a fixture-owned CTO claim with a
-  // canonical run, and a deterministic Telegram-shaped inbound transport.
-  // This fixture does not exercise registered public slash ingress or simulate
-  // public command acceptance; it acquires the exact claim through core ingress.
-  const scratch = mkdtempSync(join(tmpdir(), 'omp-ux-e2e-cto-inbox-'));
-  initScratch(scratch);
-  const mockOmp = join(scratch, 'mock-omp.sh');
-  writeMockOmp(mockOmp);
+  const fixture = createIsolatedRunFixture({ runtimeScript: MOCK_OMP_SCRIPT });
+  const workspace = fixture.manifest.roots.workspace;
 
   let session: TestSession | null = null;
   let driver: WsDriver | null = null;
@@ -172,19 +144,19 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
   let suspendSession: (() => void) | null = null;
   try {
     session = await startTestSession({
-      cwd: scratch,
-      ompBinary: mockOmp,
+      manifest: fixture.manifest,
+      sessionId: 'cto-inbox-mock',
       surface: 'text',
       maxTimeSec: 30,
       idleMs: 30_000,
     });
     if (session.pty.mode !== 'pty') {
-      t.skip('node-pty PTY is unavailable; startTestSession used its noPty fallback');
+      t.skip('node-pty is unavailable for the isolated resident-process probe');
       return;
     }
     driver = new WsDriver({ url: session.url, transcriptPath: session.transcriptPath });
     await driver.open();
-    await waitFor(async () => (await driver!.readScreen()).includes('MOCK_READY'), { label: 'mock omp ready' });
+    await waitFor(async () => (await driver!.readScreen()).includes('MOCK_READY'), { label: 'mock runtime ready' });
 
     // The mock binary is used only for the PTY/WS surface; no public `/cto`
     // command is typed or accepted in this fixture.
@@ -194,18 +166,18 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
     await resident.flush();
     await waitFor(async () => (await driver!.readScreen()).includes('MOCK_WAVE_1_STARTED'), { label: 'wave 1 started' });
 
-    const sessionId = `mock-inbox:${scratch}`;
-    const branch = resolveActiveBranch(scratch);
+    const sessionId = session.sessionId;
+    const branch = resolveActiveBranch(workspace);
     const executionContext: TrustedExecutionContext = {
       session_id: sessionId,
       caller: 'host',
       process_id: process.pid,
-      worktree: scratch,
+      worktree: workspace,
       branch,
       authority: 'coordinator',
     };
-    const controller: WorkflowSessionController = createWorkflowSessionController({ cwd: scratch, context: executionContext });
-    const ingress = acquireCtoIngress({ cwd: scratch, branch, task: '', controller });
+    const controller: WorkflowSessionController = createWorkflowSessionController({ cwd: workspace, context: executionContext });
+    const ingress = acquireCtoIngress({ cwd: workspace, branch, task: '', controller });
     const exactClaim = controller.activeCtoClaim();
     assert.ok(exactClaim, 'fixture ingress publishes an exact active claim');
     assert.equal(exactClaim.run_id, ingress.run_id);
@@ -213,49 +185,42 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
     suspendSession = () => suspendCtoSession(controller, 'session-shutdown');
 
     const adapter = new MockInboundAdapter();
-    stopDispatcher = startDispatcher(scratch, adapter as unknown as Parameters<typeof startDispatcher>[1], 5, {
+    stopDispatcher = startDispatcher(workspace, adapter as unknown as Parameters<typeof startDispatcher>[1], 5, {
       binding: { session_id: sessionId, getClaim: () => controller.activeCtoClaim() },
       // This mirrors the production main-session callback: the resident CTO is
       // woken through a user message, not by starting another CTO session.
       onTask: task => resident.acceptInboxTask(task),
     });
 
-    // WHEN: two new tasks arrive while wave 1 is still active.
     adapter.push('tg:inbox-1', 'add the export endpoint');
     adapter.push('tg:inbox-2', 'update the mobile copy');
     await waitFor(() => resident.received.length === 2, { label: 'two inbox wakes', timeoutMs: 3000 });
     await resident.flush();
 
-    // THEN: both tasks are durable in the active run, both wakes reach the
-    // resident CTO, and no poll overlap occurs.
     assert.equal(resident.activeWave, 1);
     assert.deepEqual(
-      readdirSync(inboxDir(runId, scratch)).filter(name => name.endsWith('.json')).sort(),
+      readdirSync(inboxDir(runId, workspace)).filter(name => name.endsWith('.json')).sort(),
       ['tg-inbox-1.json', 'tg-inbox-2.json'],
     );
     assert.deepEqual(resident.received.map(task => task.text), ['add the export endpoint', 'update the mobile copy']);
-    assert.equal(adapter.maxConcurrentPolls, 1, 'mock Telegram polling never overlaps');
+    assert.equal(adapter.maxConcurrentPolls, 1);
     assert.ok(adapter.pollCount >= 1);
     await waitFor(async () => {
       const screen = await driver!.readScreen();
       return screen.includes('MOCK_INBOX_ACCEPTED:[CTO-INBOX] tg:inbox-1') && screen.includes('MOCK_INBOX_ACCEPTED:[CTO-INBOX] tg:inbox-2');
     }, { label: 'resident accepts both inbox tasks', timeoutMs: 3000 });
 
-    // WHEN: the current wave completes.
     await resident.finishWaveAndStartNext();
     await resident.flush();
-
-    // THEN: the queued tasks are folded into the next wave without spawning a
-    // nested CTO or losing either message.
     await waitFor(async () => (await driver!.readScreen()).includes('MOCK_WAVE_2_STARTED:tg:inbox-1,tg:inbox-2'), {
       label: 'wave 2 started with both inbox tasks',
       timeoutMs: 3000,
     });
     assert.equal(resident.activeWave, 2);
-    const files = readdirSync(inboxDir(runId, scratch)).filter(name => name.endsWith('.json'));
+    const files = readdirSync(inboxDir(runId, workspace)).filter(name => name.endsWith('.json'));
     assert.equal(files.length, 2);
     assert.deepEqual(
-      JSON.parse(readFileSync(join(inboxDir(runId, scratch), 'tg-inbox-1.json'), 'utf8')).runId,
+      JSON.parse(readFileSync(join(inboxDir(runId, workspace), 'tg-inbox-1.json'), 'utf8')).runId,
       runId,
     );
   } finally {
@@ -263,6 +228,6 @@ test('mock E2E: resident CTO accepts inbox tasks during wave 1 and starts wave 2
     suspendSession?.();
     await driver?.close();
     await session?.close();
-    rmSync(scratch, { recursive: true, force: true });
+    fixture.cleanup();
   }
 });
