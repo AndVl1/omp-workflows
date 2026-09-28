@@ -20,7 +20,7 @@ echo "//npm.pkg.github.com/:_authToken=ghp_xxx" >> ~/.npmrc
 Then install with your usual tooling:
 
 ```bash
-# Both packages must satisfy the fullstack peer dependency (currently core `^0.28.0`).
+# Both packages must satisfy the fullstack peer dependency declared in packages/fullstack/package.json.
 # Keep published core/fullstack versions on a compatible release line; npm does not
 # upgrade core automatically.
 
