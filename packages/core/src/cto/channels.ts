@@ -19,7 +19,8 @@
  * have inbound AND outbound (otherwise it downgrades to "ro"); a declared
  * "read-only" channel NEVER upgrades, even with full capabilities. When no
  * capabilities table is supplied, built-in defaults apply (telegram/mock =
- * rw, http and any other kind = ro).
+ * rw, http and any other kind = ro). An explicit table replaces built-ins;
+ * unknown kinds fail closed to "ro".
  *
  * The only I/O is a node:fs read of the config file — everything else is
  * pure. Never throws.
@@ -68,7 +69,7 @@ export function loadEscalationConfigRaw(cwd: string): Record<string, unknown> | 
 
 /** Capability table for an adapter kind: explicit param wins, else built-in defaults. */
 function capabilityOf(kind: string, capabilities?: Record<string, ChannelCapabilities>): ChannelCapabilities | undefined {
-  if (capabilities) return capabilities[kind];
+  if (capabilities) return capabilities[kind] ?? { canReceiveInbound: false, canSend: false };
   return BUILTIN_CAPABILITIES[kind] ?? { canReceiveInbound: false, canSend: true }; // unknown kind: push-only
 }
 

@@ -23,6 +23,15 @@ import {
   ctoBackstop,
   type TeamDef,
 } from "@andvl1/omp-workflows-core";
+import { readRunControl } from "../src/engine/run-store.js";
+import { acquireCtoIngress } from "../src/cto/run.js";
+import { createWorkflowSessionController } from "../src/engine/host-controller.js";
+import { LifecycleError } from "../src/engine/run-lifecycle.js";
+import type { TrustedExecutionContext } from "../src/engine/types.js";
+
+function executionContext(root: string, sessionId = "cto-owner-session", branch = "main"): TrustedExecutionContext {
+  return { session_id: sessionId, caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" };
+}
 
 function sampleDefs(): Record<string, TeamDef> {
   return {
@@ -41,6 +50,7 @@ test("cto-owner: same-session task runs amend, foreign sessions get a fresh cont
       autonomous: false,
       teams: [{ team: "backend", slice: "s1" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
       owner_session: "sess-A",
     });
     assert.ok(res);
@@ -58,6 +68,33 @@ test("cto-owner: same-session task runs amend, foreign sessions get a fresh cont
   }
 });
 
+test("cto-owner: exact --run selector cannot replace a live foreign claim", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-owner-selector-"));
+  try {
+    const owner = createWorkflowSessionController({ cwd: root, context: executionContext(root, "owner-session") });
+    const ingress = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "owned task",
+      controller: owner,
+    });
+    const foreign = createWorkflowSessionController({ cwd: root, context: executionContext(root, "foreign-session") });
+    assert.throws(
+      () => acquireCtoIngress({
+        cwd: root,
+        branch: "main",
+        task: "foreign continuation",
+        run_id: ingress.run_id,
+        controller: foreign,
+      }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+      "an explicit run selector identifies but does not prove ownership",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("cto-owner: standby runs remain adoptable across sessions", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-owner-standby-"));
   try {
@@ -65,7 +102,7 @@ test("cto-owner: standby runs remain adoptable across sessions", () => {
     const standby = newCtoState({
       id: "standby-1",
       task: "standby — awaiting inbox tasks",
-      branch: "",
+      branch: "main",
       autonomous: true,
       standby: true,
       plan: { id: "standby-1", task: "standby — awaiting inbox tasks", teams: [], created_at: now },
@@ -92,6 +129,7 @@ test("cto-owner: all teams done plus integration done is terminal without pause 
       autonomous: false,
       teams: [{ team: "backend", slice: "s1" }, { team: "frontend", slice: "s2" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
     });
     assert.ok(res);
     assert.equal(isCtoRunTerminal(res.state), false, "fresh run is not terminal");
@@ -121,6 +159,7 @@ test("cto-owner: state without pause is non-terminal and never crashes detection
       autonomous: false,
       teams: [{ team: "backend", slice: "s1" }],
       defs: sampleDefs(),
+      execution: executionContext(root),
     });
     assert.ok(res);
 
@@ -144,9 +183,12 @@ test("cto-owner: state without pause is non-terminal and never crashes detection
     assert.deepEqual(ctoBackstop({ ...state!, pause: { kind: "needs_human", reason: "blocker" } }, root), { continue: true });
     assert.deepEqual(ctoBackstop({ ...state!, pause: { kind: "failed", reason: "boom" } }, root), { continue: true });
 
-    // Missing pause + all teams done + integration done -> still terminal.
-    setTeamStatus(state!, "backend", "done", root);
-    setIntegration(state!, "done", "wave 1", root);
+    // Complete the legacy image directly: a domain writer cannot publish an
+    // unauthenticated terminal transition, but selection must still recognize
+    // an already-completed zero-pause legacy state.
+    state!.teams[0]!.status = "done";
+    state!.integration = { status: "done", note: "wave 1" };
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
     assert.equal(isCtoRunTerminal(state!), true, "integration/team conditions prove terminality even without pause");
     assert.equal(findActiveCtoRun(root), null, "completed legacy run is not selectable");
 
@@ -209,6 +251,47 @@ test("cto-owner: markdown state without metadata stays non-autonomous and amenda
     assert.ok(active, "legacy unowned markdown run stays amendable");
     assert.equal(active?.state.autonomous, false, "absent metadata defaults to non-autonomous");
     assert.equal(active?.state.owner_session, undefined, "absent metadata leaves the run unowned");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-owner: absent private binding is undefined but a stale bound CTO token refuses", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-owner-claim-proof-"));
+  try {
+    const absent = createWorkflowSessionController({ cwd: root, context: executionContext(root, "absent-session") });
+    assert.equal(absent.activeCtoClaim(), undefined, "a controller without a private CTO binding is genuinely absent");
+
+    const owner = createWorkflowSessionController({ cwd: root, context: executionContext(root, "bound-session") });
+    const ingress = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "claim proof",
+      controller: owner,
+    });
+    assert.deepEqual(owner.activeCtoClaim(), {
+      run_id: ingress.run_id,
+      ownership_epoch: ingress.claim.claim.ownership_epoch,
+    });
+
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const control = readRunControl(root);
+    assert.ok(control.execution_claim);
+    writeFileSync(controlPath, JSON.stringify({
+      ...control,
+      execution_claim: { ...control.execution_claim, token: "stale-token" },
+    }) + "\n");
+    assert.throws(
+      () => owner.activeCtoClaim(),
+      (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
+      "a durable token mismatch is typed refusal, not ordinary absence",
+    );
+    writeFileSync(controlPath, "{\n");
+    assert.throws(
+      () => owner.activeCtoClaim(),
+      (error: unknown) => error instanceof LifecycleError && error.code === "recovery_required",
+      "a durable read failure is typed recovery refusal, not ordinary absence",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

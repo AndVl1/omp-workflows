@@ -9,9 +9,9 @@
  * restarts only exist when the dispatcher runs in its own process. This test
  * drives the ACTUAL exported fullstack dispatcher machinery
  * (createChannelSet / startChannelDispatcher / queueCtoDelivery /
- * handleInboxTask / resolveInboxRunId) plus the core wave/gate APIs against
- * an ISOLATED temporary git repository with real git worktrees. No network,
- * no credentials, no LLM, no omp binary.
+ * handleInboxTask) plus the core wave/gate APIs against an ISOLATED temporary
+ * git repository with real git worktrees. No network, no credentials, no LLM,
+ * no omp binary.
  *
  * Test code NEVER writes inside the monorepo: every artifact lives in a
  * fresh `mkdtempSync` scratch (the dispatcher fixture + slice workers are
@@ -37,6 +37,7 @@ import {
   queueCtoDelivery,
   sha256Hex,
 } from '../../fullstack/src/adapters/registry.js';
+import { readRunControl } from '../../core/src/engine/run-store.js';
 import { appendWave, finishWave, readCtoState, writeCtoState } from '../../core/src/cto/state.js';
 import {
   assertCtoSliceDispatchable,
@@ -120,43 +121,95 @@ interface TrackedChild {
   logs: { out: string; err: string };
 }
 
-function spawnFixture(scratch: string, evidencePath: string, intervalMs: number): TrackedChild {
-  const proc = spawn(
-    process.execPath,
-    ['--import', 'tsx', FIXTURE, '--root', scratch, '--evidence', evidencePath, '--interval-ms', String(intervalMs)],
-    { cwd: E2E_DIR, stdio: ['ignore', 'pipe', 'pipe'] },
-  );
+function spawnFixture(
+  scratch: string,
+  evidencePath: string,
+  intervalMs: number,
+  sessionId: string,
+  runId?: string,
+  options?: { leaseOnly?: boolean },
+): TrackedChild {
+  const args = [
+    '--import',
+    'tsx',
+    FIXTURE,
+    '--root',
+    scratch,
+    '--evidence',
+    evidencePath,
+    '--interval-ms',
+    String(intervalMs),
+    '--session-id',
+    sessionId,
+  ];
+  if (runId) args.push('--run-id', runId);
+  if (options?.leaseOnly) args.push('--lease-only');
+  const proc = spawn(process.execPath, args, { cwd: E2E_DIR, stdio: ['ignore', 'pipe', 'pipe'] });
   const logs = { out: '', err: '' };
   proc.stdout?.on('data', (d: Buffer) => (logs.out += String(d)));
   proc.stderr?.on('data', (d: Buffer) => (logs.err += String(d)));
   return { proc, logs };
 }
 
-/** SIGTERM, wait up to 5s, then SIGKILL fallback; returns the exit code. */
+/** SIGTERM, wait up to 5s, then bounded SIGKILL fallback; returns the exit code. */
 async function stopChild(tracked: TrackedChild): Promise<number> {
   const { proc } = tracked;
   if (proc.exitCode !== null) return proc.exitCode;
-  const exited = new Promise<number>((resolve) => proc.once('exit', (code) => resolve(code ?? -1)));
-  proc.kill('SIGTERM');
+  if (proc.signalCode !== null) return -1;
+
+  let resolveExit!: (code: number) => void;
+  const exited = new Promise<number>((resolve) => {
+    resolveExit = resolve;
+  });
+  const onExit = (code: number | null): void => {
+    resolveExit(code ?? -1);
+  };
+  proc.once('exit', onExit);
+
+  if (proc.exitCode !== null) {
+    proc.removeListener('exit', onExit);
+    return proc.exitCode;
+  }
+  if (proc.signalCode !== null) {
+    proc.removeListener('exit', onExit);
+    return -1;
+  }
+
+  try {
+    proc.kill('SIGTERM');
+  } catch {
+    // The process can settle between the state check and kill.
+  }
   const code = await Promise.race([
     exited,
     new Promise<number>((resolve) => setTimeout(() => resolve(-2), 5000)),
   ]);
-  if (code === -2) {
+  if (code !== -2) return code;
+
+  if (proc.exitCode !== null) return proc.exitCode;
+  if (proc.signalCode !== null) return -1;
+  try {
     proc.kill('SIGKILL');
-    return exited;
+  } catch {
+    // The process may have exited during the bounded wait.
   }
-  return code;
+  const forced = await Promise.race([
+    exited,
+    new Promise<number>((resolve) => setTimeout(() => resolve(-3), 1000)),
+  ]);
+  if (forced !== -3) return forced;
+
+  proc.removeListener('exit', onExit);
+  return proc.exitCode ?? -1;
 }
 
 function initScratch(scratch: string): void {
   mkdirSync(join(scratch, '.omp'), { recursive: true });
   // Two-channel config: RW primary "control" (persisted fake-RW) + RO
-  // audit sink "audit" (persisted, subscribed to progress/summary). The
-  // audit channel uses the "mock-ro" transport kind registered by the
-  // dispatcher fixture — createChannelSet builds each channel from the
-  // entry whose adapter kind matches, so distinct kinds are required for
-  // distinct persisted dirs.
+  // audit sink "audit" (persisted, subscribed to progress/summary). Explicit
+  // channel profiles are bound by their normalized profile ids, so these
+  // distinct ids keep their persisted directories separate. `mock-ro` is
+  // registered by the fixture solely as an explicit RO transport profile.
   writeFileSync(
     join(scratch, '.omp', 'escalation.json'),
     `${JSON.stringify(
@@ -194,21 +247,85 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
   // GIVEN: an isolated scratch git repository with the two-channel escalation config.
   const scratch = mkdtempSync(join(tmpdir(), 'omp-cto-process-e2e-'));
   const evidencePath = join(scratch, 'evidence.jsonl');
+  const sessionId = `process-e2e:${scratch}`;
   const children: TrackedChild[] = [];
   const stopped = new Set<TrackedChild>();
   try {
     initScratch(scratch);
 
+    // The holder owns only the real dispatcher lease; its binding returns
+    // undefined, so this path has no CTO token, epoch, or run identity.
+    // ══════════════════════════════════════════════════════════════════════
+    // PHASE 0 — FOREIGN DISPATCHER LEASE WITHOUT A CTO CLAIM
+    // ══════════════════════════════════════════════════════════════════════
+    const leaseOwnerSessionId = `${sessionId}:lease-owner`;
+    const leaseOwner = spawnFixture(scratch, evidencePath, 1000, leaseOwnerSessionId, undefined, { leaseOnly: true });
+    children.push(leaseOwner);
+    await waitForEvidence(
+      evidencePath,
+      (l) => l.t === 'lease-ready' && l.sessionId === leaseOwnerSessionId,
+      'claim-free lease owner readiness',
+      10_000,
+    );
+    assert.equal(readRunControl(scratch).execution_claim, null, 'lease owner has no CTO execution claim');
+    assert.equal(
+      existsSync(join(scratch, '.work-state', 'cto')),
+      false,
+      'lease owner creates no CTO run before ingress',
+    );
+
+    const contenderSessionId = `${sessionId}:contender`;
+    const contender = spawnFixture(scratch, evidencePath, 1000, contenderSessionId);
+    children.push(contender);
+    await waitForEvidence(
+      evidencePath,
+      (l) => l.t === 'lease-busy' && l.sessionId === contenderSessionId,
+      'foreign lease rejection',
+      10_000,
+    );
+    await waitFor(
+      () => contender.proc.exitCode !== null || contender.proc.signalCode !== null,
+      { timeoutMs: 5_000, label: 'foreign lease contender exit' },
+    );
+    assert.equal(contender.proc.exitCode, 3, 'foreign lease contender exits with code 3');
+    assert.equal(readRunControl(scratch).execution_claim, null, 'busy contender publishes no CTO claim');
+    assert.equal(
+      existsSync(join(scratch, '.work-state', 'cto')),
+      false,
+      'busy contender creates no fresh CTO run',
+    );
+    const leaseRecord = JSON.parse(readFileSync(dispatcherLockPath(scratch), 'utf8')) as { pid?: number };
+    assert.equal(leaseRecord.pid, leaseOwner.proc.pid, 'foreign lease owner remains the lock holder');
+    assert.equal(leaseOwner.proc.exitCode, null, 'foreign lease owner remains alive');
+    assert.equal(leaseOwner.proc.signalCode, null, 'foreign lease owner is not signalled by contender');
+    const leaseOwnerCode = await stopChild(leaseOwner);
+    stopped.add(leaseOwner);
+    assert.equal(leaseOwnerCode, 0, 'lease-only owner exits cleanly');
+    await waitFor(
+      () => !existsSync(dispatcherLockPath(scratch)),
+      { timeoutMs: 5_000, label: 'claim-free lease released' },
+    );
+    stopped.add(contender);
+
     // ══════════════════════════════════════════════════════════════════════
     // PHASE A — MAIN WAVE + durable admission + online ACK
     // ══════════════════════════════════════════════════════════════════════
-    const child1 = spawnFixture(scratch, evidencePath, 1000);
+    const child1 = spawnFixture(scratch, evidencePath, 1000, sessionId);
     children.push(child1);
-
-    // WHEN: the dispatcher comes online and the main task lands in the RW inbound.
-    await waitFor(
-      () => evidenceLines(evidencePath).some((l) => l.t === 'start'),
-      { timeoutMs: 10_000, label: 'dispatcher start evidence' },
+    // WHEN: the fixture acquires its real exact CTO claim and comes online,
+    // then the main task lands in the RW inbound.
+    const firstStart = await waitForEvidence(
+      evidencePath,
+      (l) => l.t === 'start' && l.sessionId === sessionId,
+      'dispatcher start evidence',
+      10_000,
+    );
+    const runId = firstStart.runId;
+    const firstOwnershipEpoch = firstStart.ownershipEpoch;
+    assert.ok(typeof runId === 'string' && runId.length > 0, 'startup evidence carries exact runId');
+    assert.ok(
+      typeof firstOwnershipEpoch === 'string' && firstOwnershipEpoch.length > 0,
+      'startup evidence carries exact ownership epoch',
     );
     writeInbound(scratch, 'task-1.json', {
       id: MAIN_TASK_ID,
@@ -224,9 +341,8 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
       'main wake',
       20_000,
     );
-    const runId = wakeMain.task.runId;
     const wave1Id = wakeMain.task.waveId;
-    assert.ok(typeof runId === 'string' && runId.length > 0, 'wake carries runId');
+    assert.equal(wakeMain.task.runId, runId, 'wake remains bound to the startup claim run');
     assert.ok(typeof wave1Id === 'string' && wave1Id.length > 0, 'wake carries waveId');
 
     assert.ok(
@@ -238,9 +354,21 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     assert.equal(stateA!.wave_history!.length, 1, 'exactly one wave admitted');
     assert.equal(stateA!.wave_history![0].source_id, MAIN_TASK_ID);
     assert.equal(stateA!.wave_history![0].status, 'active', 'wave active right after admission');
+    const onlineAckId = firstStart.onlineAckId;
+    assert.equal(typeof onlineAckId, 'string', 'startup evidence names the online ACK');
+    assert.ok(
+      onlineAckId.startsWith(`${runId}/system/ack/`),
+      'startup online ACK id is scoped to the exact claimed run',
+    );
     await waitFor(
-      () => controlLines(scratch).some((l) => l.intent === 'ack' && l.receipt?.sent === true),
-      { timeoutMs: 10_000, label: 'online ack line' },
+      () =>
+        controlLines(scratch).some(
+          (l) =>
+            l.escId === onlineAckId
+            && l.escId.startsWith(`${runId}/system/ack/`)
+            && l.receipt?.sent === true,
+        ),
+      { timeoutMs: 10_000, label: 'exact online ack delivery' },
     );
 
     // ══════════════════════════════════════════════════════════════════════
@@ -318,6 +446,13 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     const code1 = await stopChild(child1);
     stopped.add(child1);
     assert.equal(code1, 0, 'dispatcher child exits 0 on SIGTERM');
+    const shutdown = await waitForEvidence(
+      evidencePath,
+      (l) => l.t === 'shutdown' && l.runId === runId,
+      'managed CTO shutdown suspension',
+      5_000,
+    );
+    assert.equal(shutdown.ownershipEpoch, firstOwnershipEpoch, 'shutdown evidence names the original claim epoch');
     await waitFor(
       () => !existsSync(dispatcherLockPath(scratch)),
       { timeoutMs: 5_000, label: 'dispatcher lease released' },
@@ -335,8 +470,21 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     assert.ok(queued, 'progress delivery queued');
     assert.ok(existsSync(queued!), 'delivery file durable in outbox before restart');
 
-    const child2 = spawnFixture(scratch, evidencePath, 1000);
+    const child2 = spawnFixture(scratch, evidencePath, 1000, sessionId, runId);
     children.push(child2);
+    const restartStart = await waitForEvidence(
+      evidencePath,
+      (l) =>
+        l.t === 'start'
+        && l.sessionId === sessionId
+        && l.runId === runId
+        && typeof l.ownershipEpoch === 'string'
+        && l.ownershipEpoch !== firstOwnershipEpoch,
+      'same-run reacquisition evidence',
+      10_000,
+    );
+    assert.equal(restartStart.runId, runId, 'restart reacquires the exact original run');
+    assert.notEqual(restartStart.ownershipEpoch, firstOwnershipEpoch, 'restart receives a new legitimate ownership epoch');
 
     // THEN (disk): the pending delivery is recovered across the restart, and
     // the wave/run state is untouched (exactly-one wave, one inbox file,
@@ -354,38 +502,72 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
       'admitted',
       'main-task hash quarantined as admitted',
     );
+    const originalInboxPath = join(inboxDir(runId, scratch), `${MAIN_TASK_ID}.json`);
+    const originalInboxContent = readFileSync(originalInboxPath, 'utf8');
+    const admittedHashesBefore = Object.entries(stateD.inbox_quarantine ?? {})
+      .filter(([, record]) => record?.status === 'admitted')
+      .map(([hash]) => hash)
+      .sort();
 
     // ══════════════════════════════════════════════════════════════════════
     // PHASE E — DUPLICATE MESSAGE ID (both layers: quarantine hash + wx)
     // ══════════════════════════════════════════════════════════════════════
     const now = new Date().toISOString();
-    // (a) same id + same text -> quarantine admitted-dedup
-    writeInbound(scratch, 'task-2.json', { id: MAIN_TASK_ID, text: MAIN_TASK_TEXT, at: now, by: 'fake-rw' });
-    // (b) same id + different text -> wx collision on the inbox file
-    writeInbound(scratch, 'task-3.json', { id: MAIN_TASK_ID, text: 'Different text body for the same id', at: now, by: 'fake-rw' });
+    const conflictingTaskText = 'Different text body for the same id';
+    const mainAdmissionAckId = `${runId}/wave/${MAIN_TASK_ID}/ack`;
     await waitFor(
       () =>
-        !existsSync(join(scratch, '.omp', 'fake-rw-control', 'inbound', 'task-2.json')) &&
-        !existsSync(join(scratch, '.omp', 'fake-rw-control', 'inbound', 'task-3.json')),
-      { timeoutMs: 10_000, label: 'duplicate tasks consumed by transport' },
+        controlLines(scratch).some(
+          (l) => l.escId === mainAdmissionAckId && l.receipt?.sent === true,
+        ),
+      { timeoutMs: 10_000, label: 'main task admission ack delivery' },
+    );
+    const admissionAckCountBefore = controlLines(scratch)
+      .filter((l) => l.escId === mainAdmissionAckId)
+      .length;
+    assert.equal(admissionAckCountBefore, 1, 'main task has exactly one admission ACK before duplicates');
+
+    // (a) same id + same text -> exact duplicate consumed by transport
+    const duplicateSourcePath = join(scratch, '.omp', 'fake-rw-control', 'inbound', 'task-2.json');
+    const duplicateProcessedPath = join(scratch, '.omp', 'fake-rw-control', 'inbound', 'processed', 'task-2.json');
+    writeInbound(scratch, 'task-2.json', { id: MAIN_TASK_ID, text: MAIN_TASK_TEXT, at: now, by: 'fake-rw' });
+    // (b) same id + different text -> immutable-ID conflict; retain the
+    // original transport source and refuse a second wake/admission.
+    const conflictingSourcePath = join(scratch, '.omp', 'fake-rw-control', 'inbound', 'task-3.json');
+    writeInbound(scratch, 'task-3.json', { id: MAIN_TASK_ID, text: conflictingTaskText, at: now, by: 'fake-rw' });
+    const conflictingSourceContent = readFileSync(conflictingSourcePath, 'utf8');
+    await waitFor(
+      () =>
+        !existsSync(duplicateSourcePath)
+        && existsSync(duplicateProcessedPath)
+        && existsSync(conflictingSourcePath)
+        && readFileSync(conflictingSourcePath, 'utf8') === conflictingSourceContent,
+      { timeoutMs: 10_000, label: 'exact duplicate consumed; conflicting source retained' },
     );
 
     const wakesMain = evidenceLines(evidencePath).filter((l) => l.t === 'wake' && l.task?.id === MAIN_TASK_ID);
     assert.equal(wakesMain.length, 1, 'no new wake for the duplicate message id');
+    const controlAfterDuplicates = controlLines(scratch);
+    assert.equal(
+      controlAfterDuplicates.filter((l) => l.escId === mainAdmissionAckId).length,
+      admissionAckCountBefore,
+      'no second admission ACK for the duplicate message id',
+    );
+    assert.equal(readFileSync(conflictingSourcePath, 'utf8'), conflictingSourceContent, 'conflicting source content is unchanged');
     const stateE = readCtoState(runId, scratch)!;
     assert.equal(readdirSync(inboxDir(runId, scratch)).length, 1, 'still exactly one inbox file');
     assert.equal(stateE.wave_history!.length, 1, 'still exactly one wave');
+    assert.equal(readFileSync(originalInboxPath, 'utf8'), originalInboxContent, 'original inbox file content is unchanged');
     assert.equal(stateE.wave_history![0].source_id, MAIN_TASK_ID);
-    assert.equal(
-      stateE.inbox_quarantine![sha256Hex(MAIN_TASK_TEXT)]?.status,
-      'admitted',
-      'admitted record for the main-task hash',
-    );
-    assert.notEqual(
-      stateE.inbox_quarantine![sha256Hex('Different text body for the same id')]?.status,
-      'admitted',
-      'no second admission for the different-text duplicate',
-    );
+    const admittedHashesAfter = Object.entries(stateE.inbox_quarantine ?? {})
+      .filter(([, record]) => record?.status === 'admitted')
+      .map(([hash]) => hash)
+      .sort();
+    assert.deepEqual(admittedHashesAfter, admittedHashesBefore, 'no new admitted normalized-text hash');
+    const conflictingRecord = stateE.inbox_quarantine?.[sha256Hex(conflictingTaskText)];
+    if (conflictingRecord !== undefined) {
+      assert.equal(conflictingRecord.status, 'rejected', 'conflicting hash diagnostic is rejected when present');
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // PHASE F — FOLLOW-UP WAVE (same resident run, worktree reuse)
@@ -470,15 +652,17 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
 
     // ALLOWED: full per-slice classification + workflow + DoD are on disk.
     assert.equal(
-      ctoSliceTaskGate(gateEvent, { cwd: scratch }),
+      ctoSliceTaskGate(gateEvent, { cwd: scratch, cto_run_id: runId }),
       undefined,
       'slice gate allows a fully-provisioned dispatchable slice',
     );
 
     // Negative (fail-closed, architecture-3): corrupt the persisted
     // classification and the gate must BLOCK mentioning the field.
-    const pristine = structuredClone(readCtoState(runId, scratch));
-    const corrupted = readCtoState(runId, scratch)!;
+    const pristine = readCtoState(runId, scratch);
+    assert.ok(pristine);
+    const corrupted = readCtoState(runId, scratch);
+    assert.ok(corrupted);
     const teamA = corrupted.teams.find((t) => t.id === 'slice-a' || t.slice_id === 'slice-a')!;
     teamA.classification = {
       type: 'FEATURE',
@@ -488,13 +672,16 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
     } as never;
     writeCtoState(corrupted, scratch);
     try {
-      const res = ctoSliceTaskGate(gateEvent, { cwd: scratch });
+      const res = ctoSliceTaskGate(gateEvent, { cwd: scratch, cto_run_id: runId });
       assert.ok(res, 'gate blocks on corrupt classification');
       assert.match(res!.reason, /autonomous/, 'block reason mentions the field');
     } finally {
-      writeCtoState(pristine!, scratch); // restore the real scratch state
+      const current = readCtoState(runId, scratch);
+      assert.ok(current);
+      Object.assign(current, structuredClone(pristine));
+      writeCtoState(current, scratch); // restore through the current read snapshot
     }
-    assert.equal(ctoSliceTaskGate(gateEvent, { cwd: scratch }), undefined, 'gate allows again after restore');
+    assert.equal(ctoSliceTaskGate(gateEvent, { cwd: scratch, cto_run_id: runId }), undefined, 'gate allows again after restore');
 
     // Marker run mismatch -> actionable failure.
     const restored = readCtoState(runId, scratch)!;
@@ -522,14 +709,16 @@ test('cto process e2e: resident control plane — waves, worktrees, dedupe, rest
       { timeoutMs: 5_000, label: 'dispatcher #2 lease released' },
     );
   } finally {
-    // Kill every child (SIGTERM -> SIGKILL fallback), then drop the scratch.
     for (const tracked of children) {
       if (!stopped.has(tracked)) {
         await stopChild(tracked).catch(() => -1);
       }
     }
     for (const tracked of children) {
-      assert.notEqual(tracked.proc.exitCode, null, 'no fixture child remains alive');
+      assert.ok(
+        tracked.proc.exitCode !== null || tracked.proc.signalCode !== null,
+        'no fixture child remains alive',
+      );
     }
     // The scratch holds the git worktrees; removing it removes them too.
     rmSync(scratch, { recursive: true, force: true });

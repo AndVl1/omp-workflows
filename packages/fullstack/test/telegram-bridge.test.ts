@@ -1,13 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, readFileSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   classifyIncoming,
-  buildStatusReply,
-  findCompletedSummary,
   sendTelegramText,
+  writeAnswerMarker,
   writeTaskDrop,
 } from "../src/telegram-bridge.js";
 
@@ -32,97 +31,35 @@ function activeRun(root: string): void {
   );
 }
 
-function finishedRun(root: string): void {
-  const runDir = join(root, ".work-state", "cto", "run-done");
-  mkdirSync(runDir, { recursive: true });
-  const now = new Date().toISOString();
-  writeFileSync(
-    join(runDir, "summary.json"),
-    JSON.stringify({
-      runId: "run-done",
-      verdict: "APPROVE",
-      first_sweep: {
-        "#348": { action: "r5 fixes pushed", state: "awaiting next review" },
-        "#355": { action: "r2 fixes pushed", state: "awaiting next review" },
-      },
-    }),
-  );
-  writeFileSync(
-    join(runDir, "state.json"),
-    JSON.stringify({
-      schema: 1,
-      id: "run-done",
-      task: "Done task",
-      branch: "main",
-      autonomous: true,
-      plan: { id: "run-done", task: "Done task", teams: [], created_at: now },
-      teams: [],
-      integration: { status: "done" },
-      pause: { kind: "done", reason: "" },
-      updated_at: now,
-    }),
-  );
-}
 
 const MSG = { id: "tg:11", text: "Какой статус?", at: new Date().toISOString(), by: "telegram" };
 
-test("bridge: active run -> task filed in the local drop, no reply", () => {
+test("bridge: active run -> task stays in local drop without run selection", () => {
   const root = mkdtempSync(join(tmpdir(), "bridge-active-"));
   try {
     activeRun(root);
     const result = classifyIncoming(root, MSG);
-    assert.equal(result.action, "active-task");
-    assert.equal(result.reply, undefined, "no reply — the session owns the conversation");
+    assert.equal(result.action, "local-task");
     assert.ok(result.filedPath?.startsWith(join(root, ".omp", "inbox")), "filed in the local drop");
     assert.equal(existsSync(result.filedPath!), true);
-    assert.equal(result.runId, "run-one");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("bridge: finished run -> status reply + standby task filed", () => {
-  const root = mkdtempSync(join(tmpdir(), "bridge-done-"));
-  try {
-    finishedRun(root);
-    const result = classifyIncoming(root, MSG);
-    assert.equal(result.action, "completed-status");
-    assert.ok(result.reply!.includes("run-done"), "reply names the run");
-    assert.ok(result.reply!.includes("APPROVE"), "reply carries the verdict");
-    assert.ok(result.reply!.includes("#348"), "reply carries per-item status");
-    assert.ok(result.filedPath, "message still filed (user may have meant a task)");
-    assert.equal(result.runId, "run-done");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
-test("bridge: nothing -> standby run + saved reply", () => {
+test("bridge: nothing -> local drop without creating run state", () => {
   const root = mkdtempSync(join(tmpdir(), "bridge-empty-"));
   try {
     const result = classifyIncoming(root, MSG);
-    assert.equal(result.action, "standby-task");
-    assert.ok(result.reply!.includes("saved"), "reply says the message was saved");
-    assert.ok(result.runId!.startsWith("standby-"), "standby run created");
-    const inboxFiles = readdirSync(join(root, ".work-state", "cto", result.runId!, "inbox")).filter((f) => f.endsWith(".json"));
-    assert.equal(inboxFiles.length, 1, "task filed in the standby inbox");
+    assert.equal(result.action, "local-task");
+    assert.ok(result.filedPath?.startsWith(join(root, ".omp", "inbox")), "message is filed in local drop");
+    assert.equal(existsSync(join(root, ".work-state")), false, "run state is not created implicitly");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("bridge: buildStatusReply + findCompletedSummary agree", () => {
-  const root = mkdtempSync(join(tmpdir(), "bridge-summary-"));
-  try {
-    finishedRun(root);
-    const found = findCompletedSummary(root);
-    assert.equal(found?.runId, "run-done");
-    const reply = buildStatusReply(found!.runId, found!.summary);
-    assert.ok(reply.includes("#355") && reply.includes("r2 fixes pushed"));
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 test("bridge: task writes are wx-idempotent (duplicate delivery skipped)", () => {
   const root = mkdtempSync(join(tmpdir(), "bridge-idem-"));
@@ -135,6 +72,98 @@ test("bridge: task writes are wx-idempotent (duplicate delivery skipped)", () =>
     assert.equal(second, null, "duplicate delivery skipped");
     const files = readdirSync(join(root, ".omp", "inbox")).filter((f) => f.endsWith(".json"));
     assert.equal(files.length, 1, "exactly one task file");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: sanitized ids suffix, while same-id conflicts fail closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-collision-"));
+  try {
+    const first = writeTaskDrop(root, { id: "a:b", text: "first", at: new Date().toISOString() });
+    const second = writeTaskDrop(root, { id: "a-b", text: "second", at: new Date().toISOString() });
+    assert.ok(first && second && first !== second);
+    assert.equal(JSON.parse(readFileSync(first, "utf8")).id, "a:b");
+    assert.equal(JSON.parse(readFileSync(second, "utf8")).id, "a-b");
+
+    assert.throws(
+      () => writeTaskDrop(root, { id: "a:b", text: "changed", at: new Date().toISOString() }),
+      /conflicting content or kind/,
+      "same transport id cannot create a second task",
+    );
+    assert.equal(JSON.parse(readFileSync(first, "utf8")).text, "first", "the original task remains authoritative");
+    assert.ok(readdirSync(join(root, ".omp", "inbox", "rejected")).some((name) => name.includes(".conflict-")));
+
+    const markerOne = writeAnswerMarker(root, { id: "answer:a", answer: "one" });
+    const markerTwo = writeAnswerMarker(root, { id: "answer-a", answer: "two" });
+    assert.ok(markerOne && markerTwo && markerOne !== markerTwo);
+    assert.equal(JSON.parse(readFileSync(markerOne, "utf8")).id, "answer:a");
+    assert.equal(JSON.parse(readFileSync(markerTwo, "utf8")).id, "answer-a");
+    assert.throws(
+      () => writeAnswerMarker(root, { id: "a:b", answer: "answer" }),
+      /conflicting content or kind/,
+      "task/answer kind collision under one transport id is rejected",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("bridge: processed source identity blocks changed task or answer before reply", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-processed-conflict-"));
+  try {
+    const first = writeTaskDrop(root, { id: "processed:id", text: "first", at: new Date().toISOString() });
+    assert.ok(first);
+    const processed = join(root, ".omp", "inbox", "processed");
+    mkdirSync(processed, { recursive: true });
+    renameSync(first, join(processed, "processed-id.json"));
+
+    assert.throws(
+      () => classifyIncoming(root, { id: "processed:id", text: "changed", at: new Date().toISOString() }),
+      /conflicting content or kind/,
+      "processed task identity is checked before classifyIncoming can reply",
+    );
+    assert.throws(
+      () => writeAnswerMarker(root, { id: "processed:id", answer: "answer" }),
+      /conflicting content or kind/,
+      "a processed task cannot become a second answer wake",
+    );
+    assert.equal(
+      readdirSync(join(root, ".omp", "inbox")).filter((name) => name.endsWith(".json")).length,
+      0,
+      "conflicting processed source creates no active replacement",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: processed sanitized-id collision still gets a deterministic suffix", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-processed-collision-"));
+  try {
+    const first = writeTaskDrop(root, { id: "a:b", text: "first", at: new Date().toISOString() });
+    assert.ok(first);
+    const processed = join(root, ".omp", "inbox", "processed");
+    mkdirSync(processed, { recursive: true });
+    renameSync(first, join(processed, "a-b.json"));
+    const second = writeTaskDrop(root, { id: "a-b", text: "second", at: new Date().toISOString() });
+    assert.ok(second && second !== first);
+    assert.match(second, /a-b-[a-f0-9]{64}\.json$/);
+    assert.equal(JSON.parse(readFileSync(join(processed, "a-b.json"), "utf8")).id, "a:b");
+    assert.equal(JSON.parse(readFileSync(second, "utf8")).id, "a-b");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bridge: answer marker IO failure is surfaced for Telegram retry", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-marker-error-"));
+  try {
+    mkdirSync(join(root, ".omp"), { recursive: true });
+    writeFileSync(join(root, ".omp", "inbox"), "not a directory");
+    assert.throws(
+      () => writeAnswerMarker(root, { id: "run-1/answer-1", answer: "retry me" }),
+      /cannot verify|ENOTDIR|directory/i,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

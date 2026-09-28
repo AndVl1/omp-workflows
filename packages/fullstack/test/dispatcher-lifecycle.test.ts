@@ -27,9 +27,9 @@ test("dispatcher lifecycle: session cwd resolves from context only, never proces
   assert.equal(resolveSessionCwd(undefined), undefined);
   assert.equal(resolveSessionCwd(null), undefined);
 });
-test("dispatcher lifecycle: canonical session manager cwd wins over a stale context cwd", () => {
+test("dispatcher lifecycle: contradictory context cwd is rejected even with a canonical session manager", () => {
   const sessionManager = { getCwd: () => "/canonical/project" };
-  assert.equal(resolveSessionCwd({ cwd: "/stale/project", sessionManager }), "/canonical/project");
+  assert.equal(resolveSessionCwd({ cwd: "/stale/project", sessionManager }), undefined);
 });
 
 test("dispatcher lifecycle: session_start without context cwd starts nothing and leaves no lock", () => {

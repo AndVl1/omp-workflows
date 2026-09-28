@@ -52,7 +52,6 @@ import { join } from "node:path";
 import {
   appendWave,
   ctoStateDir,
-  defaultBudgetState,
   findWaveBySourceId,
   hasRwPrimary,
   loadEscalationConfigRaw,
@@ -64,6 +63,7 @@ import {
   writeCtoState,
   type ChannelCapabilities,
   type ChannelProfile,
+  type CtoClaimScope,
   type CtoState,
   type Escalation,
   type EscalationAdapter,
@@ -71,7 +71,6 @@ import {
   type QuarantineRecord,
   type WaveRecord,
 } from "@andvl1/omp-workflows-core";
-import { findActiveCtoRun } from "@andvl1/omp-workflows-core";
 import { HttpEscalationAdapter } from "./http.js";
 import { TelegramEscalationAdapter } from "./telegram.js";
 import { MockEscalationAdapter, registerMockAdapter } from "./mock.js";
@@ -184,10 +183,9 @@ registerMockAdapter();
 
 /**
  * Register a consumer transport adapter (e.g. slack, whatsapp, signal) so the
- * in-session dispatcher and the standalone bridge can create it from
- * `.omp/escalation.json` like any built-in. Implement the optional inbound
- * surface (pollOnce / setPlainMessageHandler / sendPlainText) for the same
- * bidirectional behavior as telegram.
+ * in-session dispatcher can create it from `.omp/escalation.json` like any
+ * built-in. The standalone `tg-bridge` executable is Telegram-only and
+ * rejects consumer-registered kinds.
  */
 export function registerEscalationAdapter(kind: string, factory: EscalationAdapterFactory): void {
   adapterFactories.set(kind, factory);
@@ -399,14 +397,15 @@ function isSummarizableWave(wave: unknown): boolean {
  *
  * Returns the number of NEW deliveries queued (0 on re-runs). Never throws.
  */
-export function produceWaveDeliveries(root: string): number {
+export function produceWaveDeliveries(root: string, claimedRunId?: string): number {
   try {
     const channelSet = createChannelSet(root);
     if (channelSet.profiles.length === 0) return 0;
     const runsDir = join(root, ".work-state", "cto");
     if (!existsSync(runsDir)) return 0;
+    const runs = claimedRunId ? [claimedRunId] : readdirSync(runsDir);
     let queued = 0;
-    for (const runId of readdirSync(runsDir)) {
+    for (const runId of runs) {
       const state = readCtoState(runId, root);
       if (!state) continue;
       const history = state.wave_history;
@@ -473,14 +472,14 @@ export async function drainOutbox(
   root: string,
   adapter: EscalationAdapter | null,
   maxRetries = 3,
-  opts: { roSinks?: EscalationAdapter[] } = {},
+  opts: { roSinks?: EscalationAdapter[]; runId?: string } = {},
 ): Promise<DrainOutboxResult[]> {
   const roSinks = opts.roSinks ?? [];
   if (!adapter && roSinks.length === 0) return [];
   const results: DrainOutboxResult[] = [];
   const runsDir = join(root, ".work-state", "cto");
   if (!existsSync(runsDir)) return results;
-  const runs = readdirSync(runsDir);
+  const runs = opts.runId ? [opts.runId] : readdirSync(runsDir);
   for (const runId of runs) {
     const outbox = outboxDir(runId, root);
     if (!existsSync(outbox)) continue;
@@ -757,15 +756,41 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): () => void
   const lease = claimDispatcher(root);
   if (!lease) return () => undefined;
   const heartbeat = setInterval(() => refreshDispatcherLease(lease), DISPATCHER_HEARTBEAT_MS);
-  const { onTask, onAnswer } = opts;
-  const wakeTask = (task: InboxTask): void => {
-    if (!ownsDispatcherLease(lease)) throw new Error("messenger dispatcher lease lost before task wake");
-    onTask?.(task);
+  const { onTask, onAnswer, binding } = opts;
+  const wakeTask = (task: InboxTask): InboxWakeResult => {
+    if (!ownsDispatcherLease(lease)) {
+      throw new InboxWakeRejectedError("messenger dispatcher lease lost before task wake");
+    }
+    const claim = currentDispatcherClaim(binding, root);
+    if (!claim || task.runId !== claim.run_id) return "rejected";
+    if (!onTask) throw new InboxWakeRejectedError("messenger task wake has no host callback");
+    const result = onTask(task);
+    return result ?? "accepted";
   };
-  const wakeAnswer = (answer: { id: string; answer: string }): void => {
-    if (ownsDispatcherLease(lease)) onAnswer?.(answer);
+  const wakeAnswer = (answer: InboxAnswer): InboxWakeResult => {
+    if (!ownsDispatcherLease(lease)) {
+      throw new InboxWakeRejectedError("messenger dispatcher lease lost before answer wake");
+    }
+    const claim = currentDispatcherClaim(binding, root);
+    if (!claim || (answer.id.split("/")[0] ?? "") !== claim.run_id) return "rejected";
+    if (!onAnswer) throw new InboxWakeRejectedError("messenger answer wake has no host callback");
+    const result = onAnswer(answer);
+    return result ?? "accepted";
   };
-  const inboxHandler = (task: InboxTask) => handleInboxTask(root, task, wakeTask);
+  const inboxHandler = (task: InboxTask): void => {
+    const claim = currentDispatcherClaim(binding, root);
+    if (!claim || (task.runId && task.runId !== claim.run_id)) {
+      // The adapter may already have consumed this transport update; retain
+      // it in the local durable drop rather than assigning it to another run.
+      retainLocalInboxTask(root, task);
+      return;
+    }
+    if (!onTask) {
+      handleInboxTask(root, { ...task, runId: claim.run_id }, undefined);
+      return;
+    }
+    handleInboxTask(root, { ...task, runId: claim.run_id }, wakeTask);
+  };
   // Inbound surface lives on the primary ONLY (telegram/mock implement it;
   // http is send-only). Cast at the boundary once, guarded at runtime.
   const inboundCapable = primary as { setPlainMessageHandler: (h: (t: InboxTask) => void) => void } | null;
@@ -773,15 +798,24 @@ function startDispatcherLoop(root: string, target: DispatcherTarget): () => void
     inboundCapable.setPlainMessageHandler(inboxHandler);
   }
   let ticking = false;
+  // Durable answer files are intentionally NOT replayed when a claim or
+  // ownership epoch changes. The exact `/cto --run` ingress reads them as
+  // durable data; this consumer wakes only new transport/local-drop input
+  // while the current claim is present. Proven pre-send refusal remains the
+  // only retryable wake path.
   const tick = async (): Promise<void> => {
     if (ticking || !ownsDispatcherLease(lease)) return;
     ticking = true;
     try {
-      // Wave-completion summaries first: a wave that finished since the
-      // last tick is queued AND drained in this same tick.
-      produceWaveDeliveries(root);
-      await drainOutbox(root, drainAdapter, 3, { roSinks });
-      await pollInbox(root, primary, wakeTask, wakeAnswer);
+      const claim = currentDispatcherClaim(binding, root);
+      if (!claim) {
+        return;
+      }
+      // Wave-completion summaries and outbox entries are scoped to the exact
+      // claimed run; no latest-active run is ever drained.
+      produceWaveDeliveries(root, claim.run_id);
+      await drainOutbox(root, drainAdapter, 3, { roSinks, runId: claim.run_id });
+      await pollInbox(root, primary, wakeTask, wakeAnswer, binding, lease.token);
     } catch {
       // drain/poll never throw in practice; keep the loop alive regardless.
     } finally {
@@ -836,6 +870,18 @@ export function startChannelDispatcher(
 }
 
 // ── CTO task inbox ─────────────────────────────────────────────────────────
+export type InboxWakeResult = "accepted" | "rejected" | "unknown";
+
+/** Exact host/session binding used by the resident dispatcher. */
+export interface DispatcherBinding {
+  readonly session_id: string;
+  readonly getClaim: () => CtoClaimScope | undefined;
+}
+
+export interface InboxAnswer {
+  id: string;
+  answer: string;
+}
 
 /** A task arriving from the messenger or the local drop. */
 export interface InboxTask {
@@ -843,6 +889,8 @@ export interface InboxTask {
   text: string;
   at: string;
   by?: string;
+  /** Optional local-drop marker kind, retained for immutable identity checks. */
+  kind?: string;
   /** Resolved run id the task was filed under. */
   runId?: string;
   /** Resident wave id admitted for this task (set when run state is readable). */
@@ -850,15 +898,26 @@ export interface InboxTask {
 }
 
 export interface DispatcherOptions {
+  /** Exact captured host/session claim; absent means inbound is fail-closed. */
+  binding?: DispatcherBinding;
   /** Called once per new inbox task (after the inbox file is written). */
-  onTask?: (task: InboxTask) => void;
+  onTask?: (task: InboxTask) => InboxWakeResult | void;
   /**
    * Called once per newly received escalation answer (user-initiated reply
    * or button in the messenger channel). The answer file is already written
    * by the adapter; the wake tells the agent to apply it at the next
    * checkpoint (or immediately if it is waiting).
    */
-  onAnswer?: (answer: { id: string; answer: string }) => void;
+  onAnswer?: (answer: InboxAnswer) => InboxWakeResult | void;
+}
+/** Typed refusal proving the wake was rejected before host send. */
+export class InboxWakeRejectedError extends Error {
+  readonly code = "INBOX_WAKE_REJECTED";
+
+  constructor(message = "messenger wake rejected before host send") {
+    super(message);
+    this.name = "InboxWakeRejectedError";
+  }
 }
 
 /** `.work-state/cto/<runId>/inbox/` — tasks the CTO reads at checkpoints. */
@@ -866,7 +925,7 @@ export function inboxDir(runId: string, root: string): string {
   return join(ctoStateDir(runId, root), "inbox");
 }
 
-/** Local task drop: `<root>/.omp/inbox/*.json` ({ id, text, by? }). */
+/** Local task drop: `<root>/.omp/inbox/*.json` ({ id, text, kind?, by? }). */
 export function localInboxDrop(root: string): string {
   return join(root, ".omp", "inbox");
 }
@@ -916,59 +975,6 @@ export function clearBridgeLock(root: string): void {
   }
 }
 
-/**
- * Resolve the run an inbox task belongs to: the active CTO run when there is
- * one, otherwise create a standby run (id `standby-<ts>`) so the task has a
- * home and the run becomes active.
- */
-export function resolveInboxRunId(root: string): string {
-  const active = findActiveCtoRun(root);
-  if (active) return active.runId;
-  return ensureStandbyRun(root);
-}
-
-/**
- * Create a minimal standby run state.json; returns its run id. Reuses an
- * existing active run (e.g. a standby created by an earlier telegram task)
- * instead of always minting a new `standby-<ts>` — otherwise /cto could
- * start a second run with a fresh inbox and miss the tasks already filed
- * (findActiveCtoRun treats the standby state — pause: none — as active).
- */
-export function ensureStandbyRun(root: string): string {
-  const active = findActiveCtoRun(root);
-  if (active) return active.runId;
-  const runId = `standby-${Date.now()}`;
-  const runDir = ctoStateDir(runId, root);
-  mkdirSync(runDir, { recursive: true });
-  mkdirSync(join(runDir, "inbox"), { recursive: true });
-  const now = new Date().toISOString();
-  const state = {
-    schema: 2,
-    id: runId,
-    task: "standby — awaiting inbox tasks",
-    branch: "",
-    autonomous: true,
-    // Explicit standby marker (RC4): adoptable cross-session so queued
-    // inbox tasks are never lost when a new session starts. Ownership is
-    // enforced only for interactive task runs, never for standby runs.
-    standby: true,
-    plan: { id: runId, task: "standby — awaiting inbox tasks", teams: [], created_at: now },
-    teams: [],
-    integration: { status: "pending" },
-    pause: { kind: "none", reason: "standby" },
-    updated_at: now,
-    // Canonical schema-2 fields (br-zps.1): this writer emits state.json
-    // directly, so it must not create a partial canonical state — missing
-    // fields would be default-filled only on read, leaving the file itself
-    // non-canonical until a later canonicalizeState write.
-    budget: defaultBudgetState(),
-    leases: {},
-    decisions: [],
-    inbox_quarantine: {},
-  };
-  writeFileSync(join(runDir, "state.json"), JSON.stringify(state, null, 2));
-  return runId;
-}
 
 /**
  * Maximum accepted inbox task body length (br-zps.4). Oversized bodies are
@@ -987,13 +993,18 @@ export function sha256Hex(text: string): string {
   return createHash("sha256").update(text.trim(), "utf8").digest("hex");
 }
 
+/** Read the optional local-drop marker kind for immutable identity checks. */
+function inboxTaskKind(task: InboxTask): string | undefined {
+  return task.kind;
+}
+
 /**
  * Persist a quarantine record for a task (br-zps.4). Best-effort, NEVER
  * throws: a rejection (or an unreadable run state) must not take down the
- * messenger path. `state.inbox_quarantine` is default-filled when absent
- * (standby states written without the canonical schema-2 fields migrate to
- * schema 2 on read).
+ * messenger path. Legacy states missing schema-2 fields are default-filled
+ * by readCtoState before this record is written.
  */
+
 function recordQuarantine(
   root: string,
   runId: string,
@@ -1001,19 +1012,30 @@ function recordQuarantine(
   hash: string,
   status: QuarantineRecord["status"],
   reason?: string,
+  preserveExistingHash = false,
 ): void {
   try {
     const state = readCtoState(runId, root);
     if (!state) return;
     state.inbox_quarantine = state.inbox_quarantine ?? {};
-    state.inbox_quarantine[hash] = {
+    const kind = inboxTaskKind(task);
+    const record: QuarantineRecord & { kind?: unknown } = {
       id: task.id,
       hash,
       received_at: task.at ?? new Date().toISOString(),
       by: task.by ?? "inbox",
       status,
+      ...(kind !== undefined ? { kind } : {}),
       ...(reason ? { reason } : {}),
     };
+    const existing = state.inbox_quarantine[hash];
+    if (preserveExistingHash && existing) {
+      // The normalized hash is already authoritative for another source (or
+      // an in-flight retry). Leave it untouched; the typed rejection and the
+      // retained transport source are independent conflict evidence.
+      return;
+    }
+    state.inbox_quarantine[hash] = record;
     writeCtoState(state, root);
   } catch {
     // best-effort — the rejection itself must never throw
@@ -1029,6 +1051,8 @@ function recordQuarantine(
  *   - empty/oversized bodies are REJECTED — recorded in the run's
  *     `state.inbox_quarantine` and dropped (nothing filed, no wake);
  *   - an already-ADMITTED hash is a duplicate — dropped (no file, no wake);
+ *   - an existing transport id with different content/kind is REJECTED
+ *     without touching the original file or admitting a second wave;
  *   - otherwise the record is persisted as `quarantined` BEFORE the write
  *     and flipped to `admitted` AFTER it. A wake failure reverts the record
  *     to `quarantined` (before removing the file) so the transport's retry
@@ -1037,21 +1061,23 @@ function recordQuarantine(
  * bookkeeping — availability over strictness; corrupt state is a separate
  * incident.
  *
- * The file write is idempotent (`wx`: the first write wins; duplicates are
- * at-most-once — the winner wakes, later calls return null without waking)
- * and is separated from the wake callback. The callback runs only after the
- * file is durable, and its exceptions are NOT hidden: the just-created file
- * is removed and the error propagates to the transport, which keeps the
- * update (the local drop file stays in place) and retries on the next tick —
- * the retry writes the file fresh, so no wx collision blocks the re-wake.
+ * The file write is idempotent (`wx`: the first write wins). A callback that
+ * reports a verified pre-send refusal rolls back only this in-flight
+ * admission; an ambiguous host exception keeps the durable file and never
+ * queues an admission ACK.
  *
- * Returns the path when this call wrote the file and woke; null when the
- * task was rejected, deduped, or already filed (duplicate — no re-wake);
- * throws when the task could not be filed (IO error) or when the wake
- * callback threw (the file is removed so the transport can retry the update).
+ * Returns the path when this call wrote the file; null when the task was
+ * rejected, deduped, already filed, or has no exact run binding. A typed
+ * {@link InboxWakeRejectedError} is thrown only for a verified pre-send
+ * refusal so the transport can retain its source update for retry.
  */
-export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: InboxTask) => void): string | null {
-  const runId = task.runId ?? resolveInboxRunId(root);
+export function handleInboxTask(
+  root: string,
+  task: InboxTask,
+  onTask?: (t: InboxTask) => InboxWakeResult | void,
+): string | null {
+  const runId = typeof task.runId === "string" && task.runId.length > 0 ? task.runId : undefined;
+  if (!runId) return null;
 
   // ── Quarantine pass (br-zps.4) ───────────────────────────────────────────
   const rawText = typeof task.text === "string" ? task.text : "";
@@ -1062,26 +1088,81 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
     recordQuarantine(root, runId, task, hash, "rejected", reason);
     return null; // nothing filed, no wake — validation failures never throw
   }
+
+  // Deduplicate by the immutable transport identity first. A prior wave is
+  // authoritative even after its inbox file was consumed; a different
+  // payload or marker kind under the same source id is a conflict, never a
+  // new wave. The kind is retained in the quarantine record because WaveRecord
+  // deliberately has no transport-marker field.
+  const state = readCtoState(runId, root);
+  const priorWave = state ? findWaveBySourceId(state, task.id) : null;
+  const taskKind = inboxTaskKind(task);
+  const conflictReason = `inbox task ${task.id} has conflicting content or kind for the same transport id`;
+  if (priorWave) {
+    const priorHash = sha256Hex(priorWave.task);
+    const priorKind = (state?.inbox_quarantine?.[priorHash] as (QuarantineRecord & { kind?: unknown }) | undefined)?.kind;
+    if (priorWave.task !== task.text || priorKind !== taskKind) {
+      recordQuarantine(root, runId, task, hash, "rejected", conflictReason, true);
+      throw new InboxWakeRejectedError(conflictReason);
+    }
+    if (state?.inbox_quarantine?.[priorHash]?.status !== "quarantined") return null;
+  }
+
+  const dir = inboxDir(runId, root);
+  const fileName = task.id.replace(/[^a-zA-Z0-9._-]/g, "-");
+  const suffix = createHash("sha256").update(task.id).digest("hex");
+  const serialized = JSON.stringify({ ...task, runId }, null, 2);
+  // Check every direct inbox candidate before text-hash deduplication so a
+  // changed payload or marker kind under the same id cannot be hidden by
+  // another task's normalized-text quarantine record. Do not create this
+  // directory until after the no-callback refusal below.
+  if (existsSync(dir)) {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".json")) continue;
+      let existing: { id?: unknown; text?: unknown; kind?: unknown };
+      try {
+        existing = JSON.parse(readFileSync(join(dir, name), "utf8")) as { id?: unknown; text?: unknown; kind?: unknown };
+      } catch (readError) {
+        if (readError instanceof SyntaxError) continue;
+        throw new Error(`inbox task ${task.id} cannot verify existing file ${join(dir, name)}: ${readError instanceof Error ? readError.message : String(readError)}`);
+      }
+      if (existing.id !== task.id) continue;
+      const existingIsSameTask = existing.text === task.text && existing.kind === taskKind;
+      if (existingIsSameTask) {
+        recordQuarantine(root, runId, task, hash, "admitted");
+        return null;
+      }
+      recordQuarantine(root, runId, task, hash, "rejected", conflictReason, true);
+      throw new InboxWakeRejectedError(conflictReason);
+    }
+  }
   // Dedup: an already-admitted hash is a duplicate task (same normalized
   // text) — no file, no wake. A "quarantined" record means a previous
   // attempt died mid-flight (wake failed, write rolled back) → proceed.
-  const state = readCtoState(runId, root);
   if (state && state.inbox_quarantine?.[hash]?.status === "admitted") {
     return null;
   }
+  if (!onTask) {
+    const reason = "inbox task wake rejected before host send: no onTask callback";
+    recordQuarantine(root, runId, task, hash, "rejected", reason);
+    throw new InboxWakeRejectedError(reason);
+  }
+  mkdirSync(dir, { recursive: true });
   // Track the in-flight task BEFORE the write; flipped to "admitted" after
   // the file write succeeds. State unreadable → file as today, no tracking.
   let quarantineTracked = false;
   if (state) {
     try {
       state.inbox_quarantine = state.inbox_quarantine ?? {};
-      state.inbox_quarantine[hash] = {
+      const inFlightRecord: QuarantineRecord & { kind?: unknown } = {
         id: task.id,
         hash,
         received_at: task.at ?? new Date().toISOString(),
         by: task.by ?? "inbox",
         status: "quarantined",
+        ...(taskKind !== undefined ? { kind: taskKind } : {}),
       };
+      state.inbox_quarantine[hash] = inFlightRecord;
       writeCtoState(state, root);
       quarantineTracked = true;
     } catch {
@@ -1090,19 +1171,39 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
     }
   }
 
-  const dir = inboxDir(runId, root);
-  const fileName = `${task.id.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`;
-  const path = join(dir, fileName);
-  try {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(path, JSON.stringify({ ...task, runId }, null, 2), { flag: "wx" });
-  } catch (error) {
-    // wx collision (another dispatcher already filed this task — at-most-once:
-    // the winner woke, we must NOT re-wake) or IO error (nothing durable).
-    if (!existsSync(path)) {
-      throw new Error(`inbox task ${task.id} not filed: ${error instanceof Error ? error.message : String(error)}`);
+  let collision = 0;
+  let path: string;
+  for (;;) {
+    const suffixPart = collision === 0 ? "" : `-${suffix}${collision === 1 ? "" : `-${collision}`}`;
+    path = join(dir, `${fileName}${suffixPart}.json`);
+    try {
+      writeFileSync(path, serialized, { flag: "wx" });
+      break;
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+      let existing: { id?: unknown; text?: unknown; kind?: unknown };
+      try {
+        existing = JSON.parse(readFileSync(path, "utf8")) as { id?: unknown; text?: unknown; kind?: unknown };
+      } catch (readError) {
+        if (readError instanceof SyntaxError) {
+          collision += 1;
+          continue;
+        }
+        throw new Error(`inbox task ${task.id} cannot verify existing file ${path}: ${readError instanceof Error ? readError.message : String(readError)}`);
+      }
+      if (existing.id === task.id) {
+        const existingIsSameTask = existing.text === task.text && existing.kind === taskKind;
+        if (existingIsSameTask) {
+          recordQuarantine(root, runId, task, hash, "admitted");
+          return null;
+        }
+        recordQuarantine(root, runId, task, hash, "rejected", conflictReason, true);
+        throw new InboxWakeRejectedError(conflictReason);
+      }
+      // Distinct ids that sanitize to the same path get a deterministic
+      // hash-suffixed sibling rather than being silently dropped.
+      collision += 1;
     }
-    return null; // duplicate — first write wins, no re-wake
   }
   if (quarantineTracked && state) {
     try {
@@ -1145,17 +1246,7 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
   } catch {
     // best-effort — the wake below is the primary path
   }
-  try {
-    // Wake AFTER the file is durable and OUTSIDE the write guard: a throwing
-    // callback must reach the transport so it can retry the update instead of
-    // being hidden as a null result.
-    onTask?.({ ...task, runId, waveId });
-  } catch (error) {
-    // Roll back the just-created file so the retry is a fresh write (no wx
-    // collision) — otherwise the transport's retry would see a duplicate and
-    // skip the wake, losing the update. ALSO revert the quarantine record to
-    // "quarantined" (best-effort) so the retry is not swallowed by the
-    // admitted-dedup. Order: revert record → rm file → rethrow.
+  const rollbackAdmission = (): void => {
     if (quarantineTracked) {
       try {
         const current = readCtoState(runId, root) ?? state;
@@ -1165,30 +1256,41 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
           writeCtoState(current, root);
         }
       } catch {
-        // best-effort — the wake failure is the primary error to propagate
+        // best-effort — the wake refusal is the primary outcome
       }
     }
     try {
       rmSync(path, { force: true });
     } catch {
-      // best-effort removal; worst case the next poll collides and skips
+      // best-effort removal; the durable source retry remains authoritative
     }
-    throw error;
+  };
+
+  let wakeResult: InboxWakeResult = "accepted";
+  try {
+    if (!onTask) throw new InboxWakeRejectedError("inbox task wake has no host callback");
+    const result = onTask({ ...task, runId, waveId });
+    wakeResult = result ?? "accepted";
+  } catch (error) {
+    if (error instanceof InboxWakeRejectedError) {
+      rollbackAdmission();
+      throw error;
+    }
+    // The host may have accepted the send before throwing. Preserve the
+    // durable inbox file and make no admission ACK or retry claim.
+    wakeResult = "unknown";
+  }
+  if (wakeResult === "rejected") {
+    rollbackAdmission();
+    throw new InboxWakeRejectedError();
   }
   // ── Admission ACK (RW outbound producer) ────────────────────────────────
-  // A SUCCESSFUL wake is what makes the task admitted, so the deterministic
-  // `<runId>/wave/<task.id>/ack` entry is queued only AFTER the wake callback
-  // completed: a throwing wake rolls back the file and rethrows, never
-  // reaching this block — no false "task admitted" ACK can outlive a failed
-  // admission. At-most-once via the outbox/ wx guard + the sent/ dedupe in
-  // queueCtoDelivery (transport retries and dispatcher restarts never
-  // produce a second ACK). The body is short authoritative text — run id,
-  // wave id, trimmed task excerpt — and the entry is addressed to the
-  // profile's ackTarget when one is set. Best-effort, NEVER throws: a
-  // missing/malformed config (or any IO failure) must not break the return.
+  // A verified successful wake is what permits an admission ACK. Ambiguous
+  // host sends keep only the durable inbox record; they never claim exactly
+  // once delivery and never emit a false ACK.
   try {
     const channelSet = createChannelSet(root);
-    if (channelSet.profile.direction === "rw" && channelSet.primary !== null) {
+    if (wakeResult === "accepted" && channelSet.profile.direction === "rw" && channelSet.primary !== null) {
       const excerpt = task.text.trim().slice(0, 200);
       queueCtoDelivery(root, runId, {
         id: `${runId}/wave/${task.id}/ack`,
@@ -1205,6 +1307,429 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
   return path;
 }
 
+interface DispatcherClaimFailure {
+  code: "run_busy" | "recovery_required";
+  message: string;
+  next_action?: string;
+}
+
+const reportedDispatcherClaimFailures = new Map<string, string>();
+
+function dispatcherClaimFailure(error: unknown): DispatcherClaimFailure | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const candidate = error as { code?: unknown; message?: unknown; next_action?: unknown };
+  if (
+    (candidate.code !== "run_busy" && candidate.code !== "recovery_required")
+    || typeof candidate.message !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    code: candidate.code,
+    message: candidate.message,
+    ...(typeof candidate.next_action === "string" ? { next_action: candidate.next_action } : {}),
+  };
+}
+
+function currentDispatcherClaim(
+  binding: DispatcherBinding | undefined,
+  root = "",
+): CtoClaimScope | undefined {
+  if (!binding || binding.session_id.length === 0) return undefined;
+  try {
+    const claim = binding.getClaim();
+    const validClaim = claim
+      && typeof claim.run_id === "string"
+      && claim.run_id.length > 0
+      && typeof claim.ownership_epoch === "string"
+      && claim.ownership_epoch.length > 0
+      ? claim
+      : undefined;
+    if (validClaim) {
+      reportedDispatcherClaimFailures.delete(root);
+      return validClaim;
+    }
+    return undefined;
+  } catch (error) {
+    const failure = dispatcherClaimFailure(error);
+    if (failure) {
+      const reportKey = `${failure.code}\u0000${failure.message}\u0000${failure.next_action ?? ""}`;
+      if (reportedDispatcherClaimFailures.get(root) !== reportKey) {
+        reportedDispatcherClaimFailures.set(root, reportKey);
+        console.error(
+          `CTO dispatcher claim unavailable (${failure.code}): ${failure.message}` +
+          (failure.next_action ? `; next action: ${failure.next_action}` : ""),
+        );
+      }
+    }
+    // A typed stale/recovery refusal is not ordinary absence: it is reported
+    // above, while this dispatcher remains fail-closed and never releases or
+    // replaces the host's private ownership claim.
+    return undefined;
+  }
+}
+type AnswerWakeStatus = "pending" | "in-flight" | "accepted" | "pre-send-rejected" | "unknown";
+
+interface PersistedInboxAnswer extends InboxAnswer {
+  delivery_status?: AnswerWakeStatus;
+  delivery_run_id?: string;
+  delivery_ownership_epoch?: string;
+  delivery_session_id?: string;
+  delivery_reason?: string;
+}
+function canonicalAnswerPreferredPath(root: string, answerId: string): string | undefined {
+  const runId = answerId.split("/")[0] ?? "";
+  if (!/^[A-Za-z0-9_-]+$/.test(runId) || answerId.length === 0) return undefined;
+  return join(
+    ctoStateDir(runId, root),
+    "answers",
+    `${answerId.replace(/[^a-zA-Z0-9._-]/g, "-")}.json`,
+  );
+}
+
+function canonicalAnswerPath(root: string, answerId: string): string | undefined {
+  const preferred = canonicalAnswerPreferredPath(root, answerId);
+  if (!preferred) return undefined;
+  const dir = join(preferred, "..");
+  const fileName = answerId.replace(/[^a-zA-Z0-9._-]/g, "-");
+  const suffix = createHash("sha256").update(answerId).digest("hex");
+
+  let names: string[] = [];
+  try {
+    names = readdirSync(dir).filter((name) => name.endsWith(".json"));
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  // Preserve an answer already written under an older hash-suffixed name.
+  for (const name of names) {
+    const candidate = join(dir, name);
+    try {
+      const raw = JSON.parse(readFileSync(candidate, "utf8")) as { id?: unknown };
+      if (raw.id === answerId) return candidate;
+    } catch (error) {
+      if (error instanceof SyntaxError) continue;
+      throw error;
+    }
+  }
+
+  for (let collision = 0; ; collision += 1) {
+    const suffixPart = collision === 0 ? "" : `-${suffix}${collision === 1 ? "" : `-${collision}`}`;
+    const candidate = join(dir, `${fileName}${suffixPart}.json`);
+    try {
+      const raw = JSON.parse(readFileSync(candidate, "utf8")) as { id?: unknown };
+      if (raw.id === answerId) return candidate;
+      // A distinct valid id occupies this deterministic name; try the next
+      // hash-suffixed candidate without overwriting it.
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return candidate;
+      if (error instanceof SyntaxError) continue;
+      throw error;
+    }
+  }
+}
+
+function readCanonicalAnswer(root: string, answer: InboxAnswer): PersistedInboxAnswer | undefined {
+  const path = canonicalAnswerPath(root, answer.id);
+  if (!path) return undefined;
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as PersistedInboxAnswer;
+    return raw.id === answer.id && raw.answer === answer.answer ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+interface PreviousAnswerAttempt {
+  run_id: string;
+  ownership_epoch: string;
+  session_id: string;
+}
+
+/**
+ * Replace a JSON record without truncating the authoritative source on a
+ * serialization or write failure. The temporary file lives beside the
+ * source, so rename is a same-filesystem atomic replacement on supported
+ * hosts; failed attempts clean up only the temporary path.
+ */
+function atomicReplaceJson(path: string, value: unknown): void {
+  const temporary = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  try {
+    const serialized = JSON.stringify(value, null, 2);
+    if (serialized === undefined) throw new Error(`cannot serialize JSON record ${path}`);
+    writeFileSync(temporary, serialized, { flag: "wx" });
+    renameSync(temporary, path);
+  } finally {
+    try {
+      if (existsSync(temporary)) rmSync(temporary, { force: true });
+    } catch {
+      // Best-effort temporary cleanup; the authoritative path was not
+      // touched unless rename completed.
+    }
+  }
+}
+
+/**
+ * Reserve the canonical answer before invoking the host. A crash after this
+ * write leaves an in-flight receipt, which is intentionally never replayed.
+ * The only cross-epoch transition is from a matching trusted local
+ * pre-send-refusal marker.
+ */
+function reserveAnswerWake(
+  root: string,
+  answer: InboxAnswer,
+  claim: CtoClaimScope,
+  sessionId: string,
+  previous?: PreviousAnswerAttempt,
+): boolean {
+  const path = canonicalAnswerPath(root, answer.id);
+  if (!path) return false;
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    if (raw.id !== answer.id || raw.answer !== answer.answer) return false;
+    if (raw.delivery_status !== undefined) {
+      if (
+        raw.delivery_status !== "pre-send-rejected"
+        || !previous
+        || raw.delivery_run_id !== previous.run_id
+        || raw.delivery_ownership_epoch !== previous.ownership_epoch
+        || raw.delivery_session_id !== previous.session_id
+      ) return false;
+    }
+    raw.delivery_status = "in-flight";
+    raw.delivery_run_id = claim.run_id;
+    raw.delivery_ownership_epoch = claim.ownership_epoch;
+    raw.delivery_session_id = sessionId;
+    delete raw.delivery_reason;
+    atomicReplaceJson(path, raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Complete only the same in-flight attempt that reserved this answer. A late
+ * callback from an older claim/epoch cannot clobber a newer receipt.
+ */
+function finishAnswerWake(
+  root: string,
+  answer: InboxAnswer,
+  status: Exclude<AnswerWakeStatus, "pending" | "in-flight">,
+  claim: CtoClaimScope,
+  sessionId: string,
+  reason?: string,
+): boolean {
+  const path = canonicalAnswerPath(root, answer.id);
+  if (!path) return false;
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    if (
+      raw.id !== answer.id
+      || raw.answer !== answer.answer
+      || raw.delivery_status !== "in-flight"
+      || raw.delivery_run_id !== claim.run_id
+      || raw.delivery_ownership_epoch !== claim.ownership_epoch
+      || raw.delivery_session_id !== sessionId
+    ) return false;
+    raw.delivery_status = status;
+    if (reason) raw.delivery_reason = reason;
+    else delete raw.delivery_reason;
+    atomicReplaceJson(path, raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function markLocalAnswerWakeStatus(
+  path: string,
+  status: AnswerWakeStatus,
+  claim: CtoClaimScope,
+  sessionId: string,
+  reason?: string,
+): boolean {
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    if (raw.kind !== "answer" || typeof raw.id !== "string" || typeof raw.text !== "string") return false;
+    raw.delivery_status = status;
+    raw.delivery_run_id = claim.run_id;
+    raw.delivery_ownership_epoch = claim.ownership_epoch;
+    raw.delivery_session_id = sessionId;
+    if (reason) raw.delivery_reason = reason;
+    else delete raw.delivery_reason;
+    atomicReplaceJson(path, raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const preSendAnswerAttemptsByRoot = new Map<string, Set<string>>();
+
+function preSendAnswerAttemptsFor(root: string): Set<string> {
+  let attempts = preSendAnswerAttemptsByRoot.get(root);
+  if (!attempts) {
+    attempts = new Set<string>();
+    preSendAnswerAttemptsByRoot.set(root, attempts);
+  }
+  return attempts;
+}
+
+function preSendAnswerAttemptKey(path: string, claim: CtoClaimScope, sessionId: string, leaseToken: string): string {
+  return `${path}\u0000${claim.run_id}\u0000${claim.ownership_epoch}\u0000${sessionId}\u0000${leaseToken}`;
+}
+
+function retainPreSendRejectedAnswer(
+  root: string,
+  answer: InboxAnswer,
+  claim: CtoClaimScope,
+  sessionId: string,
+  leaseToken: string,
+  reason: string,
+): void {
+  const drop = localInboxDrop(root);
+  mkdirSync(drop, { recursive: true });
+  const answerKey = answer.id.replace(/[^a-zA-Z0-9._-]/g, "-");
+  const epochKey = claim.ownership_epoch.replace(/[^a-zA-Z0-9._-]/g, "-");
+  const suffix = createHash("sha256").update(`${answer.id}\u0000${claim.ownership_epoch}`).digest("hex");
+  const marker = {
+    kind: "answer",
+    id: answer.id,
+    text: answer.answer,
+    at: new Date().toISOString(),
+    by: "dispatcher",
+    delivery_status: "pre-send-rejected" as const,
+    delivery_run_id: claim.run_id,
+    delivery_ownership_epoch: claim.ownership_epoch,
+    delivery_session_id: sessionId,
+    delivery_reason: reason,
+  };
+  let path = "";
+  for (let collision = 0; ; collision += 1) {
+    const suffixPart = collision === 0 ? "" : `-${suffix}${collision === 1 ? "" : `-${collision}`}`;
+    path = join(drop, `answer-retry-${answerKey}-${epochKey}${suffixPart}.json`);
+    try {
+      writeFileSync(path, JSON.stringify(marker, null, 2), { flag: "wx" });
+      break;
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+      let existing: { id?: unknown; kind?: unknown; text?: unknown };
+      try {
+        existing = JSON.parse(readFileSync(path, "utf8")) as { id?: unknown; kind?: unknown; text?: unknown };
+      } catch (readError) {
+        if (readError instanceof SyntaxError) continue;
+        throw new Error(`answer retry marker ${answer.id} cannot verify existing file ${path}: ${readError instanceof Error ? readError.message : String(readError)}`);
+      }
+      if (existing.id === answer.id && existing.kind === "answer" && existing.text === answer.answer) break;
+    }
+  }
+  preSendAnswerAttemptsFor(root).add(preSendAnswerAttemptKey(path, claim, sessionId, leaseToken));
+}
+
+
+function persistCanonicalAnswer(root: string, answer: InboxAnswer): void {
+  if (!answer || typeof answer !== "object" || typeof answer.id !== "string" || answer.id.length === 0) {
+    throw new Error("canonical answer has an invalid id; expected a non-empty string");
+  }
+  if (typeof answer.answer !== "string") {
+    throw new Error(`canonical answer ${answer.id} has invalid content; expected a string`);
+  }
+  const path = canonicalAnswerPath(root, answer.id);
+  if (!path) {
+    throw new Error(`canonical answer ${answer.id} has an unsafe id/path and cannot be persisted`);
+  }
+  const dir = join(path, "..");
+  mkdirSync(dir, { recursive: true });
+  try {
+    writeFileSync(path, JSON.stringify(answer, null, 2), { flag: "wx" });
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+    let existing: { id?: unknown; answer?: unknown };
+    try {
+      existing = JSON.parse(readFileSync(path, "utf8")) as { id?: unknown; answer?: unknown };
+    } catch (readError) {
+      throw new Error(`canonical answer ${answer.id} cannot verify existing file ${path}: ${readError instanceof Error ? readError.message : String(readError)}`);
+    }
+    if (existing.id !== answer.id || existing.answer !== answer.answer) {
+      const detail = existing.id === answer.id ? "distinct answer content" : "distinct stored id";
+      const message = `canonical answer ${answer.id} collided with ${detail} in ${path}`;
+      recordAnswerConflictDiagnostic(root, answer, message);
+      throw new Error(message);
+    }
+  }
+}
+function recordAnswerConflictDiagnostic(root: string, answer: InboxAnswer, reason: string): void {
+  const runId = answer.id.split("/")[0] ?? "";
+  if (!/^[A-Za-z0-9_-]+$/.test(runId)) return;
+  const dir = join(ctoStateDir(runId, root), "answers", "rejected");
+  const answerKey = answer.id.replace(/[^a-zA-Z0-9._-]/g, "-");
+  const suffix = createHash("sha256").update(`${answer.id}\u0000${answer.answer}`).digest("hex");
+  const path = join(dir, `${answerKey}.conflict-${suffix}.json`);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({ id: answer.id, answer: answer.answer, reason, at: new Date().toISOString() }, null, 2),
+      { flag: "wx" },
+    );
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") return;
+    // The canonical conflict remains fail-closed even if its diagnostic
+    // directory is temporarily unavailable.
+  }
+}
+
+
+function recordLocalInboxConflictDiagnostic(root: string, task: InboxTask, taskKind: unknown, reason: string): void {
+  const dir = join(localInboxDrop(root), "rejected");
+  const fileName = task.id.replace(/[^a-zA-Z0-9._-]/g, "-");
+  const suffix = createHash("sha256").update(`${task.id}\u0000${String(taskKind ?? "")}\u0000${task.text}`).digest("hex");
+  const path = join(dir, `${fileName}.conflict-${suffix}.json`);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({ id: task.id, kind: taskKind, text: task.text, reason, at: new Date().toISOString() }, null, 2),
+      { flag: "wx" },
+    );
+  } catch (error) {
+    if (isAlreadyExists(error)) return;
+    // The original local-drop task remains authoritative if diagnostics fail.
+  }
+}
+
+function retainLocalInboxTask(root: string, task: InboxTask): void {
+  const dir = localInboxDrop(root);
+  const fileName = task.id.replace(/[^a-zA-Z0-9._-]/g, "-");
+  const suffix = createHash("sha256").update(task.id).digest("hex");
+  const taskKind = task.kind;
+  const conflictReason = `local inbox task ${task.id} has conflicting content or kind for the same transport id`;
+  const serialized = JSON.stringify(task, null, 2);
+  mkdirSync(dir, { recursive: true });
+  for (let collision = 0; ; collision += 1) {
+    const suffixPart = collision === 0 ? "" : `-${suffix}${collision === 1 ? "" : `-${collision}`}`;
+    const path = join(dir, `${fileName}${suffixPart}.json`);
+    try {
+      writeFileSync(path, serialized, { flag: "wx" });
+      return;
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+      let existing: { id?: unknown; kind?: unknown; text?: unknown };
+      try {
+        existing = JSON.parse(readFileSync(path, "utf8")) as { id?: unknown; kind?: unknown; text?: unknown };
+      } catch (readError) {
+        if (readError instanceof SyntaxError) continue;
+        throw new Error(`local inbox task ${task.id} cannot verify existing file ${path}: ${readError instanceof Error ? readError.message : String(readError)}`);
+      }
+      if (existing.id === task.id) {
+        if (existing.kind === taskKind && existing.text === task.text) return;
+        recordLocalInboxConflictDiagnostic(root, task, taskKind, conflictReason);
+        throw new InboxWakeRejectedError(conflictReason);
+      }
+    }
+  }
+}
+
 /**
  * Poll all inbox sources:
  *  1. local drop `<root>/.omp/inbox/*.json` (moved into the run inbox),
@@ -1215,12 +1740,19 @@ export function handleInboxTask(root: string, task: InboxTask, onTask?: (t: Inbo
 export async function pollInbox(
   root: string,
   adapter: EscalationAdapter | null,
-  onTask?: (t: InboxTask) => void,
-  onAnswer?: (a: { id: string; answer: string }) => void,
+  onTask?: (t: InboxTask) => InboxWakeResult | void,
+  onAnswer?: (a: InboxAnswer) => InboxWakeResult | void,
+  binding?: DispatcherBinding,
+  leaseToken = "",
 ): Promise<void> {
-  // 1. Local drop (bridge-written tasks + answer markers, or manual/test
-  //    injection). The bridge files answers as { kind: "answer" } markers so
-  //    the session wakes [CTO-ANSWER] even though it does not poll telegram.
+  // No exact captured claim means neither local markers nor adapter answers
+  // may be consumed. The source remains durable for explicit reacquisition.
+  const initialClaim = currentDispatcherClaim(binding, root);
+  if (!initialClaim || !binding) return;
+
+  // 1. Local drop (bridge-written tasks + answer markers). Answer markers
+  // reserve the canonical answer before invoking the host. A crash after
+  // reservation is ambiguous and therefore never replayed automatically.
   try {
     const drop = localInboxDrop(root);
     if (existsSync(drop)) {
@@ -1228,14 +1760,125 @@ export async function pollInbox(
         if (!name.endsWith(".json")) continue;
         const path = join(drop, name);
         try {
-          const raw = JSON.parse(readFileSync(path, "utf8")) as InboxTask & { kind?: string };
+          const raw = JSON.parse(readFileSync(path, "utf8")) as InboxTask & {
+            kind?: string;
+            delivery_status?: AnswerWakeStatus;
+            delivery_run_id?: string;
+            delivery_ownership_epoch?: string;
+            delivery_session_id?: string;
+          };
+          const claim = currentDispatcherClaim(binding, root);
+          if (!claim) break;
           const text = typeof raw?.text === "string" ? raw.text : "";
           if (raw.kind === "answer") {
-            // Answer markers must carry non-empty text (an empty answer is
-            // meaningless); a malformed marker stays in the drop for
-            // operator visibility (today's behavior).
-            if (text.trim().length === 0) continue;
-            onAnswer?.({ id: raw.id, answer: raw.text });
+            if (text.trim().length === 0 || typeof raw.id !== "string") continue;
+            if ((raw.id.split("/")[0] ?? "") !== claim.run_id) continue;
+            const answer: InboxAnswer = { id: raw.id, answer: raw.text };
+            persistCanonicalAnswer(root, answer);
+            const canonical = readCanonicalAnswer(root, answer);
+
+            // Terminal/in-flight local markers are retained only as durable
+            // evidence; they must never invoke the host a second time.
+            if (raw.delivery_status === "in-flight"
+              || raw.delivery_status === "accepted"
+              || raw.delivery_status === "unknown") {
+              moveToProcessed(drop, path, name);
+              continue;
+            }
+
+            const attemptKey = preSendAnswerAttemptKey(path, claim, binding.session_id, leaseToken);
+            if (preSendAnswerAttemptsFor(root).has(attemptKey) && raw.delivery_status === "pre-send-rejected") {
+              // One wake attempt per exact claim/epoch in this dispatcher.
+              // A fresh dispatcher lease may retry the proven refusal.
+              continue;
+            }
+            let previous: PreviousAnswerAttempt | undefined;
+            if (raw.delivery_status === "pre-send-rejected") {
+              if (
+                canonical?.delivery_status !== "pre-send-rejected"
+                || raw.delivery_run_id !== canonical.delivery_run_id
+                || raw.delivery_ownership_epoch !== canonical.delivery_ownership_epoch
+                || raw.delivery_session_id !== canonical.delivery_session_id
+                || typeof raw.delivery_run_id !== "string"
+                || typeof raw.delivery_ownership_epoch !== "string"
+                || typeof raw.delivery_session_id !== "string"
+              ) {
+                moveToRejected(drop, path, name);
+                continue;
+              }
+              previous = {
+                run_id: raw.delivery_run_id,
+                ownership_epoch: raw.delivery_ownership_epoch,
+                session_id: raw.delivery_session_id,
+              };
+            } else if (
+              canonical?.delivery_status !== undefined
+              || raw.delivery_status !== undefined
+            ) {
+              // A canonical reservation without its matching local recovery
+              // marker is ambiguous. Fail closed rather than replaying.
+              moveToRejected(drop, path, name);
+              continue;
+            }
+
+            if (!reserveAnswerWake(root, answer, claim, binding.session_id, previous)) {
+              moveToRejected(drop, path, name);
+              continue;
+            }
+            preSendAnswerAttemptsFor(root).add(attemptKey);
+            markLocalAnswerWakeStatus(path, "in-flight", claim, binding.session_id);
+
+            let result: InboxWakeResult = "accepted";
+            let refusalReason: string | undefined;
+            try {
+              if (!onAnswer) {
+                const refusal = new InboxWakeRejectedError("messenger answer wake has no host callback");
+                result = "rejected";
+                refusalReason = refusal.message;
+              } else {
+                const callbackResult = onAnswer(answer);
+                result = callbackResult ?? "accepted";
+              }
+            } catch (error) {
+              if (error instanceof InboxWakeRejectedError) {
+                result = "rejected";
+                refusalReason = error.message;
+              } else {
+                result = "unknown";
+                refusalReason = "host send outcome unknown; explicit /cto --run reconciliation required";
+              }
+            }
+            if (result === "rejected") {
+              const reason = refusalReason ?? "host rejected before send";
+              if (
+                finishAnswerWake(root, answer, "pre-send-rejected", claim, binding.session_id, reason)
+              ) {
+                markLocalAnswerWakeStatus(path, "pre-send-rejected", claim, binding.session_id, reason);
+              } else {
+                markLocalAnswerWakeStatus(
+                  path,
+                  "unknown",
+                  claim,
+                  binding.session_id,
+                  "answer wake reservation changed; explicit /cto --run reconciliation required",
+                );
+                moveToProcessed(drop, path, name);
+              }
+              continue;
+            }
+            const terminal: Exclude<AnswerWakeStatus, "pending" | "in-flight"> =
+              result === "accepted" ? "accepted" : "unknown";
+            const reason = result === "accepted"
+              ? undefined
+              : refusalReason ?? "host send outcome unknown; explicit /cto --run reconciliation required";
+            const finished = finishAnswerWake(root, answer, terminal, claim, binding.session_id, reason);
+            markLocalAnswerWakeStatus(
+              path,
+              finished ? terminal : "unknown",
+              claim,
+              binding.session_id,
+              finished ? reason : "answer wake reservation changed; explicit /cto --run reconciliation required",
+            );
             moveToProcessed(drop, path, name);
             continue;
           }
@@ -1244,58 +1887,97 @@ export async function pollInbox(
             text,
             at: raw.at ?? new Date().toISOString(),
             by: raw.by ?? "local-drop",
+            ...(typeof raw.kind === "string" ? { kind: raw.kind } : {}),
+            ...(raw.runId ? { runId: raw.runId } : {}),
           };
+          if (task.runId && task.runId !== claim.run_id) continue;
+          const routedTask = { ...task, runId: claim.run_id };
           if (text.trim().length === 0 || text.trim().length > MAX_INBOX_TEXT_LENGTH) {
-            // Rejected (SEC-2): empty or oversized bodies are never
-            // deliverable. Record a durable `inbox_quarantine` rejection
-            // (best-effort — handleInboxTask validates and returns null,
-            // never throws for validation failures) and MOVE the drop file
-            // to rejected/ instead of leaving it in drop/ forever.
-            try {
-              handleInboxTask(root, task, onTask);
-            } catch {
-              // quarantine bookkeeping is best-effort; the move below is
-              // the durable part
-            }
+            handleInboxTask(root, routedTask, onTask);
             moveToRejected(drop, path, name);
             continue;
           }
-          // File the task (wx idempotent) and wake. A throwing wake (or an
-          // IO failure to file) propagates to the catch below, keeping the
-          // drop file in place so the next tick retries the wake. Any
-          // non-throwing return means the task is durable AND woken →
-          // move to processed.
-          handleInboxTask(root, task, onTask);
+          handleInboxTask(root, routedTask, onTask);
           moveToProcessed(drop, path, name);
         } catch {
-          // unreadable / malformed / wake failed — leave in place for the
-          // next tick (nothing is lost)
+          // unreadable / malformed / wake refusal — leave in place for the
+          // next exact claim tick (nothing is lost)
         }
       }
     }
   } catch {
     // drop missing — nothing to do
   }
-  // 2. Adapter long-poll (answers + plain-message inbox) — Telegram is
-  //    polled ONLY when no tg-bridge owns the bot: while the bridge is alive
-  //    it is the sole getUpdates consumer (409 otherwise); the session just
-  //    reads its files. The bridge lock is TELEGRAM-specific (one getUpdates
-  //    consumer per bot token) — a non-telegram adapter (the persisted
-  //    fake-RW mock, consumer transports) has no getUpdates consumer and is
-  //    polled REGARDLESS of the lock, so a live tg bridge never suppresses a
-  //    configured RW channel's inbound delivery.
+
+  // 2. Adapter long-poll. The exact claim gate above runs before pollOnce,
+  // preventing Telegram/mock transports from consuming answers while the
+  // resident session is unbound.
   const bridgeOwnsPoll = adapter !== null && adapter.kind === "telegram" && isBridgeAlive(root);
   if (adapter && !bridgeOwnsPoll && isPollOnceCapable(adapter)) {
+    if (isAnswerPersistenceCapable(adapter)) {
+      adapter.setAnswerPersistenceHandler((answer) => persistCanonicalAnswer(root, answer));
+    }
     try {
       const answers = (await adapter.pollOnce()) ?? [];
       const seen = seenAnswersFor(root);
       for (const answer of answers) {
-        if (!answer?.id || seen.has(answer.id)) continue;
-        seen.add(answer.id);
-        onAnswer?.(answer);
+        if (!answer?.id || typeof answer.answer !== "string") continue;
+        const answerKey = seenAnswerKey(answer);
+        if (seen.has(answerKey)) continue;
+        const claim = currentDispatcherClaim(binding, root);
+        persistCanonicalAnswer(root, answer);
+        if (!claim || (answer.id.split("/")[0] ?? "") !== claim.run_id) continue;
+        const canonical = readCanonicalAnswer(root, answer);
+        if (canonical?.delivery_status !== undefined) {
+          // Existing in-flight/terminal/legacy provenance is durable but is
+          // never treated as a fresh wake.
+          seen.add(answerKey);
+          continue;
+        }
+        if (!reserveAnswerWake(root, answer, claim, binding.session_id)) {
+          seen.add(answerKey);
+          continue;
+        }
+        let result: InboxWakeResult = "accepted";
+        let refusalReason: string | undefined;
+        try {
+          if (!onAnswer) {
+            const refusal = new InboxWakeRejectedError("messenger answer wake has no host callback");
+            result = "rejected";
+            refusalReason = refusal.message;
+          } else {
+            const callbackResult = onAnswer(answer);
+            result = callbackResult ?? "accepted";
+          }
+        } catch (error) {
+          if (error instanceof InboxWakeRejectedError) {
+            result = "rejected";
+            refusalReason = error.message;
+          } else {
+            result = "unknown";
+            refusalReason = "host send outcome unknown; explicit /cto --run reconciliation required";
+          }
+        }
+        if (result === "rejected") {
+          const reason = refusalReason ?? "host rejected before send";
+          if (finishAnswerWake(root, answer, "pre-send-rejected", claim, binding.session_id, reason)) {
+            retainPreSendRejectedAnswer(root, answer, claim, binding.session_id, leaseToken, reason);
+          }
+          seen.add(answerKey);
+          continue;
+        }
+        const terminal: Exclude<AnswerWakeStatus, "pending" | "in-flight"> =
+          result === "accepted" ? "accepted" : "unknown";
+        const reason = result === "accepted"
+          ? undefined
+          : refusalReason ?? "host send outcome unknown; explicit /cto --run reconciliation required";
+        finishAnswerWake(root, answer, terminal, claim, binding.session_id, reason);
+        seen.add(answerKey);
       }
-    } catch {
-      // network hiccup / 409 with a bridge — next tick retries
+    } catch (error) {
+      console.error(
+        `dispatcher inbox poll failed; pending transport input was retained where possible: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 }
@@ -1312,6 +1994,14 @@ function isPollOnceCapable(
   if (typeof adapter !== "object" || adapter === null) return false;
   if (!("pollOnce" in adapter)) return false;
   return typeof adapter.pollOnce === "function";
+}
+
+function isAnswerPersistenceCapable(
+  adapter: unknown,
+): adapter is { setAnswerPersistenceHandler: (handler: (answer: InboxAnswer) => void) => void } {
+  if (typeof adapter !== "object" || adapter === null) return false;
+  if (!("setAnswerPersistenceHandler" in adapter)) return false;
+  return typeof adapter.setAnswerPersistenceHandler === "function";
 }
 
 function moveToProcessed(drop: string, path: string, name: string): void {
@@ -1337,15 +2027,15 @@ function moveToRejected(drop: string, path: string, name: string): void {
 
 /**
  * Esc-ids already woken for, scoped per root/cwd. pollOnce advances the TG
- * offset so a single dispatcher never sees the same update twice; this set
- * guards against double-wake if a dispatcher's tick overlaps itself.
- * Multiple dispatchers in multiple live sessions (same or different roots)
- * may both wake on the same answer — acceptable: the session that owns the
  * waiting team applies it, others treat it as advisory (the CTO contract
  * says late answers are advisory). Keyed by root so one project's wakes
- * never suppress another project's wakes for the same esc id.
+ * never suppress another project's wakes for the same id/content pair.
  */
 const seenAnswersByRoot = new Map<string, Set<string>>();
+
+function seenAnswerKey(answer: InboxAnswer): string {
+  return `${answer.id}\u0000${answer.answer}`;
+}
 
 function seenAnswersFor(root: string): Set<string> {
   let seen = seenAnswersByRoot.get(root);

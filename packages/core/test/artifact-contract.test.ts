@@ -23,6 +23,7 @@ import {
   loadArtifactSchemas,
   type ArtifactContractPolicy,
 } from "../src/engine/artifact-contract.js";
+import { readOptionalStageInputs } from "../src/engine/stage.js";
 import type { StageDef, TeamState } from "../src/engine/types.js";
 
 function state(overrides: Partial<TeamState> = {}): TeamState {
@@ -215,6 +216,62 @@ test("artifact contract: consumed artifacts are prevalidated; present-but-invali
       assert.match(invalid.error, /exploration/);
       assert.match(invalid.error, /expected type array/);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("artifact contract: optional inputs distinguish absence from invalid presence and never become required receipts", () => {
+  const root = mkdtempSync(join(tmpdir(), "ac-optional-"));
+  try {
+    const artifactsDir = join(root, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    const profile = loadProfile("full-feature");
+    assert.ok(profile);
+    const stage: StageDef = { id: "optional", title: "Optional", type: "single", role: "worker", optional_consumes: ["review"] };
+
+    const absent = readOptionalStageInputs(stage, state(), artifactsDir);
+    assert.deepEqual(absent, { ok: true, inputs: [], absent: ["review"] });
+    const absentContract = validateConsumedArtifacts(stage, artifactsDir, state(), profile);
+    assert.equal(absentContract.ok, true);
+    if (absentContract.ok) {
+      assert.equal(absentContract.diagnostics[0]?.optional, true);
+      assert.equal(absentContract.diagnostics[0]?.missing, true);
+    }
+
+    const reviewRaw = JSON.stringify({
+      verdict: "approve",
+      findings: [{ title: "t", severity: "MEDIUM", confidence: 80, zone: "backend-kotlin" }],
+      tests: { passed: 1, failed: 0 },
+    });
+    writeFileSync(join(artifactsDir, "review.json"), reviewRaw);
+    const present = readOptionalStageInputs(stage, state(), artifactsDir);
+    assert.equal(present.ok, true);
+    if (present.ok) {
+      assert.equal(present.inputs.length, 1);
+      assert.equal(present.inputs[0]?.content, reviewRaw);
+      assert.match(present.inputs[0]?.sha256 ?? "", /^[0-9a-f]{64}$/);
+    }
+    const presentContract = validateConsumedArtifacts(stage, artifactsDir, state(), profile);
+    assert.equal(presentContract.ok, true);
+    const persistedRequired = state({ required_inputs: { optional: [{ artifact_id: "review", path: "review.json" }] } });
+    const precedence = readOptionalStageInputs(stage, persistedRequired, artifactsDir);
+    assert.deepEqual(precedence, { ok: true, inputs: [], absent: [] }, "persisted required manifests outrank optional metadata");
+
+    writeFileSync(join(artifactsDir, "review.json"), "{");
+    const malformed = readOptionalStageInputs(stage, state(), artifactsDir);
+    assert.equal(malformed.ok, false);
+    if (!malformed.ok) assert.match(malformed.error, /recovery_required.*not valid JSON/);
+    const malformedContract = validateConsumedArtifacts(stage, artifactsDir, state(), profile);
+    assert.equal(malformedContract.ok, false);
+    if (!malformedContract.ok) assert.match(malformedContract.error, /optional input.*invalid/);
+
+    writeFileSync(join(artifactsDir, "review.json"), JSON.stringify({ verdict: "approve", findings: "not-an-array" }));
+    const schemaInvalid = readOptionalStageInputs(stage, state(), artifactsDir);
+    assert.equal(schemaInvalid.ok, false);
+    if (!schemaInvalid.ok) assert.match(schemaInvalid.error, /recovery_required.*artifact contract/);
+    const schemaInvalidContract = validateConsumedArtifacts(stage, artifactsDir, state(), profile);
+    assert.equal(schemaInvalidContract.ok, false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

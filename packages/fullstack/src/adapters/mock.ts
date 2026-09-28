@@ -32,12 +32,12 @@
  * injectTask / injectPlainMessage write the inbound file ATOMICALLY (unique
  * tmp name + rename) and THEN fire the in-memory handler when set;
  * injectAnswer writes the answer file and queues it in memory as today.
- * pollOnce() drains answers/ (read -> rename to answers/processed/; the
- * rename is the at-most-once consume — failures leave the file in place)
- * merged with the in-memory queue, then drains inbound/ (read -> invoke the
- * stored plain handler -> rename to inbound/processed/; handler failures
- * leave the file for retry, and malformed/empty/oversized files are moved
- * to inbound/rejected/ with a durable record). This is how a SECOND
+ * pollOnce() drains answers/ only after a canonical persistence callback
+ * succeeds (read -> callback -> rename to answers/processed/; failures leave
+ * the file in place) merged with the in-memory queue, then drains inbound/
+ * (read -> invoke the stored plain handler -> rename to inbound/processed/;
+ * a missing handler or handler failure leaves the file pending, and malformed/empty/
+ * oversized files are moved to inbound/rejected/ with a durable record).
  * process's dispatcher receives tasks persisted by the first. reset()
  * clears the in-memory state AND empties the persisted dirs (test helper).
  *
@@ -62,6 +62,16 @@ export interface MockPersistedOptions {
   dir: string;
 }
 
+function answerKey(answer: Pick<EscalationAnswer, "id" | "answer">): string {
+  return `${answer.id}\u0000${answer.answer}`;
+}
+
+interface PersistedAnswerDrain {
+  answers: EscalationAnswer[];
+  failedKeys: Set<string>;
+  failure?: Error;
+}
+
 export class MockEscalationAdapter implements EscalationAdapter {
   readonly kind = "mock";
 
@@ -73,6 +83,7 @@ export class MockEscalationAdapter implements EscalationAdapter {
   private queuedAnswers: EscalationAnswer[] = [];
   private cancelled = new Set<string>();
   private plainHandler: ((msg: EscalationInboundMessage) => void) | null = null;
+  private answerPersistenceHandler: ((answer: EscalationAnswer) => void) | null = null;
   private readonly plainTextLog: Array<{ target: string; text: string; at: string }> = [];
   private counter = 0;
 
@@ -111,24 +122,81 @@ export class MockEscalationAdapter implements EscalationAdapter {
   }
 
   /**
-   * Drain queued answers (persisted mode: answers/ files renamed to
-   * answers/processed/ merged with the in-memory queue; a record is
-   * returned once even when present in both) then drain inbound/ tasks into
-   * the stored plain handler. Never throws.
+   * Drain queued answers. In persisted mode a canonical answer persistence
+   * callback is required before an answer source is consumed; without that
+   * boundary both disk answers and queued answers remain pending. Inbound
+   * tasks are independent and still drain through the plain handler.
    */
   async pollOnce(): Promise<EscalationAnswer[]> {
-    const fromDisk = this.persisted ? this.drainPersistedAnswers() : [];
+    const diskDrain: PersistedAnswerDrain = this.persisted && this.answerPersistenceHandler
+      ? this.drainPersistedAnswers()
+      : { answers: [], failedKeys: new Set<string>() };
     const merged = new Map<string, EscalationAnswer>();
-    for (const answer of fromDisk) merged.set(answer.id, answer);
-    for (const answer of this.queuedAnswers) merged.set(answer.id, answer);
-    this.queuedAnswers = [];
+    const diskKeys = new Set<string>();
+    for (const answer of diskDrain.answers) {
+      const key = answerKey(answer);
+      diskKeys.add(key);
+      merged.set(key, answer);
+    }
+    if (this.persisted && !this.answerPersistenceHandler) {
+      this.drainPersistedInbound();
+      return [];
+    }
+
+    const persistence = this.answerPersistenceHandler;
+    const pending = this.queuedAnswers;
+    const remaining: EscalationAnswer[] = [];
+    let persistenceFailure = diskDrain.failure;
+    for (let index = 0; index < pending.length; index += 1) {
+      const answer = pending[index]!;
+      const key = answerKey(answer);
+      if (diskKeys.has(key)) {
+        // The durable source already succeeded; consume its in-memory mirror
+        // without invoking the callback twice.
+        merged.set(key, answer);
+        continue;
+      }
+      if (diskDrain.failedKeys.has(key)) {
+        // Keep the in-memory mirror paired with the failed durable source.
+        remaining.push(...pending.slice(index));
+        break;
+      }
+      if (persistenceFailure) {
+        // A failed durable source stays pending; do not wake any later
+        // in-memory source behind it during the same pass.
+        remaining.push(...pending.slice(index));
+        break;
+      }
+      if (this.persisted && persistence) {
+        try {
+          persistence(answer);
+        } catch (error) {
+          persistenceFailure = new Error(
+            `mock queued answer ${answer.id} could not reach canonical storage; source retained for retry: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          remaining.push(...pending.slice(index));
+          break;
+        }
+      }
+      merged.set(key, answer);
+    }
+    this.queuedAnswers = remaining;
     if (this.persisted) this.drainPersistedInbound();
+    if (persistenceFailure && merged.size === 0) throw persistenceFailure;
     return [...merged.values()].map((answer) => (this.cancelled.has(answer.id) ? { ...answer, stale: true } : answer));
   }
 
   /** Store the plain (non-answer) inbound message handler for injectPlainMessage/injectTask. */
   setPlainMessageHandler(handler: (msg: EscalationInboundMessage) => void): void {
     this.plainHandler = handler;
+  }
+
+  /**
+   * Install the registry's canonical answer persistence hook. Persisted
+   * answers are not moved to processed/ until this callback succeeds.
+   */
+  setAnswerPersistenceHandler(handler: (answer: EscalationAnswer) => void): void {
+    this.answerPersistenceHandler = handler;
   }
 
   /** Record a plain text send (no real channel); persisted mode appends outbound/plain.jsonl. */
@@ -188,6 +256,7 @@ export class MockEscalationAdapter implements EscalationAdapter {
   reset(): void {
     this.sentEscalations = [];
     this.queuedAnswers = [];
+    this.answerPersistenceHandler = null;
     this.cancelled.clear();
     this.plainHandler = null;
     this.plainTextLog.length = 0;
@@ -240,39 +309,67 @@ export class MockEscalationAdapter implements EscalationAdapter {
     };
     appendFileSync(join(dir, "messages.jsonl"), `${JSON.stringify(record)}\n`);
   }
-
   /**
-   * Drain answers/ files: read -> rename to answers/processed/. The rename
-   * is the at-most-once consume under concurrent consumers (a file is gone
-   * from answers/ once renamed; a rename race between two readers is
-   * deduped downstream by the dispatcher/state layer); unreadable or
-   * malformed files are left in place for the next poll.
+   * Drain answers/ files: read, durably persist through the registry callback
+   * when configured, then rename to answers/processed/. A persistence failure
+   * leaves that source pending; successful earlier sources remain available
+   * to the same pollOnce() result.
    */
-  private drainPersistedAnswers(): EscalationAnswer[] {
+  private drainPersistedAnswers(): PersistedAnswerDrain {
+    const result: PersistedAnswerDrain = { answers: [], failedKeys: new Set<string>() };
+    const persistence = this.answerPersistenceHandler;
+    if (!persistence) return result;
     const dir = join(this.persisted!.dir, "answers");
-    const out: EscalationAnswer[] = [];
     try {
-      if (!existsSync(dir)) return out;
+      if (!existsSync(dir)) return result;
       const processed = join(dir, "processed");
       mkdirSync(processed, { recursive: true });
       for (const name of readdirSync(dir)) {
         if (!name.endsWith(".json")) continue;
         const path = join(dir, name);
+        let answer: EscalationAnswer;
         try {
           const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<EscalationAnswer>;
-          if (typeof raw?.id !== "string" || typeof raw.answer !== "string") continue; // malformed — left in place
-          renameSync(path, join(processed, name));
-          out.push(raw as EscalationAnswer);
-        } catch {
-          // unreadable / rename failure — left in place for the next poll
+          if (typeof raw?.id !== "string" || typeof raw.answer !== "string") {
+            result.failure = new Error(
+              `mock persisted answer ${name} is malformed; source retained for retry: expected string id and answer`,
+            );
+            break;
+          }
+          answer = raw as EscalationAnswer;
+        } catch (error) {
+          result.failure = new Error(
+            `mock persisted answer ${name} could not be read; source retained for retry: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          break;
         }
+        try {
+          persistence(answer);
+        } catch (error) {
+          result.failedKeys.add(answerKey(answer));
+          result.failure = new Error(
+            `mock persisted answer ${name} could not reach canonical storage; source retained for retry: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          break;
+        }
+        try {
+          renameSync(path, join(processed, name));
+        } catch (error) {
+          result.failedKeys.add(answerKey(answer));
+          result.failure = new Error(
+            `mock persisted answer ${name} could not be archived; source retained for retry: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          break;
+        }
+        result.answers.push(answer);
       }
-    } catch {
-      // dir missing / unreadable — nothing to drain
+    } catch (error) {
+      result.failure = new Error(
+        `mock persisted answers directory could not be drained; source retained for retry: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
-    return out;
+    return result;
   }
-
   /**
    * Drain inbound/ task files into the stored plain handler: read -> invoke
    * the handler -> rename to inbound/processed/. The handler runs BEFORE the
@@ -316,7 +413,8 @@ export class MockEscalationAdapter implements EscalationAdapter {
             at: typeof raw.at === "string" ? raw.at : new Date().toISOString(),
             by: typeof raw.by === "string" ? raw.by : undefined,
           };
-          this.plainHandler?.(msg);
+          if (!this.plainHandler) continue;
+          this.plainHandler(msg);
           renameSync(path, join(processed, name));
         } catch {
           // handler failure or unreadable — left in place for retry

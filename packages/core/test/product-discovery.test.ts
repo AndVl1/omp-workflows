@@ -17,7 +17,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,12 +28,16 @@ import {
   validateProducedArtifact,
 } from "@andvl1/omp-workflows-core";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
+import { createCapability, advanceCursor, recordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
 import { checkpointPolicyHash, recordTrustedCheckpointAnswer, unresolvedCheckpointError } from "../src/engine/checkpoints.js";
 import { migrationCheckpointPolicy } from "../src/engine/workflow-contract.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+
+import { runTarget } from "../src/engine/run-store.js";
+
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
+const APPROVAL_RUN_ID = "77777777-7777-4777-8777-777777777777";
+
 
 const COMPLEXITIES = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"] as const;
 
@@ -66,11 +70,21 @@ function classification(workflow: string, autonomous: boolean): TeamState["class
 }
 
 function readState(root: string): TeamState {
-  return JSON.parse(readFileSync(join(root, ".work-state", "features", "product-approval", "state.json"), "utf8")) as TeamState;
+  return JSON.parse(readFileSync(join(root, ".work-state", "runs", APPROVAL_RUN_ID, "state.json"), "utf8")) as TeamState;
 }
 
-function advanceAuth(issued: ReturnType<typeof createCapability>) {
+function writeCanonicalState(root: string, state: TeamState): { statePath: string; artifactsDir: string } {
+  const target = runTarget(root, APPROVAL_RUN_ID);
+  mkdirSync(target.stateDir!, { recursive: true });
+  mkdirSync(target.artifactsDir!, { recursive: true });
+  const persisted = { ...state, state_revision: state.state_revision ?? 1 };
+  writeFileSync(target.statePath!, `${JSON.stringify(persisted, null, 2)}\n`);
+  return { statePath: target.statePath!, artifactsDir: target.artifactsDir! };
+}
+
+function advanceAuth(issued: IssuedCapability) {
   return {
+    run_id: APPROVAL_RUN_ID,
     token: issued.advance_token,
     capability_id: issued.capability_id,
     run_key: issued.state.issued_for!.run_key,
@@ -83,26 +97,29 @@ function advanceAuth(issued: ReturnType<typeof createCapability>) {
   };
 }
 
-function setupApprovalStage(root: string, branch: string, profile: Profile): { issued: ReturnType<typeof createCapability>; artifactsDir: string } {
+function setupApprovalStage(root: string, branch: string, profile: Profile): { issued: IssuedCapability; artifactsDir: string } {
   const persistedHash = profileHash(profile);
   const policy = profile.stages.find((stage) => stage.id === "product_approval")?.checkpoint_policy
     ?? profile.checkpoint_policy
     ?? migrationCheckpointPolicy("product_approval");
   const policyHash = checkpointPolicyHash(policy);
   const issued = createCapability({
-    run_key: branch,
+    run_key: APPROVAL_RUN_ID,
     branch,
     workflow: profile.name,
     profile_hash: persistedHash,
     stage_cursor: "product_approval",
-    kind: "none", // orchestrator stages are non-dispatch: empty roster
+    kind: "none",
     expected_roster: [],
     checkpoint_policy_hash: policyHash,
   });
-  const { artifactsDir } = writeStateBootstrap(root, {
-    schema: 1,
+  const { artifactsDir } = writeCanonicalState(root, {
+    schema: 2,
+    run_id: APPROVAL_RUN_ID,
+    run_key: APPROVAL_RUN_ID,
+    lifecycle_status: "active",
+    title: "product approval gate regression",
     branch,
-    run_key: branch,
     classification: classification(profile.name, false),
     task: "product approval gate regression",
     workflow_override: false,
@@ -110,7 +127,7 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
     stage_cursor: "product_approval",
     stages: profile.stages.map((s) => ({ id: s.id, status: s.id === "product_approval" ? "in_progress" as const : "pending" as const })),
     artifacts: {},
-    pause: { kind: "none", reason: "" },
+    pause: { kind: "none" as const, reason: "" },
     policy: { strict_orchestrator: true },
     profile_hash: persistedHash,
     checkpoint_policy: policy,
@@ -119,7 +136,7 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     dispatch_capability: issued.state,
     updated_at: new Date().toISOString(),
-  }, { featureSlug: "product-approval" });
+  });
   return { issued, artifactsDir };
 }
 
@@ -435,7 +452,7 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
     // 1. Advance with no durable decision fails closed: the gate fires its
     //    no-decision diagnostic before the unresolved-checkpoint check.
     assert.equal((readState(root).checkpoint_decisions ?? []).length, 0, "no decision recorded yet");
-    const noDecision = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" });
+    const noDecision = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" }, { runId: APPROVAL_RUN_ID });
     assert.equal(noDecision.ok, false, "advance without a product decision must block");
     if (!noDecision.ok) assert.match(noDecision.error, /gate 'product_approval_recorded' is not satisfied/);
 
@@ -449,7 +466,7 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
     const unresolved = unresolvedCheckpointError(profile.stages.find((stage) => stage.id === "product_approval")!, unresolvedState);
     assert.match(unresolved ?? "", /checkpoint_unresolved/);
     assert.equal(unresolvedState.pause.kind, "needs_human");
-    writeStateBootstrap(root, unresolvedState, { featureSlug: "product-approval" });
+    writeCanonicalState(root, unresolvedState);
     assert.equal(readState(root).pause.kind, "needs_human");
 
     // 3. An interactive answer must carry typed human provenance. The
@@ -464,7 +481,7 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
       checkpoint_id: "product_approval",
       decision: "proceed",
     });
-    writeStateBootstrap(root, trusted.state, { featureSlug: "product-approval" });
+    writeCanonicalState(root, trusted.state);
     const expectedEpoch = beforeInteractive.dispatch_capability!.issued_for!.cursor_epoch;
     const interactive = recordCheckpointDecision(root, {
       ...advanceAuth(issued),
@@ -487,7 +504,7 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
     const interactiveRecord = readState(root).checkpoint_decisions?.[0];
     assert.equal(interactiveRecord?.mode, "interactive");
     assert.equal(interactiveRecord?.decision, "proceed");
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" });
+    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" }, { runId: APPROVAL_RUN_ID });
     assert.equal(advanced.ok, true, "an interactive proceed decision allows advance");
     if (!advanced.ok) return;
     assert.equal(advanced.state.stages.find((s) => s.id === "product_approval")?.status, "done");

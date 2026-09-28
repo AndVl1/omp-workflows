@@ -8,30 +8,110 @@
  * fail closed for strict-state writes.
  */
 import { isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
-import { resolveState } from "../engine/state.js";
-
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 interface ToolCallEvent {
   toolName: string;
   input?: Record<string, unknown> | string;
 }
-interface ToolCallContext { cwd: string; hasUI?: boolean; actor?: Actor }
+const REGISTERED_LIFECYCLE_DEVICE_ROUTES = new Set([
+  "xd://workflow_prepare",
+  "xd://workflow_instructions",
+  "xd://workflow_begin",
+  "xd://workflow_status",
+  "xd://workflow_complete",
+  "xd://workflow_checkpoint",
+  "xd://workflow_checkpoint_ask",
+  "xd://workflow_advance",
+  "xd://cto_state",
+]);
 
 type Actor = "orchestrator" | "worker" | "lead";
+
+/**
+ * Internal proof attached by the core host adapter after authenticating the
+ * current session. The unique symbol keeps model/tool input and ordinary
+ * runtime context fields from manufacturing the narrowed orchestrator scope.
+ */
+export const TRUSTED_ORCHESTRATOR_WRITE_PROOF = Symbol("trusted-orchestrator-write-proof");
+export interface TrustedOrchestratorWriteProof {
+  readonly [TRUSTED_ORCHESTRATOR_WRITE_PROOF]: true;
+  readonly artifactsDir: string;
+}
+
+export function createTrustedOrchestratorWriteProof(artifactsDir: string): TrustedOrchestratorWriteProof {
+  const root = resolve(artifactsDir);
+  return Object.freeze({
+    [TRUSTED_ORCHESTRATOR_WRITE_PROOF]: true as const,
+    artifactsDir: root,
+  });
+}
+
+interface ToolCallContext {
+  cwd: string;
+  run_id?: string;
+  cto_run_id?: string;
+  hasUI?: boolean;
+  actor?: Actor;
+  [TRUSTED_ORCHESTRATOR_WRITE_PROOF]?: TrustedOrchestratorWriteProof;
+}
 
 export function orchestratorWriteGate(
   event: ToolCallEvent,
   ctx: ToolCallContext,
 ): { block?: boolean; reason?: string } | void {
-  if (!hasStrictOrchestratorState(ctx.cwd)) return;
-  if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
-  // The host invokes mounted `xd://` devices through the generic write
-  // transport. That transport is not a project filesystem mutation.
-  if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
   const actor = trustedActorOf(ctx);
+  const policyActive = hasStrictOrchestratorState(ctx.cwd, ctx.run_id) || hasActiveCtoState(ctx.cwd, ctx.cto_run_id);
+  if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
+  // Registered lifecycle devices use the generic write transport, but only
+  // exact route writes are exempt from project-write policy.
+  if (isRegisteredLifecycleDeviceWrite(event)) return;
 
+  // Canonical CTO state is engine-owned even when no ordinary strict run or
+  // active CTO scope is selected (for example, immediately after a managed
+  // zero-slot suspension). This narrow preflight uses the same supported
+  // mutation detectors as the policy-active path and does not broaden
+  // protection to noncanonical artifacts or source files.
   if (event.toolName === "bash") {
-    const command = commandFromInput(event.input);
+    const earlyBash = bashProofInput(event.input);
+    if (earlyBash.valid) {
+      const canonical = bashMutationTargets(earlyBash.command).find((path) => isCanonicalStatePath(path, ctx.cwd));
+      if (canonical || looksLikeWorkflowStateMutation(earlyBash.command)) {
+        return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused bash mutation${canonical ? ` '${canonical}'` : ""}` };
+      }
+    }
+  } else {
+    const canonical = pathsFromInput(event.input).find((path) => isCanonicalStatePath(path, ctx.cwd));
+    if (canonical) {
+      return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused '${canonical}'` };
+    }
+  }
+  if (!policyActive) return;
+  const bashSnapshot = event.toolName === "bash" ? bashProofInput(event.input) : undefined;
+  const bashCommand = event.toolName === "bash" && bashSnapshot?.valid ? bashSnapshot.command : "";
+
+  // A proof-derived artifact scope is deliberately a positive allowlist:
+  // read-only status/log/diff/show plus exactly `branch --show-current`
+  // may run through bash.
+  // Accepted command encodings are not mutually exclusive transports:
+  // inline `GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false ...`
+  // accepts env absent or the exact own one-key `{ GIT_OPTIONAL_LOCKS: "0" }`;
+  // non-inline `git --no-pager -c core.fsmonitor=false ...` requires that
+  // exact env. Wrong/extra/malformed env and omitted non-inline env remain
+  // blocked; diff/show additionally require --no-ext-diff and --no-textconv.
+  // Other branch modes, unsupported args, helpers, mutations, and injections
+  // remain blocked.
+  const artifactsDir = trustedArtifactsDirOf(ctx, actor);
+  if (event.toolName === "bash" && artifactsDir) {
+    if (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv)) {
+      return { block: true, reason: "orchestrator policy: trusted host artifact proof permits only sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false; diff/show also require --no-ext-diff --no-textconv" };
+    }
+  }
+
+  if (event.toolName === "bash" && !bashSnapshot?.valid) {
+    return { block: true, reason: "orchestrator policy: malformed bash input" };
+  }
+  if (event.toolName === "bash") {
+    const command = bashCommand;
     const targets = bashMutationTargets(command);
     const canonical = targets.find((path) => isCanonicalStatePath(path, ctx.cwd));
     if (canonical || looksLikeWorkflowStateMutation(command)) {
@@ -59,6 +139,13 @@ export function orchestratorWriteGate(
   if (actor !== "orchestrator" && actor !== "lead") {
     return { block: true, reason: "orchestrator policy: trusted actor identity is required for source writes" };
   }
+  if (artifactsDir) {
+    const invalid = paths.find((path) => !isArtifactPath(path, ctx.cwd, artifactsDir));
+    if (invalid) {
+      return { block: true, reason: `orchestrator policy: trusted host may write only under the selected artifacts directory; refused '${invalid}'` };
+    }
+    return;
+  }
   const invalid = paths.find((path) => !isWorkStatePath(path, ctx.cwd));
   if (invalid) {
     return { block: true, reason: `orchestrator policy: ${actor} may write only under .work-state; refused '${invalid}'` };
@@ -72,7 +159,75 @@ function trustedActorOf(ctx: ToolCallContext): Actor | undefined {
   return undefined;
 }
 
+function trustedArtifactsDirOf(ctx: ToolCallContext, actor: Actor | undefined): string | undefined {
+  if (actor !== "orchestrator") return undefined;
+  const proof = ctx[TRUSTED_ORCHESTRATOR_WRITE_PROOF];
+  return proof?.[TRUSTED_ORCHESTRATOR_WRITE_PROOF] === true ? proof.artifactsDir : undefined;
+}
+
+
 /** Diagnostic parser only. Values from tool input are never authorization. */
+function simpleGitWords(command: string): string[] | undefined {
+  const trimmed = command.trim();
+  if (!trimmed || /[\u0000-\u001f\u007f"'\\`;&|<>()$*?[\]{}!]/.test(trimmed)) return undefined;
+  const words = trimmed.split(/\s+/);
+  if (words.some((word) => !/^[A-Za-z0-9._/@:+~^=-]+$/.test(word))) return undefined;
+  return words;
+}
+
+function splitGitArgs(args: string[], options: ReadonlySet<string>): { before: string[]; after: string[] } | undefined {
+  const separator = args.indexOf("--");
+  const before = separator < 0 ? args : args.slice(0, separator);
+  const after = separator < 0 ? [] : args.slice(separator + 1);
+  if (before.some((arg) => arg.startsWith("-") && !options.has(arg))) return undefined;
+  if (before.some((arg) => !arg.startsWith("-") && !/^[A-Za-z0-9._/@:+~^-]+$/.test(arg))) return undefined;
+  if (after.some((arg) => !/^[A-Za-z0-9._/@:+~^-]+$/.test(arg))) return undefined;
+  return { before, after };
+}
+
+/** Bounded read-only git grammar for trusted artifact-proof bash. */
+function isReadOnlyProofCommand(command: string, env: unknown, hasEnv: boolean): boolean {
+  const words = simpleGitWords(command);
+  const inlinePrefix = ["GIT_OPTIONAL_LOCKS=0", "git", "--no-pager", "-c", "core.fsmonitor=false"];
+  const structuredPrefix = ["git", "--no-pager", "-c", "core.fsmonitor=false"];
+  if (!words) return false;
+  if (hasEnv && !isExactSafeGitEnv(env)) return false;
+  const matches = (prefix: string[]): boolean =>
+    words.length >= prefix.length + 1 && prefix.every((word, index) => words[index] === word);
+  const inlineMatch = matches(inlinePrefix);
+  const structuredMatch = hasEnv && matches(structuredPrefix);
+  const prefixLength = inlineMatch
+    ? inlinePrefix.length
+    : structuredMatch
+      ? structuredPrefix.length
+      : undefined;
+  if (prefixLength === undefined) return false;
+  const subcommand = words[prefixLength]!;
+  const args = words.slice(prefixLength + 1);
+  if (subcommand === "status") {
+    const parsed = splitGitArgs(args, new Set(["-b", "-s", "--branch", "--no-renames", "--porcelain", "--short"]));
+    return !!parsed && parsed.before.every((arg) => arg.startsWith("-")) && parsed.after.length === 0;
+  }
+  if (subcommand === "branch") {
+    return args.length === 1 && args[0] === "--show-current";
+  }
+  if (subcommand === "diff") {
+    const parsed = splitGitArgs(args, new Set(["--stat", "--name-only", "--name-status", "--no-color", "--no-ext-diff", "--no-textconv"]));
+    if (!parsed || parsed.before.filter((arg) => !arg.startsWith("-")).length > 2) return false;
+    return parsed.before.includes("--no-ext-diff") && parsed.before.includes("--no-textconv");
+  }
+  if (subcommand === "show") {
+    const parsed = splitGitArgs(args, new Set(["--name-only", "--name-status", "--no-color", "--no-patch", "--oneline", "--stat", "--no-ext-diff", "--no-textconv"]));
+    if (!parsed || parsed.before.filter((arg) => !arg.startsWith("-")).length > 1) return false;
+    return parsed.before.includes("--no-ext-diff") && parsed.before.includes("--no-textconv");
+  }
+  if (subcommand === "log") {
+    const parsed = splitGitArgs(args, new Set(["-1", "--no-color", "--no-decorate", "--oneline", "--reverse"]));
+    if (!parsed || parsed.before.filter((arg) => !arg.startsWith("-")).length > 1) return false;
+    return true;
+  }
+  return false;
+}
 export function actorOf(input: Record<string, unknown> | undefined): Actor | undefined {
   const raw = input?.__omp_actor ?? input?.actor;
   return raw === "orchestrator" || raw === "worker" || raw === "lead" ? raw : undefined;
@@ -82,6 +237,53 @@ function commandFromInput(input: ToolCallEvent["input"]): string {
   if (typeof input === "string") return input;
   if (!input) return "";
   return String(input.command ?? "");
+}
+type BashProofInput = {
+  valid: boolean;
+  command: string;
+  env?: unknown;
+  hasEnv: boolean;
+};
+
+function invalidBashProofInput(): BashProofInput {
+  return { valid: false, command: "", hasEnv: true };
+}
+
+function bashProofInput(input: ToolCallEvent["input"]): BashProofInput {
+  if (typeof input === "string") return { valid: true, command: input, hasEnv: false };
+  if (!input || typeof input !== "object" || Array.isArray(input)) return invalidBashProofInput();
+  try {
+    if (Object.getPrototypeOf(input) !== Object.prototype) return invalidBashProofInput();
+    const commandDescriptor = Object.getOwnPropertyDescriptor(input, "command");
+    if (!commandDescriptor || !("value" in commandDescriptor) || commandDescriptor.get !== undefined || commandDescriptor.set !== undefined) {
+      return invalidBashProofInput();
+    }
+    const command = commandDescriptor.value;
+    if (typeof command !== "string") return invalidBashProofInput();
+    const envDescriptor = Object.getOwnPropertyDescriptor(input, "env");
+    if (!envDescriptor) {
+      if ("env" in input) return invalidBashProofInput();
+      return { valid: true, command, hasEnv: false };
+    }
+    if (!("value" in envDescriptor) || envDescriptor.get !== undefined || envDescriptor.set !== undefined) return invalidBashProofInput();
+    const env = envDescriptor.value;
+    return { valid: true, command, env, hasEnv: true };
+  } catch {
+    return invalidBashProofInput();
+  }
+}
+function isExactSafeGitEnv(env: unknown): boolean {
+  try {
+    if (!env || typeof env !== "object" || Array.isArray(env) || Object.getPrototypeOf(env) !== Object.prototype) return false;
+    const keys = Reflect.ownKeys(env);
+    if (keys.length !== 1 || keys[0] !== "GIT_OPTIONAL_LOCKS") return false;
+    const descriptor = Object.getOwnPropertyDescriptor(env, "GIT_OPTIONAL_LOCKS");
+    if (!descriptor || !("value" in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) return false;
+    const value = descriptor.value;
+    return typeof value === "string" && value === "0";
+  } catch {
+    return false;
+  }
 }
 
 function pathsFromInput(input: ToolCallEvent["input"]): string[] {
@@ -105,9 +307,10 @@ function pathsFromPatch(patch: string): string[] {
   return paths;
 }
 
-function isMountedToolRouteInput(input: ToolCallEvent["input"]): boolean {
-  const paths = pathsFromInput(input);
-  return paths.length > 0 && paths.every((path) => path.trim().toLowerCase().startsWith("xd://"));
+export function isRegisteredLifecycleDeviceWrite(event: ToolCallEvent): boolean {
+  if (event.toolName !== "write") return false;
+  const paths = pathsFromInput(event.input);
+  return paths.length > 0 && paths.every((path) => REGISTERED_LIFECYCLE_DEVICE_ROUTES.has(path));
 }
 
 function isWorkStatePath(path: string, cwd: string): boolean {
@@ -127,10 +330,71 @@ function isWorkStatePath(path: string, cwd: string): boolean {
   }
 }
 
+function isArtifactPath(path: string, cwd: string, artifactsDir: string): boolean {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+  const root = resolve(artifactsDir);
+  const lexical = relative(root, absolute);
+  if (lexical === "" || lexical.startsWith(`..${sep}`) || lexical === ".." || isAbsolute(lexical)) return false;
+  const projectRoot = resolve(cwd);
+  const rootFromProject = relative(projectRoot, root);
+  if (rootFromProject.startsWith(`..${sep}`) || rootFromProject === ".." || isAbsolute(rootFromProject)) return false;
+  try {
+    // The proof root itself must be a real directory. In particular, a
+    // symlinked artifacts directory is never an authenticated write target.
+    let rootCursor = projectRoot;
+    for (const segment of rootFromProject.split(sep).filter(Boolean)) {
+      rootCursor = join(rootCursor, segment);
+      const rootInfo = lstatSync(rootCursor);
+      if (rootInfo.isSymbolicLink()) return false;
+      if (!rootInfo.isDirectory()) return false;
+    }
+    const rootInfo = lstatSync(root);
+    if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) return false;
+    const realRoot = realpathSync(root);
+    const isInsideRoot = (candidate: string): boolean => {
+      const realRel = relative(realRoot, candidate);
+      return realRel !== "" && !realRel.startsWith(`..${sep}`) && realRel !== ".." && !isAbsolute(realRel);
+    };
+
+    let current = root;
+    for (const segment of lexical.split(sep).filter(Boolean)) {
+      current = join(current, segment);
+      let info;
+      try {
+        info = lstatSync(current);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+        return false;
+      }
+      if (info.isSymbolicLink()) {
+        let realLink: string;
+        try {
+          realLink = realpathSync(current);
+        } catch {
+          // This includes dangling final symlinks.
+          return false;
+        }
+        if (!isInsideRoot(realLink)) return false;
+      }
+    }
+    return isInsideRoot(realpathSync(absolute));
+  } catch {
+    return false;
+  }
+}
 function isCanonicalStatePath(path: string, cwd: string): boolean {
   const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
   const canonical = (rel: string): boolean =>
-    rel === ".active-feature" || rel === "team-state.json" || /^features\/[^/]+\/state\.json$/.test(rel) || /^cto\/[^/]+\/state\.json$/.test(rel);
+    rel === ".active-feature"
+    || rel === "team-state.json"
+    || rel === "run-control.json"
+    || /^features\/[^/]+\/state\.json$/.test(rel)
+    || /^cto\/[^/]+\/state\.json$/.test(rel)
+    || /^runs\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/(?:state\.json|team-state\.md|migration-receipt\.json)$/i.test(rel)
+    || /^runs\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/revisions(?:\/|$)/i.test(rel)
+    || /^lifecycle-transactions\/[^/]+(?:\/transaction\.json)?$/.test(rel)
+    || /^artifact-transactions\/[^/]+\.json$/.test(rel)
+    || /^migrations\/[^/]+\/receipt\.json$/.test(rel);
   const workState = resolve(cwd, ".work-state");
   if (canonical(relative(workState, absolute).split(sep).join("/"))) return true;
   try {
@@ -142,23 +406,27 @@ function isCanonicalStatePath(path: string, cwd: string): boolean {
     return false;
   }
 }
-
 function looksLikeWorkflowStateMutation(command: string): boolean {
-  const workflowPath =
-    /(?:^|[\s"'`/])(?:\.\/)?\.work-state\/(?:team-state\.json|\.active-feature|features\/[A-Za-z0-9._-]+\/state\.json|cto\/[A-Za-z0-9._-]+\/state\.json)(?=$|[\s"'`;&|),])|(?:^|[\s"'`])(?:\.\/)?(?:team-state\.json|\.active-feature)(?=$|[\s"'`;&|),])/i;
+  const workflowPath = new RegExp(
+    String.raw`(?:^|[\s"'\x60/])(?:\./)?\.work-state/(?:team-state\.json|\.active-feature|run-control\.json|features/[A-Za-z0-9._-]+/state\.json|cto/[A-Za-z0-9._-]+/state\.json|lifecycle-transactions/[^\s"'\x60;&|),]+|artifact-transactions/[^\s"'\x60;&|),]+|migrations/[^\s"'\x60;&|),]+|runs/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/(?:state\.json|team-state\.md|migration-receipt\.json|revisions(?:/[^\s"'\x60;&|),]+)?))(?=$|[\s"'\x60;&|),])|(?:^|[\s"'\x60])(?:\./)?(?:team-state\.json|\.active-feature|run-control\.json)(?=$|[\s"'\x60;&|),])`,
+    "i",
+  );
   if (!workflowPath.test(command) && !hasRelativeWorkflowStateContext(command)) return false;
   return /(?:>|>>|tee\b|(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|chmod|rsync|patch|ed|sponge)\b|(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["\'][^"\']*[wax+][^"\']*["\']|git\s+(?:apply|checkout|restore|reset|clean|mv|rm|show|stash)\b)/i.test(command);
 }
 
 function hasRelativeWorkflowStateContext(command: string): boolean {
   const cd = /(?:^|[;&|]\s*)cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi;
-  const rootRelative = /(?:^|[\s"'`])(?:\.\/)?(?:team-state\.json|\.active-feature|(?:features|cto)\/[A-Za-z0-9._-]+\/state\.json)(?=$|[\s"'`;&|),])/i;
-  const nestedRelative = /(?:^|[\s"'`])(?:\.\/)?state\.json(?=$|[\s"'`;&|),])/i;
+  const rootRelative = new RegExp(String.raw`(?:^|[\s"'\x60])(?:\./)?(?:team-state\.json|\.active-feature|(?:features|cto)/[A-Za-z0-9._-]+/state\.json)(?=$|[\s"'\x60;&|),])`, "i");
+  const nestedRelative = /(?:^|[\s"'\x60])(?:state\.json|team-state\.md|migration-receipt\.json)(?=$|[\s"'\x60;&|),])/i;
+  const ordinaryRun = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
+  const workStateRelative = /(?:^|[\s"'\x60])(?:run-control\.json|lifecycle-transactions\/[^\s"'\x60;&|),]+|artifact-transactions\/[^\s"'\x60;&|),]+)(?=$|[\s"'\x60;&|),])/i;
 
   for (const match of command.matchAll(cd)) {
     const directory = (match[1] ?? match[2] ?? match[3] ?? "").replace(/\/+$/, "");
     const afterCd = command.slice((match.index ?? 0) + match[0].length);
-    if (/(?:^|\/)\.work-state$/.test(directory) && rootRelative.test(afterCd)) return true;
+    if (/(?:^|\/)\.work-state$/.test(directory) && (rootRelative.test(afterCd) || workStateRelative.test(afterCd))) return true;
+    if (/(?:^|\/)\.work-state\/runs\/[^/]+$/.test(directory) && ordinaryRun.test(directory.split(/[\\/]/).pop() ?? "") && nestedRelative.test(afterCd)) return true;
     if (/(?:^|\/)\.work-state\/features\/[A-Za-z0-9._-]+$/.test(directory) && nestedRelative.test(afterCd)) return true;
     if (/(?:^|\/)\.work-state\/cto\/[A-Za-z0-9._-]+$/.test(directory) && nestedRelative.test(afterCd)) return true;
   }
@@ -208,7 +476,7 @@ const SWITCH_FORCE_BRANCH_MUTATION = /(?:^|[;&|]\s*)git\s+switch\b[^;&|]*(?:^|\s
  * discard worktree contents remain blocked.
  */
 function looksLikeSourceMutation(command: string): boolean {
-  return /(?:\b(?:tee)\b|\b(?:cat|printf|echo)\b[^\n]*(?:>|>>|<<)|(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:cp|mv|install|touch|rm|rmdir|truncate|dd|ln|rsync|patch|ed|sponge)\b|\b(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\b(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\bgit\s+(?:apply|restore|reset|clean|mv|rm|stash)\b|\bgit\s+show\b[^\n]*(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["'][^"']*[wax+][^"']*["'])/i.test(command)
+  return /(?:\b(?:tee)\b|\b(?:cat|printf|echo)\b[^\n]*(?:>|>>|<<)|(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:cp|mv|install|touch|rm|rmdir|mkfifo|mknod|truncate|dd|ln|rsync|patch|ed|sponge)\b|\b(?:sed|perl)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\b(?:g?awk)\b[^\n]*(?:\s-i(?:\s|$)|--in-place\b)|\bgit\s+(?:apply|restore|reset|clean|mv|rm|stash)\b|\bgit\s+show\b[^\n]*(?:>|>>)\s*(?:\.\/)?(?:src|packages|test|tests|app|config)(?:[\/\s"'`]|$)|\b(?:python(?:3)?|node|ruby)\b[^\n]*(?:-c|--eval)[^\n]*(?:writeFile(?:Sync)?|appendFile(?:Sync)?|write_text|write_bytes|unlink|rename|mkdir|rmdir|remove|replace)\b|(?:python(?:3)?|ruby)\b[^\n]*(?:-c|--eval)[^\n]*open\([^\n)]*,\s*["'][^"']*[wax+][^"']*["'])/i.test(command)
     || CHECKOUT_PATH_MUTATION.test(command)
     || CHECKOUT_FORCE_MUTATION.test(command)
     || CHECKOUT_FORCE_BRANCH_MUTATION.test(command)
@@ -216,10 +484,26 @@ function looksLikeSourceMutation(command: string): boolean {
     || SWITCH_FORCE_BRANCH_MUTATION.test(command);
 }
 
-export function hasStrictOrchestratorState(cwd: string): boolean {
-  const resolved = resolveState(cwd);
-  if (resolved.invalid) return true;
-  return resolved.state?.policy?.strict_orchestrator === true;
+export function hasStrictOrchestratorState(cwd: string, runId?: string): boolean {
+  if (!runId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) return false;
+  const path = join(resolve(cwd, ".work-state"), "runs", runId, "state.json");
+  try {
+    const state = JSON.parse(readFileSync(path, "utf8")) as { policy?: { strict_orchestrator?: boolean } };
+    return state.policy?.strict_orchestrator === true;
+  } catch { return false; }
+}
+
+function hasActiveCtoState(cwd: string, runId?: string): boolean {
+  if (!runId || !/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === "..") return false;
+  try {
+    const value = JSON.parse(readFileSync(join(resolve(cwd, ".work-state"), "cto", runId, "state.json"), "utf8")) as {
+      schema?: unknown;
+      id?: unknown;
+    };
+    return value.schema === 2 && value.id === runId;
+  } catch {
+    return false;
+  }
 }
 
 // ── Bounded write_scope experiment (scope 7) ───────────────────────────────
@@ -262,9 +546,9 @@ export function workerWriteScopeGate(
   ctx: ToolCallContext & { writeScope?: WorkerWriteScope },
 ): { block?: boolean; reason?: string } | void {
   const scope = ctx.writeScope;
+  if (isRegisteredLifecycleDeviceWrite(event)) return;
   if (!scope?.enabled) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
-  if (event.toolName !== "bash" && isMountedToolRouteInput(event.input)) return;
   if (trustedActorOf(ctx) !== "worker") return;
   const paths = event.toolName === "bash" ? bashMutationTargets(commandFromInput(event.input)) : pathsFromInput(event.input);
   if (paths.length === 0) return;

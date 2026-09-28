@@ -10,7 +10,7 @@ import {
   setCtoControlPlane,
   setTeamControlPlane,
 } from "../src/cto/state.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+import { normalizePersistedState } from "../src/engine/state.js";
 import type { CtoState, TeamPlan } from "../src/cto/types.js";
 import type { CompletionIntent, WorkIdentity, TeamState } from "../src/engine/types.js";
 
@@ -175,15 +175,14 @@ function engineStateFixture(): TeamState {
   };
 }
 
-test("engine bootstrap fixture writer: malformed and conflicting typed state throws concrete rejection reasons", () => {
+test("engine state normalization: malformed and conflicting typed state returns concrete rejection reasons", () => {
   const malformedRoot = mkdtempSync(join(tmpdir(), "write-state-malformed-"));
   try {
     const malformed = engineStateFixture();
     malformed.completion_intent = { mode: "invalid" } as unknown as CompletionIntent;
-    assert.throws(
-      () => writeStateBootstrap(malformedRoot, malformed, { featureSlug: "malformed" }),
-      /state\.completion_intent\.mode/,
-    );
+    const issues: string[] = [];
+    assert.equal(normalizePersistedState(malformed, issues), null);
+    assert.match(issues.join("; "), /state\.completion_intent\.mode/);
   } finally {
     rmSync(malformedRoot, { recursive: true, force: true });
   }
@@ -197,10 +196,9 @@ test("engine bootstrap fixture writer: malformed and conflicting typed state thr
       acceptance: "explicit_human_acceptance",
       rationale: "A conflicting classification projection must fail closed.",
     };
-    assert.throws(
-      () => writeStateBootstrap(conflictRoot, conflicting, { featureSlug: "conflicting" }),
-      /classification\.completion_intent conflicts/,
-    );
+    const issues: string[] = [];
+    assert.equal(normalizePersistedState(conflicting, issues), null);
+    assert.match(issues.join("; "), /classification\.completion_intent conflicts/);
   } finally {
     rmSync(conflictRoot, { recursive: true, force: true });
   }

@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Escalation } from "@andvl1/omp-workflows-core";
+import { newCtoState, type Escalation, writeCtoState } from "@andvl1/omp-workflows-core";
 import {
   createChannelSet,
   startChannelDispatcher,
@@ -28,7 +28,6 @@ import {
   loadEscalationConfig,
   createEscalationAdapter,
   registerEscalationAdapter,
-  resolveInboxRunId,
   type InboxTask,
 } from "../src/adapters/registry.js";
 import { MockEscalationAdapter } from "../src/adapters/mock.js";
@@ -39,25 +38,49 @@ function withConfig(root: string, config: unknown): void {
   writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify(config));
 }
 
-function withActiveRun(root: string): void {
-  const runDir = join(root, ".work-state", "cto", "run-one");
-  mkdirSync(runDir, { recursive: true });
-  const now = new Date().toISOString();
-  writeFileSync(
-    join(runDir, "state.json"),
-    JSON.stringify({
-      schema: 1,
-      id: "run-one",
-      task: "Some task",
+function withActiveRun(root: string, ownerSession = "session-direct"): void {
+  const task = "Some task";
+  const runId = "run-one";
+  const createdAt = new Date().toISOString();
+  writeCtoState(
+    newCtoState({
+      id: runId,
+      task,
       branch: "main",
       autonomous: true,
-      plan: { id: "run-one", task: "Some task", teams: [], created_at: now },
-      teams: [],
-      integration: { status: "pending" },
-      pause: { kind: "none", reason: "" },
-      updated_at: now,
+      owner_session: ownerSession,
+      plan: { id: runId, task, teams: [], created_at: createdAt },
     }),
+    root,
   );
+}
+
+function writeCtoFixture(root: string, runId: string, task = "Test task"): string {
+  const createdAt = new Date().toISOString();
+  writeCtoState(
+    newCtoState({
+      id: runId,
+      task,
+      branch: "main",
+      autonomous: true,
+      plan: { id: runId, task, teams: [], created_at: createdAt },
+    }),
+    root,
+  );
+  return runId;
+}
+
+function claimBinding(runId: string): { session_id: string; getClaim: () => { run_id: string; ownership_epoch: string } } {
+  return {
+    session_id: "test-session",
+    getClaim: () => ({ run_id: runId, ownership_epoch: "test-epoch" }),
+  };
+}
+
+function exactClaim(_ctx: unknown, cwd: string): { run_id: string; ownership_epoch: string } | undefined {
+  return existsSync(join(cwd, ".work-state", "cto", "run-one", "state.json"))
+    ? { run_id: "run-one", ownership_epoch: "epoch-one" }
+    : undefined;
 }
 
 /**
@@ -254,7 +277,8 @@ test("RO inbound prohibition: an RO-only channel set is never wired or polled", 
       return origPoll();
     }) as typeof sink.pollOnce;
 
-    const stop = startChannelDispatcher(root, set, 10_000, {});
+    const runId = writeCtoFixture(root, "run-ro-prohibition");
+    const stop = startChannelDispatcher(root, set, 10_000, { binding: claimBinding(runId) });
     // Wiring is synchronous inside startChannelDispatcher; the immediate
     // tick for a primary-less set is a pure-microtask chain (drainOutbox
     // with a null adapter and pollInbox with no drop and no pollable both
@@ -308,17 +332,24 @@ test("RO inbound prohibition: only the primary is wired; the RO sink is not", as
       return result;
     }) as typeof primary.pollOnce;
 
-    const stop = startChannelDispatcher(root, set, 10_000, {});
+    const runId = writeCtoFixture(root, "run-ro-wire");
+    const received: InboxTask[] = [];
+    const stop = startChannelDispatcher(root, set, 10_000, {
+      binding: claimBinding(runId),
+      onTask: (task) => {
+        received.push(task);
+      },
+    });
     await pollGate.promise;
     await Promise.resolve();
 
     // The primary's inbound path IS live while the dispatcher owns the
-    // lease: a plain message files a task into the standby run's inbox
+    // lease: a plain message files a task into the claimed run's inbox
     // through the dispatcher's wired handler (wakeTask checks the lease).
     primary.injectPlainMessage("task via primary");
-    const runId = readdirSync(join(root, ".work-state", "cto"))[0]!;
     const filed = readdirSync(inboxDir(runId, root)).filter((n) => n.endsWith(".json"));
     assert.equal(filed.length, 1, "primary inbound filed the task");
+    assert.equal(received.length, 1, "primary inbound woke the supplied host callback");
 
     stop();
     assert.equal(sinkWired, 0, "RO sink never wired");
@@ -466,14 +497,14 @@ test("legacy RO adapter still receives outbox entries via startChannelDispatcher
     assert.equal(set.roSinks.length, 1);
     assert.equal(set.legacySingleAdapter, true, "no channels[] -> legacy single-adapter set");
 
-    const runId = "run-legacy";
+    const runId = writeCtoFixture(root, "run-legacy");
     mkdirSync(outboxDir(runId, root), { recursive: true });
     writeFileSync(
       join(outboxDir(runId, root), "q1.json"),
       JSON.stringify({ id: "run-legacy/team-a/q1", level: "question", title: "Q", body: "q" }),
     );
 
-    const stop = startChannelDispatcher(root, set, 10_000, {});
+    const stop = startChannelDispatcher(root, set, 10_000, { binding: claimBinding(runId) });
     await sendGate.promise;
     await Promise.resolve();
     stop();
@@ -619,9 +650,9 @@ test("envelope/legacy: isBidirectionalChannel telegram true, http false", () => 
 test("wave: handleInboxTask admits a wave with source_id == task.id", () => {
   const root = mkdtempSync(join(tmpdir(), "wave-admit-"));
   try {
-    const runId = resolveInboxRunId(root);
+    const runId = writeCtoFixture(root, "run-wave-admit");
     const received: InboxTask[] = [];
-    const path = handleInboxTask(root, { id: "t1", text: "Ship the fix", at: new Date().toISOString() }, (t) => received.push(t));
+    const path = handleInboxTask(root, { id: "t1", text: "Ship the fix", at: new Date().toISOString(), runId }, (t) => received.push(t));
     assert.ok(path, "task filed");
     const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
       wave_history: Array<{ id: string; source: string; source_id: string; task: string; status: string }>;
@@ -643,10 +674,11 @@ test("wave: handleInboxTask admits a wave with source_id == task.id", () => {
 test("wave: duplicate transport id admits exactly one wave", () => {
   const root = mkdtempSync(join(tmpdir(), "wave-dedup-"));
   try {
-    const runId = resolveInboxRunId(root);
+    const runId = writeCtoFixture(root, "run-wave-dedup");
     const at = new Date().toISOString();
-    handleInboxTask(root, { id: "t1", text: "Do the thing", at }, () => undefined);
-    const second = handleInboxTask(root, { id: "t1", text: "Do the thing", at }, () => undefined);
+    const task = { id: "t1", text: "Do the thing", at, runId };
+    handleInboxTask(root, task, () => undefined);
+    const second = handleInboxTask(root, task, () => undefined);
     assert.equal(second, null, "duplicate -> no re-file, no re-wake");
     const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
       wave_history: Array<{ source_id: string }>;
@@ -658,27 +690,28 @@ test("wave: duplicate transport id admits exactly one wave", () => {
   }
 });
 
-test("wave: wake rollback retry re-admits the SAME wave (no duplicate)", () => {
+test("wave: ambiguous wake retains the admitted wave without duplicate retry", () => {
   const root = mkdtempSync(join(tmpdir(), "wave-retry-"));
   try {
-    const runId = resolveInboxRunId(root);
+    const runId = writeCtoFixture(root, "run-wave-ambiguous");
     let calls = 0;
     const failing = () => {
       calls += 1;
-      if (calls === 1) throw new Error("wake failed (transport down)");
+      throw new Error("wake result unknown after host invocation");
     };
-    assert.throws(
-      () => handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, failing),
-      /wake failed/,
-    );
+    const task = { id: "t1", text: "Do the thing", at: new Date().toISOString(), runId };
+    const path = handleInboxTask(root, task, failing);
+    assert.ok(path, "ambiguous wake retains durable task");
     const received: InboxTask[] = [];
-    handleInboxTask(root, { id: "t1", text: "Do the thing", at: new Date().toISOString() }, (t) => received.push(t));
+    assert.equal(calls, 1);
+    const retry = handleInboxTask(root, task, (t) => received.push(t));
+    assert.equal(retry, null, "ambiguous task is not retried as a new admission");
+    assert.equal(received.length, 0);
     const state = JSON.parse(readFileSync(join(root, ".work-state", "cto", runId, "state.json"), "utf8")) as {
       wave_history: Array<{ id: string; source_id: string }>;
     };
-    assert.equal(state.wave_history.length, 1, "one wave across wake rollback + retry");
+    assert.equal(state.wave_history.length, 1, "one wave across ambiguous wake");
     assert.equal(state.wave_history[0]?.source_id, "t1");
-    assert.equal(received[0]?.waveId, state.wave_history[0]?.id, "retry carries the same wave id");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -686,28 +719,28 @@ test("wave: wake rollback retry re-admits the SAME wave (no duplicate)", () => {
 
 // ── Ask gate (capability-validated) ────────────────────────────────────────
 
-test("ask gate: blocks only with a validated RW primary AND an active run", () => {
+test("ask gate: blocks only with a validated RW primary AND an exact controller claim", () => {
   const root = mkdtempSync(join(tmpdir(), "ask-cap-"));
   try {
-    const gate = createAskRedirectGate();
+    const gate = createAskRedirectGate(exactClaim);
 
     // no config -> ask passes
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "no config -> pass");
+    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" }), undefined, "no config -> pass");
 
-    // http-only (RO, no validated rw primary) + active run -> ask passes
+    // http-only (RO, no validated rw primary) + claimed run -> ask passes
     withConfig(root, { adapter: "http", http: { url: "https://x" } });
     withActiveRun(root);
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "http-only + active run -> pass (RO fallback)");
+    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" }), undefined, "http-only + claim -> pass (RO fallback)");
 
-    // telegram rw + active run -> blocked with the outbox contract
+    // telegram rw + exact claim -> blocked with the outbox contract
     withConfig(root, { adapter: "telegram", telegram: { token: "t", chatId: "c" } });
-    const blocked = gate({ toolName: "ask" }, { cwd: root });
-    assert.ok(blocked?.block === true, "telegram rw + active run -> blocked");
+    const blocked = gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" });
+    assert.ok(blocked?.block === true, "telegram rw + exact claim -> blocked");
     assert.ok(blocked?.reason.includes("outbox"), "reason names the outbox route");
 
-    // telegram rw but NO active run -> ask passes (normal interactive work)
+    // telegram rw but NO exact claim -> ask passes (normal interactive work)
     rmSync(join(root, ".work-state"), { recursive: true, force: true });
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "rw channel without run -> pass");
+    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" }), undefined, "rw channel without claim -> pass");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -716,17 +749,17 @@ test("ask gate: blocks only with a validated RW primary AND an active run", () =
 test("ask gate: explicit validated RW primary blocks; declared-rw incapable kind passes (explicit channels[])", () => {
   const root = mkdtempSync(join(tmpdir(), "ask-explicit-"));
   try {
-    const gate = createAskRedirectGate();
+    const gate = createAskRedirectGate(exactClaim);
 
     // explicit validated RW primary (mock: inbound+outbound) + active run -> blocked
     withConfig(root, { channels: [{ id: "control", adapter: "mock", direction: "read-write", primary: true }] });
     withActiveRun(root);
-    const blocked = gate({ toolName: "ask" }, { cwd: root });
+    const blocked = gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" });
     assert.ok(blocked?.block === true, "explicit validated RW primary + active run -> blocked");
 
     // explicit declared-rw incapable kind (http: no inbound -> ro) + active run -> passes
     withConfig(root, { channels: [{ id: "sink", adapter: "http", direction: "read-write" }] });
-    assert.equal(gate({ toolName: "ask" }, { cwd: root }), undefined, "explicit declared-rw http downgrades to ro -> ask passes");
+    assert.equal(gate({ toolName: "ask" }, { cwd: root, session_id: "session-direct" }), undefined, "explicit declared-rw http downgrades to ro -> ask passes");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

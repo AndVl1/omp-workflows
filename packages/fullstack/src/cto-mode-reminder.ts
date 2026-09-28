@@ -6,81 +6,83 @@
  * the reminder states that so neither the main agent nor a subagent spawns
  * a nested CTO.
  *
- * Wired as a `context` hook: that event fires before EVERY LLM call (main
- * session and subagents alike). When an active CTO run exists under
- * `.work-state/cto/` (detected via core `findActiveCtoRun`), the handler
- * prepends a short `steering` user message restating the delegation contract
- * (orchestrator -> teams, lead -> workers, worker -> escalate up). The harness
- * wraps steering messages for emphasis and consumes them per turn, so the
- * reminder is fresh in front of the model at the moment it is about to act —
- * including turns after compaction, where the /cto prompt has drifted.
+ * Wired as a `context` hook: it receives an exact CTO claim from the
+ * bundle-owned session controller and prepends a short `steering` user
+ * message restating the delegation contract (orchestrator -> teams, lead ->
+ * workers, worker -> escalate up). A persisted latest-active run is never
+ * sufficient authority for this reminder.
  *
- * The mechanism was verified live (omp 17.2.8): `context` fires per turn, the
- * handler must return `{ messages: [...] }` (bare arrays are dropped), and a
- * `steering: true` user message reaches the model on every turn. Cost is one
- * short message per LLM call while a run is active; zero overhead otherwise
- * (one cached readdir per 10s when no run exists).
+ * The hook is intentionally fail-closed: a persisted latest-active run or
+ * cwd-only lookup never authorizes a reminder. The invoking bundle supplies
+ * the exact manager/session/profile claim for each callback.
  */
 
-import { findActiveCtoRun } from "@andvl1/omp-workflows-core";
-import type { ContextEvent, ContextEventResult } from "@oh-my-pi/pi-coding-agent";
-
+import { isCtoRunTerminal, readCtoState, type CtoClaimScope } from "@andvl1/omp-workflows-core";
+import type {
+  ContextEvent,
+  ContextEventResult,
+  ExtensionHandler,
+} from "@oh-my-pi/pi-coding-agent";
 /** Marker line used for dedupe and tests. Keep stable — it is user-visible. */
 export const CTO_MODE_MARKER = "[CTO-MODE-ACTIVE]";
-
-const CACHE_TTL_MS = 10_000;
 
 export interface CtoRunRef {
   runId: string;
   task: string;
 }
 
-interface CachedRef {
-  at: number;
-  run: CtoRunRef | null;
-}
+export type CtoReminderContext = {
+  cwd: string;
+};
 
-const cache = new Map<string, CachedRef>();
-
-/**
- * Build the reminder text. Kept short (~90 tokens) because it is paid on
- * every LLM call while a run is active.
- */
-export function buildCtoModeReminder(run: CtoRunRef): string {
-  const task = run.task && run.task !== run.runId ? run.task.trim().slice(0, 80) : "";
-  return [
-    `${CTO_MODE_MARKER} A CTO sub-orchestration run is ACTIVE in this workspace (run \`${run.runId}\`${task ? `: ${task}` : ""}).`,
-    "You are part of that run. DELEGATE, do not absorb:",
-    "- Orchestrator (the CTO): decompose and delegate problems to teams via `task`; never code or patch yourself.",
-    "- Team lead: every slice goes to a worker via `task`; escalate what you cannot decide to the CTO.",
-    "- Worker: complete your single task; escalate blockers to your lead; never re-delegate or expand scope.",
-    "The CTO is THE MAIN AGENT of this session (the resident CTO) — never spawned: do not run",
-    "`task(agent=cto)` / `task(agent=@cto)`; the role has no nested form. The CTO stays on-line",
-    "after each wave and returns to standby (await the next `[CTO-INBOX]` task).",
-  ].join("\n");
-}
+type CtoClaimResolver = (ctx: CtoReminderContext) => CtoClaimScope | undefined;
 
 /**
- * Resolve the active CTO run for a cwd. Cached briefly per cwd — the hook
- * fires per LLM call and must not do filesystem work each time. Returns null
- * on any error (the hook must never break the agent loop).
+ * Resolve the active CTO run only from an exact claim supplied by the
+ * invoking callback's captured host context. There is intentionally no
+ * latest-run or cwd-only fallback: a resolver must prove the manager,
+ * session, and interactive profile before returning a claim.
  */
-export function resolveActiveCtoRun(cwd: string): CtoRunRef | null {
-  const now = Date.now();
-  const hit = cache.get(cwd);
-  if (hit && now - hit.at < CACHE_TTL_MS) return hit.run;
-  cache.set(cwd, { at: now, run: null });
+export function resolveActiveCtoRun(
+  ctx: CtoReminderContext,
+  resolveClaim?: CtoClaimResolver,
+): CtoRunRef | null {
   try {
-    const active = findActiveCtoRun(cwd);
-    const run: CtoRunRef | null = active
-      ? { runId: active.runId, task: active.state.plan.task ?? "" }
-      : null;
-    cache.set(cwd, { at: now, run });
-    return run;
+    if (!ctx || typeof ctx.cwd !== "string" || ctx.cwd.length === 0 || !resolveClaim) return null;
+    const claim = resolveClaim(ctx);
+    if (
+      !claim
+      || typeof claim.run_id !== "string"
+      || claim.run_id.length === 0
+      || typeof claim.ownership_epoch !== "string"
+      || claim.ownership_epoch.length === 0
+    ) return null;
+    const state = readCtoState(claim.run_id, ctx.cwd);
+    if (!state || state.id !== claim.run_id || isCtoRunTerminal(state)) return null;
+    return { runId: claim.run_id, task: state.plan?.task ?? "" };
   } catch {
     return null;
   }
 }
+/**
+ * Render the short, explicit delegation contract for the resident CTO.
+ * Keep this text self-contained because it is injected into every context
+ * turn while the exact claim remains active.
+ */
+export function buildCtoModeReminder(run: CtoRunRef): string {
+  return [
+    CTO_MODE_MARKER,
+    "You are the MAIN AGENT — the resident CTO for this session.",
+    `Active CTO run: ${run.runId} — ${run.task}`,
+    "DELEGATE, do not absorb: orchestrator -> teams, lead -> workers, worker -> escalate up.",
+    "As orchestrator, never code or patch yourself; delegate implementation and reviews.",
+    "As lead, delegate every worker slice and escalate what you cannot decide to the CTO.",
+    "As worker, complete only the assigned slice, never re-delegate, and escalate blockers to the lead.",
+    "NEVER spawn a nested CTO with task(agent=cto) or task(agent=@cto).",
+    "After each wave, return to standby and await the next explicit task.",
+  ].join("\n");
+}
+
 
 /**
  * Prepend a steering reminder to a context snapshot. Returns the
@@ -127,19 +129,16 @@ function messageContainsText(message: unknown, needle: string): boolean {
 }
 
 /**
- * Extension `context` hook factory. The handler resolves the active CTO run
- * (cached), builds the reminder and prepends it as a steering user message.
- * Never throws: any error silently skips injection so the agent loop is never
- * disturbed. Returns `undefined` when no CTO run is active.
- *
- * The `context` hook contract: return `{ messages }` (a bare array is
- * dropped by the harness) with the modified snapshot. Steering user messages
- * are wrapped for emphasis and consumed per turn, so each LLM call re-injects.
+ * Extension `context` hook factory. The handler resolves a run only from the
+ * exact claim supplied by the fullstack session controller, then builds the
+ * reminder and prepends it as a steering user message. Never throws.
  */
-export function createCtoModeReminderHandler(): (event: ContextEvent, ctx: { cwd: string }) => ContextEventResult | undefined {
+export function createCtoModeReminderHandler(
+  resolveClaim?: CtoClaimResolver,
+): ExtensionHandler<ContextEvent, ContextEventResult> {
   return (event, ctx) => {
     try {
-      const run = resolveActiveCtoRun(ctx.cwd);
+      const run = resolveActiveCtoRun(ctx, resolveClaim);
       if (!run) return undefined;
       const injected = injectCtoModeReminder(event.messages ?? [], buildCtoModeReminder(run));
       if (!injected) return undefined;

@@ -2,6 +2,19 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [Unreleased]
+### Changed
+- **Breaking run-lifecycle cutover** — ordinary workflow state/API now use schema-2 canonical identity (`run_id = run_key = WorkIdentity.run_id`) and explicit `new`/`resume`/`rework`; existing runs resolve by human-readable name or read-only list (UUID remains technical). Branch is routing/compatibility context rather than run identity, so foreign-branch `resume`/`rework` is rejected. `workflow_prepare` emits committed transition receipts, while the transaction journal and lock/CAS protect state, artifact, and observability publication; execution claims and coordinator handover preserve worker/evidence identity and fail closed on busy or unknown ownership.
+- **Canonical consumers and legacy recovery** — legacy state and `continuation` are explicit import-only inputs; incompatible schema/API returns `migration_required`, and interrupted migration recovers transactionally or fails closed with `recovery_required`/`run_busy`. Before canonical commit only staging is rolled back; after commit recovery is forward repair that preserves canonical mapping. Fullstack/internal commands, status/report, run-scoped observability, and viewer use canonical run/revision readers; `/session-report` and `/workflow-view` require canonical selection and return explicit migration/unavailable guidance instead of legacy fallback. Ordinary runs have no archive command; deleting markers or manually editing canonical state is unsupported.
+
+### Fixed
+- **Explicit claimless legacy CTO recovery** — `/cto --recover-legacy --run <exact-cto-id>` (including namespaced host commands) can reconcile supported legacy JSON and transfer it to the current authenticated coordinator after interactive confirmation that the previous coordinator and all workers have stopped. Recovery preserves active work/history, records a byte-exact immutable backup and audit receipt, and atomically publishes canonical state with an engine-owned claim. Ordinary resume remains strict; headless/declined confirmation, ownership or snapshot drift, claims, pending work, unsafe backup paths and malformed state cannot bypass admission.
+- **Claimless legacy CTO contention** — ordinary run admission now treats an active legacy CTO state without a current control claim as `run_busy`, leaves `execution_claim` unset, and points to resume or explicit reconciliation instead of admitting competing work.
+- **Foreground E2E exit** — `ux-e2e start` now wakes its foreground observer on the PTY `exit` frame even when no later output arrives, closes the session, and exits instead of waiting indefinitely.
+- **Selector-only resume admission** — `workflow_prepare` now resolves the read-only selector before new-task intent handling for explicit `--run` resume, while conflicting top-level and selector IDs are rejected without mutation; no new public required field or alias was introduced.
+- **Idle branch-context refresh** — ordinary new-command ingress refreshes an idle cached host controller from the actual Git branch before intent handling; active, selected, or unknown claims retain the fail-closed branch check, so stale context is not silently migrated.
+
+
 ## [0.28.4] — 2026-09-04
 ### Fixed
 - **CTO state identity guidance** — `/cto` now explicitly distinguishes canonical CTO `CtoState.id` in `.work-state/cto/<id>/state.json` from `/do-work` `TeamState.run_key`, and requires CTO slice markers to use the canonical CTO run identity. Added a regression guard for the state-family boundary.

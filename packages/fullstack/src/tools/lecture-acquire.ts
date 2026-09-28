@@ -1,11 +1,15 @@
-import { readArtifact, resolveState, writeArtifact } from "@andvl1/omp-workflows-core";
+import { readArtifact, writeArtifact, type TeamState, type WorkflowSessionController } from "@andvl1/omp-workflows-core";
 import { createDefaultLectureAcquisitionService, isLectureAcquisitionError } from "../lecture-acquisition/service.js";
 import { loadLectureResearchConfig } from "../lecture-acquisition/config.js";
 
 type ToolContext = unknown;
 type Pi = { registerTool: (definition: any) => void };
 type Z = { object(shape: Record<string, unknown>): unknown };
-type Callbacks = { resolveSessionCwd(ctx: unknown): string | undefined; isMainSessionContext(ctx: unknown): boolean };
+type Callbacks = {
+  resolveSessionCwd(ctx: unknown): string | undefined;
+  isMainSessionContext(ctx: unknown): boolean;
+  getSessionController?(ctx: unknown, cwd: string): WorkflowSessionController | undefined;
+};
 const contextSignal = (ctx: unknown): AbortSignal | undefined => {
   if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return undefined;
   const signal = (ctx as Record<string, unknown>).signal;
@@ -20,6 +24,25 @@ type Result = Record<string, unknown>;
 const fail = (code: string, error?: string): Result => ({ ok: false, code, ...(error ? { error } : {}) });
 const MAX_LECTURE_TASK_LENGTH = 16_384;
 
+type CanonicalLectureSource =
+  | { state: TeamState; artifactsDir: string }
+  | { error: "WORKFLOW_STATE_UNAVAILABLE" | "WORKFLOW_STATE_INVALID" };
+function readCanonicalLectureSource(
+  cwd: string,
+  ctx: ToolContext,
+  callbacks: Callbacks,
+): CanonicalLectureSource {
+  const controller = callbacks.getSessionController?.(ctx, cwd);
+  const runId = controller?.selectedRunId();
+  if (!controller || !runId) return { error: "WORKFLOW_STATE_UNAVAILABLE" };
+  try {
+    const read = controller.readSelector().read(runId);
+    return { state: read.state, artifactsDir: read.artifacts_dir };
+  } catch {
+    return { error: "WORKFLOW_STATE_INVALID" };
+  }
+}
+
 export function registerLectureAcquireTool(pi: Pi, z: Z, callbacks: Callbacks): void {
   pi.registerTool({ name: "lecture_acquire", label: "Acquire lecture evidence", description: "Acquire bounded lecture evidence from the single URL and prompt in lecture_intake. Rights and media mode are read explicitly from intake; absent approval is metadata-only/fail-closed.", parameters: z.object({}), async execute(_id: string, _params: unknown, signal?: AbortSignal, _update?: unknown, ctx?: ToolContext) {
     let value: Result;
@@ -29,12 +52,10 @@ export function registerLectureAcquireTool(pi: Pi, z: Z, callbacks: Callbacks): 
         const cwd = callbacks.resolveSessionCwd(ctx);
         if (!cwd) value = fail("WORKFLOW_STATE_UNAVAILABLE");
         else {
-          const resolved = resolveState(cwd);
-          const state = resolved.state;
-          if (resolved.invalid) value = fail("WORKFLOW_STATE_INVALID");
-          else if (!state || !resolved.artifactsDir) value = fail("WORKFLOW_STATE_UNAVAILABLE");
-          else if (field(field(state, "classification"), "workflow") !== "lecture-research") value = fail("WORKFLOW_NOT_LECTURE_RESEARCH");
-          else if (field(state, "stage_cursor") !== "acquisition") value = fail("WORKFLOW_STAGE_REJECTED");
+          const resolved = readCanonicalLectureSource(cwd, ctx, callbacks);
+          if ("error" in resolved) value = fail(resolved.error);
+          else if (field(field(resolved.state, "classification"), "workflow") !== "lecture-research") value = fail("WORKFLOW_NOT_LECTURE_RESEARCH");
+          else if (field(resolved.state, "stage_cursor") !== "acquisition") value = fail("WORKFLOW_STAGE_REJECTED");
           else {
             const intake = readArtifact(resolved.artifactsDir, "lecture_intake");
             const taskValue = field(intake, "task");

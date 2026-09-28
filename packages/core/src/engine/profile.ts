@@ -11,6 +11,8 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateProfileExpressions } from "./predicate.js";
 import { validateStageFanInResolutions } from "./fan-in.js";
+import { isSafeArtifactId } from "./artifacts.js";
+
 import type {
   CheckpointPolicy,
   CheckpointRule,
@@ -72,6 +74,31 @@ function stringArray(value: unknown, path: string, issues: string[], allowEmpty 
   if (!allowEmpty && value.length === 0) issue(issues, path, "must not be empty");
   return true;
 }
+
+function validateStageArtifactLists(value: UnknownRecord, path: string, issues: string[]): void {
+  const lists: Array<{ key: "consumes" | "optional_consumes"; ids: string[] }> = [];
+  for (const key of ["consumes", "optional_consumes"] as const) {
+    if (!hasOwn(value, key)) continue;
+    if (!stringArray(value[key], `${path}.${key}`, issues)) continue;
+    const ids = value[key] as string[];
+    const seen = new Set<string>();
+    for (const [index, id] of ids.entries()) {
+      if (!isSafeArtifactId(id)) issue(issues, `${path}.${key}[${index}]`, "must be a safe artifact id");
+      if (seen.has(id)) issue(issues, `${path}.${key}[${index}]`, "duplicate artifact id");
+      seen.add(id);
+    }
+    lists.push({ key, ids });
+  }
+  const consumes = lists.find((list) => list.key === "consumes")?.ids;
+  const optional = lists.find((list) => list.key === "optional_consumes")?.ids;
+  if (consumes && optional) {
+    const requiredIds = new Set(consumes);
+    for (const [index, id] of optional.entries()) {
+      if (requiredIds.has(id)) issue(issues, `${path}.optional_consumes[${index}]`, "must not overlap consumes");
+    }
+  }
+}
+
 
 function enumValue(value: unknown, allowed: readonly string[], path: string, issues: string[]): boolean {
   if (typeof value !== "string" || !allowed.includes(value)) {
@@ -281,6 +308,7 @@ export function validateProfileControlPlane(profile: unknown): { ok: true } | { 
           if (stageIds.has(stage.id)) issue(issues, `${path}.id`, "duplicate stage id");
           stageIds.add(stage.id);
         }
+        validateStageArtifactLists(stage, path, issues);
         if (hasOwn(stage, "completion_intent")) validateCompletionIntent(stage.completion_intent, `${path}.completion_intent`, issues);
         if (hasOwn(stage, "checkpoint_policy")) validateCheckpointPolicy(stage.checkpoint_policy, `${path}.checkpoint_policy`, issues);
         if (hasOwn(stage, "roster_policy")) validateRosterPolicy(stage.roster_policy, `${path}.roster_policy`, issues);

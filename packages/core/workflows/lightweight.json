@@ -56,7 +56,8 @@
       "type": "single",
       "role": "${scope.dev_agent}",
       "consumes": ["review"],
-      "skip_if": "review.findings == []"
+      "skip_if": "review.findings == []",
+      "produces": "review_fixes"
     },
     {
       "id": "qa_tests",

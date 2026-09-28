@@ -37,21 +37,31 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, type CapabilityHandoff } from "../src/engine/durable.js";
-import { writeStateBootstrap, checkMonotonic } from "../src/engine/state.js";
+import { createCapability, authorizeDispatch as rawAuthorizeDispatch, completeDispatch as rawCompleteDispatch, advanceCursor as rawAdvanceCursor, type CapabilityHandoff } from "../src/engine/durable.js";
+import { checkMonotonic } from "../src/engine/state.js";
 import { buildDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
-import { run } from "../src/engine/run.js";
+import { run, prepareWorkflowState } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TaskCaller } from "../src/engine/stage.js";
 
 const NO_RUNTIME: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
 const WITH_RUNTIME: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
+const RUN_ID = "66666666-6666-4666-8666-666666666666";
+
+function authorizeDispatch(root: string, input: Parameters<typeof rawAuthorizeDispatch>[1]) {
+  return rawAuthorizeDispatch(root, { run_id: RUN_ID, ...input });
+}
+function completeDispatch(root: string, input: Parameters<typeof rawCompleteDispatch>[1]) {
+  return rawCompleteDispatch(root, { run_id: RUN_ID, ...input }, { runId: RUN_ID });
+}
+function advanceCursor(root: string, input: Parameters<typeof rawAdvanceCursor>[1]) {
+  return rawAdvanceCursor(root, { run_id: RUN_ID, ...input }, { runId: RUN_ID });
+}
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
 }
-
 function setup(
   branch: string,
   profile: Profile,
@@ -66,38 +76,30 @@ function setup(
   registerWorkflowProfiles([profile]);
   const persistedHash = profileHash(profile);
   const issued = createCapability({
-    run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
+    run_key: RUN_ID, branch, workflow: profile.name, profile_hash: persistedHash,
     stage_cursor: currentStageId, kind, expected_roster: roster,
   });
-  writeStateBootstrap(root, {
-    schema: 1,
-    branch,
-    run_key: branch,
+  const runDir = join(root, ".work-state", "runs", RUN_ID);
+  const artifactsDir = join(runDir, "artifacts");
+  mkdirSync(artifactsDir, { recursive: true });
+  for (const [id, value] of Object.entries(preArtifacts)) writeFileSync(join(artifactsDir, `${id}.json`), JSON.stringify(value));
+  writeFileSync(join(runDir, "state.json"), JSON.stringify({
+    schema: 2, run_id: RUN_ID, run_key: RUN_ID, lifecycle_status: "active", rework_generation: 0,
+    branch, title: "skip regression",
     classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: profile.name },
-    task: "skip regression",
-    workflow_override: false,
-    issue: null,
+    task: "skip regression", workflow_override: false, issue: null, required_inputs: {}, required_input_receipts: {},
     stage_cursor: currentStageId,
     stages: profile.stages.map((s) => ({ id: s.id, status: s.id === currentStageId ? "in_progress" as const : "pending" as const })),
-    artifacts: {},
-    pause: { kind: "none" as const, reason: "" },
-    policy: { strict_orchestrator: true },
-    profile_hash: persistedHash,
-    scope: flags,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    dispatch_capability: issued.state,
-    updated_at: new Date().toISOString(),
-  }, { featureSlug: "skip" });
-  const artifactsDir = join(root, ".work-state", "features", "skip", "artifacts");
-  mkdirSync(artifactsDir, { recursive: true });
-  for (const [id, value] of Object.entries(preArtifacts)) {
-    writeFileSync(join(artifactsDir, `${id}.json`), JSON.stringify(value));
-  }
+    artifacts: Object.fromEntries(Object.keys(preArtifacts).map((id) => [id, `artifacts/${id}.json`])),
+    pause: { kind: "none" as const, reason: "" }, policy: { strict_orchestrator: true },
+    profile_hash: persistedHash, scope: flags, cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    dispatch_capability: issued.state, updated_at: new Date().toISOString(),
+  }) + "\n");
   return { issued, root };
 }
 
 function readState(root: string): TeamState {
-  return JSON.parse(readFileSync(join(root, ".work-state", "features", "skip", "state.json"), "utf8")) as TeamState;
+  return JSON.parse(readFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), "utf8")) as TeamState;
 }
 
 function advanceAuth(issued: ReturnType<typeof createCapability>) {
@@ -376,11 +378,32 @@ test("WF-3: interpreter parity — run() skips the skip_if stage without dispatc
       ],
     };
     registerWorkflowProfiles([interpProfile]);
-    // The artifact the skip_if reads must exist when the walk evaluates it.
-    const artifactsDir = join(root, ".work-state", "features", branch, "artifacts");
+    const execution = {
+      session_id: "skip-interpreter-session",
+      caller: "host",
+      process_id: process.pid,
+      worktree: root,
+      branch,
+      authority: "coordinator",
+    } as const;
+    const prepared = prepareWorkflowState({
+      task: "interpreter skip",
+      cwd: root,
+      branch,
+      autonomous: true,
+      classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "skip-interp" },
+      files: [],
+      mode: "new",
+      execution,
+    });
+    const preparedState = JSON.parse(readFileSync(prepared.statePath, "utf8")) as TeamState;
+    writeFileSync(prepared.statePath, JSON.stringify({
+      ...preparedState,
+      artifacts: { ...(preparedState.artifacts ?? {}), qa_tests: "artifacts/qa_tests.json" },
+    }) + "\n");
+    const artifactsDir = prepared.artifactsDir;
     mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, "review.json"), JSON.stringify({ verdict: "approve", findings: [] }));
-
+    writeFileSync(join(artifactsDir, "review.json"), JSON.stringify({ findings: [] }) + "\n");
     const dispatchedAgents: string[] = [];
     const taskTool: TaskCaller = {
       async call({ agent }) {
@@ -388,7 +411,16 @@ test("WF-3: interpreter parity — run() skips the skip_if stage without dispatc
         return {
           id: "x",
           output: "ok",
-          artifacts: agent === "qa" ? { qa_tests: { tests_added: [], build_status: "pass" } } : {},
+          artifacts: agent === "qa"
+            ? {
+              qa_tests: {
+                tests_added: [],
+                build_status: "pass",
+                based_on_manual_qa: false,
+                coverage_note: "interpreter parity fixture",
+              },
+            }
+            : {},
           exitCode: 0,
         };
       },
@@ -398,11 +430,13 @@ test("WF-3: interpreter parity — run() skips the skip_if stage without dispatc
       task: "interpreter skip",
       cwd: root,
       branch,
-      autonomous: true,
       classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "skip-interp" },
+      mode: "resume",
+      run_id: prepared.state.run_id,
+      execution,
       taskTool,
     });
-    assert.equal(result.outcomes.some((o) => o.status === "failed"), false, "the run completes without failures");
+    assert.equal(result.outcomes.some((o) => o.status === "failed"), false, `the run completes without failures: ${JSON.stringify(result.outcomes)}`);
     assert.deepEqual(
       result.outcomes.map((o) => ({ stageId: o.stageId, status: o.status })),
       [

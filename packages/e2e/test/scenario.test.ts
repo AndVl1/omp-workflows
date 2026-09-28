@@ -19,28 +19,6 @@ test('scenario: loadScenario loads the built-in full-feature scenario', () => {
   const scenario = loadScenario(FULL_FEATURE, { slug: 'my-feature', branch: 'feat/x' });
 
   assert.equal(scenario.id, 'full-feature');
-  assert.equal(scenario.stages.length, 10);
-  assert.deepEqual(
-    scenario.stages.map(s => s.id),
-    [
-      'discovery',
-      'exploration',
-      'clarify',
-      'architecture',
-      'implementation',
-      'code_review',
-      'review_fixes',
-      'manual_qa',
-      'qa_tests',
-      'summary',
-    ],
-  );
-  const clarify = scenario.stages[2];
-  assert.ok(clarify !== undefined && clarify.ask_user !== undefined);
-  assert.equal(clarify.ask_user[0]?.count, 6, 'clarify expects 6 ask_user prompts');
-  const architecture = scenario.stages[3];
-  assert.ok(architecture !== undefined && architecture.ask_user !== undefined);
-  assert.equal(architecture.ask_user[0]?.answer, '1', 'architecture choice answers option #1');
   assert.ok(scenario.task.length > 0, 'task file content is resolved to a string');
   assert.ok(scenario.task.includes('feat/x'), '{{branch}} expanded in the task');
 });

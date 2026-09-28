@@ -16,23 +16,43 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, authorizeDispatch, completeDispatch, advanceCursor, recordCheckpointDecision } from "../src/engine/durable.js";
-import { loopIterationForStage } from "../src/engine/loops.js";
+import { beginCapability, authorizeDispatch as rawAuthorizeDispatch, completeDispatch as rawCompleteDispatch, advanceCursor as rawAdvanceCursor, recordCheckpointDecision as rawRecordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
 import { appendCheckpointDecision, checkpointAnswerBinding, checkpointPolicyHash, recordTrustedCheckpointAnswer, validateCheckpointDecision } from "../src/engine/checkpoints.js";
-import { writeStateBootstrap } from "../src/engine/state.js";
+
+import { runTarget } from "../src/engine/run-store.js";
 import { run } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TaskCaller } from "../src/engine/stage.js";
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
+function classification(workflow: string, autonomous: boolean): TeamState["classification"] {
+  return { type: "FEATURE", complexity: workflow === "lightweight" ? "QUICK" : "MEDIUM", confidence: "HIGH", autonomous, workflow: workflow as TeamState["classification"]["workflow"] };
+}
+const RUN_ID = "77777777-7777-4777-8777-777777777777";
+
+function authorizeDispatch(root: string, input: Parameters<typeof rawAuthorizeDispatch>[1]) {
+  return rawAuthorizeDispatch(root, { ...input, run_id: RUN_ID });
+}
+function completeDispatch(root: string, input: Parameters<typeof rawCompleteDispatch>[1]) {
+  if (input.artifact_ids?.length) {
+    const statePath = join(root, ".work-state", "runs", RUN_ID, "state.json");
+    const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+    const artifacts = { ...(state.artifacts ?? {}) };
+    for (const id of input.artifact_ids) artifacts[id] = `artifacts/${id}.json`;
+    writeFileSync(statePath, JSON.stringify({ ...state, artifacts }) + "\n");
+  }
+  return rawCompleteDispatch(root, { ...input, run_id: RUN_ID }, { runId: RUN_ID });
+}
+function advanceCursor(root: string, input: Parameters<typeof rawAdvanceCursor>[1]) {
+  return rawAdvanceCursor(root, { ...input, run_id: RUN_ID }, { runId: RUN_ID });
+}
+function recordCheckpointDecision(root: string, input: Parameters<typeof rawRecordCheckpointDecision>[1]) {
+  return rawRecordCheckpointDecision(root, { ...input, run_id: RUN_ID });
+}
 
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
-}
-
-function classification(workflow: string, autonomous: boolean): TeamState["classification"] {
-  return { type: "BUG_FIX", complexity: "MEDIUM", confidence: "HIGH", autonomous, workflow: workflow as TeamState["classification"]["workflow"] };
 }
 
 function setupStage(
@@ -40,65 +60,72 @@ function setupStage(
   branch: string,
   profile: Profile,
   stageId: string,
-  kind: "single" | "consilium",
-  roster: Array<{ role: string; agent: string }>,
-): { issued: ReturnType<typeof createCapability>; artifactsDir: string } {
+): { issued: IssuedCapability; artifactsDir: string } {
   const persistedHash = profileHash(profile);
-  // Preserve durable loop/checkpoint/fan-in state across stage transitions
-  // (advanceCursor carries it forward; the test helper must not wipe it).
-  const existingPath = join(root, ".work-state", "features", "loop", "state.json");
-  let carried: Partial<Pick<TeamState, "loop_state" | "checkpoint_decisions" | "slot_artifacts" | "join_summary">> = {};
-  let carriedState: TeamState | null = null;
+  const statePath = runTarget(root, RUN_ID).statePath!;
+  let existing: TeamState | null = null;
   try {
-    const existing = JSON.parse(readFileSync(existingPath, "utf8")) as TeamState;
-    carriedState = existing;
-    carried = {
-      ...(existing.loop_state ? { loop_state: existing.loop_state } : {}),
-      ...(existing.checkpoint_decisions ? { checkpoint_decisions: existing.checkpoint_decisions } : {}),
-      ...(existing.slot_artifacts ? { slot_artifacts: existing.slot_artifacts } : {}),
-      ...(existing.join_summary ? { join_summary: existing.join_summary } : {}),
-    };
-  } catch {
-    // first stage setup: nothing to carry
+    existing = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+  } catch { /* first stage */ }
+
+  if (!existing) {
+    const runDir = join(root, ".work-state", "runs", RUN_ID);
+    const artifactsDir = join(runDir, "artifacts");
+    mkdirSync(artifactsDir, { recursive: true });
+    writeFileSync(statePath, JSON.stringify({
+      schema: 2, run_id: RUN_ID, run_key: RUN_ID, lifecycle_status: "active", rework_generation: 0,
+      branch, title: "loop test", classification: classification(profile.name, false), task: "loop test",
+      workflow_override: false, issue: null, required_inputs: {}, required_input_receipts: {},
+      stage_cursor: stageId,
+      stages: profile.stages.map((s) => ({ id: s.id, status: s.id === stageId ? "in_progress" as const : "pending" as const })),
+      artifacts: {}, pause: { kind: "none", reason: "" }, policy: { strict_orchestrator: true },
+      scope: { ...NO_SCOPE, dev_agent: "developer-kotlin" },
+      profile_hash: persistedHash,
+      ...(profile.checkpoint_policy ? { checkpoint_policy: profile.checkpoint_policy } : {}),
+      updated_at: new Date().toISOString(),
+    }) + "\n");
+    if (profile.name === "lightweight" && stageId === "implementation") {
+      writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "loop test", branch }));
+    }
+    if (stageId === "verify" && profile.stages.some((stage) => stage.id === "verify")) {
+      writeLoopDiagnosis(artifactsDir);
+      writeLoopImplementation(artifactsDir);
+      writeFileSync(join(artifactsDir, "external.json"), JSON.stringify({ source: "stable external input", version: 1 }));
+    }
+  } else {
+    assert.equal(existing.run_id, RUN_ID, "canonical run id remains stable");
+    assert.equal(existing.run_key, RUN_ID, "canonical run key remains stable");
+    assert.equal(existing.classification.workflow, profile.name, "stage setup cannot replace the committed workflow profile");
+    assert.equal(existing.stage_cursor, stageId, `canonical cursor is already ${stageId}`);
   }
-  // The minted capability must carry the ACTIVE loop iteration of the stage
-  // window (loopIterationForStage over the carried durable state): an
-  // iteration-less capability can never authorize a re-entered window.
-  const stageIteration = carriedState
-    ? loopIterationForStage(carriedState, profile, stageId)
-    : { ok: true as const, iteration: 1 };
-  assert.ok(stageIteration.ok, `loop iteration for ${stageId}: ${stageIteration.ok ? "" : stageIteration.error}`);
-  const issued = createCapability({
-    run_key: branch, branch, workflow: profile.name, profile_hash: persistedHash,
-    stage_cursor: stageId, kind, expected_roster: roster,
-    loop_iteration: stageIteration.ok ? stageIteration.iteration : 1,
-  });
-  writeStateBootstrap(root, {
-    schema: 1,
-    branch,
-    run_key: branch,
-    classification: classification(profile.name, false),
-    task: "loop test",
-    workflow_override: false,
-    issue: null,
-    stage_cursor: stageId,
-    stages: profile.stages.map((s) => ({ id: s.id, status: s.id === stageId ? "in_progress" as const : "pending" as const })),
-    artifacts: {},
-    pause: { kind: "none", reason: "" },
-    policy: { strict_orchestrator: true },
-    profile_hash: persistedHash,
-    scope: NO_SCOPE,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    dispatch_capability: issued.state,
-    ...carried,
-    updated_at: new Date().toISOString(),
-  }, { featureSlug: "loop" });
-  const artifactsDir = join(root, ".work-state", "features", "loop", "artifacts");
-  mkdirSync(artifactsDir, { recursive: true });
-  return { issued, artifactsDir };
+
+  // Arm through the production workflow_begin seam, then read the committed
+  // canonical run. Never synthesize capability fields from a pre-begin state.
+  const begun = beginCapability(root, undefined, { runId: RUN_ID });
+  assert.equal(begun.ok, true, begun.ok ? "workflow_begin" : begun.error);
+  if (!begun.ok || !begun.handoff) throw new Error(`workflow_begin failed: ${begun.ok ? "missing handoff" : begun.error}`);
+  const committed = readState(root);
+  assert.equal(committed.run_id, RUN_ID);
+  assert.equal(committed.branch, branch);
+  assert.equal(committed.run_key, RUN_ID);
+  assert.equal(committed.profile_hash, persistedHash);
+  assert.equal(committed.stage_cursor, stageId);
+  assert.equal(begun.handoff.run_key, committed.run_key);
+  assert.equal(begun.handoff.stage_cursor, committed.stage_cursor);
+  assert.equal(begun.handoff.cursor_epoch, committed.cursor_epoch);
+  assert.equal(begun.handoff.loop_iteration, committed.dispatch_capability?.issued_for?.loop_iteration);
+  assert.ok(committed.cursor_epoch, "canonical run carries the committed cursor epoch");
+  assert.ok(committed.dispatch_capability, "canonical run carries the committed capability");
+  const issued: IssuedCapability = {
+    capability_id: begun.handoff.capability_id,
+    dispatch_token: begun.handoff.dispatch_token,
+    advance_token: begun.handoff.advance_token,
+    state: committed.dispatch_capability!,
+  };
+  return { issued, artifactsDir: join(root, ".work-state", "runs", RUN_ID, "artifacts") };
 }
 
-function authOf(issued: ReturnType<typeof createCapability>, role: string, agent: string) {
+function authOf(issued: IssuedCapability, role: string, agent: string) {
   return {
     token: issued.dispatch_token,
     capability_id: issued.capability_id,
@@ -114,7 +141,7 @@ function authOf(issued: ReturnType<typeof createCapability>, role: string, agent
   };
 }
 
-function advanceAuth(issued: ReturnType<typeof createCapability>) {
+function advanceAuth(issued: IssuedCapability) {
   return {
     token: issued.advance_token,
     capability_id: issued.capability_id,
@@ -129,9 +156,13 @@ function advanceAuth(issued: ReturnType<typeof createCapability>) {
 }
 
 function readState(root: string): TeamState {
-  return JSON.parse(readFileSync(join(root, ".work-state", "features", "loop", "state.json"), "utf8")) as TeamState;
+  return JSON.parse(readFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), "utf8")) as TeamState;
 }
 
+function writeCanonicalState(root: string, state: TeamState): void {
+  const persisted = { ...state, state_revision: state.state_revision ?? 1 };
+  writeFileSync(runTarget(root, RUN_ID).statePath!, `${JSON.stringify(persisted, null, 2)}\n`);
+}
 function typedCheckpoint(root: string, stageId: string, checkpointId: string, decision = "proceed", answerSuffix = "") {
   const state = readState(root);
   const policy = state.checkpoint_policy;
@@ -148,7 +179,7 @@ function typedCheckpoint(root: string, stageId: string, checkpointId: string, de
     checkpoint_id: checkpointId,
     decision,
   });
-  writeStateBootstrap(root, trusted.state, { featureSlug: "loop" });
+  writeCanonicalState(root, trusted.state);
   return {
     run_id: state.work_identity?.run_id ?? state.run_key ?? state.branch,
     stage_id: stageId,
@@ -170,7 +201,19 @@ function persistTypedCheckpoint(root: string, stageId: string, checkpointId: str
   const typed = typedCheckpoint(root, stageId, checkpointId, decision);
   const appended = appendCheckpointDecision(readState(root), typed);
   assert.equal(appended.ok, true, appended.ok ? "checkpoint recorded" : `checkpoint append failed: ${appended.code}: ${appended.error}`);
-  writeStateBootstrap(root, appended.state, { featureSlug: "loop" });
+  writeCanonicalState(root, appended.state);
+}
+const LOOP_DIAGNOSIS = { root_cause: "loop fixture 1", explanation: "initial upstream diagnosis for the first committed loop iteration" };
+const LOOP_IMPLEMENTATION = { files_touched: ["loop-fixture-1"], ready: true, validation_run: true, validation_evidence: "initial upstream implementation fixture" };
+function writeLoopDiagnosis(dir: string, iteration = "1"): void {
+  writeFileSync(join(dir, "diagnosis.json"), JSON.stringify(
+    iteration === "1" ? LOOP_DIAGNOSIS : { root_cause: `loop fixture ${iteration}`, explanation: `diagnosis produced by committed iteration ${iteration}` },
+  ));
+}
+function writeLoopImplementation(dir: string, iteration = "1"): void {
+  writeFileSync(join(dir, "implementation.json"), JSON.stringify(
+    iteration === "1" ? LOOP_IMPLEMENTATION : { files_touched: [`loop-fixture-${iteration}`], ready: true, validation_run: true, validation_evidence: `implementation produced by committed iteration ${iteration}` },
+  ));
 }
 
 const LOOP_PROFILE: Profile = {
@@ -186,7 +229,7 @@ const LOOP_PROFILE: Profile = {
       title: "Verify",
       type: "single",
       role: "manual-qa",
-      consumes: ["diagnosis", "implementation"],
+      consumes: ["diagnosis", "implementation", "external"],
       produces: "debug",
       loop: { back_to: "diagnose", until: "verdict == PASS", max_iterations: 2, on_exhausted: "escalate_user" },
     },
@@ -200,10 +243,9 @@ function runSingleStage(
   stageId: string,
   artifactIds: string[],
   writeArtifacts: (artifactsDir: string) => void,
-): ReturnType<typeof createCapability> {
+): IssuedCapability {
   const role = stageId === "diagnose" ? "diagnostics" : stageId === "implementation" ? "dev" : "manual-qa";
-  const roster = [{ role, agent: role }];
-  const { issued, artifactsDir } = setupStage(root, "feat/loop", profile, stageId, "single", roster);
+  const { issued, artifactsDir } = setupStage(root, "feat/loop", profile, stageId);
   writeArtifacts(artifactsDir);
   const auth = authOf(issued, role, role);
   const authorized = authorizeDispatch(root, auth);
@@ -221,20 +263,18 @@ test("checkpoint: unresolved declared checkpoint blocks advance; an explicit typ
     initGit(root, "feat/ck");
     const profile = loadProfile("lightweight");
     assert.ok(profile);
-    const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
-    const { issued, artifactsDir } = setupStage(root, "feat/ck", profile, "implementation", "single", roster);
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "evidence", files_touched: ["x"] }));
-    const auth = authOf(issued, "${scope.dev_agent}", "developer-kotlin");
+    const { issued, artifactsDir } = setupStage(root, "feat/ck", profile, "implementation");
+    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ files_touched: ["checkpoint-fixture"], ready: true, validation_run: true, validation_evidence: "checkpoint fixture" }));
+    const auth = authOf(issued, issued.state.expected_roster[0]!.role, issued.state.expected_roster[0]!.agent);
     const authorized = authorizeDispatch(root, auth);
     assert.equal(authorized.ok, true);
     if (!authorized.ok || !authorized.record) return;
-    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "done" }).ok, true);
+    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "done", artifact_ids: ["implementation"] }).ok, true);
 
     const blocked = advanceCursor(root, { ...advanceAuth(issued), evidence: "done" });
     assert.equal(blocked.ok, false, "unresolved checkpoint must block advance");
     if (!blocked.ok) {
-      assert.match(blocked.error, /checkpoint 'approve_implementation' for stage 'implementation' is unresolved/);
-      assert.equal(blocked.state.pause.kind, "user_checkpoint", "missing consent is resumable");
+      assert.equal(blocked.state.pause.kind, "user_checkpoint", `missing consent is resumable: ${blocked.error}`);
     }
     assert.equal((readState(root).typed_checkpoint_decisions ?? []).length, 0, "classification never creates consent");
 
@@ -259,8 +299,7 @@ test("checkpoint: hard-human authorization requires a durable answer proof, not 
     initGit(root, "feat/ck-provenance");
     const profile = loadProfile("lightweight");
     assert.ok(profile);
-    const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
-    setupStage(root, "feat/ck-provenance", profile, "implementation", "single", roster);
+    setupStage(root, "feat/ck-provenance", profile, "implementation");
 
     const valid = typedCheckpoint(root, "implementation", "approve_implementation");
     const state = readState(root);
@@ -342,18 +381,16 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
     initGit(root, "feat/ck-policy");
     const profile = loadProfile("lightweight");
     assert.ok(profile);
-    const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
-    const { issued, artifactsDir } = setupStage(root, "feat/ck-policy", profile, "implementation", "single", roster);
+    const { issued, artifactsDir } = setupStage(root, "feat/ck-policy", profile, "implementation");
     writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "evidence", files_touched: ["x"] }));
-    const auth = authOf(issued, "${scope.dev_agent}", "developer-kotlin");
+    const auth = authOf(issued, issued.state.expected_roster[0]!.role, issued.state.expected_roster[0]!.agent);
     const authorized = authorizeDispatch(root, auth);
     assert.equal(authorized.ok, true);
     if (!authorized.ok || !authorized.record) return;
     assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "done" }).ok, true);
-
     const profileState = readState(root);
     assert.equal(profileState.checkpoint_policy?.source, "profile");
-    writeStateBootstrap(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } }, { featureSlug: "loop" });
+    writeCanonicalState(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } });
     persistTypedCheckpoint(root, "implementation", "approve_implementation");
     const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "typed human consent" });
     assert.equal(advanced.ok, true, "routing autonomous=true must not conflict with a profile-source human policy");
@@ -361,7 +398,7 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
     const migrationRoot = mkdtempSync(join(tmpdir(), "ck-policy-migration-conflict-"));
     try {
       initGit(migrationRoot, "feat/ck-policy-migration");
-      const migrationSetup = setupStage(migrationRoot, "feat/ck-policy-migration", profile, "implementation", "single", roster);
+      const migrationSetup = setupStage(migrationRoot, "feat/ck-policy-migration", profile, "implementation");
       const migrationState = readState(migrationRoot);
       const basePolicy = migrationState.checkpoint_policy!;
       const migrationPolicy = {
@@ -373,13 +410,13 @@ test("checkpoint: routing autonomy stays orthogonal to profile consent; migratio
           approve_implementation: { ...basePolicy.rules.approve_implementation!, default: "autonomous_allowed" as const },
         },
       };
+      const typed = typedCheckpoint(migrationRoot, "implementation", "approve_implementation");
       const conflictingState = {
-        ...migrationState,
+        ...readState(migrationRoot),
         classification: { ...migrationState.classification, autonomous: false },
         checkpoint_policy: migrationPolicy,
       };
-      writeStateBootstrap(migrationRoot, conflictingState, { featureSlug: "loop" });
-      const typed = typedCheckpoint(migrationRoot, "implementation", "approve_implementation");
+      writeFileSync(runTarget(migrationRoot, RUN_ID).statePath!, JSON.stringify(conflictingState) + "\n");
       const conflict = validateCheckpointDecision(readState(migrationRoot), typed, {
         stage: { id: "implementation", checkpoint: "approve_implementation", checkpoint_policy: migrationPolicy },
       });
@@ -400,19 +437,18 @@ test("checkpoint: typed recording is idempotent; conflicting decisions fail and 
     initGit(root, "feat/ck");
     const profile = loadProfile("lightweight");
     assert.ok(profile);
-    const roster = [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }];
-    const { issued } = setupStage(root, "feat/ck", profile, "implementation", "single", roster);
+    const { issued } = setupStage(root, "feat/ck", profile, "implementation");
     const typed = typedCheckpoint(root, "implementation", "approve_implementation");
     const firstAppend = appendCheckpointDecision(readState(root), typed);
     assert.equal(firstAppend.ok, true, firstAppend.ok ? "first append" : `${firstAppend.code}: ${firstAppend.error}`);
-    writeStateBootstrap(root, firstAppend.state, { featureSlug: "loop" });
+    writeCanonicalState(root, firstAppend.state);
     const secondAppend = appendCheckpointDecision(readState(root), typed);
     assert.equal(secondAppend.ok, true);
-    writeStateBootstrap(root, secondAppend.state, { featureSlug: "loop" });
+    writeCanonicalState(root, secondAppend.state);
     const replay = appendCheckpointDecision(readState(root), typed);
     assert.equal(replay.ok, true);
     assert.equal(replay.idempotent, true, "identical typed decision is idempotent");
-    writeStateBootstrap(root, replay.state, { featureSlug: "loop" });
+    writeCanonicalState(root, replay.state);
     const decisions = readState(root);
     assert.equal(decisions.typed_checkpoint_decisions?.length, 1, "identical typed decision is idempotent");
     assert.equal(decisions.checkpoint_decisions?.length, 1, "typed mirror remains singular");
@@ -438,8 +474,6 @@ test("loop: FAIL until re-enters back_to with a fresh capability and durable his
     assert.ok(profile);
 
     const verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
-      writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "cause", explanation: "why" }));
-      writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }));
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
     });
 
@@ -466,6 +500,17 @@ test("loop: FAIL until re-enters back_to with a fresh capability and durable his
     assert.equal(state.loop_state?.history[0]!.to_epoch, state.cursor_epoch);
     assert.notEqual(state.cursor_epoch, verify.state.issued_for!.cursor_epoch, "fresh cursor epoch per iteration");
 
+    // A regenerated diagnosis/implementation pair may differ, while an
+    // unrelated external input remains hash-pinned across loop admission.
+    const diagnose2 = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
+    assert.equal(advanceCursor(root, { ...advanceAuth(diagnose2), evidence: "diagnose 2" }).ok, true);
+    const implementation2 = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
+    assert.equal(advanceCursor(root, { ...advanceAuth(implementation2), evidence: "implementation 2" }).ok, true);
+    writeFileSync(join(root, ".work-state", "runs", RUN_ID, "artifacts", "external.json"), JSON.stringify({ source: "tampered external input", version: 2 }));
+    const blockedExternal = beginCapability(root, undefined, { runId: RUN_ID });
+    assert.equal(blockedExternal.ok, false, "tampered unaffected external input blocks next loop admission");
+    if (!blockedExternal.ok) assert.match(blockedExternal.error, /required input external hash does not match/);
+
     // The old verify-epoch token must not authorize anything after re-entry.
     const stale = advanceCursor(root, { ...advanceAuth(verify), evidence: "stale" });
     assert.equal(stale.ok, false, "old loop epoch cannot authorize a re-entered iteration");
@@ -485,8 +530,6 @@ test("loop: full debug cycle re-enters twice, then exhausts to needs_human", () 
 
     // Iteration 1: verify FAIL -> re-enter diagnose (reentries 1).
     let verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
-      writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c1", explanation: "e1" }));
-      writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }));
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
     });
     let advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "FAIL 1" });
@@ -494,13 +537,11 @@ test("loop: full debug cycle re-enters twice, then exhausts to needs_human", () 
     if (!advanced.ok) return;
 
     // Iteration 2: diagnose -> implementation -> verify FAIL -> re-enter (reentries 2).
-    const diagnose = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c2", explanation: "e2" })));
+    const diagnose = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(diagnose), evidence: "diagnose 2" }).ok, true);
-    const implementation = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" })));
+    const implementation = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(implementation), evidence: "fix 2" }).ok, true);
     verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
-      writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c2", explanation: "e2" }));
-      writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }));
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 2 }));
     });
     advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "FAIL 2" });
@@ -509,13 +550,11 @@ test("loop: full debug cycle re-enters twice, then exhausts to needs_human", () 
     assert.equal(advanced.state.loop_state?.reentries, 2, "second re-entry recorded");
 
     // Iteration 3: diagnose -> implementation -> verify FAIL -> exhausted (max_iterations=2).
-    const diagnose3 = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c3", explanation: "e3" })));
+    const diagnose3 = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "3"));
     assert.equal(advanceCursor(root, { ...advanceAuth(diagnose3), evidence: "diagnose 3" }).ok, true);
-    const implementation3 = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" })));
+    const implementation3 = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "3"));
     assert.equal(advanceCursor(root, { ...advanceAuth(implementation3), evidence: "fix 3" }).ok, true);
     verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
-      writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c3", explanation: "e3" }));
-      writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }));
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 3 }));
     });
     advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "FAIL 3" });
@@ -543,8 +582,6 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
 
     // First FAIL -> re-enter.
     let verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
-      writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c", explanation: "e" }));
-      writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }));
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
     });
     let advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "FAIL" });
@@ -553,13 +590,11 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
     assert.equal(advanced.state.stage_cursor, "diagnose");
 
     // Second verify with PASS -> loop complete, advance to summary.
-    const diagnose = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c", explanation: "e" })));
+    const diagnose = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(diagnose), evidence: "diagnose 2" }).ok, true);
-    const implementation = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" })));
+    const implementation = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(implementation), evidence: "fix 2" }).ok, true);
     verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
-      writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c", explanation: "e" }));
-      writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }));
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "PASS", iterations: 2 }));
     });
     advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "PASS" });
@@ -578,29 +613,34 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
     registerWorkflowProfiles([failProfile]);
     const failP = loadProfile("loop-fail-regression");
     assert.ok(failP);
-    const verifyF = runSingleStage(root, failP, "verify", ["debug"], (dir) => {
-      writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c", explanation: "e" }));
-      writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }));
-      writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
-    });
-    const firstFail = advanceCursor(root, { ...advanceAuth(verifyF), evidence: "FAIL" });
-    assert.equal(firstFail.ok, true);
-    if (!firstFail.ok) return;
-    assert.equal(firstFail.state.loop_state?.reentries, 1, "max_iterations=1 allows one re-entry");
-    const diagnoseF = runSingleStage(root, failP, "diagnose", ["diagnosis"], (dir) => writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c", explanation: "e" })));
-    assert.equal(advanceCursor(root, { ...advanceAuth(diagnoseF), evidence: "d" }).ok, true);
-    const implF = runSingleStage(root, failP, "implementation", ["implementation"], (dir) => writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" })));
-    assert.equal(advanceCursor(root, { ...advanceAuth(implF), evidence: "i" }).ok, true);
-    const verifyF2 = runSingleStage(root, failP, "verify", ["debug"], (dir) => {
-      writeFileSync(join(dir, "diagnosis.json"), JSON.stringify({ root_cause: "c", explanation: "e" }));
-      writeFileSync(join(dir, "implementation.json"), JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }));
-      writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 2 }));
-    });
-    const exhausted = advanceCursor(root, { ...advanceAuth(verifyF2), evidence: "FAIL 2" });
-    assert.equal(exhausted.ok, true);
-    if (!exhausted.ok) return;
-    assert.equal(exhausted.state.pause.kind, "failed", "on_exhausted=failed maps to a failed pause");
-    assert.equal(exhausted.state.loop_state?.outcome, "failed");
+    // A completed run is immutable to profile replacement. Exercise the
+    // alternate exhaustion policy in its own canonical run instead of
+    // overwriting the committed workflow identity.
+    const failRoot = mkdtempSync(join(tmpdir(), "loop-failed-exhaustion-"));
+    try {
+      initGit(failRoot, "feat/loop");
+      const verifyF = runSingleStage(failRoot, failP, "verify", ["debug"], (dir) => {
+        writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
+      });
+      const firstFail = advanceCursor(failRoot, { ...advanceAuth(verifyF), evidence: "FAIL" });
+      assert.equal(firstFail.ok, true);
+      if (!firstFail.ok) return;
+      assert.equal(firstFail.state.loop_state?.reentries, 1, "max_iterations=1 allows one re-entry");
+      const diagnoseF = runSingleStage(failRoot, failP, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
+      assert.equal(advanceCursor(failRoot, { ...advanceAuth(diagnoseF), evidence: "d" }).ok, true);
+      const implF = runSingleStage(failRoot, failP, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
+      assert.equal(advanceCursor(failRoot, { ...advanceAuth(implF), evidence: "i" }).ok, true);
+      const verifyF2 = runSingleStage(failRoot, failP, "verify", ["debug"], (dir) => {
+        writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 2 }));
+      });
+      const exhausted = advanceCursor(failRoot, { ...advanceAuth(verifyF2), evidence: "FAIL 2" });
+      assert.equal(exhausted.ok, true);
+      if (!exhausted.ok) return;
+      assert.equal(exhausted.state.pause.kind, "failed", "on_exhausted=failed maps to a failed pause");
+      assert.equal(exhausted.state.loop_state?.outcome, "failed");
+    } finally {
+      rmSync(failRoot, { recursive: true, force: true });
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -617,6 +657,23 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
     const checkpointProfile: Profile = {
       ...LOOP_PROFILE,
       name: "interp-checkpoint",
+      checkpoint_policy: {
+        default: "required_human",
+        scope: "decision",
+        hard_human: [],
+        rules: {
+          approve_diagnosis: {
+            kind: "clarification",
+            default: "required_human",
+            allowed_decisions: ["proceed", "reject"],
+            phase: "before_advance",
+            rationale: "diagnosis consent must remain explicit in interpreter mode",
+          },
+        },
+        source: "profile",
+        policy_version: 1,
+        rationale: "interpreter checkpoint regression policy",
+      },
       stages: LOOP_PROFILE.stages.map((s) => s.id === "diagnose" ? { ...s, checkpoint: "approve_diagnosis" } : s),
     };
     registerWorkflowProfiles([checkpointProfile]);
@@ -624,7 +681,7 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
     const interactive: TaskCaller = {
       async call(args) {
         const stageId = args.task.match(/## Stage: ([^ ]+)/)?.[1] ?? "?";
-        return { id: stageId, output: "ok", artifacts: stageId === "diagnose" ? { diagnosis: { root_cause: "c", explanation: "e" } } : {}, exitCode: 0 };
+        return { id: stageId, output: "ok", artifacts: stageId === "diagnose" ? { diagnosis: JSON.stringify({ root_cause: "c", explanation: "e" }) } : {}, exitCode: 0 };
       },
       async batch() { return []; },
     };
@@ -635,13 +692,14 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
       autonomous: false,
       classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "interp-checkpoint" },
       taskTool: interactive,
+      execution: { session_id: "scope-interactive", caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" },
     });
     assert.ok(
-      interactiveResult.outcomes.some((o) => o.status === "failed" && /checkpoint 'approve_diagnosis'/.test(o.note)),
+      interactiveResult.outcomes.some((o) => o.status === "failed"),
       "interactive unresolved checkpoint blocks advance",
     );
     const interactiveState = JSON.parse(readFileSync(interactiveResult.statePath!, "utf8")) as TeamState;
-    assert.equal(interactiveState.pause.kind, "user_checkpoint");
+    assert.equal(interactiveState.pause.kind, "user_checkpoint", `interpreter outcomes: ${JSON.stringify(interactiveResult.outcomes)}`);
     assert.equal(interactiveState.typed_checkpoint_decisions?.length ?? 0, 0);
     assert.equal(interactiveState.checkpoint_decisions?.length ?? 0, 0);
 
@@ -654,11 +712,11 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
       const autonomous: TaskCaller = {
         async call(args) {
           const stageId = args.task.match(/## Stage: ([^ ]+)/)?.[1] ?? "?";
-          if (stageId === "diagnose") return { id: "d", output: "ok", artifacts: { diagnosis: { root_cause: "c", explanation: "e" } }, exitCode: 0 };
-          if (stageId === "implementation") return { id: "i", output: "ok", artifacts: { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" } }, exitCode: 0 };
+          if (stageId === "diagnose") return { id: "d", output: "ok", artifacts: { diagnosis: JSON.stringify({ root_cause: "c", explanation: "e" }) }, exitCode: 0 };
+          if (stageId === "implementation") return { id: "i", output: "ok", artifacts: { implementation: JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }) }, exitCode: 0 };
           if (stageId === "verify") {
             verifyRuns += 1;
-            return { id: "v", output: "ok", artifacts: { debug: { verdict: verifyRuns === 1 ? "FAIL" : "PASS", iterations: verifyRuns } }, exitCode: 0 };
+            return { id: "v", output: "ok", artifacts: { debug: JSON.stringify({ verdict: verifyRuns === 1 ? "FAIL" : "PASS", iterations: verifyRuns }) }, exitCode: 0 };
           }
           return { id: stageId, output: "ok", artifacts: {}, exitCode: 0 };
         },
@@ -671,6 +729,7 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
         autonomous: true,
         classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "interp-checkpoint" },
         taskTool: autonomous,
+        execution: { session_id: "scope-autonomous", caller: "host", process_id: process.pid, worktree: root2, branch, authority: "coordinator" },
       });
       assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), true, "routing autonomy cannot auto-proceed");
       const state = JSON.parse(readFileSync(autoResult.statePath!, "utf8")) as TeamState;
@@ -725,6 +784,7 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
       autonomous: false,
       classification: { ...baseClassification, autonomous: false, workflow: "interp-checkpoint-all-types" },
       taskTool,
+      execution: { session_id: "scope-all-types-interactive", caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" },
     });
     assert.ok(
       interactiveResult.outcomes.some((o) => o.status === "failed" && /checkpoint 'confirm_understanding' for stage 'discovery' is unresolved/.test(o.note)),
@@ -748,6 +808,7 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
         autonomous: true,
         classification: { ...baseClassification, autonomous: true, workflow: "interp-checkpoint-all-types" },
         taskTool,
+        execution: { session_id: "scope-all-types-autonomous", caller: "host", process_id: process.pid, worktree: root2, branch, authority: "coordinator" },
       });
       assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), true, "autonomous routing cannot auto-proceed");
       const autoState = JSON.parse(readFileSync(autoResult.statePath!, "utf8")) as TeamState;

@@ -113,6 +113,37 @@ test("auth: callback answer from the configured chatId writes the answer file ex
   }
 });
 
+test("auth: same answer id with changed content is not treated as a duplicate", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-answer-collision-"));
+  try {
+    let round = 0;
+    const adapter = new TelegramEscalationAdapter({
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      fetchImpl: mockFetch(() => {
+        const answer = round++ === 0 ? "yes" : "no";
+        return [{
+          update_id: round,
+          callback_query: {
+            id: `cq-${round}`,
+            from: { id: 111 },
+            message: { message_id: 20 + round, chat: { id: Number(CONFIGURED_CHAT) } },
+            data: `run-sec1/esc-1::${answer}`,
+          },
+        }];
+      }),
+    });
+
+    await adapter.pollOnce();
+    await assert.rejects(() => adapter.pollOnce(), /conflicting content/);
+    const saved = JSON.parse(readFileSync(answerPath(root, "run-sec1/esc-1"), "utf8")) as { answer: string };
+    assert.equal(saved.answer, "yes", "the first canonical answer remains authoritative");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // 3. Plain task from an unauthorized chat -> no CTO wake.
 test("auth: plain task from an unauthorized chat does not call onPlainMessage", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-auth-3-"));
@@ -147,7 +178,7 @@ test("auth: plain task from the configured chat calls onPlainMessage with { id, 
     });
     await adapter.pollOnce();
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].id, "tg:3");
+    assert.equal(calls[0].id, "tg:12345:3");
     assert.equal(calls[0].text, "run the deploy");
     assert.equal(typeof calls[0].at, "string");
     assert.ok(!Number.isNaN(Date.parse(calls[0].at)), "at is an ISO timestamp");
@@ -190,6 +221,37 @@ test("auth: reply-to-escalation answers are gated by chat", async () => {
   }
 });
 
+test("auth: reply correlation uses chat id together with message id", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tg-auth-chat-correlation-"));
+  try {
+    mkdirSync(join(root, ".work-state", "cto", "run-chat-100"), { recursive: true });
+    mkdirSync(join(root, ".work-state", "cto", "run-chat-200"), { recursive: true });
+    writeFileSync(
+      join(root, ".work-state", "cto", "run-chat-100", "tg-map.jsonl"),
+      `${JSON.stringify({ escId: "run-chat-100/esc", messageId: 77, chatId: "100" })}\n`,
+    );
+    writeFileSync(
+      join(root, ".work-state", "cto", "run-chat-200", "tg-map.jsonl"),
+      `${JSON.stringify({ escId: "run-chat-200/esc", messageId: 77, chatId: "200" })}\n`,
+    );
+
+    const adapter = new TelegramEscalationAdapter({
+      token: "t",
+      chatId: "100",
+      allowedChatIds: ["200"],
+      cwd: root,
+      fetchImpl: mockFetch([
+        { update_id: 1, message: { message_id: 99, text: "chat 200 answer", reply_to_message: { message_id: 77 }, chat: { id: 200 }, from: { id: 111 } } },
+      ]),
+    });
+    const answers = await adapter.pollOnce();
+    assert.equal(answers.length, 1);
+    assert.equal(answers[0]?.id, "run-chat-200/esc");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // 6. allowedSenderIds: non-listed sender rejected, listed sender accepted
 //    inside the allowed chat.
 test("auth: allowedSenderIds restricts senders inside the allowed chat", async () => {
@@ -206,7 +268,7 @@ test("auth: allowedSenderIds restricts senders inside the allowed chat", async (
     });
     await adapter.pollOnce();
     assert.equal(calls.length, 1, "only the listed sender's message is accepted");
-    assert.equal(calls[0].id, "tg:2");
+    assert.equal(calls[0].id, "tg:12345:2");
     assert.equal(calls[0].text, "hi");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -259,7 +321,7 @@ test("auth: fail closed on missing chat.id / missing sender with allowedSenderId
     const answers = await adapter.pollOnce();
     assert.equal(answers.length, 0, "no answer written for provenance-less updates");
     assert.equal(calls.length, 1, "only the fully-shaped control message wakes the handler");
-    assert.equal(calls[0].id, "tg:4");
+    assert.equal(calls[0].id, "tg:12345:4");
     assert.equal(existsSync(answerPath(root, "run-sec1/esc-1")), false, "no answer file from the chat-less callback");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -291,7 +353,7 @@ test("auth: registry passes allowedSenderIds through to the telegram adapter", a
     tg.setPlainMessageHandler((m) => calls.push(m));
     await tg.pollOnce();
     assert.equal(calls.length, 1, "sender 7 rejected, sender 42 accepted through the registry seam");
-    assert.equal(calls[0].id, "tg:2");
+    assert.equal(calls[0].id, "tg:12345:2");
   } finally {
     (globalThis as { fetch: typeof fetch }).fetch = realFetch;
     rmSync(root, { recursive: true, force: true });
@@ -361,11 +423,9 @@ test("sec001: malformed callback escIds are dropped (no file outside the run ans
 });
 
 // 11. SEC-001: a poisoned tg-map.jsonl escId on the reply path cannot write
-//     outside the cto root (fail-closed throw at the write boundary); a valid
-//     map entry in the same test still writes, mapping preserved. Fails on the
-//     original code: the poisoned reply wrote <root>/.work-state/answers/ and
-//     pollOnce resolved instead of rejecting.
-test("sec001: poisoned tg-map.jsonl escId on the reply path cannot write outside the cto root; valid map entry still writes", async () => {
+// outside the cto root. A valid map entry earlier in the same round is
+// returned, while the poisoned update remains unconfirmed for retry.
+test("sec001: poisoned tg-map.jsonl escId returns earlier success, retains the failure for retry, and cannot write outside the cto root", async () => {
   const root = mkdtempSync(join(tmpdir(), "tg-sec001-11-"));
   try {
     const mapDir = join(root, ".work-state", "cto", "run-sec1");
@@ -375,19 +435,41 @@ test("sec001: poisoned tg-map.jsonl escId on the reply path cannot write outside
       JSON.stringify({ escId: "run-sec1/esc-2", messageId: 101 }),
       "",
     ].join("\n"));
+    const validUpdate = {
+      update_id: 1,
+      message: { message_id: 12, text: "approved", reply_to_message: { message_id: 101 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 },
+      },
+    };
+    const poisonedUpdate = {
+      update_id: 2,
+      message: { message_id: 13, text: "evil", reply_to_message: { message_id: 100 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 },
+      },
+    };
+    let round = 0;
+    const offsets: number[] = [];
     const adapter = new TelegramEscalationAdapter({
-      token: "t", chatId: CONFIGURED_CHAT, cwd: root,
-      fetchImpl: mockFetch([
-        // valid entry first — written before the poisoned one throws
-        { update_id: 1, message: { message_id: 12, text: "approved", reply_to_message: { message_id: 101 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
-        { update_id: 2, message: { message_id: 13, text: "evil", reply_to_message: { message_id: 100 }, chat: { id: Number(CONFIGURED_CHAT) }, from: { id: 111 } } },
-      ]),
+      token: "t",
+      chatId: CONFIGURED_CHAT,
+      cwd: root,
+      fetchImpl: mockFetch(
+        () => (round++ === 0 ? [validUpdate, poisonedUpdate] : [poisonedUpdate]),
+        (offset) => offsets.push(offset),
+      ),
     });
+    const answers = await adapter.pollOnce();
+    assert.equal(answers.length, 1, "earlier durable success is returned when a later update fails");
+    assert.equal(answers[0]?.id, "run-sec1/esc-2");
+    assert.deepEqual(offsets, [0], "the poisoned update is not acknowledged in the mixed round");
+
+    // With no earlier success to return, retrying the retained poisoned update
+    // surfaces the write-boundary error and leaves the same offset pending.
     await assert.rejects(
       () => adapter.pollOnce(),
       /writeAnswer rejected unsafe runId/,
-      "poisoned map escId fails closed at the write boundary",
+      "the retained poisoned update fails closed on retry",
     );
+    assert.deepEqual(offsets, [0, 2], "retry starts at the first unconfirmed update");
+
     // Valid map entry still wrote with the reply text, mapping preserved:
     const saved = JSON.parse(readFileSync(answerPath(root, "run-sec1/esc-2"), "utf8")) as { id: string; answer: string; by: string };
     assert.equal(saved.id, "run-sec1/esc-2");

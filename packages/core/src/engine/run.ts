@@ -23,6 +23,8 @@
  * is used verbatim, never defaulted).
  */
 
+import { randomUUID } from "node:crypto";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { readFileSync } from "node:fs";
 import { loadAllProfiles, profileHash, resolveWorkflow, selectProfile } from "./profile.js";
 import { resolveConfig, resolveAgentForRole } from "./config.js";
@@ -31,17 +33,47 @@ import {
   DETACHED_BRANCH,
   NO_GIT_BRANCH,
   resolveActiveBranch,
+  resolveCanonicalRun,
   reopenFromFeedback,
-  resolveState,
+  invalidateReentryInputEvidence,
   setStageStatus,
   updateStateAtomically,
+  withWorkspaceTransaction,
 } from "./state.js";
-import { authorizeDispatch, completeDispatch, advanceCursor, createCapability, type IssuedCapability } from "./durable.js";
+import { readRequiredStageInputs, resolveStageDispatchSlots, walkProfile, type StageContext, type TaskCaller } from "./stage.js";
+import { authorizeDispatch, completeDispatch, advanceCursor, createCapability, materializeMigratedDispatches, type IssuedCapability } from "./durable.js";
 import { resolveCheckpointDeclaration } from "./checkpoints.js";
 import { loopIterationForStage } from "./loops.js";
 import { keywordClassify } from "./classify.js";
-import type { Classification, Complexity, Confidence, Profile, RoleConfig, TaskType, TeamState, WorkflowName } from "./types.js";
-import { walkProfile, resolveStageDispatchSlots, type StageContext, type TaskCaller } from "./stage.js";
+import { assertTrustedExecutionContext, LifecycleError, lifecyclePayloadHash } from "./run-lifecycle.js";
+import { discoverLegacySources, migrateLegacySource, recoverLegacyMigrations } from "./run-migration.js";
+import {
+  candidateForState,
+  finalizeCanonicalRun,
+  persistCanonicalRun,
+  readRunControl,
+  readRunState,
+  readRunStateNoRecovery,
+  reworkCanonicalRunAtomically,
+  resumeCanonicalRun,
+  runTarget,
+  runStatePath,
+} from "./run-store.js";
+import type {
+  CapturedDispatchContext,
+  Classification,
+  Complexity,
+  Confidence,
+  LifecycleMode,
+  LifecycleRequest,
+  Profile,
+  PrepareRequestReceipt,
+  RoleConfig,
+  TaskType,
+  TeamState,
+  TrustedExecutionContext,
+  WorkflowName,
+} from "./types.js";
 import type { DispatchSlot } from "./types.js";
 
 /**
@@ -77,8 +109,13 @@ export interface RunOptions {
   issue?: { number: number; url?: string } | null;
   pause?: (reason: string) => Promise<void>;
   log?: (line: string) => void;
-  /** Resume prior state after user feedback, preserving artifacts/history. */
-  continuation?: { feedback: string; stageId: string };
+  /** Explicit lifecycle mode; state existence never changes this value. */
+  mode?: LifecycleMode;
+  run_id?: string;
+  request_id?: string;
+  execution: TrustedExecutionContext;
+  feedback?: string;
+  affected_stage?: string;
 }
 
 export interface RunResult {
@@ -135,7 +172,7 @@ export function resolveClassification(opts: Pick<RunOptions, "task" | "autonomou
   };
 }
 
-export type WorkflowPrepareOptions = Pick<RunOptions, "task" | "cwd" | "branch" | "autonomous" | "classification" | "files" | "issue" | "continuation">;
+export type WorkflowPrepareOptions = Pick<RunOptions, "task" | "cwd" | "branch" | "autonomous" | "classification" | "files" | "issue" | "mode" | "run_id" | "request_id" | "execution" | "feedback" | "affected_stage">;
 
 export interface PreparedWorkflowState {
   config: RoleConfig;
@@ -146,6 +183,8 @@ export interface PreparedWorkflowState {
   statePath: string;
   artifactsDir: string;
   expectedRoster: (stage: NonNullable<Profile["stages"][number]>) => Array<{ role: string; agent: string }>;
+  operation?: LifecycleMode;
+  transition?: PrepareRequestReceipt;
 }
 
 /**
@@ -153,111 +192,326 @@ export interface PreparedWorkflowState {
  * The interactive orchestrator must call this helper through `workflow_prepare`
  * instead of editing canonical `.work-state` files directly.
  */
+type ReworkArtifactBindings = { artifactIds: Set<string>; ownedFiles: Set<string> };
+
+function stageProducedIds(stage: Profile["stages"][number]): string[] {
+  return Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+}
+
+function collectReworkArtifactBindings(cwd: string, runId: string, current: TeamState, profile: Profile, stageId: string): ReworkArtifactBindings {
+  const target = runTarget(cwd, runId);
+  const runRoot = resolve(target.stateDir ?? cwd);
+  const artifactRoot = resolve(target.artifactsDir ?? join(runRoot, "artifacts"));
+  const artifactIds = new Set<string>();
+  const ownedFiles = new Set<string>();
+  const normalizeOwnedPath = (candidate: unknown): string | null => {
+    if (typeof candidate !== "string" || !candidate.trim()) return null;
+    const absolute = isAbsolute(candidate) ? resolve(candidate) : resolve(runRoot, candidate);
+    const rel = relative(artifactRoot, absolute);
+    if (!rel || rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) return null;
+    return absolute;
+  };
+  const addOwnedPath = (candidate: unknown): string | null => {
+    const absolute = normalizeOwnedPath(candidate);
+    if (!absolute) return null;
+    ownedFiles.add(absolute);
+    return absolute;
+  };
+  const index = current.stages.findIndex((entry) => entry.id === stageId);
+  const profileIndex = profile.stages.findIndex((entry) => entry.id === stageId);
+  const clearedStageIds = new Set(index < 0 ? [] : current.stages.slice(index).map((entry) => entry.id));
+  if (profileIndex >= 0) for (const stage of profile.stages.slice(profileIndex)) {
+    clearedStageIds.add(stage.id);
+    for (const id of stageProducedIds(stage)) {
+      artifactIds.add(id);
+      addOwnedPath(join(artifactRoot, id + ".json"));
+    }
+  }
+  for (const clearedStageId of clearedStageIds) {
+    const records = current.slot_artifacts?.[clearedStageId];
+    for (const slotRecords of Object.values(records?.slots ?? {})) {
+      for (const [artifactId, record] of Object.entries(slotRecords ?? {})) {
+        artifactIds.add(artifactId);
+        addOwnedPath(record?.path);
+      }
+    }
+  }
+  const capability = current.dispatch_capability;
+  const capabilityStage = capability?.issued_for?.stage_cursor;
+  if (capability && capabilityStage && clearedStageIds.has(capabilityStage)) {
+    for (const record of capability.dispatches ?? []) {
+      for (const id of record.completion?.artifact_ids ?? []) {
+        artifactIds.add(id);
+        addOwnedPath(join(artifactRoot, id + ".json"));
+      }
+    }
+  }
+  for (const [artifactId, path] of Object.entries(current.artifacts ?? {})) {
+    const normalized = normalizeOwnedPath(path);
+    if (artifactIds.has(artifactId)) {
+      addOwnedPath(path);
+      continue;
+    }
+    if (normalized && ownedFiles.has(normalized)) artifactIds.add(artifactId);
+  }
+  return { artifactIds, ownedFiles };
+}
+
 export function prepareWorkflowState(opts: WorkflowPrepareOptions): PreparedWorkflowState {
-  // Host git state is the ingress authority. Reject detached/non-git roots
-  // and model-supplied branch drift before resolveState/updateStateAtomically
-  // can create `.work-state` or write an active pointer.
+  const operation: LifecycleMode = opts.mode ?? "new";
+  const requestedAffectedStage = opts.affected_stage;
+  if (operation === "rework" && (typeof requestedAffectedStage !== "string" || requestedAffectedStage.trim().length === 0)) {
+    throw new LifecycleError(
+      "lifecycle_request_conflict",
+      "rework requires an affected_stage selected from the current workflow profile",
+      {
+        ...(opts.run_id ? { run_id: opts.run_id } : {}),
+        next_action: "discover the affected stage from the selected run profile using a read-only resolver, then retry workflow_prepare with affected_stage",
+      },
+    );
+  }
+
+  if (!opts.execution) throw new LifecycleError("lifecycle_request_conflict", "trusted execution context is required for workflow lifecycle mutation");
+  assertTrustedExecutionContext(opts.execution);
   const activeBranch = resolveActiveBranch(opts.cwd);
-  if (activeBranch === DETACHED_BRANCH) {
-    throw new Error("cannot prepare workflow state from detached HEAD");
-  }
-  if (activeBranch === NO_GIT_BRANCH) {
-    throw new Error("cannot prepare workflow state outside a git worktree");
-  }
-  if (opts.branch !== activeBranch) {
-    throw new Error(`workflow branch mismatch: host is '${activeBranch}', request supplied '${opts.branch}'`);
-  }
+  if (activeBranch === DETACHED_BRANCH) throw new LifecycleError("run_context_mismatch", "cannot prepare workflow state from detached HEAD", { branch: activeBranch });
+  if (activeBranch === NO_GIT_BRANCH) throw new LifecycleError("run_context_mismatch", "cannot prepare workflow state outside a git worktree");
+  if (opts.branch !== activeBranch) throw new LifecycleError("run_context_mismatch", `workflow branch mismatch: host is '${activeBranch}', request supplied '${opts.branch}'`, { branch: activeBranch });
+
   const config = resolveConfig(opts.cwd);
   const profiles = loadAllProfiles();
-  const existing = resolveState(opts.cwd, activeBranch);
-  const isContinuation = Boolean(opts.continuation);
-  if (existing.invalid) throw new Error("workflow state is invalid or unsafe");
-  if (isContinuation && (!existing.state || existing.isStale)) {
-    throw new Error(`cannot continue workflow: no non-stale state for branch ${activeBranch}`);
+  if ("continuation" in opts) {
+    throw new LifecycleError("migration_required", "legacy continuation requests are unsupported; use explicit mode=resume or mode=rework with run_id, feedback, and affected_stage", { next_action: "replace continuation with an explicit lifecycle request" });
   }
-  if (!isContinuation && existing.state && !existing.isStale) {
-    throw new Error("workflow state already exists for this branch; use continuation mode");
+  const execution = opts.execution;
+  if (execution.branch !== activeBranch || execution.worktree !== opts.cwd) {
+    throw new LifecycleError("run_context_mismatch", "trusted execution context does not match the host worktree", { branch: activeBranch });
   }
-
-  const persistedClassification = isContinuation ? existing.state?.classification : undefined;
-  const classification = persistedClassification ?? resolveClassification(opts);
-  const profile = persistedClassification
-    ? profiles.find((candidate) => candidate.name === persistedClassification.workflow)
-    : selectProfile(profiles, classification);
-  if (!profile) throw new Error(`no profile matches classification ${JSON.stringify(classification)}`);
-
-  const flags = opts.files !== undefined
-    ? resolveScope(opts.files, config)
-    : isContinuation && existing.state?.scope
-      ? existing.state.scope
-      : resolveScope([], config);
-  const resolveSlots = (stage: NonNullable<Profile["stages"][number]>): DispatchSlot[] =>
-    resolveStageDispatchSlots(stage, { cwd: opts.cwd, flags, resolveDevAgent: () => flags.dev_agent });
-  const expectedRoster = (stage: NonNullable<Profile["stages"][number]>): Array<{ role: string; agent: string }> =>
-    resolveSlots(stage).map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
-
-  // The classification write is ONE cross-process transaction: the
-  // already-exists gate and the continuation gate run against the freshly
-  // persisted state under the workspace lock, never a pre-lock snapshot.
-  const outcome = updateStateAtomically<{ state: TeamState }>(opts.cwd, (snapshot) => {
-    if (isContinuation) {
-      if (!snapshot.state || snapshot.target.isStale) {
-        return { op: "fail", code: "state_missing", error: `cannot continue workflow: no non-stale state for branch ${activeBranch}` };
+  const requestId = opts.request_id ?? randomUUID();
+  const previousRunId = operation === "new" ? null : opts.run_id ?? null;
+  if (operation !== "new" && !previousRunId) throw new LifecycleError("run_selection_required", `${operation} requires an explicit run_id before mutation`, { next_action: "resolve a run selector before calling workflow_prepare" });
+  let newClassification: Classification | undefined;
+  if (operation === "new") newClassification = resolveClassification(opts);
+  const replayReceipt = readRunControl(opts.cwd).prepare_receipts[requestId];
+  if (replayReceipt) {
+    const replayClassification = operation === "new" ? newClassification : undefined;
+    const replayRequest = {
+      mode: operation,
+      request_id: requestId,
+      execution,
+      ...(operation === "new"
+        ? { task: opts.task, branch: activeBranch, classification: replayClassification, files: opts.files, issue: opts.issue ?? null }
+        : operation === "resume"
+          ? { run_id: previousRunId!, branch: activeBranch }
+          : { run_id: previousRunId!, branch: activeBranch, feedback: opts.feedback ?? "", affected_stage: requestedAffectedStage! }),
+    } as LifecycleRequest;
+    if (lifecyclePayloadHash(replayRequest) !== replayReceipt.payload_hash) {
+      throw new LifecycleError("lifecycle_request_conflict", "request_id replayed with a different payload", { run_id: replayReceipt.selected_run_id });
+    }
+    const replayState = readRunState(opts.cwd, replayReceipt.selected_run_id);
+    if (!replayState) throw new LifecycleError("recovery_required", "exact replay receipt points to a missing canonical run", { run_id: replayReceipt.selected_run_id });
+    const replayProfile = profiles.find((candidate) => candidate.name === replayState.classification.workflow);
+    if (!replayProfile) throw new LifecycleError("run_state_invalid", `profile '${replayState.classification.workflow}' for replayed run is unavailable`, { run_id: replayState.run_id });
+    const replayFlags = replayState.scope ?? resolveScope([], config);
+    const replaySlots = (stage: NonNullable<Profile["stages"][number]>): DispatchSlot[] => resolveStageDispatchSlots(stage, { cwd: opts.cwd, flags: replayFlags, resolveDevAgent: () => replayFlags.dev_agent });
+    const replayRoster = (stage: NonNullable<Profile["stages"][number]>): Array<{ role: string; agent: string }> => replaySlots(stage).map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+    return {
+      config,
+      profile: replayProfile,
+      flags: replayFlags,
+      classification: replayState.classification,
+      state: replayState,
+      statePath: runStatePath(opts.cwd, replayState.run_id!),
+      artifactsDir: runTarget(opts.cwd, replayState.run_id!).artifactsDir ?? "",
+      expectedRoster: replayRoster,
+      operation,
+      transition: replayReceipt,
+    };
+  }
+  if (operation === "rework") {
+    const targetState = readRunStateNoRecovery(opts.cwd, previousRunId!, activeBranch);
+    if (targetState) {
+      if (targetState.branch !== activeBranch) {
+        throw new LifecycleError("run_context_mismatch", `run '${previousRunId!}' belongs to branch '${targetState.branch}', current branch is '${activeBranch}'`, { run_id: previousRunId!, branch: targetState.branch, next_action: `checkout '${targetState.branch}' before resume/rework` });
       }
-      const reopened = reopenFromFeedback(snapshot.state, opts.continuation!.feedback, opts.continuation!.stageId);
-      const next: TeamState = { ...reopened, scope: flags, policy: { ...(reopened.policy ?? {}), strict_orchestrator: true } };
-      // Continuation re-arms stages through the durable transitions: the prior
-      // run's capability mirrors are cleared by DELETING their keys — an own
-      // undefined value would fail persisted-state normalization and every
-      // continuation of a durable run would throw at write time.
-      delete next.dispatch_capability;
-      delete next.cursor_epoch;
-      return { op: "commit", state: next, value: { state: next } };
+      const targetProfile = profiles.find((candidate) => candidate.name === targetState.classification.workflow);
+      if (!targetProfile) throw new LifecycleError("run_state_invalid", `profile '${targetState.classification.workflow}' for run '${previousRunId!}' is unavailable`, { run_id: previousRunId! });
+      if (!targetProfile.stages.some((candidate) => candidate.id === requestedAffectedStage)) {
+        throw new LifecycleError("run_state_invalid", "rework stage '" + requestedAffectedStage + "' is not declared by workflow '" + targetProfile.name + "'", { run_id: previousRunId! });
+      }
     }
-    if (snapshot.state && !snapshot.target.isStale) {
-      return { op: "fail", code: "state_conflict", error: "workflow state already exists for this branch; use continuation mode" };
+  }
+  let newProfile: Profile | undefined;
+  if (operation === "new") {
+    const requestedWorkflow = opts.classification?.workflow;
+    const selectedProfile = requestedWorkflow !== undefined
+      ? profiles.find((candidate) => candidate.name === requestedWorkflow)
+      : selectProfile(profiles, newClassification!);
+    if (!selectedProfile) {
+      if (requestedWorkflow !== undefined) {
+        throw new LifecycleError("run_state_invalid", `workflow profile '${requestedWorkflow}' is unavailable`);
+      }
+      throw new LifecycleError("run_state_invalid", `no profile matches classification ${JSON.stringify(newClassification)}`);
     }
-    const fresh: TeamState = {
-      schema: 1,
+    newProfile = selectedProfile;
+  }
+
+  const recovered = recoverLegacyMigrations(opts.cwd);
+  if (recovered.pending.length > 0) throw new LifecycleError("recovery_required", `legacy migration recovery is pending for ${recovered.pending.join(", ")}`, { next_action: "retry migration recovery before preparing a workflow" });
+  const legacyDiscovery = discoverLegacySources(opts.cwd);
+  if (legacyDiscovery.issues.length > 0) throw new LifecycleError("migration_required", `legacy source discovery failed: ${legacyDiscovery.issues.map((issue) => issue.error).join("; ")}`, { next_action: "repair the legacy source or run explicit migration" });
+  for (const source of legacyDiscovery.sources) {
+    const migration = migrateLegacySource(opts.cwd, source, execution);
+    if (!migration.ok) throw new LifecycleError(migration.code === "run_busy" ? "run_busy" : migration.code === "recovery_required" ? "recovery_required" : "migration_required", migration.error, { next_action: "resolve the migration result before continuing" });
+  }
+  let state: TeamState;
+  let classification: Classification;
+  let profile: Profile;
+  let flags: ScopeFlags;
+  let transition: PrepareRequestReceipt;
+  if (operation === "new") {
+    classification = newClassification!;
+    profile = newProfile!;
+    flags = opts.files !== undefined ? resolveScope(opts.files, config) : resolveScope([], config);
+    const runId = randomUUID();
+    state = {
+      schema: 2,
+      run_id: runId,
+      run_key: runId,
+      lifecycle_status: "active",
+      rework_generation: 0,
       branch: activeBranch,
       classification,
+      title: opts.task,
       task: opts.task,
+      required_inputs: Object.fromEntries(profile.stages.map((stage) => [stage.id, []])),
+      decisions: [],
+      required_input_receipts: {},
       workflow_override: opts.classification?.workflow !== undefined,
       issue: opts.issue ?? null,
       stage_cursor: profile.stages[0]?.id ?? "",
-      stages: profile.stages.map((s) => ({ id: s.id, status: "pending" as const })),
+      stages: profile.stages.map((stage) => ({ id: stage.id, status: "pending" as const })),
       pause: { kind: "none" as const, reason: "" },
       artifacts: {},
       scope: flags,
       policy: { strict_orchestrator: true },
       profile_hash: profileHash(profile),
-      run_key: activeBranch,
       updated_at: new Date().toISOString(),
-    } satisfies TeamState;
-    return { op: "commit", state: fresh, value: { state: fresh } };
-  }, { branch: activeBranch });
-  if (!outcome.ok) throw new Error(outcome.error);
-  if (!outcome.value) throw new Error("workflow state transaction completed without a result");
-  // The prepared state is the COMMITTED, normalized and revision-stamped
-  // state on disk — never the pre-normalization mutation output.
-  const state = outcome.committed && outcome.state ? outcome.state : outcome.value.state;
-  // A fresh run can commit either from an absent target or by retargeting a
-  // stale active feature to the current branch. In both cases the
-  // transaction's resolved target does not describe the committed file, so
-  // resolve it again after the commit.
-  const committedTarget = outcome.target.statePath && !outcome.target.isStale
-    ? outcome.target
-    : resolveState(opts.cwd, activeBranch);
-  const statePath = committedTarget.statePath ?? "";
-  const artifactsDir = committedTarget.artifactsDir ?? "";
-  return { config, profile, flags, classification, state, statePath, artifactsDir, expectedRoster };
+    };
+    const request: LifecycleRequest = {
+      mode: "new",
+      request_id: requestId,
+      execution,
+      task: opts.task,
+      branch: activeBranch,
+      classification,
+      files: opts.files,
+      issue: opts.issue ?? null,
+    };
+    const selectedCandidate = candidateForState(state);
+    transition = {
+      request_id: requestId,
+      payload_hash: lifecyclePayloadHash(request),
+      operation,
+      previous_run_id: null,
+      previous_title: null,
+      previous_status: null,
+      selected_run_id: selectedCandidate.run_id,
+      selected_title: selectedCandidate.title,
+      selected_status: selectedCandidate.status,
+      committed_at: new Date().toISOString(),
+      continuation: { stage: selectedCandidate.stage, status: selectedCandidate.status },
+    };
+    const committed = persistCanonicalRun(opts.cwd, state, { context: execution, request, receipt: transition });
+    state = committed.state;
+  } else {
+    const runId = previousRunId!;
+    const existing = withWorkspaceTransaction(opts.cwd, () => resolveCanonicalRun(opts.cwd, { kind: "team", runId }));
+    if (!existing?.state || existing.state.schema !== 2) throw new LifecycleError("run_not_found", `run '${runId}' is missing or invalid`, { run_id: runId });
+    if (existing.state.branch !== activeBranch) throw new LifecycleError("run_context_mismatch", `run '${runId}' belongs to branch '${existing.state.branch}', current branch is '${activeBranch}'`, { run_id: runId, branch: existing.state.branch, next_action: `checkout '${existing.state.branch}' before resume/rework` });
+    state = existing.state;
+    classification = state.classification;
+    profile = profiles.find((candidate) => candidate.name === classification.workflow)!;
+    if (!profile) throw new LifecycleError("run_state_invalid", `profile '${classification.workflow}' for run '${runId}' is unavailable`, { run_id: runId });
+    flags = state.scope ?? resolveScope([], config);
+    const previousCandidate = candidateForState(state);
+    if (operation === "resume") {
+      if (state.lifecycle_status === "complete" || state.pause.kind === "done") throw new LifecycleError("run_terminal", `run '${runId}' is complete; use rework or new`, { run_id: runId });
+      const resumeRequest = { mode: "resume", request_id: requestId, execution, run_id: runId, branch: activeBranch } as LifecycleRequest;
+      const resumeReceipt: PrepareRequestReceipt = {
+        request_id: requestId,
+        payload_hash: lifecyclePayloadHash(resumeRequest),
+        operation: "resume",
+        previous_run_id: previousCandidate.run_id,
+        previous_title: previousCandidate.title,
+        previous_status: previousCandidate.status,
+        selected_run_id: previousCandidate.run_id,
+        selected_title: previousCandidate.title,
+        selected_status: previousCandidate.status,
+        committed_at: new Date().toISOString(),
+        continuation: { stage: previousCandidate.stage, status: previousCandidate.status },
+      };
+      state = resumeCanonicalRun(opts.cwd, runId, execution, { request: resumeRequest, receipt: resumeReceipt });
+      transition = resumeReceipt;
+    } else {
+      const affectedStage = requestedAffectedStage!;
+      if (!profile.stages.some((candidate) => candidate.id === affectedStage)) throw new LifecycleError("run_state_invalid", "rework stage '" + affectedStage + "' is not declared by workflow '" + profile.name + "'", { run_id: runId });
+      if (!opts.feedback) throw new LifecycleError("lifecycle_request_conflict", "rework requires feedback", { run_id: runId });
+      const activeDispatch = state.dispatch_capability?.dispatches?.find((dispatch) => ["authorized", "running", "pending"].includes(dispatch.status) && !dispatch.completion);
+      if (activeDispatch) throw new LifecycleError("run_busy", "rework requires all dispatch workers to be reconciled", { run_id: runId });
+      const feedback = opts.feedback;
+      const reworkRequest = { mode: operation, request_id: requestId, execution, run_id: runId, branch: activeBranch, feedback, affected_stage: affectedStage } as LifecycleRequest;
+      const reworkReceipt: PrepareRequestReceipt = {
+        request_id: requestId,
+        payload_hash: lifecyclePayloadHash(reworkRequest),
+        operation: "rework",
+        previous_run_id: previousCandidate.run_id,
+        previous_title: previousCandidate.title,
+        previous_status: previousCandidate.status,
+        selected_run_id: previousCandidate.run_id,
+        selected_title: previousCandidate.title,
+        selected_status: previousCandidate.status,
+        committed_at: new Date().toISOString(),
+        continuation: { stage: affectedStage, status: "active" },
+      };
+      let reworkBindings: ReworkArtifactBindings | null = null;
+      state = reworkCanonicalRunAtomically(opts.cwd, runId, (current) => {
+        reworkBindings = collectReworkArtifactBindings(opts.cwd, runId, current, profile, affectedStage);
+        const reopened = invalidateReentryInputEvidence(reopenFromFeedback(current, feedback, affectedStage), profile.stages, affectedStage);
+        const retainedArtifacts = Object.fromEntries(Object.entries(reopened.artifacts ?? {}).filter(([artifactId]) => !reworkBindings!.artifactIds.has(artifactId)));
+        return { ...reopened, artifacts: retainedArtifacts, schema: 2, run_id: runId, run_key: runId, lifecycle_status: "active", rework_generation: (current.rework_generation ?? 0) + 1, rework_feedback: [...(current.rework_feedback ?? []), { feedback, affected_stage: affectedStage, at: new Date().toISOString() }] };
+      }, reworkRequest, reworkReceipt, {
+        context: execution,
+        invalidateOwnedFiles: () => reworkBindings ? Array.from(reworkBindings.ownedFiles) : [],
+      });
+      transition = reworkReceipt;
+    }
+  }
+  const resolveSlots = (stage: NonNullable<Profile["stages"][number]>): DispatchSlot[] =>
+    resolveStageDispatchSlots(stage, { cwd: opts.cwd, flags, resolveDevAgent: () => flags.dev_agent });
+  const expectedRoster = (stage: NonNullable<Profile["stages"][number]>): Array<{ role: string; agent: string }> =>
+    resolveSlots(stage).map((slot) => ({ role: slot.slot, agent: resolveAgentForRole(slot.role, config) }));
+  return {
+    config, profile, flags, classification, state,
+    statePath: runStatePath(opts.cwd, state.run_id!),
+    artifactsDir: runTarget(opts.cwd, state.run_id!).artifactsDir ?? "",
+    expectedRoster,
+    operation,
+    transition,
+  };
 }
 
 export async function run(opts: RunOptions): Promise<RunResult> {
   const prepared = prepareWorkflowState(opts);
   const { config, profile, flags, classification, state: initialState, statePath, artifactsDir, expectedRoster } = prepared;
   const completed = new Set(initialState.stages.filter((s) => s.status === "done" || s.status === "skipped").map((s) => s.id));
-  const runnableProfile = completed.size === 0 ? profile : { ...profile, stages: profile.stages.filter((s) => !completed.has(s.id)) };
+  const capabilityPending = initialState.dispatch_capability?.pending?.some((entry) =>
+    entry.status === "authorized" || entry.status === "running" || entry.status === "pending",
+  ) ?? false;
+  if (initialState.pending || capabilityPending) {
+    return { classification, profile, outcomes: [], statePath };
+  }
+  const runnableProfile = completed.size === 0 ? profile : { ...profile, stages: profile.stages.filter((stage) => !completed.has(stage.id)) };
   let durableStage: { stageId: string; dispatchToken: string; advanceToken: string; epoch: string; loopIteration?: number } | null = null;
   const ctx: StageContext = {
     cwd: opts.cwd,
@@ -286,7 +540,7 @@ export async function run(opts: RunOptions): Promise<RunResult> {
           durableStage &&
           durableStage.stageId === stageId &&
           armed?.issued_for?.stage_cursor === stageId &&
-          (armed.status === "ready" || armed.status === "dispatched")
+          (armed?.status === "ready" || armed?.status === "dispatched")
         ) {
           return { op: "commit", state: setStageStatus(current, stageId, "in_progress", opts.cwd), value: { issued: null, reuse: true } };
         }
@@ -317,18 +571,30 @@ export async function run(opts: RunOptions): Promise<RunResult> {
           workflow: profile.name,
           profile_hash: persistedProfileHash,
           stage_cursor: stage.id,
+          rework_generation: next.rework_generation ?? 0,
           kind,
           expected_roster: kind === "none" ? [] : expectedRoster(stage),
           loop_iteration: iteration.iteration,
           checkpoint_policy_hash: declaration.declaration?.policy_hash ?? null,
         });
+        const materialized = materializeMigratedDispatches(next, issued.state, profile.name, stage.id, runTarget(opts.cwd, next.run_id ?? ""));
+        if (!materialized.ok) return { op: "fail", code: "recovery_required", error: materialized.error };
+        const migratedDispatches = materialized.records;
         const nextState: TeamState = {
           ...next,
           run_key: next.run_key ?? next.branch,
           cursor_epoch: issued.state.issued_for!.cursor_epoch,
           profile_hash: persistedProfileHash,
-          dispatch_capability: issued.state,
+          dispatch_capability: migratedDispatches.length > 0
+            ? { ...issued.state, status: "dispatched", dispatches: migratedDispatches }
+            : issued.state,
         };
+        if (nextState.migration_succeeded_slots) {
+          const remainingMigrated = { ...nextState.migration_succeeded_slots };
+          delete remainingMigrated[stage.id];
+          if (Object.keys(remainingMigrated).length > 0) nextState.migration_succeeded_slots = remainingMigrated;
+          else delete nextState.migration_succeeded_slots;
+        }
         if (declaration.declaration) {
           nextState.checkpoint_policy = declaration.declaration.policy;
           nextState.checkpoint_policy_binding = {
@@ -352,7 +618,7 @@ export async function run(opts: RunOptions): Promise<RunResult> {
           delete nextState.work_identity;
         }
         return { op: "commit", state: nextState, value: { issued, reuse: false } };
-      });
+      }, { target: runTarget(opts.cwd, initialState.run_id ?? ""), branch: initialState.branch });
       if (!outcome.ok || !outcome.committed) throw new Error(outcome.ok ? "workflow stage start did not commit" : outcome.error);
       const issued = outcome.value?.issued ?? null;
       if (issued) {
@@ -375,37 +641,121 @@ export async function run(opts: RunOptions): Promise<RunResult> {
           return { op: "discard" };
         }
         return { op: "commit", state: setStageStatus(current, stageId, status, opts.cwd) };
-      });
+      }, { target: runTarget(opts.cwd, initialState.run_id ?? ""), branch: initialState.branch });
       if (!outcome.ok) throw new Error(outcome.error);
       ctx.state = outcome.state ?? ctx.state;
     },
     log: opts.log ?? (() => undefined),
     resolveDevAgent: () => flags.dev_agent,
     durable: {
+      readInputs: (stageId) => {
+        const stage = profile.stages.find((candidate) => candidate.id === stageId);
+        if (!stage) return { ok: false, error: `recovery_required: stage ${stageId} is unavailable` };
+        const current = readState(statePath);
+        const read = readRequiredStageInputs(stage, current, artifactsDir);
+        if (!read.ok) return read;
+        if (!durableStage || current.stage_cursor !== stageId || !current.dispatch_capability?.capability_id) {
+          return { ok: false, error: `recovery_required: stage ${stageId} has no persisted capability binding` };
+        }
+        const receipt = {
+          stage_id: stageId,
+          capability_id: current.dispatch_capability.capability_id,
+          cursor_epoch: current.cursor_epoch ?? durableStage.epoch,
+          rework_generation: current.rework_generation ?? 0,
+          read_at: new Date().toISOString(),
+          inputs: read.inputs.map((input) => ({ artifact_id: input.artifact_id, path: input.path, sha256: input.sha256 })),
+        };
+        const updated = updateStateAtomically(opts.cwd, (snapshot) => {
+          if (!snapshot.state) return { op: "fail", code: "state_missing", error: "workflow state missing" };
+          const state = snapshot.state;
+          if (state.run_id !== current.run_id || state.stage_cursor !== stageId || state.cursor_epoch !== current.cursor_epoch) {
+            return { op: "fail", code: "state_conflict", error: "required input read raced with a cursor change" };
+          }
+          return {
+            op: "commit",
+            state: {
+              ...state,
+              required_inputs: { ...(state.required_inputs ?? {}), [stageId]: receipt.inputs },
+              required_input_receipts: { ...(state.required_input_receipts ?? {}), [stageId]: receipt },
+              updated_at: new Date().toISOString(),
+            },
+          };
+        }, { target: runTarget(opts.cwd, current.run_id ?? ""), branch: current.branch });
+        if (!updated.ok || !updated.state) return { ok: false, error: updated.ok ? "recovery_required: input read receipt was not committed" : updated.error };
+        ctx.state = updated.state;
+        return read;
+      },
       authorize: (role, agent) => {
         if (!durableStage) return { ok: false, error: "durable stage unavailable" };
         const current = readState(statePath);
-        const r = authorizeDispatch(opts.cwd, { token: durableStage.dispatchToken, capability_id: current.dispatch_capability?.capability_id ?? "", run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, loop_iteration: durableStage.loopIteration, role, agent });
-        if (r.ok) ctx.state = r.state;
-        return r.ok && r.record ? { ok: true, dispatchId: r.record.id } : { ok: false, error: r.ok ? "missing dispatch record" : r.error };
+        const runId = current.run_id;
+        if (!runId) return { ok: false, error: "canonical run identity unavailable" };
+        const capabilityId = current.dispatch_capability?.capability_id;
+        if (!capabilityId) return { ok: false, error: "dispatch capability unavailable" };
+        const result = authorizeDispatch(opts.cwd, {
+          run_id: runId,
+          token: durableStage.dispatchToken,
+          capability_id: capabilityId,
+          run_key: current.run_key ?? current.branch,
+          branch: current.branch,
+          workflow: profile.name,
+          profile_hash: current.profile_hash ?? profileHash(profile),
+          stage_cursor: durableStage.stageId,
+          cursor_epoch: durableStage.epoch,
+          loop_iteration: durableStage.loopIteration,
+          role,
+          slot_id: role,
+          agent,
+        });
+        if (!result.ok || !result.record) return { ok: false, error: result.ok ? "dispatch authorization produced no record" : result.error };
+        const captured: CapturedDispatchContext = {
+          run_id: runId,
+          dispatch_id: result.record.id,
+          capability_id: capabilityId,
+          ownership_epoch: readRunControl(opts.cwd).execution_claim?.ownership_epoch,
+          rework_generation: current.rework_generation ?? 0,
+          origin_session_id: opts.execution?.session_id ?? readRunControl(opts.cwd).execution_claim?.coordinator_session_id,
+        };
+        ctx.captured = captured;
+        return { ok: true, dispatchId: result.record.id, captured };
       },
       complete: (dispatchId, output, outcome, artifactIds) => {
         if (!durableStage) return { ok: false, error: "durable stage unavailable" };
         const current = readState(statePath);
-        const r = completeDispatch(opts.cwd, { token: durableStage.dispatchToken, capability_id: current.dispatch_capability?.capability_id ?? "", dispatch_id: dispatchId, run_key: current.run_key ?? current.branch, branch: current.branch, workflow: profile.name, profile_hash: current.profile_hash ?? profileHash(profile), stage_cursor: durableStage.stageId, cursor_epoch: durableStage.epoch, loop_iteration: durableStage.loopIteration, outcome, evidence: output || (outcome === "failed" ? "task failed" : "task completed"), artifact_ids: artifactIds });
-        if (r.ok) ctx.state = r.state;
-        return r.ok ? { ok: true } : { ok: false, error: r.error };
+        const runId = current.run_id;
+        if (!runId) return { ok: false, error: "canonical run identity unavailable" };
+        const capabilityId = current.dispatch_capability?.capability_id;
+        if (!capabilityId) return { ok: false, error: "dispatch capability unavailable" };
+        const result = completeDispatch(opts.cwd, {
+          run_id: runId,
+          token: durableStage.dispatchToken,
+          capability_id: capabilityId,
+          dispatch_id: dispatchId,
+          run_key: current.run_key ?? current.branch,
+          branch: current.branch,
+          workflow: profile.name,
+          profile_hash: current.profile_hash ?? profileHash(profile),
+          stage_cursor: durableStage.stageId,
+          cursor_epoch: durableStage.epoch,
+          loop_iteration: durableStage.loopIteration,
+          outcome,
+          evidence: output || (outcome === "failed" ? "task failed" : "task completed"),
+          artifact_ids: artifactIds,
+        }, { runId });
+        if (result.ok) ctx.state = result.state;
+        return result.ok ? { ok: true } : { ok: false, error: result.error };
       },
       advance: (evidence) => {
         if (!durableStage) return { ok: false, error: "durable stage unavailable" };
         const current = readState(statePath);
-        // advanceCursor performs checkpoint resolution, pause selection and
-        // the cursor move inside its own fresh-state transaction. A decision
-        // recorded after this adapter read is therefore observed rather than
-        // overwritten by a stale pause decision.
-        const r = advanceCursor(opts.cwd, {
+        const runId = current.run_id;
+        if (!runId) return { ok: false, error: "canonical run identity unavailable" };
+        const capabilityId = current.dispatch_capability?.capability_id;
+        if (!capabilityId) return { ok: false, error: "dispatch capability unavailable" };
+        const result = advanceCursor(opts.cwd, {
+          run_id: runId,
           token: durableStage.advanceToken,
-          capability_id: current.dispatch_capability?.capability_id ?? "",
+          capability_id: capabilityId,
           run_key: current.run_key ?? current.branch,
           branch: current.branch,
           workflow: profile.name,
@@ -414,17 +764,24 @@ export async function run(opts: RunOptions): Promise<RunResult> {
           cursor_epoch: durableStage.epoch,
           loop_iteration: durableStage.loopIteration,
           evidence,
-        });
-        if (!r.ok) return { ok: false, error: `${r.error}: ${evidence}` };
-        ctx.state = r.state;
-        if (r.handoff) durableStage = { stageId: r.state.stage_cursor, dispatchToken: r.handoff.dispatch_token, advanceToken: r.handoff.advance_token, epoch: r.handoff.cursor_epoch, loopIteration: r.handoff.loop_iteration };
-        return { ok: true, handoff: r.handoff };
+        }, { runId });
+        if (!result.ok) return { ok: false, error: `${result.error}: ${evidence}` };
+        ctx.state = result.state;
+        if (result.handoff) {
+          durableStage = {
+            stageId: result.state.stage_cursor,
+            dispatchToken: result.handoff.dispatch_token,
+            advanceToken: result.handoff.advance_token,
+            epoch: result.handoff.cursor_epoch,
+            loopIteration: result.handoff.loop_iteration,
+          };
+        }
+        return { ok: true, handoff: result.handoff };
       },
     },
   };
-  opts.log?.(`walking profile: ${profile.name} (${runnableProfile.stages.length} stages)`);
-  const outcomes = await walkProfile(profile, ctx);
-  finalizeWorkflowRun(opts.cwd);
+  const outcomes = await walkProfile(runnableProfile, ctx);
+  finalizeWorkflowRun(opts.cwd, initialState.run_id);
   return { classification, profile, outcomes: outcomes.map((o) => ({ stageId: o.stageId, status: o.status, note: o.note })), statePath };
 }
 
@@ -433,28 +790,13 @@ export async function run(opts: RunOptions): Promise<RunResult> {
  * transaction lock. Kept as a named engine boundary so adapters and race
  * tests exercise the same fresh-state decision used by run().
  */
-export function finalizeWorkflowRun(cwd: string): TeamState {
-  const terminal = updateStateAtomically(cwd, (snapshot) => {
-    if (!snapshot.state) return { op: "fail", code: "state_missing", error: "workflow state missing" };
-    const current = snapshot.state;
-    const resumablePause = current.pause.kind === "user_checkpoint"
-      || current.pause.kind === "needs_human"
-      || current.pause.kind === "background_wait"
-      || current.pause.kind === "failed";
-    if (resumablePause) return { op: "discard" };
-    const done = current.stages.every((stage) => stage.status === "done" || stage.status === "skipped");
-    return {
-      op: "commit",
-      state: {
-        ...current,
-        pause: { kind: done ? "done" : "failed", reason: done ? "" : "one or more stages failed" },
-        updated_at: new Date().toISOString(),
-      },
-    };
-  });
-  if (!terminal.ok) throw new Error(terminal.error);
-  if (!terminal.state) throw new Error("workflow state missing after terminal transaction");
-  return terminal.state;
+export function finalizeWorkflowRun(cwd: string, runId?: string): TeamState {
+  if (runId) {
+    const claim = readRunControl(cwd).execution_claim;
+    return finalizeCanonicalRun(cwd, runId, claim?.run_id === runId ? claim.token : undefined);
+  }
+  throw new LifecycleError("run_selection_required", "finalizeWorkflowRun requires an explicit canonical run_id", { next_action: "select a canonical run before terminal finalization" });
+ 
 }
 
 function readState(path: string): TeamState {

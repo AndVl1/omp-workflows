@@ -9,10 +9,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import {
   registerTeamWorkflow,
   registerWorkflowCommands,
@@ -26,6 +27,8 @@ import { classificationToolGate } from "../src/gates/classification.js";
 import { createTaskCaller, runStage, type TaskToolLike } from "../src/engine/stage.js";
 
 const genericRoles = { worker: "worker" };
+const CANONICAL_RUN_ID = "66666666-6666-4666-8666-666666666666";
+
 
 test("core: workflow commands register before project command discovery", async () => {
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
@@ -178,14 +181,50 @@ test("core: registerTeamWorkflow registers gates but NOT commands", () => {
 		"extension must not register slash commands",
 	);
 });
-test("core: task gate blocks launches without zero-step state", () => {
+
+test("core: selected canonical run blocks task launches without zero-step classification", () => {
   const root = join(tmpdir(), `omp-gate-${Date.now()}`);
-  mkdirSync(join(root, ".work-state"), { recursive: true });
-  writeFileSync(join(root, ".work-state", ".active-feature"), "pending\n");
   try {
-    const result = classificationToolGate({ toolName: "task" }, { cwd: root });
-    assert.equal(result?.block, true);
-    assert.match(result?.reason ?? "", /PHASE 0/);
+    mkdirSync(root, { recursive: true });
+    execFileSync("git", ["init", "-b", "feature/smoke"], { cwd: root, stdio: "ignore" });
+    const branch = execFileSync("git", ["branch", "--show-current"], { cwd: root, encoding: "utf8" }).trim();
+    const runDir = join(root, ".work-state", "runs", CANONICAL_RUN_ID);
+    mkdirSync(runDir, { recursive: true });
+    const state = {
+      schema: 2,
+      run_id: CANONICAL_RUN_ID,
+      run_key: CANONICAL_RUN_ID,
+      lifecycle_status: "active",
+      branch,
+      task: "missing classification",
+      stage_cursor: "discovery",
+      stages: [{ id: "discovery", status: "pending" }],
+      artifacts: {},
+      pause: { kind: "none", reason: "" },
+    };
+    const statePath = join(runDir, "state.json");
+    writeFileSync(statePath, JSON.stringify(state));
+    const before = readFileSync(statePath);
+
+    const blocked = classificationToolGate({ toolName: "task" }, { cwd: root, run_id: CANONICAL_RUN_ID });
+    assert.equal(blocked?.block, true);
+    assert.deepEqual(readFileSync(statePath), before);
+
+    const classifiedState = {
+      ...state,
+      classification: {
+        type: "FEATURE",
+        complexity: "QUICK",
+        confidence: "HIGH",
+        autonomous: false,
+        workflow: "lightweight",
+      },
+    };
+    writeFileSync(statePath, JSON.stringify(classifiedState));
+    const classifiedBefore = readFileSync(statePath);
+    const allowed = classificationToolGate({ toolName: "task" }, { cwd: root, run_id: CANONICAL_RUN_ID });
+    assert.equal(allowed, undefined);
+    assert.deepEqual(readFileSync(statePath), classifiedBefore);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

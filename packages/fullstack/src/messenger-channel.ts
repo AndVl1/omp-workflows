@@ -8,22 +8,22 @@
  * `ask` tool. This module:
  *   - `channelMode(cwd)` — "telegram" | "http" | null (cached).
  *   - `createAskRedirectGate()` — a `tool_call` hook that BLOCKS `ask` while
- *     a capability-validated RW primary AND an active CTO run exist,
- *     returning the outbox contract as the reason (the LLM sees it and
- *     routes the question).
+ *     a capability-validated RW primary and the originating host session's
+ *     owned active CTO run exist, returning the run-scoped outbox contract.
  *
- * The gate is deliberately scoped to active CTO runs: outside a run, normal
- * interactive work keeps `ask` working even in projects with a channel.
- * Terminal/RO-only modes keep `ask` as the fallback (no validated RW
- * primary -> no redirect). The gate is CAPABILITY-validated (core
- * `hasRwPrimary`): a declared `bidirectional` flag is no longer sufficient
- * on its own for explicit `channels[]` entries — http has no inbound path,
- * so a declared-rw http entry downgrades to ro and never blocks ask.
+ * The gate is deliberately scoped to an explicit host session and owned CTO
+ * run: outside that binding, normal interactive work keeps `ask` working even
+ * in projects with a channel. Terminal/RO-only modes keep `ask` as the
+ * fallback (no validated RW primary -> no redirect). The gate is
+ * CAPABILITY-validated (core `hasRwPrimary`): a declared `bidirectional` flag
+ * is no longer sufficient on its own for explicit `channels[]` entries —
+ * http has no inbound path, so a declared-rw http entry downgrades to ro and
+ * never blocks ask.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { findActiveCtoRun, hasRwPrimary } from "@andvl1/omp-workflows-core";
+import { hasRwPrimary, type CtoClaimScope } from "@andvl1/omp-workflows-core";
 
 export type ChannelMode = "telegram" | "http" | null;
 
@@ -53,27 +53,34 @@ export function clearChannelCache(): void {
 
 export { isBidirectionalChannel } from "./adapters/registry.js";
 
+export type AskRedirectClaimResolver = (ctx: unknown, cwd: string) => CtoClaimScope | undefined;
+
 /**
- * `tool_call` hook: block the `ask` tool when a capability-validated RW
- * primary is configured AND a CTO run is active. The `reason` is returned
- * to the LLM, which then writes the question to the outbox instead.
+ * `tool_call` hook: block the `ask` tool only when the bundle supplies the
+ * exact current CTO claim for the originating host session. A resolver is
+ * required so this module cannot infer authority from a latest active run,
+ * raw model fields, or persisted `owner_session` data.
  */
-export function createAskRedirectGate(): (
+export function createAskRedirectGate(
+  resolveClaim?: AskRedirectClaimResolver,
+): (
   event: { toolName?: string },
-  ctx: { cwd: string },
+  ctx: { cwd: string; session_id?: string; sessionId?: string },
 ) => { block: boolean; reason: string } | undefined {
   return (event, ctx) => {
     try {
       if (event?.toolName !== "ask") return undefined;
       if (!hasRwPrimary(ctx.cwd)) return undefined;
-      if (!findActiveCtoRun(ctx.cwd)) return undefined;
+      const claim = resolveClaim?.(ctx, ctx.cwd);
+      if (!claim) return undefined;
       return {
         block: true,
         reason:
-          "messenger-mode: a bidirectional messenger channel is active in this CTO run. Do NOT use ask — " +
-          "write the question as an escalation to `.work-state/cto/<runId>/outbox/<escId>.json` " +
-          "(level question/decision, timeoutMs + default); the answer will land in `answers/<escId>.json` " +
-          "and you pick it up at the next checkpoint.",
+          "messenger-mode: a bidirectional messenger channel is active in this owned CTO run. Do NOT use ask — " +
+          `write the question as an escalation to \`.work-state/cto/${claim.run_id}/outbox/<escId>.json\` ` +
+          "(level question/decision, timeoutMs + default); the answer will land in " +
+          `\`.work-state/cto/${claim.run_id}/answers/<escId>.json\`. Use the real \`read\` tool on that exact file at reconciliation; ` +
+          "only a dispatcher-recorded pre-send rejection is automatically retryable, while ambiguous delivery keeps the original files for explicit reconciliation.",
       };
     } catch {
       return undefined;

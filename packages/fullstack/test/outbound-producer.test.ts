@@ -31,6 +31,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as registry from "../src/adapters/registry.js";
+import { newCtoState, writeCtoState } from "@andvl1/omp-workflows-core";
 import { MockEscalationAdapter } from "../src/adapters/mock.js";
 
 const {
@@ -40,13 +41,27 @@ const {
   inboxDir,
   queueCtoDelivery,
   handleInboxTask,
-  resolveInboxRunId,
   produceWaveDeliveries,
 } = registry;
 
 function withConfig(root: string, config: unknown): void {
   mkdirSync(join(root, ".omp"), { recursive: true });
   writeFileSync(join(root, ".omp", "escalation.json"), JSON.stringify(config));
+}
+
+function writeCtoFixture(root: string, runId: string, task = "Outbound producer test"): string {
+  const createdAt = new Date().toISOString();
+  writeCtoState(
+    newCtoState({
+      id: runId,
+      task,
+      branch: "main",
+      autonomous: true,
+      plan: { id: runId, task, teams: [], created_at: createdAt },
+    }),
+    root,
+  );
+  return runId;
 }
 
 /** Deterministic outbox file name queueCtoDelivery derives from a delivery id. */
@@ -125,10 +140,12 @@ test("outbound: RW primary + active run -> handleInboxTask queues ONE determinis
     const set = createChannelSet(root);
     assert.equal(set.profile.direction, "rw", "explicit mock channels[] rw profile");
     const primary = set.primary as MockEscalationAdapter;
-    const runId = resolveInboxRunId(root);
+    const runId = writeCtoFixture(root, "run-ack");
     const at = new Date().toISOString();
     const received: Array<{ id: string; runId?: string; waveId?: string }> = [];
-    const path = handleInboxTask(root, { id: "t1", text: "Ship the fix", at }, (t) => received.push(t));
+    const path = handleInboxTask(root, { id: "t1", text: "Ship the fix", at, runId }, (t) => {
+      received.push(t);
+    });
     assert.ok(path, "task filed");
     assert.equal(received.length, 1);
 
@@ -159,7 +176,7 @@ test("outbound: RW primary + active run -> handleInboxTask queues ONE determinis
     assert.ok(existsSync(join(outboxDir(runId, root), "sent", ackFile)), "ack archived to sent/");
 
     // Simulated transport retry with the SAME task id -> no re-file, no new ack.
-    const retry = handleInboxTask(root, { id: "t1", text: "Ship the fix", at }, () => undefined);
+    const retry = handleInboxTask(root, { id: "t1", text: "Ship the fix", at, runId }, () => undefined);
     assert.equal(retry, null, "duplicate transport id -> no re-file");
     assert.equal(outboxEntries(root, runId).length, 0, "no new ack queued after retry");
     assert.equal(sentEntries(root, runId).length, 1, "still exactly one archived ack");
@@ -185,8 +202,8 @@ test("outbound: RO-only configs queue NO ack (producer never queues non-report e
       withConfig(root, config);
       const set = createChannelSet(root);
       assert.equal(set.profile.direction, "ro", "resolved profile is ro");
-      const runId = resolveInboxRunId(root);
-      handleInboxTask(root, { id: "t1", text: "Ship the fix", at: new Date().toISOString() }, () => undefined);
+      const runId = writeCtoFixture(root, "run-ro");
+      handleInboxTask(root, { id: "t1", text: "Ship the fix", at: new Date().toISOString(), runId }, () => undefined);
       assert.equal(existsSync(outboxDir(runId, root)), false, "no outbox dir created — no ack queued for an RO-only config");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -216,9 +233,9 @@ test("outbound: misconfigured RW profile (declared rw, adapter factory returns n
       const set = createChannelSet(root);
       assert.equal(set.profile.direction, "rw", "resolved profile declares rw");
       assert.equal(set.primary, null, "…but the adapter is unbuildable (primary null) — the misconfiguration");
-      const runId = resolveInboxRunId(root);
+      const runId = writeCtoFixture(root, "run-misrw");
       const received: Array<{ id: string }> = [];
-      const path = handleInboxTask(root, { id: "t1", text: "Misconfigured RW", at: new Date().toISOString() }, (t) => received.push(t));
+      const path = handleInboxTask(root, { id: "t1", text: "Misconfigured RW", at: new Date().toISOString(), runId }, (t) => received.push(t));
       assert.ok(typeof path === "string" && path.length > 0, "task admitted (inbox file written)");
       assert.equal(received.length, 1, "wake callback fired exactly once");
       assert.equal(existsSync(outboxDir(runId, root)), false, "no outbox dir created — no ack queued for an unbuildable RW profile");
@@ -374,8 +391,8 @@ test("outbound: legacy telegram RW config still produces the ACK with ackTarget=
     const set = createChannelSet(root);
     assert.equal(set.profile.direction, "rw", "legacy telegram is rw");
     assert.equal(set.profile.ackTarget, "c", "telegram profile carries chatId as ackTarget");
-    const runId = resolveInboxRunId(root);
-    handleInboxTask(root, { id: "t1", text: "Legacy task", at: new Date().toISOString() }, () => undefined);
+    const runId = writeCtoFixture(root, "run-legacy");
+    handleInboxTask(root, { id: "t1", text: "Legacy task", at: new Date().toISOString(), runId }, () => undefined);
     const ackFile = fileNameOf(`${runId}/wave/t1/ack`);
     assert.ok(existsSync(join(outboxDir(runId, root), ackFile)), "legacy telegram RW config still queues the ACK");
     const ack = JSON.parse(readFileSync(join(outboxDir(runId, root), ackFile), "utf8")) as { target?: string };
@@ -387,8 +404,8 @@ test("outbound: legacy telegram RW config still produces the ACK with ackTarget=
   // No .omp/escalation.json -> handleInboxTask unchanged: no ack, no summary.
   const bare = mkdtempSync(join(tmpdir(), "ob-none-"));
   try {
-    const runId = resolveInboxRunId(bare);
-    handleInboxTask(bare, { id: "t1", text: "No channel", at: new Date().toISOString() }, () => undefined);
+    const runId = writeCtoFixture(bare, "run-no-channel");
+    handleInboxTask(bare, { id: "t1", text: "No channel", at: new Date().toISOString(), runId }, () => undefined);
     assert.equal(existsSync(outboxDir(runId, bare)), false, "no ack without a configured channel");
     assert.equal(produceWaveDeliveries(bare), 0, "no config -> producer queues nothing");
   } finally {
@@ -396,31 +413,22 @@ test("outbound: legacy telegram RW config still produces the ACK with ackTarget=
   }
 });
 
-// ── (g) Throwing wake -> NO admission ACK ─────────────────────────────────
+// ── (g) Ambiguous wake -> durable task, no admission ACK ───────────────────
 
-test("outbound: throwing wake rolls back the inbox file AND queues NO ACK (ack only after successful wake)", () => {
+test("outbound: ambiguous wake retains the inbox file and queues NO ACK", () => {
   const root = mkdtempSync(join(tmpdir(), "ob-ackroll-"));
   try {
     withConfig(root, { channels: [{ id: "ctrl", adapter: "mock", direction: "read-write", primary: true }] });
-    const runId = resolveInboxRunId(root);
-    assert.throws(
-      () =>
-        handleInboxTask(
-          root,
-          { id: "t-throw", text: "Wake must fail", at: new Date().toISOString() },
-          () => {
-            throw new Error("wake failed");
-          },
-        ),
-      /wake failed/,
-    );
-    // The task was NOT admitted (the wake threw): no deterministic ACK may
-    // remain — neither in the outbox nor archived to sent/.
+    const runId = writeCtoFixture(root, "run-ambiguous");
+    const task = { id: "t-throw", text: "Wake result unknown", at: new Date().toISOString(), runId };
+    const path = handleInboxTask(root, task, () => {
+      throw new Error("wake result unknown");
+    });
+    assert.ok(path, "ambiguous wake retains durable task");
     const ackFile = fileNameOf(`${runId}/wave/t-throw/ack`);
-    assert.equal(outboxEntries(root, runId).includes(ackFile), false, "no ack queued after a throwing wake");
-    assert.equal(sentEntries(root, runId).includes(ackFile), false, "no ack archived after a throwing wake");
-    // The rollback still removed the just-filed inbox task (rmSync force).
-    assert.equal(existsSync(join(inboxDir(runId, root), "t-throw.json")), false, "inbox file rolled back on wake failure");
+    assert.equal(outboxEntries(root, runId).includes(ackFile), false, "no ack queued after an ambiguous wake");
+    assert.equal(sentEntries(root, runId).includes(ackFile), false, "no ack archived after an ambiguous wake");
+    assert.equal(existsSync(join(inboxDir(runId, root), "t-throw.json")), true, "inbox file remains durable");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

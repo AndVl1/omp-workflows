@@ -16,16 +16,17 @@
  *     {@link ArtifactContractPolicy.grandfathered} (legacy shapes);
  *   - present-but-invalid produced/consumed artifacts block with
  *     field-level diagnostics;
- *   - a missing consumed artifact blocks only when its producing stage is
- *     `done` (it claimed completion but the artifact is absent); producers
- *     that are pending (loop feedback on the first pass) or skipped are
- *     legitimate absences.
+ *   - a missing required consumed artifact blocks only when its producing
+ *     stage is `done`; optional missing artifacts are non-blocking, but a
+ *     present optional target is always parsed and schema-validated;
+ *   - producers that are pending (loop feedback on the first pass) or skipped
+ *     are legitimate required absences.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
-import { readArtifact } from "./artifacts.js";
+import { readArtifact, readArtifactInput } from "./artifacts.js";
 import { validateLectureAcquisitionArtifact } from "../lecture/acquisition.js";
 import type { Profile, StageDef, TeamState } from "./types.js";
 
@@ -150,6 +151,8 @@ export interface ConsumeDiagnostic {
   missing: boolean;
   /** Producer stage status when the artifact is absent (`done` => violation). */
   producer_status: string | null;
+  /** Optional inputs are informational and never enter required receipts. */
+  optional?: boolean;
   issues: ArtifactIssue[];
 }
 
@@ -158,11 +161,10 @@ export type ConsumeValidationResult =
   | { ok: false; error: string; diagnostics: ConsumeDiagnostic[] };
 
 /**
- * Validate the artifacts a stage declares in `consumes`. Present artifacts
- * are schema-checked; a missing artifact is a violation only when its
- * producing stage is `done` (the producer claimed completion without the
- * artifact). Pending producers (loop feedback on the first pass) and
- * skipped producers are legitimate absences.
+ * Validate the artifacts a stage declares in `consumes` and
+ * `optional_consumes`. Required artifacts keep their existing producer-status
+ * semantics. Optional artifacts are skipped only when truly absent; every
+ * present target is JSON/schema-validated and any invalidity blocks.
  */
 export function validateConsumedArtifacts(
   stage: StageDef,
@@ -211,6 +213,36 @@ export function validateConsumedArtifacts(
       issues.push(...validateManualQaArtifact(value));
     }
     diagnostics.push({ id, missing: false, producer_status: producerStatus.get(id) ?? null, issues });
+  }
+  const persisted = state.required_inputs?.[stage.id];
+  const requiredIds = new Set([
+    ...(stage.consumes ?? []),
+    ...(Array.isArray(persisted) ? persisted.map((input) => input.artifact_id) : []),
+    ...(state.decisions ?? []).flatMap((decision) => decision.artifact_id ? [decision.artifact_id] : []),
+  ]);
+  for (const id of stage.optional_consumes ?? []) {
+    if (requiredIds.has(id)) continue;
+    const read = readArtifactInput(artifactsDir, id);
+    if (read.status === "absent") {
+      diagnostics.push({ id, missing: true, producer_status: producerStatus.get(id) ?? null, optional: true, issues: [] });
+      continue;
+    }
+    if (read.status === "invalid") {
+      diagnostics.push({
+        id,
+        missing: false,
+        producer_status: producerStatus.get(id) ?? null,
+        optional: true,
+        issues: [{ field: "$", message: `optional input '${id}.json' is invalid: ${read.error}` }],
+      });
+      continue;
+    }
+    const issues: ArtifactIssue[] = [];
+    if (policy.validate && !policy.grandfathered.includes(id)) {
+      const validated = validateProducedArtifact(id, read.value, policy);
+      if (!validated.ok) issues.push(...validated.issues);
+    }
+    diagnostics.push({ id, missing: false, producer_status: producerStatus.get(id) ?? null, optional: true, issues });
   }
   const blocking = diagnostics.filter((diagnostic) => diagnostic.issues.length > 0);
   if (blocking.length > 0) {

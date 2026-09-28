@@ -1,0 +1,63 @@
+{
+  "id": "run-lifecycle-resume",
+  "title": "Run lifecycle: fresh-session resume and guarded recovery",
+  "description": "Registered /do-work continuation journey: close after a saved decision, resume by title/list without old chat, and verify required-evidence, pending-dispatch and terminal-history guards.",
+  "task": { "file": "run-lifecycle-resume-task.md" },
+  "params": {
+    "slug": "run-lifecycle-resume",
+    "branch": "feat/run-lifecycle-resume",
+    "task": "exercise fresh-session resume from canonical decisions and guarded recovery"
+  },
+  "stages": [
+    {
+      "id": "save_decision",
+      "name": "Persist decision before closing",
+      "expect": ["workflow_prepare", "decision|checkpoint", "saved|committed", "artifact|evidence"]
+    },
+    {
+      "id": "fresh_session_resume",
+      "name": "Resume by title without old chat",
+      "expect": ["operation[^\\n]*resume", "restored|recovered", "stage|cursor", "decision"]
+    },
+    {
+      "id": "ambiguous_list",
+      "name": "Ambiguous title requires stable list selection",
+      "expect": ["run_selection_required", "branch", "status", "stage", "1[.)]"]
+    },
+    {
+      "id": "missing_required_input",
+      "name": "Missing required evidence refuses dependent work",
+      "expect": ["recovery_required", "artifact|evidence", "no transition|blocked|не выполн"]
+    },
+    {
+      "id": "pending_identity",
+      "name": "Pending dispatch is observed, not duplicated",
+      "expect": ["pending|background_wait|transport_reconnect", "dispatch", "same|existing|duplicate"]
+    },
+    {
+      "id": "terminal_history",
+      "name": "Terminal history does not gate ordinary work",
+      "expect": ["run_terminal", "operation[^\\n]*new", "ordinary|new task|обычн"]
+    }
+  ],
+  "timing": {
+    "startupTimeoutMs": 120000,
+    "stageTimeoutMs": 900000,
+    "checkpointPollMs": 2000
+  },
+  "screenshots": {
+    "on": ["stage_start", "stage_end", "error"]
+  },
+  "ratings": {
+    "dimensions": [
+      "message_clarity",
+      "feedback_timing",
+      "error_handling",
+      "layout",
+      "interactivity",
+      "visual_rendering"
+    ],
+    "min": 1,
+    "max": 5
+  }
+}

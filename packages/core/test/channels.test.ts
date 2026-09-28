@@ -151,10 +151,20 @@ test("channels: built-in defaults apply only when capabilities param is absent",
   } finally {
     cleanup(cwd);
   }
-  // explicit capabilities table with NO entry for the kind → no constraint (declared rw stands)
-  const cwd2 = makeCwd({ channels: [{ id: "c", adapter: "my-kind", direction: "read-write" }] });
+  // explicit capabilities table replaces built-ins; a supported kind keeps rw,
+  // while an unknown kind fails closed to ro.
+  const cwd2 = makeCwd({
+    channels: [
+      { id: "known", adapter: "my-kind", direction: "read-write" },
+      { id: "unknown", adapter: "other-kind", direction: "read-write" },
+    ],
+  });
   try {
-    assert.equal(resolveChannelProfile(cwd2, {}).direction, "rw", "absent capability entry imposes no constraint");
+    const explicitCaps: Record<string, ChannelCapabilities> = { "my-kind": { canReceiveInbound: true, canSend: true } };
+    const profiles = normalizeChannelConfig(loadEscalationConfigRaw(cwd2), explicitCaps);
+    const byId = Object.fromEntries(profiles.map((p) => [p.id, p.direction]));
+    assert.equal(byId["known"], "rw", "declared rw stays rw for a supported explicit capability");
+    assert.equal(byId["unknown"], "ro", "unknown explicit capability fails closed to ro");
   } finally {
     cleanup(cwd2);
   }

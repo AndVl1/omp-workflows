@@ -3,7 +3,7 @@
 Declarative multi-stage workflow engine for [oh-my-pi](https://github.com/oh-my-pi). Native extension package — ships as a workspace of two npm packages:
 
 - **`@andvl1/omp-workflows-core`** — pure engine: state machine, gates, slash commands, profiles, artifact schemas. No agents, no skills, no domain opinions.
-- **`@andvl1/omp-workflows-fullstack`** — default bundle: 17 specialized agents + 31 domain skills for Spring/Kotlin/React/KMP/Telegram-bot stacks. Pulls core as a peer dependency.
+- **`@andvl1/omp-workflows-fullstack`** — default bundle of specialized agents and domain skills for Spring/Kotlin/React/KMP/Telegram-bot stacks. Pulls core as a peer dependency.
 
 Custom bundles (Rust, Go-only, minimal Python, etc.) compose core with their own role mappings.
 
@@ -20,9 +20,9 @@ echo "//npm.pkg.github.com/:_authToken=ghp_xxx" >> ~/.npmrc
 Then install with your usual tooling:
 
 ```bash
-# Both packages must be on the same compatible minor line (e.g. 0.17.x):
-# fullstack does not upgrade core automatically, so install core first and
-# let the peer requirement resolve against a matching core.
+# Both packages must satisfy the fullstack peer dependency (currently core `^0.28.0`).
+# Keep published core/fullstack versions on a compatible release line; npm does not
+# upgrade core automatically.
 
 # Most projects: core first, then fullstack (engine + agents + skills)
 omp plugin install @andvl1/omp-workflows-core
@@ -34,10 +34,14 @@ omp plugin install @andvl1/omp-workflows-core
 # Plain npm (works the same — npm respects the registry scoping in ~/.npmrc)
 npm install @andvl1/omp-workflows-core
 npm install @andvl1/omp-workflows-fullstack
+```
 
-### Slash command bootstrap — deterministic for both install paths
+### Slash command bootstrap and compatibility copies
 
-The fullstack extension registers `/do-work`, `/team`, and `/cto` directly while OMP loads the plugin. Registered extension commands are available to slash autocomplete and execute before project-local custom-TS files, so a stale `.omp/commands/` copy or an unresolved peer dependency cannot hide or replace the current plugin implementation.
+When the extension is loaded, its registered `/do-work`, `/team`, and `/cto`
+commands take precedence over project-local custom-TS copies. A peer-dependency
+resolution failure is an install error; a stale compatibility copy is not a
+replacement for the unavailable extension implementation.
 
 Project-local `.omp/commands/` copies remain a compatibility path for runtimes that only discover custom-TS commands from disk:
 
@@ -129,27 +133,36 @@ omp-workflows-monorepo/
 │   │   ├── test/             # smoke + integration tests
 │   │   └── package.json
 │   └── fullstack/            # @andvl1/omp-workflows-fullstack
-│       ├── src/index.ts      # bundle registration and discovery bootstrap
-│       ├── commands/         # 6 OMP custom-TS slash command adapters
-│       │   ├── cto/          # main-session CTO orchestration
-│       │   ├── do-work/      # core-backed classification workflow
-│       │   ├── team/         # compatibility alias for /do-work
+│       ├── src/index.ts            # bundle registration and discovery bootstrap
+│       ├── src/workflow-commands.ts # registered /do-work, /team, /cto handlers
+│       ├── commands/                # disk-discovery compatibility adapters
 │       │   ├── init-team/
 │       │   ├── interview/
-│       │   └── omp-model-roles/
-│       ├── agents/            # 16 domain/team agents
-│       ├── skills/            # 27 domain skills
+│       │   ├── omp-model-roles/
+│       │   ├── session-report/
+│       │   └── workflow-view/
+│       ├── agents/                  # domain/team agent definitions
+│       ├── skills/                  # domain skill definitions
 │       └── package.json
 ├── .github/workflows/
 │   └── release.yml           # tag-driven publish to GitHub Packages
 └── vibe-report/              # migration notes, walk reports
 ```
 
-### How slash commands ship (v0.20.2+)
+### Регистрация slash-команд и совместимость
 
-OMP 17.x exposes the `task` tool only to the main agent. Workflow commands therefore return prompts; the main agent executes the workflow through its own `task` tool.
+Fullstack регистрирует `/do-work`, `/team` и `/cto` как extension-команды во время
+загрузки. Зарегистрированный handler разрешает и авторизует `cwd` сессии, строит
+вход workflow и передаёт его через `pi.sendUserMessage(...)`; он сам не запускает
+subagents. Затем prompt проходит обычный lifecycle OMP, а resident main agent
+вызывает активные `workflow_*` tools.
 
-- **Authoritative runtime path:** `packages/fullstack/src/workflow-commands.ts` registers `/do-work`, `/team`, and `/cto` through `ExtensionAPI.registerCommand` during extension loading. OMP gives registered extension commands precedence over project-local custom-TS commands for both autocomplete and execution. The handlers still send the generated prompt through OMP's normal user-message lifecycle, so external `before_agent_start`/`context` hooks continue to run.
+Core сохраняет canonical state, `workflow_prepare`, execution claims, capability
+handoffs, typed artifacts, gates и переходы lifecycle; host agent вызывает эти
+инструменты в текущей сессии. Это не обещает background execution или scheduler
+без отдельного явно подключённого механизма.
+
+- **Authoritative runtime path:** `packages/fullstack/src/workflow-commands.ts` registers the three workflow handlers through `ExtensionAPI.registerCommand`. OMP gives registered extension commands precedence over project-local custom-TS commands for autocomplete and execution.
 - **Compatibility path:** `packages/fullstack/commands/<name>/index.ts` contains the thin custom-TS adapters. `copy-commands.mjs` and the `session_start` SHA-256 sync materialize them under `<project>/.omp/commands/` for runtimes that still rely on disk discovery. These copies are not an override API; same-name external extension commands use OMP's normal load-order rule, and Claude marketplace commands stay namespaced.
 
 
@@ -181,11 +194,11 @@ Workflow entry points have two independent ownership layers:
    the same slash name; its owner-aware handler fails closed with
    `owner_conflict`.
 
-The standard handlers do not spawn a subagent directly. They resolve and
-authorize the session cwd, build a workflow prompt, and call
-`pi.sendUserMessage(...)`. The prompt then passes through OMP's normal
-`before_agent_start` / `context` lifecycle, after which the resident main agent
-uses the active owner's `workflow_*` tools.
+Стандартные handlers — это ingress: они разрешают `cwd`, строят prompt и вызывают
+`pi.sendUserMessage(...)`, но не являются отдельным subagent dispatcher. Resident
+main agent выполняет текущий workflow turn через tools активного owner, а engine
+проверяет canonical state, claims, capability и typed handoffs. Command ownership и
+workflow-capability ownership остаются независимыми слоями.
 
 | Setup | Canonical commands |
 |---|---|
@@ -225,29 +238,78 @@ The complete custom-bundle recipe is in
 /do-work Review my auth changes
 /init-team
 > **Note**: `/team` remains a compatibility alias for `/do-work`; `/cto` is the sole orchestration entrypoint.
-1. **Walk** stages in profile order. Each by `type`:
-   - `orchestrator` → inline orientation
-   - `single` → one `task` call
-   - `consilium` → parallel `task` calls in one batch
-   - `bash` → deterministic shell step
-   - `none` → skip
-5. **Honour** `consumes`/`produces` typed artifacts.
-6. **Honour** `gate` (block `done` until gate holds) and `checkpoint` (interactive: stop; autonomous: apply `autonomous` decision).
-7. **Loop** if `loop: { back_to, until, max_iterations }` is set.
-8. **Mirror** progress into `team-state.md`.
 
-Concretely, in v0.4.0+:
-- The `/do-work` custom-TS command (or its `/team` alias) parses the envelope and returns a prompt
-  to the main agent with the resolved `Workflow:` name and the role
-  mapping table.
-- The main agent then runs the `task` tool with the resolved agent for
-  each stage. The engine is the *grammar* of the workflow; the main
-  agent owns the *runtime*.
+### Lifecycle: new, resume, rework
 
-Gates run as `before_agent_start` (classification + monotonic), `session_stop`
-(DoD backstop), and `tool_call` (safety). Workflow data is the same JSON
-files as the legacy `claude-plugin` (v3.0.x). The interpreter moves from
-markdown prose into TypeScript.
+Наличие старого state больше не означает автоматическое продолжение. Обычный
+workflow использует явные режимы, а UUID нужен только как технический selector:
+
+```text
+/do-work --new Добавить экспорт отчётов
+/do-work продолжи экспорт отчётов
+/do-work --resume
+/do-work --resume --run <run-id>
+/do-work --rework Исправить результат экспорта
+/do-work --list
+/do-work --list --all-branches
+```
+
+Выбор по названию или пункту read-only списка разрешается в canonical run до
+первой мутации. Успешный `workflow_prepare` возвращает receipt с operation,
+previous/selected run, статусами и continuation point; неоднозначный выбор
+запрашивает уточнение, а ошибочный явный selector не получает fallback.
+
+**Текущий lifecycle обычного `/do-work`:**
+
+- **Prepare и required inputs.** После каждого успешного `workflow_prepare` и
+  перехода к следующей стадии host получает текущий contract через
+  `workflow_instructions → workflow_begin → workflow_instructions`. Receipt
+  обязательных входов привязан к capability; отсутствующий или повреждённый
+  required input останавливает действие с `recovery_required`, а не заменяется
+  summary, chat history или случайным файлом.
+- **Walk profile.** Стадии идут в порядке профиля: `orchestrator` выполняется
+  inline, `single` dispatch-ит одного worker, `consilium` dispatch-ит
+  объявленный roster (parallel, когда это указано профилем), `document`
+  рендерится deterministic engine-ом, `bash` выполняет deterministic shell
+  step, `none` пропускается.
+- **Artifacts и gates.** `consumes`/`produces` проверяются по typed contracts;
+  `gate` и typed checkpoint policy должны быть выполнены до advance. Текст
+  `autonomous` и routing metadata не являются разрешением на checkpoint.
+  Ограниченные `loop` возвращаются к объявленной стадии только по
+  `back_to`/`until`/`max_iterations`, а progress читается из выбранного
+  canonical run.
+- **Claims и busy.** В одном физическом worktree допускается один
+  конфликтующий execution claim. Живой или неизвестно завершённый coordinator
+  или worker возвращает `run_busy`; переход не публикуется частично. Сначала
+  используйте `workflow_status`: новый run не вытесняет pending work, resume
+  присоединяется только к тому же run, а force-unlock не является обходом.
+- **Resume и rework.** Resume в новой host-сессии читает canonical state и
+  required artifacts, а не старый чат; pending dispatch не запускается повторно,
+  а недоступный transport сохраняет `background_wait`/`transport_reconnect`.
+  Rework сохраняет прежний результат в immutable revision, переоткрывает
+  затронутую стадию с downstream-зависимостями и не позволяет старым proofs
+  завершить новую версию.
+- **Canonical storage.** Для schema 2 у ordinary run совпадают `run_id`,
+  `run_key` и `WorkIdentity.run_id`; state хранится в
+  `.work-state/runs/<run-id>/state.json`, revisions — в
+  `.work-state/runs/<run-id>/revisions/<revision-id>/`. Branch — контекст
+  маршрутизации/совместимости, не identity. Legacy state, slug и
+  `.active-feature` остаются import-only и не являются runtime fallback.
+- **Canonical report и viewer.** `/session-report` и `/workflow-view` принимают
+  selector выбранного canonical run/revision (`/workflow-view --all` — список
+  доступных canonical runs). Report пишет self-contained HTML, viewer — offline
+  bundle в `.work-state/visualize`; latest/slug/legacy fallback нет. Текущий
+  viewer поддерживает canonical reader, а переработка UI/graph model остаётся
+  отдельным будущим scope.
+
+Это shipped lifecycle обычного workflow. Автономная маршрутизация не включает
+background scheduler и не отменяет typed human checkpoint policy; CTO wave
+scheduler — отдельный явно подключаемый/session-scoped механизм, а не implicit
+resume.
+
+Подробности про migration/recovery UX, branch context, report и viewer см. в
+[`core lifecycle contract`](packages/core/README.md) и
+[`fullstack command guide`](packages/fullstack/README.md).
 
 ### Bootstrap custom-TS commands into your project
 
@@ -262,14 +324,14 @@ npm run --prefix node_modules/@andvl1/omp-workflows-fullstack copy-commands
 
 OMP discovers them on the next session start.
 
-Releases are driven by pushing a semver tag:
+## Releases
 
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-`.github/workflows/release.yml` then runs `npm ci`, full monorepo build, typecheck, tests, stamps `packages/{core,fullstack}/package.json#version` from the tag, and publishes `@andvl1/omp-workflows-core` then `@andvl1/omp-workflows-fullstack` to `npm.pkg.github.com` as `--access public`. `GITHUB_TOKEN` is sufficient; the `AndVl1/omp-workflows` repo is public so its tokens carry `packages: write` for the org.
+Авторитетный release-процесс описан в
+[`release workflow`](.github/workflows/release.yml): там зафиксированы формат
+semver tag, проверка совпадения версии tag с обоими package manifests, CI
+проверки, публикация в GitHub Packages и требования к `CHANGELOG.md`. Не
+копируйте сюда конкретный version tag — перед публикацией следуйте workflow и
+текущему разделу changelog.
 
 ## Strict recommendations command (vp9)
 
@@ -312,12 +374,10 @@ deterministically. The contract relies on a marker envelope plus a
    ignored the user-prompt delegation request.
 
 4. **Why this is NOT a `/do-work` stage.** The user explicitly chose a
-   `before_agent_start` hook over a workflow stage. A new
-   `/do-work` stage would couple delegation to the team workflow
-   (`team-state.json`, gates, role mapping) and force the user to
-   commit to a profile. The hook is **session-scoped**, fires once per
-   agent loop, and does not require any `work-state` artifact.
-   `team-state.json` remains untouched.
+   `before_agent_start` hook over a workflow stage. A new `/do-work` stage would
+   couple delegation to the team workflow and force the user to commit to a
+   profile. The hook is **session-scoped**, fires once per agent loop, and does
+   not create a canonical ordinary workflow run or `.work-state` artifacts.
 
 5. **Fallback for sessions without the extension.** If the
    `@andvl1/omp-workflows-fullstack` extension is not installed (e.g.
@@ -406,30 +466,28 @@ extension entry point: it wires gates/config/observability, but not the
 identity as shown in
 [`docs/adding-agents.md`](docs/adding-agents.md#4-регистрация-workflow).
 
-## Observability (v0.7.0+)
+## Observability
 
 When the engine is wired in via `registerTeamWorkflow`, it subscribes to seven OMP extension events
 (`before_agent_start`, `agent_start`, `agent_end`, `tool_call`, `tool_result`,
-`session_start`, `session_stop`) and writes a per-feature append-only event log
-to `.work-state/features/<slug>/observability/events.jsonl`. A rollup
-is computed from the log and embedded in `TeamState.observability` on
-every `writeState`.
+`session_start`, `session_stop`) and records events only for the explicitly selected
+canonical run. Live hooks use the explicit canonical run ID and write
+`.work-state/runs/<run-id>/observability/events.jsonl`; revisions are read-only immutable
+snapshots, while live hook scope remains the parent run ID.
+Feature-slug, branch-derived and `.active-feature` recorder scopes are not a runtime
+fallback and return migration guidance.
 
-The rollup is mirrored in `team-state.md` under a new `## Observability` section:
+The rollup is persisted in the selected `TeamState.observability` pointer and is consumed by
+the canonical status/report readers:
 
 ```markdown
 ## Observability
 - events: observability/events.jsonl (last id: evt-l8v3kf72-1b)
 - agent invocations: 4
-- subagents:
-  - developer-go: 1
-  - code-reviewer: 1
-  - qa: 1
-- skills:
-  - ast-index: 3
-  - omp-workflows: 2
+- subagents: developer-go (1), code-reviewer (1), qa (1)
+- skills: ast-index (3), omp-workflows (2)
 - tool calls: 47 (errors: 2)
-- duration: 1842000ms (2026-08-01T13:00:00Z → 2026-08-01T13:30:42Z)
+- duration: 1842000ms
 ```
 
 This is the source of truth for:
@@ -444,50 +502,49 @@ Disable per-bundle via `registerTeamWorkflow(pi, { observability: false })`.
 Pre-observability features yield an absent `TeamState.observability` field
 (no migration needed).
 
-## Subagent validation contract (v0.8.0+)
+## Subagent validation contract
 
 Stages that produce a code-bearing artifact (`implementation`,
 `review_fixes`) go through a machine-checked validation gate after the
 subagent returns. The handoff is blocked unless the artifact contains:
 
-- `ready: "true"`
-- `validation_run: "true"` (the string, not the boolean)
-- `validation_evidence`: the verbatim stdout/stderr of the project's
-  build + test commands — not a summary, not "ok", the actual output.
+- `ready: true` or `"true"`
+- `validation_run: true` or `"true"`
+- `validation_evidence`: a non-empty string claiming actual validation output
+  or provenance. The gate does not machine-verify that claim.
 
-A subagent that returns `ready: true` without these is **rejected** with
-a precise reason. The stage is marked `failed` and the orchestrator must
-re-spawn the developer with the gate's reason as the new task. The
-orchestrator is forbidden from patching the artifact by hand, from
-editing source code, or from re-running the subagent's build to "double
-check".
+A missing or invalid validation block is a typed stage-readiness blocker, not a
+worker failure. Preserve any succeeded terminal receipt; do not patch the
+artifact, reuse its authorization, or re-run/re-spawn a worker in the same
+turn. Continue only through explicit lifecycle rework with a fresh capability;
+replacement output must carry actual validation output or provenance.
 
 Why: in production we observed subagents returning
 `ready: true, validation_run: "false", validation_note: "Per assignment,
-orchestrator owns validation"`. The "per assignment" was an LLM
-hallucination — the assignment said no such thing. There is no
-escape hatch in the engine. The gate is the source of truth.
+orchestrator owns validation"`. The "per assignment" was an LLM hallucination —
+the assignment said no such thing. There is no escape hatch in the engine. The
+gate is the source of truth.
 
-Profiles that re-use the `implementation` or `review_fixes` produce keys
-for non-code stages must either rename the produces key or include the
-validation fields; otherwise the stage will be marked `failed`.
+If a profile uses the stage id `implementation` or `review_fixes` for a
+non-code stage, it must either satisfy this validation contract or use a
+different stage id; the gate is keyed by those stage ids.
 
 ## Orchestrator discipline
 
 The orchestrator (the main agent driving the workflow) is a
 **dispatcher**, not a coder:
 
-- It does not edit source code. If a subagent's output is wrong, the
-  orchestrator re-spawns the same agent with a sharper task. It does
-  not patch the subagent's artifact.
-- It does not second-guess build/test output by re-running it. The
-  subagent owns the validation evidence; the orchestrator either trusts
-  it or re-spawns.
+- It does not edit source code. If a dispatched worker actually fails or is
+  cancelled and the profile permits another dispatch, follow the declared
+  lifecycle path; do not patch the worker's artifact.
+- It does not second-guess build/test output by re-running it. The worker owns
+  the validation evidence; the orchestrator either accepts it or uses the
+  explicit lifecycle rework path.
 - It does not skip stages to "save time". The profile order is the
   contract.
-- On a validation-gate failure, the orchestrator's only job is to call
-  the same agent again with the gate's reason (the stage outcome's
-  `note` field) as the new task, copied verbatim.
+- On a stage-readiness gate failure after a successful worker result, it preserves
+  the receipt and waits for explicit lifecycle rework; it does not re-spawn or
+  retry the worker in the same turn.
 
 These rules are documented in the `/do-work` command prompt and injected
 into the stage prompt for every executor via `buildStagePrompt`.

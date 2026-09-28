@@ -27,11 +27,12 @@ import { resolveWorkflowContract, validateDispatchCapability, validateTypedContr
 import type { DispatchCapabilityState, PendingState, WorkIdentity } from "../src/engine/types.js";
 
 const TIMESTAMP = "2026-08-30T00:00:00Z";
+const RUN_ID = "22222222-2222-4222-8222-222222222222";
 
 function workIdentity(capability: DispatchCapabilityState): WorkIdentity {
   const issued = capability.issued_for!;
   return {
-    run_id: "run-1",
+    run_id: RUN_ID,
     wave_id: "wave-1",
     slice_id: "slice-1",
     session_id: "session-1",
@@ -65,7 +66,7 @@ function capabilityFixture(): DispatchCapabilityState {
   const profile = loadProfile("feature-regression");
   assert.ok(profile);
   const capability = createCapability({
-    run_key: "main",
+    run_key: RUN_ID,
     branch: "main",
     workflow: "feature-regression",
     profile_hash: profileHash(profile),
@@ -124,7 +125,7 @@ test("malformed nested capability pending fails at the exact array path", () => 
 
 test("root-state pending stays a single-object contract", () => {
   const capability = createCapability({
-    run_key: "main",
+    run_key: RUN_ID,
     branch: "main",
     workflow: "feature-regression",
     profile_hash: "profile-hash",
@@ -146,25 +147,30 @@ test("root-state pending stays a single-object contract", () => {
 function initGit(root: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
 }
-
 function persist(root: string, capability: DispatchCapabilityState, rootPending?: PendingState[]): void {
   const profile = loadProfile("feature-regression");
   assert.ok(profile);
-  mkdirSync(join(root, ".work-state"), { recursive: true });
-  writeFileSync(join(root, ".work-state", "team-state.json"), JSON.stringify({
-    schema: 1,
+  const runDir = join(root, ".work-state", "runs", RUN_ID);
+  mkdirSync(join(runDir, "artifacts"), { recursive: true });
+  writeFileSync(join(runDir, "artifacts", "regression_intake.json"), JSON.stringify({ summary: "intake" }) + "\n");
+  writeFileSync(join(runDir, "state.json"), JSON.stringify({
+    schema: 2,
+    run_id: RUN_ID,
+    run_key: RUN_ID,
+    lifecycle_status: "active",
+    rework_generation: 0,
     branch: "main",
-    run_key: "main",
+    title: "capability pending regression",
     classification: { type: "REGRESS", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "feature-regression" },
     task: "capability pending regression",
+    required_inputs: {},
+    required_input_receipts: {},
+    workflow_override: false,
+    issue: null,
     stage_cursor: "surface_mapping",
-    stages: profile.stages.map((stage) => ({
-      id: stage.id,
-      status: stage.id === "surface_mapping" ? "in_progress" : stage.id === "discovery_intake" ? "done" : "pending",
-    })),
-    artifacts: {},
+    stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "surface_mapping" ? "in_progress" as const : stage.id === "discovery_intake" ? "done" as const : "pending" as const })),
     scope: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null },
-    policy: { strict_orchestrator: true },
+    artifacts: { regression_intake: "artifacts/regression_intake.json" },
     pause: { kind: "none", reason: "" },
     profile_hash: profileHash(profile),
     cursor_epoch: capability.issued_for?.cursor_epoch,
@@ -179,7 +185,7 @@ test("resolveWorkflowContract accepts a capability whose pending is a PendingSta
     initGit(root);
     const capability = capabilityFixture();
     persist(root, capability);
-    const contract = resolveWorkflowContract(root);
+    const contract = resolveWorkflowContract(root, { runId: RUN_ID });
     assert.equal(contract.pending?.identity.dispatch_id, "dispatch-1", "the capability lifecycle log resolves as the live pending");
     assert.equal(contract.pending?.status, "running");
     assert.equal(contract.status.lifecycle, "pending");
@@ -208,8 +214,8 @@ test("an array-shaped pending at the state root is still rejected by the resolve
     // it. The single-object root contract itself — "$.pending must be an
     // object" — is pinned by the validateTypedControlPlane test above.
     assert.throws(
-      () => resolveWorkflowContract(root),
-      (error: unknown) => error instanceof WorkflowContractError && error.code === "STATE_INVALID",
+      () => resolveWorkflowContract(root, { runId: RUN_ID }),
+      (error: unknown) => error instanceof WorkflowContractError && error.code === "RECOVERY_REQUIRED",
       "the root-state single-object pending contract is not weakened",
     );
   } finally {
