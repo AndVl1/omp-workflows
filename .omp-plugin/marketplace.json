@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Declarative multi-stage workflow engine for omp — 21 specialized agents, 28 domain skills, 9 command surfaces, 13 declarative JSON profiles, role-driven DoD gate, profile-driven workflow engine. Native omp plugin (no Claude Code hooks).",
-    "version": "0.28.4",
+    "version": "0.29.0",
     "pluginRoot": "packages/fullstack"
   },
   "plugins": [
     {
       "name": "omp-workflows",
-      "description": "Profile-driven workflow engine for omp. /do-work runs a classification-first adaptive workflow, /team ships as an alias for /do-work. 21 agents, 28 skills, 9 command surfaces, 13 JSON profiles, typed DoD artifact with backstop gate.",
+      "description": "Profile-driven workflow engine for omp. /do-work supports explicit new, resume, and rework modes, with classification-first routing for new tasks; /team remains an alias for /do-work. 21 agents, 28 skills, 9 command surfaces, 13 JSON profiles, typed DoD artifact with backstop gate.",
       "source": "./",
       "category": "development",
       "keywords": [
