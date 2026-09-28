@@ -2543,7 +2543,37 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       sessionController = shared;
       return shared;
     }
-    if (sessionController && sessionController.context().worktree === cwd) return sessionController;
+    if (sessionController) {
+      const existing = sessionController;
+      let existingContext: TrustedExecutionContext | undefined;
+      try {
+        existingContext = existing.context();
+      } catch {
+        existingContext = undefined;
+      }
+      if (existingContext && resolve(existingContext.worktree) === resolve(cwd)) {
+        const branch = resolveActiveBranch(cwd);
+        if (existingContext.branch === branch) return existing;
+        try {
+          if (
+            existing.activeCtoClaim() !== undefined
+            || existing.activeClaimRunId() !== undefined
+            || existing.selectedRunId() !== undefined
+          ) return existing;
+        } catch {
+          return existing;
+        }
+        sessionController = createWorkflowSessionController({
+          cwd,
+          context: {
+            ...existingContext,
+            process_id: process.pid,
+            branch,
+          },
+        });
+        return sessionController;
+      }
+    }
     const sessionId = hostSession?.session_id ?? sessionIdFromContext(ctx);
     if (!sessionId) throw new Error("WORKFLOW_CONTEXT_REJECTED: trusted session identity is unavailable");
     const branch = resolveActiveBranch(cwd);
@@ -2697,15 +2727,12 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       }
       try {
         const controller = controllerFor(ctx, cwd);
-        const commandIntent = controller.consumeCommandIntent({
-          command_intent_id: input.command_intent_id,
-          mode,
-          ...(input.run_id ? { run_id: input.run_id } : {}),
-        });
-        // Probe an explicit selector before prepare so the host boundary keeps
-        // the resolver's exact candidates/snapshot; prepare still resolves it
-        // again under its mutation lock and remains authoritative.
-        if (selectionMode && input.selector && !input.run_id) {
+        // Resolve selector identity before consuming an explicit command intent.
+        // The selector is read-only; prepare resolves it again under the
+        // workspace lock. This lets a selector.run_id/list item satisfy an
+        // ingress-bound --run without requiring a duplicate top-level alias.
+        let resolvedSelectionRunId: string | undefined;
+        if (selectionMode && input.selector) {
           const resolved = controller.readSelector().resolve(selectionMode, input.selector);
           if (!resolved.ok) {
             const boundaryError = resolved.error as LifecycleBoundaryError;
@@ -2713,7 +2740,24 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
             if (resolved.snapshot) boundaryError.snapshot = resolved.snapshot;
             throw boundaryError;
           }
+          resolvedSelectionRunId = resolved.candidate.run_id;
+          if (input.run_id && input.run_id !== resolvedSelectionRunId) {
+            throw new LifecycleError(
+              "lifecycle_request_conflict",
+              `workflow_prepare run_id '${input.run_id}' does not match the resolved selector run '${resolvedSelectionRunId}'`,
+              { run_id: input.run_id },
+            );
+          }
         }
+        const commandIntent = controller.consumeCommandIntent({
+          command_intent_id: input.command_intent_id,
+          mode,
+          ...(input.run_id
+            ? { run_id: input.run_id }
+            : resolvedSelectionRunId
+              ? { run_id: resolvedSelectionRunId }
+              : {}),
+        });
         const prepared = controller.prepare({
           mode,
           task: input.task,

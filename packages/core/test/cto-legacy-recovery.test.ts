@@ -172,12 +172,12 @@ test("legacy CTO recovery rejects snapshot drift while confirmation is pending",
 test("legacy CTO recovery refuses active claims and pending lease evidence", async () => {
   const root = mkdtempSync(join(tmpdir(), "cto-legacy-recovery-busy-"));
   try {
-    const fixture = legacyFixture(root);
     acquireExecutionClaim(root, {
       run_id: "11111111-1111-4111-8111-111111111111",
       context: context(root, "ordinary-owner"),
       owner_kind: "workflow",
     });
+    legacyFixture(root);
     await assert.rejects(
       recoverLegacyCtoIngress({ cwd: root, branch: BRANCH, task: "resume", run_id: RUN_ID, controller: makeController(root) }, async () => true),
       (error: unknown) => errorCode(error) === "run_busy",

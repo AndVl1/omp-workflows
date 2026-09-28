@@ -67,7 +67,7 @@ Fullstack регистрирует `/do-work` и alias `/team`; они испо�
 /do-work продолжи экспорт отчётов
 /do-work --resume
 /do-work --resume --run <run-id>
-/do-work --rework --run <run-id> Исправить результат экспорта
+/do-work --rework Исправить результат экспорта
 /do-work --list
 /do-work --list --all-branches
 ```

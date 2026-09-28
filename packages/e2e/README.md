@@ -41,11 +41,14 @@ Root convenience script: `npm run e2e -- <subcommand> …` (builds first).
 
 ## Run-lifecycle acceptance journeys
 
-The public registered `/do-work` journeys for OpenSpec run-lifecycle are data
-scenarios in `scenarios/run-lifecycle-journey.json` and
-`scenarios/run-lifecycle-resume.json`. They use this existing PTY/WS harness;
-they do not call core APIs directly and never edit canonical `.work-state`
-files.
+The public registered `/do-work` journeys for OpenSpec run-lifecycle are described by
+`scenarios/run-lifecycle-journey.json` and
+`scenarios/run-lifecycle-resume.json`. The JSON files describe expected stages and
+evidence patterns; their `*-task.md` files are operator checklists, not prompts for
+the model. **Для live-приёмки запускайте harness в чистой сессии без `--scenario` и
+без `--task`; вводите каждую slash-команду вручную через terminal PTY.** They use
+the existing PTY/WS harness, do not call core APIs directly, and never edit
+canonical `.work-state` files.
 
 Prerequisites (local operator setup only):
 
@@ -58,6 +61,30 @@ Prerequisites (local operator setup only):
   a missing-config warning.
 - A local checkout with the plugin wired by `bootstrap`; use a scratch
   directory, never this repository worktree, for branch changes.
+- **Scratch-only scope setup.** `bootstrap` copies the repository
+  `.omp/team.config.json`; the current map covers repository TypeScript/JSON
+  paths, not arbitrary scenario JavaScript files. Before the first
+  `workflow_prepare`, make every scenario `src/`/`test/` JavaScript path match
+  the copied scratch `scope_map` (a `**/*.js`/exact `src`/`test` mapping resolves
+  to `dev_agent: omp-engine-specialist`; a stale `packages/**/*.js` rule does
+  not cover scratch `src`). Include the same paths in `workflow_prepare.files`.
+  Resume preserves the scope persisted for the run; editing the map later does
+  not repair that run. Keep this setup in the scratch project and never repair
+  canonical `.work-state` by hand.
+- **Preflight before the first slash command.** The role overlay is configuration,
+  not proof of the active model: inspect the started session/host evidence before
+  entering `/do-work` and stop unless every live role resolves to
+  `openai-codex/gpt-6-luna` or `openai-codex/gpt-5.6-luna`. Sol/Astra resolution
+  is invalid for this acceptance.
+- **Neutral scratch ownership.** Use a branch-backed git scratch created by
+  `bootstrap`, not a detached repository checkout. Do not inherit a competing
+  project extension (for example, a monorepo `.omp/settings.json` explicit
+  internal extension together with the harness fullstack bundle): that combination
+  can produce an owner-token conflict. Keep one extension owner in the scratch.
+- For the missing-input fixture, use a valid bounded workflow JSON and an exact
+  classification/workflow override; vague task wording may resolve to a different
+  lightweight profile. Remove temporary fixture profiles and wrappers after the
+  evidence is captured; never repair canonical state manually.
 
 Prepare and run the A → B → C → A journey:
 
@@ -65,14 +92,15 @@ Prepare and run the A → B → C → A journey:
 npm run build -w @andvl1/omp-workflows-e2e
 node packages/e2e/dist/cli.js bootstrap run-lifecycle-journey feat/run-lifecycle-a \
   --monorepo . --workdir /tmp --force
+# Start a clean registered-command session; do not pass --scenario or --task.
 node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-run-lifecycle-journey \
-  --scenario packages/e2e/scenarios/run-lifecycle-journey.json \
   --surface text --detach --max-time 90m
 ```
 
-Drive the registered `/do-work` commands through the printed terminal URL (or
-`ux-e2e input`/`ux-e2e ask`), follow the task file's branch and selector steps,
-then save evidence:
+Drive the registered `/do-work` commands manually through the printed terminal URL
+(or `ux-e2e input`/`ux-e2e ask`), following the operator checklist in
+`run-lifecycle-journey-task.md`. Do not send that checklist or a scenario file to
+the model as one prompt. Save evidence:
 
 ```bash
 node packages/e2e/dist/cli.js transcript /tmp/omp-ux-e2e-run-lifecycle-journey --follow
@@ -82,17 +110,17 @@ node packages/e2e/dist/cli.js report /tmp/omp-ux-e2e-run-lifecycle-journey \
 
 Prepare the resume scratch once. After session 1 reaches the saved decision,
 run `report --copy-evidence` and `ux-e2e stop`; then start **the same scratch**
-again for session 2 without its previous chat:
+again for session 2 without its previous chat. Both starts are clean registered
+command sessions: omit `--scenario` and `--task`, and type the slash commands
+manually into the new terminal PTY.
 
 ```bash
 node packages/e2e/dist/cli.js bootstrap run-lifecycle-resume feat/run-lifecycle-resume \
   --monorepo . --workdir /tmp --force
 node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-run-lifecycle-resume \
-  --scenario packages/e2e/scenarios/run-lifecycle-resume.json \
   --surface text --detach --max-time 90m
 # after report + stop:
 node packages/e2e/dist/cli.js start /tmp/omp-ux-e2e-run-lifecycle-resume \
-  --scenario packages/e2e/scenarios/run-lifecycle-resume.json \
   --surface text --detach --max-time 90m
 ```
 

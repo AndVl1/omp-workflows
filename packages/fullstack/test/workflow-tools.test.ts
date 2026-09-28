@@ -20,6 +20,7 @@ import {
   setTeamControlPlane,
   recordWorkPending,
   recordWorkTerminal,
+  updateCanonicalRun,
   writeConfig,
   writeAgentMapping,
   prepareWorkflowState,
@@ -31,6 +32,7 @@ import {
   FULLSTACK_BUNDLE_ID,
   fullstackOwnerForCwd,
   fullstackPreset,
+  getFullstackWorkflowSessionController,
   isMainSessionContext,
   registerWorkflowTools,
   resolveSessionCwd,
@@ -1362,6 +1364,121 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     assert.equal((primaryAfterWorker.details as { ok?: boolean; error?: string }).ok, true, (primaryAfterWorker.details as { error?: string }).error);
   } finally {
     await fireSessionShutdown({ cwd: root, hasUI: true, mode: "rpc" });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("fullstack: idle same-session controller refreshes branch before a new lifecycle intent", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-branch-refresh-idle-"));
+  const toolsAndLifecycle = registerToolsWithSessionSink();
+  const sessionId = "branch-refresh-idle";
+  const manager = sessionManagerFor(root, sessionId);
+  const hostContext = {
+    cwd: root,
+    mode: "tui",
+    hasUI: true,
+    session_id: sessionId,
+    sessionManager: manager,
+  };
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "feat/run-lifecycle-a"], { stdio: "ignore" });
+    publishMapping(root);
+    await toolsAndLifecycle.fireSessionStart(hostContext);
+    const prepare = toolsAndLifecycle.tools.get("workflow_prepare");
+    if (!prepare) throw new Error("workflow_prepare tool is unavailable");
+    const first = await prepare.execute("branch-a-prepare", {
+      mode: "new",
+      task: "terminal A before branch refresh",
+      branch: "feat/run-lifecycle-a",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+    }, undefined, undefined, hostContext as never);
+    const firstDetails = first.details as { ok?: boolean; error?: string; state?: { run_id?: string; branch?: string } };
+    assert.equal(firstDetails.ok, true, firstDetails.error);
+    assert.equal(firstDetails.state?.branch, "feat/run-lifecycle-a");
+    const firstRunId = firstDetails.state?.run_id;
+    if (!firstRunId) throw new Error("branch A fixture did not return a run id");
+    const oldController = getFullstackWorkflowSessionController(hostContext, root);
+    if (!oldController) throw new Error("branch A fixture did not capture a controller");
+    oldController.release("branch-a-terminal");
+    updateCanonicalRun(root, firstRunId, state => ({
+      ...state,
+      lifecycle_status: "complete",
+      pause: { kind: "done", reason: "branch refresh fixture terminal" },
+    }));
+    execFileSync("git", ["-C", root, "switch", "--create", "feat/run-lifecycle-c"], { stdio: "ignore" });
+
+    const refreshed = getFullstackWorkflowSessionController(hostContext, root);
+    if (!refreshed) throw new Error("branch C fixture did not resolve a controller");
+    assert.notEqual(refreshed, oldController, "idle branch drift must replace the cached controller");
+    assert.equal(refreshed.context().branch, "feat/run-lifecycle-c");
+    const commandIntent = refreshed.issueCommandIntent("new");
+    const second = await prepare.execute("branch-c-prepare", {
+      mode: "new",
+      task: "new lifecycle on branch C",
+      branch: "feat/run-lifecycle-c",
+      command_intent_id: commandIntent.intent_id,
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+    }, undefined, undefined, hostContext as never);
+    const secondDetails = second.details as { ok?: boolean; error?: string; state?: { branch?: string } };
+    assert.equal(secondDetails.ok, true, secondDetails.error);
+    assert.equal(secondDetails.state?.branch, "feat/run-lifecycle-c");
+  } finally {
+    await toolsAndLifecycle.fireSessionShutdown(hostContext);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fullstack: active old-branch controller remains fail-closed after branch drift", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-branch-refresh-active-"));
+  const toolsAndLifecycle = registerToolsWithSessionSink();
+  const sessionId = "branch-refresh-active";
+  const manager = sessionManagerFor(root, sessionId);
+  const hostContext = {
+    cwd: root,
+    mode: "tui",
+    hasUI: true,
+    session_id: sessionId,
+    sessionManager: manager,
+  };
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "feat/run-lifecycle-a"], { stdio: "ignore" });
+    publishMapping(root);
+    await toolsAndLifecycle.fireSessionStart(hostContext);
+    const prepare = toolsAndLifecycle.tools.get("workflow_prepare");
+    if (!prepare) throw new Error("workflow_prepare tool is unavailable");
+    const first = await prepare.execute("active-a-prepare", {
+      mode: "new",
+      task: "active A must not cross branches",
+      branch: "feat/run-lifecycle-a",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+    }, undefined, undefined, hostContext as never);
+    const firstDetails = first.details as { ok?: boolean; error?: string; state?: { run_id?: string } };
+    assert.equal(firstDetails.ok, true, firstDetails.error);
+    const firstRunId = firstDetails.state?.run_id;
+    if (!firstRunId) throw new Error("active A fixture did not return a run id");
+    const oldController = getFullstackWorkflowSessionController(hostContext, root);
+    if (!oldController) throw new Error("active A fixture did not capture a controller");
+    const statePath = runTarget(root, firstRunId).statePath!;
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const beforeState = readFileSync(statePath, "utf8");
+    const beforeControl = readFileSync(controlPath, "utf8");
+    execFileSync("git", ["-C", root, "switch", "--create", "feat/run-lifecycle-c"], { stdio: "ignore" });
+
+    const stillBound = getFullstackWorkflowSessionController(hostContext, root);
+    assert.equal(stillBound, oldController, "active old-branch controller must not be migrated");
+    const failed = await prepare.execute("active-c-prepare", {
+      mode: "new",
+      task: "must reject active old-branch drift",
+      branch: "feat/run-lifecycle-c",
+      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+    }, undefined, undefined, hostContext as never);
+    const failedDetails = failed.details as { ok?: boolean; code?: string; error?: string };
+    assert.equal(failedDetails.ok, false);
+    assert.equal(failedDetails.code, "WORKFLOW_PREPARE_FAILED");
+    assert.match(failedDetails.error ?? "", /workflow branch mismatch/);
+    assert.equal(readFileSync(statePath, "utf8"), beforeState);
+    assert.equal(readFileSync(controlPath, "utf8"), beforeControl);
+  } finally {
+    await toolsAndLifecycle.fireSessionShutdown(hostContext);
     rmSync(root, { recursive: true, force: true });
   }
 });

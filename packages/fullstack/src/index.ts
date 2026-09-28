@@ -567,6 +567,30 @@ function createWorkflowSession(cwd: string, sessionId: string): WorkflowSessionC
     return undefined;
   }
 }
+function refreshWorkflowSessionForBranch(cwd: string, controller: WorkflowSessionController): WorkflowSessionController {
+  const activeBranch = resolveActiveBranch(cwd);
+  let context: TrustedExecutionContext;
+  try {
+    context = controller.context();
+  } catch {
+    return controller;
+  }
+  if (context.branch === activeBranch) return controller;
+  // A branch refresh is only valid for an idle controller. Active claims,
+  // selected work, and unverifiable private claims stay bound to their
+  // original trusted context and therefore fail closed in the engine.
+  try {
+    if (controller.activeCtoClaim() !== undefined
+      || controller.activeClaimRunId() !== undefined
+      || controller.selectedRunId() !== undefined) return controller;
+  } catch {
+    return controller;
+  }
+  const replacement = createWorkflowSession(cwd, context.session_id);
+  if (!replacement) return controller;
+  if (workflowSessionRef.current === controller) workflowSessionRef.current = replacement;
+  return replacement;
+}
 
 function exactCapturedInteractiveContext(ctx: unknown): CapturedHostSession | undefined {
   if (!trustedHostSession(ctx)) return undefined;
@@ -893,8 +917,9 @@ function dispatcherBindingFor(captured: CapturedHostSession): DispatcherBinding 
 
 /**
  * Shared accessor passed to commands, tools, and core hooks. The lifecycle
- * ingress is the only authority allowed to create, replace, or capture the
- * controller; this accessor only returns an already-captured exact binding.
+ * ingress owns identity capture; on a trusted same-session branch drift this
+ * accessor may replace only an idle controller with a fresh host-branch
+ * context. Active claims and selected work remain bound and fail closed.
  */
 export function getFullstackWorkflowSessionController(ctx: unknown, cwd: string): WorkflowSessionController | undefined {
   const authoritative = authoritativeHostSession(ctx);
@@ -918,19 +943,19 @@ export function getFullstackWorkflowSessionController(ctx: unknown, cwd: string)
   if (value.mode !== captured.mode || value.hasUI !== true) return undefined;
   try {
     const controllerContext = controller.context();
-    return controllerContext.session_id === captured.sessionId
-      && resolve(controllerContext.worktree) === resolve(captured.cwd)
-      ? controller
-      : undefined;
+    if (controllerContext.session_id !== captured.sessionId
+      || resolve(controllerContext.worktree) !== resolve(captured.cwd)) return undefined;
+    return refreshWorkflowSessionForBranch(cwd, controller);
   } catch {
     return undefined;
   }
 }
 
 /**
- * Raw `tool_call` contexts may be foreign or stale and must never replace the
- * controller captured at session_start. Legitimate replacement happens only
- * through the verified session_switch ingress.
+ * Raw `tool_call` contexts may be foreign or stale and cannot replace the
+ * captured identity. An idle branch drift may refresh the trusted controller
+ * from the actual host branch; session identity replacement still requires the
+ * verified session_switch ingress.
  */
 function getFullstackRawWorkflowSessionController(
   ctx: unknown,
@@ -955,10 +980,9 @@ function getFullstackRawWorkflowSessionController(
   ) return undefined;
   try {
     const controllerContext = controller.context();
-    return controllerContext.session_id === captured.sessionId
-      && resolve(controllerContext.worktree) === resolve(captured.cwd)
-      ? controller
-      : undefined;
+    if (controllerContext.session_id !== captured.sessionId
+      || resolve(controllerContext.worktree) !== resolve(captured.cwd)) return undefined;
+    return refreshWorkflowSessionForBranch(cwd, controller);
   } catch {
     return undefined;
   }

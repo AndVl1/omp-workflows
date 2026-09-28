@@ -12,7 +12,8 @@ import {
   type CanonicalRunTarget,
   type StatePublication,
 } from "./state.js";
-import { parseCtoState } from "../cto/state.js";
+import { ctoStateDir, parseCtoState } from "../cto/state.js";
+import type { CtoState } from "../cto/types.js";
 import { beginLifecycleTransaction, commitLifecycleTransaction, type LifecycleFileContent } from "./lifecycle-journal.js";
 import { LifecycleError, lifecyclePayloadHash, selectRunCandidate } from "./run-lifecycle.js";
 import type { RunSelectionInput, RunSelectionResult } from "./run-lifecycle.js";
@@ -162,7 +163,7 @@ function ctoStateImage(cwd: string, runId: string): { raw: string; value: Record
   }
 }
 
-function ctoStateIsTerminal(value: Record<string, unknown>): boolean {
+function ctoStateIsTerminal(value: Record<string, unknown> | CtoState): boolean {
   const pause = isRecord(value.pause) ? value.pause.kind : undefined;
   if (pause === "done" || pause === "failed") return true;
   if (value.standby === true) return false;
@@ -170,6 +171,81 @@ function ctoStateIsTerminal(value: Record<string, unknown>): boolean {
     return value.teams.every((team) => isRecord(team) && (team.status === "done" || team.status === "failed"));
   }
   return false;
+}
+/**
+ * A claimless legacy CTO state is still an execution authority until it is
+ * proved terminal. Ordinary acquisition must account for it under the same
+ * workspace lock as the canonical claim, otherwise a pre-cutover CTO run can
+ * race a new ordinary run without either side seeing the other in
+ * run-control.json.
+ *
+ * `excludeRunId` is used only while attaching a claim to that exact legacy
+ * state. Every other malformed or partial entry is recovery-required rather
+ * than evidence that the worktree is free.
+ */
+function claimlessActiveCtoRunId(cwd: string, excludeRunId?: string, managedReleases: Readonly<Record<string, unknown>> = {}): string | null {
+  const root = join(resolve(cwd), WORK_STATE, "cto");
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new LifecycleError("recovery_required", "CTO state directory could not be inspected", {
+      next_action: "repair or explicitly reconcile the CTO state before starting another run",
+    });
+  }
+  for (const runId of entries) {
+    if (!/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === "..") {
+      throw new LifecycleError("recovery_required", `CTO state entry '${runId.slice(0, 80)}' has an unsafe id`, {
+        next_action: "repair or explicitly reconcile the CTO state directory",
+      });
+    }
+    if (runId === excludeRunId) continue;
+    let stateDir: string;
+    try {
+      stateDir = ctoStateDir(runId, cwd);
+    } catch (error) {
+      throw new LifecycleError("recovery_required", `CTO run '${runId}' escapes the trusted state tree`, {
+        run_id: runId,
+        next_action: `repair or explicitly reconcile the CTO run: ${(error as Error).message}`,
+      });
+    }
+    const statePath = join(stateDir, "state.json");
+    if (!existsSync(statePath)) {
+      let files: string[];
+      try {
+        files = readdirSync(stateDir);
+      } catch {
+        throw new LifecycleError("recovery_required", `CTO run '${runId}' is unreadable`, {
+          run_id: runId,
+          next_action: "repair or explicitly reconcile the CTO run before starting another run",
+        });
+      }
+      if (files.length > 0) {
+        throw new LifecycleError("recovery_required", `CTO run '${runId}' has no canonical state image`, {
+          run_id: runId,
+          next_action: "repair or explicitly reconcile the CTO run before starting another run",
+        });
+      }
+      continue;
+    }
+    const image = ctoStateImage(cwd, runId);
+    if (!image) {
+      throw new LifecycleError("recovery_required", `CTO run '${runId}' is unreadable`, {
+        run_id: runId,
+        next_action: "repair or explicitly reconcile the CTO run before starting another run",
+      });
+    }
+    const parsed = parseCtoState(image.value, runId);
+    if (!parsed.ok) {
+      throw new LifecycleError("recovery_required", `CTO run '${runId}' is invalid: ${parsed.error}`, {
+        run_id: runId,
+        next_action: "repair or explicitly reconcile the CTO run before starting another run",
+      });
+    }
+    if (!ctoStateIsTerminal(parsed.state) && !Object.prototype.hasOwnProperty.call(managedReleases, runId)) return runId;
+  }
+  return null;
 }
 
 function ctoReleaseReceiptForClaim(claim: WorktreeExecutionClaim, provenance: CtoReleaseProvenance): string {
@@ -812,6 +888,16 @@ export function acquireExecutionClaim(cwd: string, input: { run_id: string; cont
     const before = controlContent(cwd);
     const control = readControlRaw(cwd);
     const currentValue: unknown = control.execution_claim;
+    if (ownerKind === "workflow") {
+      const legacyCtoRunId = claimlessActiveCtoRunId(cwd, undefined, control.cto_releases);
+      if (legacyCtoRunId) {
+        throw new LifecycleError(
+          "run_busy",
+          `worktree execution is owned by claimless legacy CTO run '${legacyCtoRunId}'`,
+          { run_id: legacyCtoRunId, next_action: "resume or explicitly reconcile the CTO run before starting ordinary work" },
+        );
+      }
+    }
     if (currentValue !== null) assertExecutionClaim(currentValue);
     const current = currentValue;
     if (current && current.owner_kind !== ownerKind) throw claimBusyError(current);
@@ -1018,6 +1104,14 @@ export function publishCtoClaim(cwd: string, input: CtoClaimPublication): ClaimR
     const currentValue: unknown = control.execution_claim;
     if (currentValue !== null) assertExecutionClaim(currentValue);
     const current = currentValue;
+    const legacyCtoRunId = claimlessActiveCtoRunId(cwd, input.run_id, control.cto_releases);
+    if (legacyCtoRunId) {
+      throw new LifecycleError(
+        "run_busy",
+        `worktree execution is owned by claimless legacy CTO run '${legacyCtoRunId}'`,
+        { run_id: legacyCtoRunId, next_action: "resume or explicitly reconcile the CTO run before starting another CTO run" },
+      );
+    }
     if (legacyRecovery) {
       if (current) {
         throw new LifecycleError("run_busy", "CTO legacy recovery cannot replace the existing worktree claim", { run_id: current.run_id, next_action: "release or reconcile the existing claim before recovery" });

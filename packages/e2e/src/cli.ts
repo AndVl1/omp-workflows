@@ -389,6 +389,11 @@ async function driveForeground(session: TestSession, scenario: ScenarioDefinitio
       process.exit(0);
     }
     const { promise: ticked, resolve: tick } = deferred<void>();
+    // Wake the foreground observer even when no new PTY data arrives. In
+    // particular, SessionController appends the exit frame and closes the
+    // socket without another output frame; polling the transcript must still
+    // notice that terminal event and let the wrapper exit.
+    setTimeout(tick, pollMs);
     await ticked;
   }
 }

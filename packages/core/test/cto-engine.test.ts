@@ -6,7 +6,7 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -268,6 +268,122 @@ test("cto-engine: ordinary claim blocks trusted CTO start without partial state"
     );
     assert.equal(existsSync(join(root, ".work-state", "cto")), false, "run_busy must not publish CTO state");
     assert.deepEqual(readRunControl(root).execution_claim, ordinary.claim, "ordinary claim remains unchanged");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-engine: claimless active legacy CTO state blocks an ordinary claim", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-legacy-contention-"));
+  try {
+    const legacy = newCtoState({
+      id: "legacy-active",
+      task: "legacy active",
+      branch: "main",
+      autonomous: false,
+      plan: { id: "legacy-active", task: "legacy active", teams: [], created_at: new Date().toISOString() },
+    });
+    writeCtoState(legacy, root);
+    assert.throws(
+      () => acquireExecutionClaim(root, {
+        run_id: "33333333-3333-4333-8333-333333333333",
+        context: executionContext(root, "ordinary-after-legacy-cto"),
+        owner_kind: "workflow",
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "run_busy"
+        && error.run_id === "legacy-active",
+    );
+    assert.equal(readRunControl(root).execution_claim, null, "legacy contention must not publish an ordinary claim");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("cto-engine: managed suspended CTO state does not block an ordinary claim", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-managed-release-contention-"));
+  try {
+    const controller = createWorkflowSessionController({
+      cwd: root,
+      context: executionContext(root, "managed-release-owner"),
+    });
+    const ingress = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "managed suspended CTO",
+      controller,
+    });
+    suspendCtoSession(controller, "session-shutdown");
+    const control = readRunControl(root);
+    assert.equal(control.execution_claim, null);
+    assert.equal(control.cto_releases[ingress.run_id]?.reason, "session-shutdown");
+
+    const ordinary = acquireExecutionClaim(root, {
+      run_id: "55555555-5555-4555-8555-555555555555",
+      context: executionContext(root, "ordinary-after-managed-release"),
+      owner_kind: "workflow",
+    });
+    assert.equal(ordinary.claim.owner_kind, "workflow");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-engine: claimless CTO scan rejects state directories escaping the worktree", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-escape-contention-"));
+  const outside = mkdtempSync(join(tmpdir(), "cto-escape-target-"));
+  try {
+    const legacy = newCtoState({
+      id: "legacy-escape",
+      task: "legacy escape",
+      branch: "main",
+      autonomous: false,
+      plan: { id: "legacy-escape", task: "legacy escape", teams: [], created_at: new Date().toISOString() },
+    });
+    writeCtoState(legacy, outside);
+    mkdirSync(join(root, ".work-state", "cto"), { recursive: true });
+    symlinkSync(
+      join(outside, ".work-state", "cto", "legacy-escape"),
+      join(root, ".work-state", "cto", "legacy-escape"),
+    );
+    assert.throws(
+      () => acquireExecutionClaim(root, {
+        run_id: "66666666-6666-4666-8666-666666666666",
+        context: executionContext(root, "ordinary-after-escape"),
+        owner_kind: "workflow",
+      }),
+      (error: unknown) => error instanceof LifecycleError
+        && error.code === "recovery_required"
+        && /escapes/.test(error.message),
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+
+test("cto-engine: claimless terminal CTO history does not block an ordinary claim", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-legacy-terminal-"));
+  try {
+    const legacy = newCtoState({
+      id: "legacy-terminal",
+      task: "legacy terminal",
+      branch: "main",
+      autonomous: false,
+      plan: { id: "legacy-terminal", task: "legacy terminal", teams: [], created_at: new Date().toISOString() },
+    });
+    writeCtoState(legacy, root);
+    const statePath = join(root, ".work-state", "cto", "legacy-terminal", "state.json");
+    const persisted = JSON.parse(readFileSync(statePath, "utf8")) as { integration: { status: string } };
+    persisted.integration.status = "done";
+    writeFileSync(statePath, `${JSON.stringify(persisted)}\n`);
+
+    const ordinary = acquireExecutionClaim(root, {
+      run_id: "44444444-4444-4444-8444-444444444444",
+      context: executionContext(root, "ordinary-after-terminal-cto"),
+      owner_kind: "workflow",
+    });
+    assert.equal(ordinary.claim.owner_kind, "workflow");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

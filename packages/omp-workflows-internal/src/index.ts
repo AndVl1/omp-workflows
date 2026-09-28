@@ -545,6 +545,33 @@ function buildTrustedController(
 		return undefined;
 	}
 }
+function refreshSessionBindingBranch(binding: InternalSessionBinding): WorkflowSessionController | undefined {
+	const controller = binding.controller;
+	if (!controller || !binding.sessionId) return controller;
+	const activeBranch = resolveActiveBranch(binding.cwd);
+	let context: TrustedExecutionContext;
+	try {
+		context = controller.context();
+	} catch {
+		return controller;
+	}
+	if (context.branch === activeBranch) return controller;
+	// Keep an active or unverifiable binding on its original trusted branch.
+	// The engine then rejects drift without migrating claims or capabilities.
+	try {
+		if (
+			controller.activeCtoClaim() !== undefined
+			|| controller.activeClaimRunId() !== undefined
+			|| controller.selectedRunId() !== undefined
+		) return controller;
+	} catch {
+		return controller;
+	}
+	const replacement = buildTrustedController(binding.cwd, binding.sessionId);
+	if (!replacement) return controller;
+	binding.controller = replacement;
+	return replacement;
+}
 /**
  * Capture the host session before any lifecycle callback can suspend. A
  * verified replacement suspends a resident CTO before releasing the old
@@ -618,9 +645,10 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 
 /**
  * Return the captured controller only for its originating workspace/session.
- * Never infer a run from cwd, selection, or a later callback. If the trusted
- * host session initially omitted its ID, bind lazily from a later ingress
- * context that exposes the host session manager's ID.
+ * A trusted same-session branch drift may refresh an idle binding from the
+ * actual host branch; active claims and selected work remain fail-closed.
+ * If the trusted host session initially omitted its ID, bind lazily from a
+ * later ingress context that exposes the host session manager's ID.
  */
 function sharedSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
 	const binding = sessionBindings.get(pi);
@@ -636,7 +664,7 @@ function sharedSessionController(pi: object, ctx: unknown, cwd: string): Workflo
 	// CTO ingress refuses to acquire without it; retain that official association
 	// now so a later verified session_switch can still release the admitted claim.
 	if (binding.sessionFile === undefined) binding.sessionFile = sessionFileFromManager(manager);
-	if (binding.controller) return binding.controller;
+	if (binding.controller) return refreshSessionBindingBranch(binding);
 	const controller = buildTrustedController(cwd, sessionId);
 	if (!controller) return undefined;
 	binding.sessionId = sessionId;
@@ -648,7 +676,8 @@ function sharedSessionController(pi: object, ctx: unknown, cwd: string): Workflo
 /**
  * Resolve the narrow orchestrator capability for raw tool calls from the
  * already-captured host binding. The manager identity is re-read on every
- * call; a raw context can neither create nor replace this controller.
+ * call; a raw context cannot replace identity, while an idle branch drift
+ * may refresh the controller from the actual host branch.
  */
 function resolveInternalTrustedToolCallActor(
 	pi: object,
@@ -708,10 +737,12 @@ function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSe
 	const identity = capturedManagerIdentity(binding, ctx, cwd);
 	if (!identity || identity.sessionId !== binding.sessionId) return undefined;
 	try {
-		const controllerContext = binding.controller.context();
+		const controller = refreshSessionBindingBranch(binding);
+		if (!controller) return undefined;
+		const controllerContext = controller.context();
 		return controllerContext.session_id === binding.sessionId
 			&& resolve(controllerContext.worktree) === resolve(binding.cwd)
-			? binding.controller
+			? controller
 			: undefined;
 	} catch {
 		return undefined;

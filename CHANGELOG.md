@@ -9,6 +9,10 @@ All notable changes to `omp-workflows` are documented here.
 
 ### Fixed
 - **Explicit claimless legacy CTO recovery** — `/cto --recover-legacy --run <exact-cto-id>` (including namespaced host commands) can reconcile supported legacy JSON and transfer it to the current authenticated coordinator after interactive confirmation that the previous coordinator and all workers have stopped. Recovery preserves active work/history, records a byte-exact immutable backup and audit receipt, and atomically publishes canonical state with an engine-owned claim. Ordinary resume remains strict; headless/declined confirmation, ownership or snapshot drift, claims, pending work, unsafe backup paths and malformed state cannot bypass admission.
+- **Claimless legacy CTO contention** — ordinary run admission now treats an active legacy CTO state without a current control claim as `run_busy`, leaves `execution_claim` unset, and points to resume or explicit reconciliation instead of admitting competing work.
+- **Foreground E2E exit** — `ux-e2e start` now wakes its foreground observer on the PTY `exit` frame even when no later output arrives, closes the session, and exits instead of waiting indefinitely.
+- **Selector-only resume admission** — `workflow_prepare` now resolves the read-only selector before new-task intent handling for explicit `--run` resume, while conflicting top-level and selector IDs are rejected without mutation; no new public required field or alias was introduced.
+- **Idle branch-context refresh** — ordinary new-command ingress refreshes an idle cached host controller from the actual Git branch before intent handling; active, selected, or unknown claims retain the fail-closed branch check, so stale context is not silently migrated.
 
 
 ## [0.28.4] — 2026-09-04

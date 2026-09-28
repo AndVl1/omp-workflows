@@ -1770,7 +1770,7 @@ test("workflow_prepare command intent reserves through selector errors and commi
     await bus.emit("session_start", {}, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
     const first = controller.prepare({ mode: "new", task: "command intent duplicate", classification: CLASSIFICATION });
     const second = controller.prepare({ mode: "new", task: "command intent duplicate", classification: CLASSIFICATION });
-    const intent = controller.issueCommandIntent("resume");
+    const intent = controller.issueCommandIntent("resume", second.state.run_id);
     const prepare = bus.tools.get("workflow_prepare")!;
     const failed = await prepare.execute("command-intent-failed", {
       mode: "resume", selector: { title: "command intent duplicate" }, command_intent_id: intent.intent_id,
@@ -1778,6 +1778,15 @@ test("workflow_prepare command intent reserves through selector errors and commi
     const failedValue = record(failed.details);
     assert.equal(failedValue.ok, false);
     assert.equal(record(failedValue.details).code, "run_selection_required");
+    const beforeMismatch = readRunControl(root);
+    const mismatched = await prepare.execute("command-intent-mismatch", {
+      mode: "resume", run_id: second.state.run_id, selector: { run_id: first.state.run_id }, command_intent_id: intent.intent_id,
+    }, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
+    const mismatchedValue = record(mismatched.details);
+    assert.equal(mismatchedValue.ok, false);
+    assert.equal(mismatchedValue.code, "WORKFLOW_PREPARE_FAILED");
+    assert.equal(record(mismatchedValue.details).code, "lifecycle_request_conflict");
+    assert.deepEqual(readRunControl(root), beforeMismatch, "an ingress/selector identity mismatch is read-only");
     const corrected = await prepare.execute("command-intent-corrected", {
       mode: "resume", selector: { run_id: second.state.run_id }, command_intent_id: intent.intent_id,
     }, undefined, undefined, { cwd: root, mode: "tui", hasUI: true, session_id: owner.session_id });
