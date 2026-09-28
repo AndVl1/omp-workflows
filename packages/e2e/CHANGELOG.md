@@ -34,6 +34,8 @@
   pass reporting; an unreachable owner receives receipt-checked failure
   recovery. Detached control workers receive an explicit environment allowlist
   while preserving the opted-in native broker profile.
+- Native broker ownership reads Linux `/proc/<pid>/cwd` rather than procps'
+  `-` placeholder, retaining exact cwd matching when launched in CI.
 
 ### Security
 

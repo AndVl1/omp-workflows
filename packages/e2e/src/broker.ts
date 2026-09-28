@@ -565,6 +565,15 @@ function processStartMarker(pid: number): string | null {
 }
 
 function processCwd(pid: number): string | null {
+  if (process.platform === 'linux') {
+    // Linux procps accepts `cwd` as an output field but reports `-`, not the
+    // process directory. Read the kernel's process-specific link instead.
+    try {
+      return realpathSync(`/proc/${pid}/cwd`);
+    } catch {
+      return null;
+    }
+  }
   const ps = psField(pid, 'cwd=');
   if (ps !== null && ps !== '(unknown)') return ps;
   const result = spawnSync(LSOF_BINARY, ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
