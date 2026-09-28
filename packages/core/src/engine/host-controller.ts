@@ -165,6 +165,18 @@ function selectionRunId(
   throw result.error;
 }
 
+function readSelectedRunState(cwd: string, runId: string) {
+  try {
+    return readRunStateNoRecovery(cwd, runId);
+  } catch (error) {
+    if (error instanceof LifecycleError) throw error;
+    throw new LifecycleError("recovery_required", "selected workflow state could not be read safely", {
+      run_id: runId,
+      next_action: "recover lifecycle state before mutating",
+    });
+  }
+}
+
 export function createWorkflowSessionController(options: WorkflowSessionControllerOptions): WorkflowSessionController {
   const cwd = options.cwd;
   const expectedOwnerKind = options.owner_kind ?? "workflow";
@@ -284,7 +296,7 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
     readSelector: () => selector,
     selectedRunId: () => {
       if (boundRunId) {
-        const state = readRunStateNoRecovery(cwd, boundRunId);
+        const state = readSelectedRunState(cwd, boundRunId);
         if (!state) {
           throw new LifecycleError("recovery_required", `bound workflow run '${boundRunId}' is missing or unreadable; recover lifecycle state before mutating`);
         }
@@ -298,7 +310,7 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
       }
       const selection = readRunControlNoRecovery(cwd).selections[trusted.session_id];
       if (!selection?.active) return undefined;
-      const state = readRunStateNoRecovery(cwd, selection.run_id);
+      const state = readSelectedRunState(cwd, selection.run_id);
       if (!state) {
         throw new LifecycleError("recovery_required", `selected workflow run '${selection.run_id}' is missing or unreadable; recover lifecycle state before mutating`);
       }

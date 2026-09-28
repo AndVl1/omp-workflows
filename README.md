@@ -466,6 +466,16 @@ extension entry point: it wires gates/config/observability, but not the
 identity as shown in
 [`docs/adding-agents.md`](docs/adding-agents.md#4-регистрация-workflow).
 
+Passing `getSessionController` to `registerTeamWorkflow` also requires the
+bundle's `resolveTrustedToolCallActor`; an incomplete pair fails at registration
+with `[workflow_registration:missing_actor_resolver]`. An authenticated idle
+host is distinct from an unknown caller, even when no workflow is selected.
+Admission failures include a stable `[workflow_admission:<code>]`, an action,
+and safe report guidance. See the
+[host/session contract and troubleshooting guide](docs/adding-agents.md#hostsession-authority--обязательный-контракт)
+before upgrading a custom bundle; do not bypass admission by removing its
+controller or trusting raw `actor`/`hasUI` fields.
+
 ## Observability
 
 When the engine is wired in via `registerTeamWorkflow`, it subscribes to seven OMP extension events

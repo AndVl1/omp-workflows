@@ -2,6 +2,15 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [Unreleased]
+
+### Changed
+- **Custom-bundle registration contract (#71)** — passing `getSessionController` to `registerTeamWorkflow` now requires `resolveTrustedToolCallActor`, enforced by TypeScript and an explicit `workflow_registration:missing_actor_resolver` runtime error before registration side effects. Bundle authors must supply authenticated host/session resolution rather than remove the controller or trust raw `actor`/`hasUI`; workflow tool/command adapter signatures remain unchanged.
+- **Custom bundle guidance** — refreshed the shipped `custom-agent-bundle` skill and integration documentation with all three registration seams, shared session authority, project activation boundaries, migration requirements, diagnostic codes, and interactive idle/selected/CTO/worker verification.
+
+### Fixed
+- **Actionable host admission failures (#71)** — core distinguishes missing/unresolved/invalid/throwing adapters, unavailable workspace, identity/profile/worktree drift, controller/claim/artifact mismatches, unreadable run control, and CTO/native authority failures. Messages include a stable `workflow_admission` code, a safe next action, and report guidance without raw exceptions, credentials, claims, tool inputs, or transcripts. Fullstack/internal adapters report structured denial causes; authenticated native authority and existing claim checks are preserved. The external Android bundle still requires its own compatible host adapter.
+
 ## [0.29.0] — 2026-09-28
 ### Changed
 - **Breaking run-lifecycle cutover** — ordinary workflow state/API now use schema-2 canonical identity (`run_id = run_key = WorkIdentity.run_id`) and explicit `new`/`resume`/`rework`; existing runs resolve by human-readable name or read-only list (UUID remains technical). Branch is routing/compatibility context rather than run identity, so foreign-branch `resume`/`rework` is rejected. `workflow_prepare` emits committed transition receipts, while the transaction journal and lock/CAS protect state, artifact, and observability publication; execution claims and coordinator handover preserve worker/evidence identity and fail closed on busy or unknown ownership.

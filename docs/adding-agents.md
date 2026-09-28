@@ -112,6 +112,11 @@ task, advisor) — знание OMP-харнесса; core OMP-agnostic. Есл�
 гейты, observability и seed-if-absent runtime config, но сам по себе **не**
 регистрирует ни `workflow_*` tools, ни slash-команды:
 
+Пример ниже показывает соединение трёх слоёв, а не готовый host adapter.
+Extension передаёт в `registerBundle` собственный адаптер, который захватывает
+доверенную host identity и возвращает один общий session controller.
+Обязательный контракт адаптера описан сразу после примера.
+
 ```typescript
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
@@ -120,16 +125,15 @@ import {
   registerTeamWorkflow,
   registerWorkflowCommands,
   type WorkflowOwnerIdentity,
+  type RegisterOptions,
 } from "@andvl1/omp-workflows-core";
 
 const BUNDLE_ID = "@acme/omp-workflows-rust";
 
-// Реализация должна брать cwd из session context/sessionManager и никогда не
-// подменять отсутствующее значение на process.cwd().
-const resolveSessionCwd = (ctx: unknown): string | undefined => {
-  if (!ctx || typeof ctx !== "object") return undefined;
-  const value = (ctx as { cwd?: unknown }).cwd;
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+type HostAdapter = {
+  resolveCwd: NonNullable<RegisterOptions["resolveCwd"]>;
+  getSessionController: NonNullable<RegisterOptions["getSessionController"]>;
+  resolveTrustedToolCallActor: NonNullable<RegisterOptions["resolveTrustedToolCallActor"]>;
 };
 
 const ownerForCwd = (cwd: string): WorkflowOwnerIdentity => ({
@@ -146,28 +150,32 @@ const ownerForCwd = (cwd: string): WorkflowOwnerIdentity => ({
   },
 });
 
-export default function (pi: ExtensionAPI) {
+export function registerBundle(pi: ExtensionAPI, host: HostAdapter) {
   const registration = {
     label: BUNDLE_ID,
     roles: { /* workflow-роль → имя агента */ },
     scopeMap: [ /* glob → scope + dev_agent */ ],
     flags: { /* флаг → glob-список */ },
     designSystem: null,
-    resolveCwd: resolveSessionCwd,
+    resolveCwd: host.resolveCwd,
+    getSessionController: host.getSessionController,
+    resolveTrustedToolCallActor: host.resolveTrustedToolCallActor,
     owner: ownerForCwd,
   };
 
   registerTeamWorkflow(pi, registration);
 
   createWorkflowToolAdapter({
-    resolveCwd: resolveSessionCwd,
+    resolveCwd: host.resolveCwd,
+    getSessionController: host.getSessionController,
     owner: ownerForCwd,
     // Вернуть свежий AgentMappingState; ошибка должна блокировать begin.
     beforeBegin: refreshAndReturnLiveAgentMapping,
   }).register(pi);
 
   registerWorkflowCommands(pi, {
-    resolveCwd: resolveSessionCwd,
+    resolveCwd: host.resolveCwd,
+    getSessionController: host.getSessionController,
     owner: ownerForCwd,
   });
 }
@@ -178,6 +186,86 @@ export default function (pi: ExtensionAPI) {
 `workflow_tools` и `config_writer`; другой bundle получает `owner_conflict`.
 Полная замена поэтому делается отключением старого extension, а не ставкой на
 порядок загрузки двух bundles.
+
+### Host/session authority — обязательный контракт
+
+Если `registerTeamWorkflow` получает `getSessionController`, он MUST получить и
+`resolveTrustedToolCallActor`. Типы запрещают неполную комбинацию; JS-бандл
+получает `[workflow_registration:missing_actor_resolver]` до установки hooks и
+регистрации владельца. Это ошибка интеграции бандла, не признак повреждённого
+workflow. Исправление — реализовать authenticated resolver, а не удалить
+controller, ослабить gates или добавить `actor: "orchestrator"` в контекст.
+Регистрация без обоих callbacks остаётся низкоуровневым legacy-вариантом,
+но не заменяет session-aware интеграцию полноценного workflow-бандла.
+
+Адаптер MUST:
+
+1. Захватывать identity интерактивного host на доверенной lifecycle-границе.
+   Проверять точную идентичность session manager, session ID, worktree и
+   согласованность явно переданных profile/session полей при каждом вызове.
+   `hasUI`, `actor`, tool input и совпадение одного session ID не являются
+   самостоятельным доказательством полномочий.
+2. Брать cwd из текущего доверенного host/session manager, без fallback к
+   `process.cwd()`. Hooks, tools и commands используют controller одной сессии;
+   callback-обёртки разных поверхностей могут различаться проверками.
+3. Для подтверждённого host без selected run возвращать
+   `{ kind: "authenticated-interactive-host-no-run" }`. Core дополнительно
+   требует отсутствия execution claim. Нельзя возвращать это значение
+   без проверки личности или при ошибке чтения состояния.
+4. Для ordinary run возвращать `{ actor: "orchestrator", artifactsDir }`
+   только при совпадении selected run, execution claim и каталога артефактов.
+   Для CTO использовать отдельный результат
+   `{ kind: "authenticated-interactive-host-cto", run_id, ownership_epoch }`
+   из текущего точного claim; эти идентификаторы не брать из текста задачи.
+5. При известном отказе возвращать
+   `{ kind: "denied", code: TrustedToolCallDenialCode }`. Неизвестный отказ
+   стороннего адаптера может вернуть `undefined`, но тогда core сообщит, что
+   адаптер не объяснил причину. Исключение не становится разрешением.
+   Core формирует текст по коду, а не доверяет произвольному тексту адаптера.
+
+Референсы реализации: `resolveFullstackTrustedToolCallActor` в
+[`packages/fullstack/src/index.ts`](../packages/fullstack/src/index.ts) и
+`resolveInternalTrustedToolCallActor` в
+[`packages/omp-workflows-internal/src/index.ts`](../packages/omp-workflows-internal/src/index.ts).
+Проверяй их вместе с lifecycle capture и controller callbacks, а не копируй
+только финальный `return`.
+
+Активация — отдельная ответственность bundle. Если он предназначен только
+для определённых проектов, вне них не устанавливай активные workflow hooks.
+Возврат `undefined` из `resolveCwd` или actor resolver после регистрации
+означает отсутствие authority, а не отключение расширения.
+
+### Как разбирать отказ admission
+
+Сообщение содержит стабильный `[workflow_admission:<code>]`, объяснение,
+`Action` и `Report`. Автоматизация опирается на код, а не на точную английскую
+формулировку. Отказ означает, что инструмент не получил разрешения на этом
+пути; запуск той же операции через другой shell/tool не исправляет authority.
+
+| Причина | Что исправлять |
+|---|---|
+| `invalid_host_context`, `untrusted_actor_context` | Неподдерживаемый/неаутентифицированный host context либо явный неподтверждённый actor; проверить адаптер, не подставлять поля вручную |
+| `host_session_not_captured`, `headless_host_session` | Lifecycle capture и поддерживаемый интерактивный TUI/RPC entrypoint; print/task-сессия не становится host по `hasUI` |
+| `session_identity_mismatch`, `host_profile_mismatch`, `worktree_mismatch` | Соответствие текущего callback захваченной сессии, profile и worktree; не подменять identity |
+| `session_controller_unavailable`, `controller_context_mismatch` | Общий controller и корректные host callbacks в bundle |
+| `selected_run_mismatch`, `execution_claim_mismatch` | Выбор нужного run и штатное согласование ownership; не удалять `.work-state` и не отменять неизвестных workers |
+| `artifacts_scope_mismatch` | Каталог артефактов именно выбранного run, без расширения write scope |
+| `controller_resolution_failed`, `session_controller_resolution_failed` | Ошибка получения controller/authoritative state; это не доказательство отсутствующего пакета |
+| `cwd_unavailable`, `cwd_resolution_failed` | Host не предоставил workspace либо callback бандла выбросил исключение; не подставлять `process.cwd()` |
+| `actor_unresolved` | Resolver не вернул ни authority, ни объяснение; автору bundle нужно проверить capture и вернуть точную причину |
+| `actor_resolver_failed`, `actor_resolver_invalid_result` | Исключение в resolver либо несовместимый результат; проверить совместимость API OMP/core/bundle |
+| `run_control_unreadable`, `no_run_claim_present` | Нечитаемый canonical control либо существующий execution claim; использовать штатную сверку/recovery, не удалять state |
+| `cto_claim_mismatch`, `cto_marker_unauthenticated` | CTO proof не соответствует live claim либо marker не подтверждён; текст marker не является полномочием |
+| `native_authority_resolution_failed` | Ошибка проверки native worker authority; репорт core/host-интеграции, не подмена worker identity |
+| `workflow_state_recovery_required` | Controller подтвердил необходимость recovery canonical state; обновление bundle само по себе не восстановит отсутствующий/повреждённый run |
+
+Для репорта достаточно полного безопасного admission-сообщения, версий OMP,
+core и bundle, способа установки/активации, названия инструмента и сценария:
+новая idle-сессия, selected workflow, CTO или worker; было ли переключение
+сессии/ветки/worktree. Если ошибки появились сразу после обновления, укажи
+версии до и после. Не прикладывай tokens, capabilities, ownership proofs,
+сырой context, аргументы инструментов или полный transcript.
+
 
 ### roles — маппинг workflow-ролей на агентов
 
@@ -351,6 +439,13 @@ npm run typecheck && npm run build && npm test
 - Live-smoke: штатная workflow-команда должна пройти
   `workflow_prepare → workflow_instructions → workflow_begin`; отдельная
   `validate`-команда проверяет mapping/owner без изменения canonical state.
+- Отдельно проверь свежую интерактивную сессию без workflow: обычные `bash`,
+  `write` и `edit` должны работать в scratch-проекте. Проверь foreign manager
+  с тем же ID, поддельный actor, несовпадение profile/worktree, selected/CTO
+  claim и испорченный control: отказы сохраняются, причины различимы.
+- Для JS-потребителя передай controller без resolver: регистрация должна
+  завершиться явной ошибкой до установки hooks. В TypeScript такая
+  комбинация должна отвергаться проверкой типов.
 
 ---
 
@@ -360,8 +455,9 @@ npm run typecheck && npm run build && npm test
 omp-workflows-rust/
 ├── package.json          # omp.extensions: ["./dist/index.js"]
 ├── src/
-│   ├── index.ts          # workflow + tool adapter + slash commands, один owner
+│   ├── index.ts          # три workflow seam под одним owner + граница активации
 │   ├── identity.ts       # WorkflowOwnerIdentity для canonical cwd
+│   ├── host-session.ts   # lifecycle capture, общий controller, trusted actor resolver
 │   └── agent-mapping.ts  # live discovery → AgentMappingState
 ├── agents/
 │   ├── rust-architect.md

@@ -72,6 +72,10 @@ type RegisteredTool = {
   execute: (...args: never[]) => Promise<{ content: [{ type: "text"; text: string }]; details: unknown }>;
 };
 
+function admissionCode(reason: string | undefined): string | undefined {
+  return reason?.match(/\[workflow_admission:([a-z_]+)\]/)?.[1];
+}
+
 type SessionManagerFixture = {
   getCwd: () => string;
   getSessionId: () => string;
@@ -99,21 +103,26 @@ function sessionManagerFor(cwd: string, sessionId: string): SessionManagerFixtur
   sessionManagerFixtures.set(key, manager);
   return manager;
 }
-type MutableSessionManagerFixture = SessionManagerFixture & { switchTo: (sessionId: string) => void };
+type MutableSessionManagerFixture = SessionManagerFixture & {
+  switchTo: (sessionId: string) => void;
+  switchCwd: (cwd: string) => void;
+};
 
 function mutableSessionManagerFor(cwd: string, initialSessionId: string): MutableSessionManagerFixture {
+  let currentCwd = cwd;
   let sessionId = initialSessionId;
   return {
-    getCwd: () => cwd,
+    getCwd: () => currentCwd,
     getSessionId: () => sessionId,
-    getSessionFile: () => join(cwd, ".omp", "sessions", `${sessionId}.jsonl`),
+    getSessionFile: () => join(currentCwd, ".omp", "sessions", `${sessionId}.jsonl`),
     getHeader: () => ({
       type: "session",
       id: sessionId,
-      cwd,
+      cwd: currentCwd,
       timestamp: "2026-01-01T00:00:00.000Z",
     }),
     switchTo: (nextSessionId: string) => { sessionId = nextSessionId; },
+    switchCwd: (nextCwd: string) => { currentCwd = nextCwd; },
   };
 }
 
@@ -1938,8 +1947,28 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       const results = await emit("tool_call", { toolName: "bash", input: { command } }, ctx);
       return results.find(value => value && typeof value === "object" && (value as { block?: unknown }).block === true) as { block?: boolean; reason?: string } | undefined;
     };
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason, "trusted host actor unavailable");
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, { ...raw, hasUI: false }))?.block, true, "explicit headless raw context is rejected");
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason),
+      "execution_claim_mismatch",
+    );
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, { ...raw, hasUI: false }))?.reason),
+      "host_profile_mismatch",
+    );
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, { ...raw, mode: "rpc" }))?.reason),
+      "host_profile_mismatch",
+    );
+    mutableManager.switchCwd(join(root, "other-worktree"));
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason),
+      "worktree_mismatch",
+    );
+    mutableManager.switchCwd(root);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, { ...raw, actor: "worker" }))?.reason),
+      "untrusted_actor_context",
+    );
     const prepare = tools.get("workflow_prepare");
     if (!prepare) throw new Error("workflow_prepare was not registered");
     const prepared = await prepare.execute("raw-first-prepare", {
@@ -1982,7 +2011,10 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     const foreign = {
       sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" },
     };
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, foreign))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, foreign))?.reason),
+      "session_identity_mismatch",
+    );
     assert.equal((await invoke({ path: "src/app.ts" }, foreign))?.block, true);
     const foreignInteractive = {
       mode: "tui",
@@ -1992,7 +2024,10 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       sessionManager: foreign.sessionManager,
       actor: "orchestrator",
     };
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, foreignInteractive))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, foreignInteractive))?.reason),
+      "session_identity_mismatch",
+    );
     assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, raw), undefined, "foreign raw context cannot replace the captured controller");
     // A conflicting event identity must not use the owner ctx as a bypass.
     const foreignEvent = {
@@ -2031,7 +2066,10 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       session_id: mutableManager.getSessionId(),
       session_file: mutableManager.getSessionFile(),
     }, host);
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason, "trusted host actor unavailable");
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason),
+      "execution_claim_mismatch",
+    );
     const resumed = await prepare.execute("raw-idle-resume", {
       mode: "resume",
       run_id: runId,
@@ -2060,7 +2098,10 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       reason: "resume",
       previousSessionFile,
     }, replacement);
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, staleRaw))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, staleRaw))?.reason),
+      "session_identity_mismatch",
+    );
     const replacementPrepared = await prepare.execute("raw-replacement-prepare", {
       mode: "resume",
       run_id: runId,
@@ -2071,9 +2112,15 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     assert.equal(replacementDetails.state?.run_id, runId);
     const replacementRaw = { sessionManager: mutableManager };
     assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw), undefined);
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, staleRaw))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, staleRaw))?.reason),
+      "session_identity_mismatch",
+    );
     await emit("session_shutdown", { type: "session_shutdown" }, replacement);
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw))?.reason),
+      "host_session_not_captured",
+    );
 
     // The same-identity headless start is an explicit invalidation boundary.
     const reboundHost = { ...replacement };
@@ -2087,7 +2134,10 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     assert.equal(reboundDetails.ok, true, reboundDetails.error);
     assert.equal(reboundDetails.state?.run_id, runId);
     await emit("session_start", { type: "session_start" }, { mode: "print", hasUI: false, cwd: root, session_id: "replacement-session", sessionManager: mutableManager });
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw))?.block, true, "headless transition cannot retain orchestrator authority");
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw))?.reason),
+      "headless_host_session",
+    );
   } finally {
     await emit("session_shutdown", { type: "session_shutdown" }, { mode: "tui", hasUI: true, cwd: root, session_id: "replacement-session", sessionManager: mutableManager });
     rmSync(root, { recursive: true, force: true });

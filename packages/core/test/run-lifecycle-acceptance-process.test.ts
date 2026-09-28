@@ -233,7 +233,12 @@ test("process acceptance: host tool events rotate observability from A to B with
     initGit(root);
     const controller = createWorkflowSessionController({ cwd: root, context: context(root, "host-observability") });
     const bus = fakePi();
-    registerTeamWorkflow(bus.pi as never, { cwd: root, observability: true, getSessionController: () => controller });
+    registerTeamWorkflow(bus.pi as never, {
+      cwd: root,
+      observability: true,
+      getSessionController: () => controller,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const a = controller.prepare({ mode: "new", task: "A", classification: CLASSIFICATION });
     await bus.emit("tool_call", { toolName: "workflow_status", toolCallId: "call-a", input: {} }, { cwd: root, session_id: "host-observability" });
     const b = controller.prepare({ mode: "new", task: "B", classification: CLASSIFICATION });
@@ -346,6 +351,7 @@ test("process acceptance: registered cto_state performs read/CAS/barrier/termina
         : value === foreignContext
           ? foreignController
           : undefined,
+      resolveTrustedToolCallActor: () => undefined,
     };
     registerTeamWorkflow(bus.pi as never, registrationOptions);
     registerWorkflowTools(bus.pi as never, registrationOptions);
@@ -605,6 +611,7 @@ test("process acceptance: registered CTO journal faults retain A and protect for
         resolveCwd: () => root,
         observability: false,
         getSessionController: (ctx) => controllers.get(ctx),
+        resolveTrustedToolCallActor: () => undefined,
       };
       registerTeamWorkflow(pi, registration);
       registerWorkflowTools(pi, registration);
@@ -963,7 +970,12 @@ test("process acceptance: cold native result replay mutates the origin run once"
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
     const bus = fakePi();
-    registerTeamWorkflow(bus.pi as never, { cwd: root, observability: false, getSessionController: () => controller });
+    registerTeamWorkflow(bus.pi as never, {
+      cwd: root,
+      observability: false,
+      getSessionController: () => controller,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const hookResults = await bus.emit("tool_call", { toolName: "task", toolCallId: "cold-tool", input }, { cwd: root, hasUI: false, session_id: owner.session_id });
     assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
     assert.equal(readRunState(root, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
@@ -976,7 +988,12 @@ test("process acceptance: cold native result replay mutates the origin run once"
         on(name, handler) { (handlers[name] ??= []).push(handler); },
       };
       const controller = createWorkflowSessionController({ cwd: root, context: { session_id: originSession, caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
-      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      registerTeamWorkflow(pi, {
+        cwd: root,
+        observability: false,
+        getSessionController: () => controller,
+        resolveTrustedToolCallActor: () => undefined,
+      });
       console.log(JSON.stringify({ registeredHandlers: Object.keys(handlers), originSession }));
       const event = {
         toolName: "task", toolCallId: "cold-tool",
@@ -1032,7 +1049,12 @@ test("process acceptance: fresh-session late native result uses exact durable lo
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
     const ownerBus = fakePi();
-    registerTeamWorkflow(ownerBus.pi as never, { cwd: root, observability: false, getSessionController: () => ownerController });
+    registerTeamWorkflow(ownerBus.pi as never, {
+      cwd: root,
+      observability: false,
+      getSessionController: () => ownerController,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "fresh-session-tool", input }, { cwd: root, hasUI: false, session_id: owner.session_id });
     assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
     assert.equal(readRunState(root, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
@@ -1047,7 +1069,12 @@ test("process acceptance: fresh-session late native result uses exact durable lo
       };
       const controller = createWorkflowSessionController({ cwd: root, context: { session_id: "fresh-host-session", caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
       if (controller.selectedRunId() !== undefined) throw new Error("fresh host session unexpectedly inherited a selected run");
-      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      registerTeamWorkflow(pi, {
+        cwd: root,
+        observability: false,
+        getSessionController: () => controller,
+        resolveTrustedToolCallActor: () => undefined,
+      });
       const event = {
         toolName: "task", toolCallId: "fresh-session-tool",
         input: { agent: "dev", role: "dev", task: marker },
@@ -1095,7 +1122,12 @@ test("process acceptance: fresh restart uses the persisted origin workspace", as
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
     const ownerBus = fakePi();
-    registerTeamWorkflow(ownerBus.pi as never, { cwd: rootA, observability: false, getSessionController: () => ownerController });
+    registerTeamWorkflow(ownerBus.pi as never, {
+      cwd: rootA,
+      observability: false,
+      getSessionController: () => ownerController,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "cross-worktree-tool", input }, { cwd: rootA, hasUI: false, session_id: owner.session_id });
     assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
     assert.equal(readRunState(rootA, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
@@ -1108,7 +1140,12 @@ test("process acceptance: fresh restart uses the persisted origin workspace", as
         on(name, handler) { (handlers[name] ??= []).push(handler); },
       };
       const controller = createWorkflowSessionController({ cwd: root, context: { session_id: "fresh-cross-worktree-host", caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
-      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      registerTeamWorkflow(pi, {
+        cwd: root,
+        observability: false,
+        getSessionController: () => controller,
+        resolveTrustedToolCallActor: () => undefined,
+      });
       const event = {
         toolName: "task", toolCallId: "cross-worktree-tool",
         input: { agent: "dev", role: "dev", task: marker },
@@ -1158,7 +1195,12 @@ test("process acceptance: ambiguous durable locator candidates reject without mu
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
     const ownerBus = fakePi();
-    registerTeamWorkflow(ownerBus.pi as never, { cwd: rootA, observability: false, getSessionController: () => ownerController });
+    registerTeamWorkflow(ownerBus.pi as never, {
+      cwd: rootA,
+      observability: false,
+      getSessionController: () => ownerController,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "ambiguous-origin-tool", input }, { cwd: rootA, hasUI: false, session_id: owner.session_id });
     assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
     const originState = readRunState(rootA, runId)!;
@@ -1186,7 +1228,12 @@ test("process acceptance: ambiguous durable locator candidates reject without mu
         on(name, handler) { (handlers[name] ??= []).push(handler); },
       };
       const controller = createWorkflowSessionController({ cwd: root, context: { session_id: "ambiguous-callback", caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
-      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      registerTeamWorkflow(pi, {
+        cwd: root,
+        observability: false,
+        getSessionController: () => controller,
+        resolveTrustedToolCallActor: () => undefined,
+      });
       const event = {
         toolName: "task", toolCallId: "ambiguous-origin-tool",
         input: { agent: "dev", role: "dev", task: marker },

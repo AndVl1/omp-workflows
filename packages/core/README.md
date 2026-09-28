@@ -34,6 +34,37 @@ export default function (pi: ExtensionAPI) {
   });
 }
 ```
+
+Этот короткий пример регистрирует только gates/config. Он не создаёт
+session-aware workflow-бандл и не регистрирует workflow tools или команды.
+Полная интеграция использует общий session controller и доверенный host
+adapter на всех трёх поверхностях:
+[`контракт и пример`](../../docs/adding-agents.md#4-регистрация-workflow).
+
+### Trusted host admission и миграция бандла
+
+В `registerTeamWorkflow` передача `getSessionController` требует
+`resolveTrustedToolCallActor`: TypeScript запрещает неполную комбинацию, а
+JS-потребитель получает `[workflow_registration:missing_actor_resolver]`
+до установки hooks. Если после обновления обычный `bash`/`write`/`edit`
+блокируется в свежей сессии, проверь именно host adapter бандла; отсутствие
+workflow не отменяет проверку личности. Не удаляй controller для обхода
+ошибки и не используй `actor`/`hasUI` как credentials.
+
+`TrustedToolCallResolution` поддерживает
+`{ kind: "denied", code: TrustedToolCallDenialCode }` для объяснимого отказа.
+Положительный no-run результат допустим только для аутентифицированного
+host; core отдельно проверяет отсутствие selected run и execution claim.
+Ordinary run, CTO и native worker сохраняют свои проверки полномочий.
+
+Отказы содержат стабильный `[workflow_admission:<code>]`, объяснение,
+безопасное действие и состав репорта. Известный отказ адаптера, отсутствие
+результата, исключение и ошибка canonical state не должны интерпретироваться
+как одна и та же проблема. В репорт включай сообщение, версии OMP/core/bundle,
+имя инструмента и сценарий idle/selected/CTO/worker, но не секреты, raw context
+или полный transcript. Подробности и действия:
+[`диагностика интеграции`](../../docs/adding-agents.md#как-разбирать-отказ-admission).
+
 ## Жизненный цикл обычного workflow
 
 Обычные запуски имеют явный режим `new`, `resume` или `rework`. Наличие старых файлов состояния само по себе не превращает новую задачу в продолжение. Для `/team` действует тот же контракт: это alias `/do-work`.

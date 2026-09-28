@@ -1403,7 +1403,7 @@ test("registered no-run host rejects CTO marker-only admission but keeps ordinar
     const ctoMarkerInput = { tasks: [{ agent: "omp-team-lead", task: `${marker}\nlead slice` }] };
     const blocked = parent.tool_call![0]!({ toolName: "task", toolCallId: "registered-no-run-lead", input: ctoMarkerInput }, f.parentContext) as { block?: boolean; reason?: string } | undefined;
     assert.equal(blocked?.block, true);
-    assert.match(blocked?.reason ?? "", /exact authenticated CTO claim or trusted owned legacy run/);
+    assert.match(blocked?.reason ?? "", /\[workflow_admission:cto_marker_unauthenticated\]/);
 
     const ordinary = parent.tool_call![0]!({
       toolName: "task",
@@ -1656,6 +1656,7 @@ test("registered session start keeps the bound controller for an active managed 
       : ctx === replacementContext
         ? replacementController
         : undefined,
+    resolveTrustedToolCallActor: () => undefined,
   });
   try {
     const start = handlers.session_start?.[0];
@@ -1879,6 +1880,7 @@ test("registered stale CTO binding fails admission without ordinary fallback", (
     observability: false,
     resolveCwd: () => f.root,
     getSessionController: (ctx) => ctx === f.parentContext ? controller : undefined,
+    resolveTrustedToolCallActor: () => undefined,
   });
   try {
     const result = handlers.tool_call![0]!({
@@ -1887,7 +1889,7 @@ test("registered stale CTO binding fails admission without ordinary fallback", (
       input: { path: join(f.root, "unsafe.txt"), content: "blocked" },
     }, f.parentContext) as { block?: boolean; reason?: string } | undefined;
     assert.equal(result?.block, true);
-    assert.match(result?.reason ?? "", /workflow session admission resolution failed/);
+    assert.match(result?.reason ?? "", /\[workflow_admission:cto_claim_mismatch\]/);
     assert.equal(readFileSync(controlPath, "utf8"), staleControl, "stale admission does not rewrite durable claim bytes");
     assert.equal(ingress.run_id, CTO_RUN_ID);
   } finally {
