@@ -9,7 +9,7 @@
       "required": ["task", "branch"],
       "properties": {
         "task": { "type": "string", "description": "Confirmed feature/bug description." },
-        "branch": { "type": "string", "description": "Feature branch created in Phase 1." },
+        "branch": { "type": "string", "description": "The actual branch bound to the prepared workflow run, including an existing branch such as main. Record that branch truthfully; this artifact does not require creating a new feature branch." },
         "constraints": { "type": "array", "items": { "type": "string" } }
       }
     },

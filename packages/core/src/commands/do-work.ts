@@ -156,7 +156,7 @@ export function buildDoWorkPrompt(envelope: ParsedWorkEnvelope, cwd: string): st
     `Mode: ${envelope.mode ?? "unspecified (model chooses after classification)"}`,
     envelope.run_id ? `Run selector: \`${envelope.run_id}\`` : "Run selector: resolve from the session/list context",
     envelope.command_intent_id
-      ? `Command intent token: \`${envelope.command_intent_id}\` (trusted binding; pass this exact value as command_intent_id to workflow_prepare and never omit, replace, or infer it)`
+      ? `Command intent token: \`${envelope.command_intent_id}\` (one-shot trusted binding for this registered invocation: pass this exact value as command_intent_id until its first successful workflow_prepare; never omit, replace, or infer it while pending. Success consumes it. Never replay it for a later resume or another lifecycle request; a new registered command supplies a fresh token, while an implicit continuation without a new command intent omits command_intent_id.)`
       : "Command intent token: none (implicit lifecycle selection remains model-controlled)",
     "Explicit mode is authoritative; do not reinterpret it from task wording or state presence.",
     "",
