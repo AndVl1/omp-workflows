@@ -2,6 +2,10 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## Unreleased
+### Fixed
+- **Debug-cycle first-pass artifact contract** — diagnostics now requires only discovery on its first pass and requests the latest debug artifact when revisiting a failed verification; verification produces debug later. A profile-wide regression check rejects artifacts consumed before their first producer.
+
 ## [0.20.5] — 2026-08-12
 ### Fixed
 - **Extension-owned workflow command discovery** — core now exposes a synchronous `/do-work`, `/team`, and `/cto` registrar for consumer bundles. Commands register during extension load, before OMP snapshots slash suggestions, so fresh sessions no longer depend on project-local `.omp/commands` imports or consumer `node_modules` resolution.

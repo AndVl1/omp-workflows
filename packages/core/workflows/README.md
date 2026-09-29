@@ -83,6 +83,11 @@ of complexity (the diagnostics ↔ manual-qa loop is how a hypothesis is formed 
 This table is mirrored in `hooks/validate-state.sh` (P5) — the classification gate blocks
 launching agents if `team-state.json`'s `workflow` does not match its `classification`.
 
+In `debug-cycle`, the first `diagnose` consumes `discovery` only. `verify` produces
+`debug` later. On a return to diagnostics after failed verification, the
+diagnostics prompt requests the latest `debug` artifact; it is not a required
+first-pass input.
+
 ## Interpreter contract (how `/team` walks a profile)
 
 1. **Classify** the request → emit a structured `CLASSIFICATION` block → write
