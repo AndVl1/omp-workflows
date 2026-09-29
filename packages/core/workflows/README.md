@@ -164,6 +164,10 @@ autonomy and is never routed to an implementation profile (research-only, human 
 This table is mirrored in `hooks/validate-state.sh` (P5) — the classification gate blocks
 launching agents if `team-state.json`'s `workflow` does not match its `classification`.
 
+In `debug-cycle`, the first `diagnose` consumes `discovery` only. `verify` produces
+`debug` later. On a return to diagnostics after failed verification, the
+diagnostics prompt requests the latest `debug` artifact; it is not a required
+first-pass input.
 ## Lecture research workflow (`lecture-research`)
 
 Dedicated URL-first, research-only profile for semantic type `LECTURE_RESEARCH`. It turns one
