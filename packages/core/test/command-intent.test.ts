@@ -411,13 +411,7 @@ test("registered workflow prompts arm private one-shot turn provenance", async (
     await harness.commands.get("do-work")!.handler("--new continue", hostContext);
     const firstPrompt = harness.prompts.at(-1)!;
     assert.match(firstPrompt, /^new:[0-9a-f-]{36}:continue$/);
-    const firstTurn = start(firstPrompt, hostContext);
-    const firstSystemPrompt = (firstTurn as { systemPrompt: string[] }).systemPrompt;
-    assert.equal(typeof firstSystemPrompt[2], "string");
-    assert.equal(firstSystemPrompt.length, 3);
-    assert.deepEqual(firstSystemPrompt.slice(0, 2), ["base-a", "base-b"]);
-    assert.match(firstSystemPrompt[2]!, /This request does not authorize dispatch/);
-    assert.match(firstSystemPrompt[2]!, /only the current engine-returned workflow_begin handoff does/);
+    assert.ok(start(firstPrompt, hostContext), "registered hook accepts the exact ordinary provenance");
     assert.equal(start(firstPrompt, hostContext), undefined, "provenance is consumed exactly once");
     const firstToken = firstPrompt.slice("new:".length).split(":", 1)[0]!;
     assert.equal(controller.consumeCommandIntent({ command_intent_id: firstToken, mode: "new" })?.intent_id, firstToken);

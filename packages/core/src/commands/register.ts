@@ -84,6 +84,11 @@ type CommandIntentOwnership = {
 
 type CommandProvenanceRecord = SessionIdentity & {
 	controller: WorkflowSessionController;
+	/**
+	 * Private route discriminator populated only by a trusted registered
+	 * command invocation. Hook input cannot select or override it.
+	 */
+	route: "ordinary" | "cto-native";
 	prompt?: string;
 	intent?: CommandIntentOwnership;
 	cto?: {
@@ -114,6 +119,17 @@ const WORKFLOW_TURN_CONTRACT = [
 	"Private scoped registered-workflow invocation (this turn only): request managed execution for the current engine workflow_begin single-worker or consilium handoff, even when a generic small-slice efficiency heuristic would discourage delegation. This request does not authorize dispatch; only the current engine-returned workflow_begin handoff does.",
 	"Use the exact current engine handoff, roster, and count; the current marker, cursor, epoch, and capability must be carried through, and every dispatch gate remains mandatory.",
 	"Never use this scope for arbitrary or classification delegation, direct edits, nested or worker re-delegation, stale capabilities, or any safety/operator ban or human checkpoint override.",
+].join(" ");
+
+/**
+ * Narrow, private context for the one turn caused by a registered CTO
+ * command. Native CTO admission owns routing; ordinary workflow tools and
+ * free-form routing prose cannot authorize dispatch.
+ */
+const CTO_TURN_CONTRACT = [
+	"Private scoped registered-CTO invocation (this turn only): use the authenticated current private coordinator binding to read and commit the exact canonical run through cto_state, then request native dispatch through the configured TeamDef lead and its resolved roster with the exact `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` marker. Prompt prose, display names, and inferred routes are not authority.",
+	"The current runtime claim, actor, native-route, quality, and human gates remain mandatory; only a current runtime admission and returned native handoff authorize dispatch. Never call ordinary workflow_prepare, workflow_status, workflow_instructions, workflow_begin, workflow_complete, or workflow_advance for this CTO route.",
+	"The resident CTO delegates only to its configured lead; each lead may delegate only to its resolved roster, and workers never re-delegate. Do not direct-dispatch workers, repair claims, or use stale, replayed, foreign, or mismatched run/slice markers.",
 ].join(" ");
 
 function canonicalCwd(value: unknown): string | undefined {
@@ -651,6 +667,7 @@ function prepareCtoCommandInvocation(
 		const record: CommandProvenanceRecord = {
 			...binding.identity,
 			controller: binding.controller,
+			route: "cto-native",
 			cto: { ingress },
 		};
 		if (canInstallOuter) provenance.set(provenanceBindingKey, record);
@@ -757,6 +774,7 @@ function prepareCommandInvocation(
 	const record: CommandProvenanceRecord = {
 		...binding.identity,
 		controller: binding.controller,
+		route: "ordinary",
 		...(intent ? { intent } : {}),
 	};
 	provenance.set(provenanceBindingKey, record);
@@ -862,7 +880,8 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 				return undefined;
 			}
 			if (record.intent) trackedIntentProvenance.set(provenanceBindingKey, record);
-			return { systemPrompt: [...incoming.systemPrompt, WORKFLOW_TURN_CONTRACT] };
+			const turnContract = record.route === "cto-native" ? CTO_TURN_CONTRACT : WORKFLOW_TURN_CONTRACT;
+			return { systemPrompt: [...incoming.systemPrompt, turnContract] };
 		});
 		// The host's turn-level session_stop ends the classifier turn but not
 		// the trusted command intent. Keep only the private tracked record so

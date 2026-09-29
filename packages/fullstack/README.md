@@ -243,6 +243,11 @@ call ordinary `workflow_prepare`/`workflow_status`/`workflow_instructions`/
 `workflow_begin`/`workflow_complete`/`workflow_advance` with the CTO slug.
 The resolved profile remains a quality contract, not a selector bridge.
 
+Registered `/cto` получает scoped native system contract, а не ordinary-only
+требование `workflow_begin`. Его выбирает проверенная private provenance;
+похожий текст в обычном сообщении не заменяет зарегистрированный ingress.
+Сам prompt не выдаёт полномочий и не отменяет runtime или human gates.
+
 Implementation, artifact recovery, review и QA выполняют roster-workers
 назначенного lead. Отсутствующая роль требует исправить состав команды,
 а не запускать такого worker напрямую из CTO-root или пропускать quality gate.

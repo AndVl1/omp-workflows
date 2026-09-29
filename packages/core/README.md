@@ -145,6 +145,13 @@ Per-team DoD remains a supplemental file at the exact configured relative
 `teams[].dod_path` (default `.work-state/artifacts/<team>/dod.json`), never
 canonical CTO state.
 
+Зарегистрированный CTO ingress получает отдельный system turn-contract для
+native-маршрута; ordinary-команды сохраняют требование текущего `workflow_begin`.
+Выбор основан на private provenance успешного ingress и проходит те же проверки
+session/controller, точного prompt и однократного использования. Текст `/cto`
+в обычном сообщении не создаёт binding или dispatch authority; сам contract
+не заменяет runtime guards и обязательные human checkpoints.
+
 Native admission проверяет фактическое имя agent: root вызывает только
 `TeamDef.lead`, а lead — только разрешённый effective config состав `roster`.
 Маркер совпадает с `teams[].slice_id`; `teams[].id` должен однозначно связывать
