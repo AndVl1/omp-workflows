@@ -176,6 +176,8 @@ export interface TrustedCheckpointAnswer {
   stage_id: string;
   checkpoint_id: string;
   work_identity_hash: string;
+  /** Engine-generated singular-root provenance retained for historical verification. */
+  work_identity_witness?: WorkIdentity;
   capability_id: string;
   capability_epoch: string;
   policy_hash: string;

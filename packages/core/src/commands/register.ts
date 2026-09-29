@@ -3,11 +3,13 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-
 import {
 	buildAmendPrompt,
 	buildCtoPrompt,
+	buildCtoResumePrompt,
 	buildStandbyCtoPrompt,
 	parseCtoCommand,
 	parseEnvelope as parseCtoEnvelope,
 } from "./cto.js";
 import { acquireCtoIngress, recoverLegacyCtoIngress, suspendCtoSession, type CtoIngressResult } from "../cto/run.js";
+import { isCtoResidentWaiting } from "../cto/state.js";
 import { buildDoWorkPrompt, parseWorkEnvelope, type ParsedWorkEnvelope } from "./do-work.js";
 import { parseWorkflowCommand, type WorkflowCommandMode } from "./envelope.js";
 import { createSelectionSnapshot } from "../engine/run-store.js";
@@ -534,13 +536,25 @@ function buildCtoCommandPrompt(
 	const command = parseCtoCommand(args);
 	if (!command.ok) return `ERROR [${command.code}]: ${command.error}`;
 	const sessionId = ctx.sessionManager.getSessionId();
-	const task = command.task || (ingress.state.standby ? "" : ingress.state.task);
+	const hasRequestedTask = command.task.trim().length > 0;
+	const waiting = isCtoResidentWaiting(ingress.state);
+	const task = hasRequestedTask ? command.task : (waiting ? "" : ingress.state.task);
 	if (!task) {
-		ctx.ui.notify(`${ctoName}: standby mode — awaiting tasks via messenger inbox`, "info");
-		return buildStandbyCtoPrompt(cwd, { runId: ingress.run_id });
+		ctx.ui.notify(
+			`${ctoName}: ${waiting && (ingress.state.wave_history?.length ?? 0) > 0 ? "resident wave closed — awaiting next task" : "standby mode — awaiting tasks via messenger inbox"}`,
+			"info",
+		);
+		return buildStandbyCtoPrompt(cwd, {
+			runId: ingress.run_id,
+			standbyMode: waiting && (ingress.state.wave_history?.length ?? 0) > 0 ? "closed-wave" : "bootstrap",
+		});
 	}
 	const envelope = parseCtoEnvelope(task, cwd);
 	if (!envelope.task) return "ERROR: empty task after stripping prefix.";
+	if (!ingress.created && !hasRequestedTask) {
+		ctx.ui.notify(`${ctoName}: resuming run ${ingress.run_id} (canonical task and lifecycle state preserved)`, "info");
+		return buildCtoResumePrompt(cwd, { runId: ingress.run_id, state: ingress.state }, { sessionId, runId: ingress.run_id });
+	}
 	if (!ingress.created) {
 		ctx.ui.notify(`${ctoName}: amending run ${ingress.run_id} with: ${envelope.task.slice(0, 50)}`, "info");
 		return buildAmendPrompt(

@@ -172,6 +172,7 @@ function residentNativeRouteContract(): string {
     "The CTO root and its leads MUST NOT call ordinary `workflow_prepare`, `workflow_status`, `workflow_instructions`, `workflow_begin`, `workflow_complete`, or `workflow_advance` with the CTO slug. A CTO `id`/slice marker is not an ordinary workflow UUID or selector; the CTO native authority route is independent.",
     "Roles are fixed by ownership: the resident main session is the CTO and canonical-state owner; each registry `TeamDef.lead` is the one team lead; that lead may spawn only worker roles from its `TeamDef.roster`; workers implement source changes and never re-delegate. Native admission recognizes the configured team-lead aliases `team-lead` and `omp-team-lead`; never substitute a `cto` child.",
     "The resolved sub-workflow profile remains a quality contract for the slice: preserve its stages, code-review/validation obligations, typed artifacts, checkpoints, and DoD evidence, but satisfy them through the native CTO lead/worker handoff rather than an ordinary selector bridge.",
+    "Implementation, artifact-recovery, code-review, and QA workers are all lead-owned slice work: the resident CTO never spawns them directly. The configured lead may dispatch only roles present in that team's `TeamDef.roster`; if a required quality role is absent, use the existing lead/CTO escalation path instead of inventing a direct worker route.",
     "Each lead task carries the exact `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` marker; every worker task repeats it verbatim. The resident CTO verifies terminal worker evidence and direct artifact payloads before committing progress; missing or malformed evidence blocks the wave.",
     "A slice DoD is a supplemental ordinary file, not canonical CTO state: write/read the exact `teams[].dod_path` through the permitted artifact tools. The default file form is `.work-state/artifacts/<team>/dod.json` relative to the workspace root (or the exact configured relative `dod_path`); it must contain non-empty typed `items`. Never write `.work-state/cto/<id>/state.json` by hand, and never guess or relocate the DoD path.",
   ].join("\n");
@@ -244,27 +245,46 @@ export function renderChannelSection(cwd: string): string {
 }
 
 /**
- * Build the CTO STANDBY prompt: CTO mode with no task yet. The agent persists
- * a standby run (so the run is active: amend detection, inbox routing and the
- * per-turn reminder all key off it), yields, and waits for `[CTO-INBOX]`
- * tasks (injected by the messenger dispatcher or dropped in
- * `.work-state/cto/<id>/inbox/`).
+ * Build the CTO resident-wait prompt. In `bootstrap` mode the run has no
+ * task yet; in `closed-wave` mode it retains the canonical task,
+ * classification, and completed wave while waiting for a new inbox task. The
+ * run stays active so inbox routing, amend detection, and the per-turn
+ * reminder all key off the exact acquired run.
  */
 export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}): string {
+  const closedWave = opts.standbyMode === "closed-wave";
   const runLine = opts.runId
     ? `The registered ingress already acquired run \`${opts.runId}\`; use this exact id and never scan for or create another run.`
     : "The registered ingress already acquired the exact run id; use that id and never scan for or create another run.";
+  const taskContext = closedWave
+    ? [
+      "   This resident run already has a canonical task and a successfully closed wave. Preserve its exact task,",
+      "   classification, wave history, completed artifacts, owner fields, and run identity. Do not reset it to the",
+      "   no-task bootstrap, reclassify the completed wave, repeat completed work, or start a new wave until a new",
+      "   inbox task arrives.",
+    ]
+    : [
+      "   This `autonomous: true` is ENGINE-CREATED — standby has NO user task, so there is nothing to",
+      "   classify. The standby state therefore carries NO `classification` field (model-first: a",
+      "   classification exists only when a task was classified). It is not a PHASE-0 decision; on wake, first",
+      "   apply terminal-request precedence: an unmistakable explicit request to end this resident run itself",
+      "   follows the terminal branch and is not classified, amended, spawned, or started as a new wave. Every",
+      "   other inbox task is classified by YOU (type, complexity, confidence, autonomous) on wake, exactly",
+      "   like a `/cto <task>` invocation.",
+    ];
   return [
-    "/cto STANDBY — CTO sub-orchestration is ON with NO task yet. Execute this contract YOURSELF, in this session.",
+    closedWave
+      ? "/cto RESIDENT WAIT — the previous CTO wave is closed and this run awaits the next task. Execute this contract YOURSELF, in this session."
+      : "/cto STANDBY — CTO sub-orchestration is ON with NO task yet. Execute this contract YOURSELF, in this session.",
     "",
-    "### You are the CTO (standby)",
+    closedWave ? "### You are the CTO (resident, awaiting the next task)" : "### You are the CTO (standby)",
     "You ARE the orchestrator — and you are THE MAIN AGENT of this session, the resident CTO.",
     "Do NOT invent work while waiting. Do NOT delegate the orchestrator role.",
     "The CTO is never spawned: NEVER run `task(agent=cto)` or `task(agent=@cto)` — not mechanically,",
     "not by text. `/cto` executes in-session; this session IS the CTO.",
     "",
-    "### Standby steps",
-    `1. **Continue the pre-acquired standby run NOW**: ${runLine}`,
+    closedWave ? "### Resident wait steps" : "### Standby steps",
+    `1. **${closedWave ? "Continue the pre-acquired resident run after its closed wave NOW" : "Continue the pre-acquired standby run NOW"}**: ${runLine}`,
     "   Read the canonical state through the registered `cto_state` tool with `operation: \"read\"` and",
     "   the exact run id; read only this run's `inbox/` directory and answer artifacts directly. The state",
     "   and claim were published atomically before this prompt; do not write a second state directory or",
@@ -272,13 +292,7 @@ export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}):
     "   lifecycle error.",
     "   The run must exist before waiting: inbox routing, amend detection and the per-turn reminder all",
     "   key off its exact state.",
-    "   **This `autonomous: true` is ENGINE-CREATED — standby has NO user task, so there is nothing to",
-    "   classify.** The standby state therefore carries NO `classification` field (model-first: a",
-    "   classification exists only when a task was classified). It is not a PHASE-0 decision; on wake, first",
-    "   apply terminal-request precedence: an unmistakable explicit request to end this resident run itself",
-    "   follows the terminal branch and is not classified, amended, spawned, or started as a new wave. Every",
-    "   other inbox task is classified by YOU (type, complexity, confidence, autonomous) on wake, exactly",
-    "   like a `/cto <task>` invocation.",
+    ...taskContext,
     "2. On every wake, read the exact run state with `cto_state(operation: \"read\", run_id: <exact-run-id>)`.",
     "   Read this run's `answers/*.json` and escalation records directly from its namespace before applying retry rules.",
     "   A dispatcher-created `.omp/inbox/answer-retry-<sanitized-id>-<sanitized-epoch>.json` marker authorizes one retry only",
@@ -324,7 +338,9 @@ export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}):
     renderChannelSection(cwd),
     persistenceContract(opts, false),
     "",
-    "Begin: use `cto_state(operation: \"read\")` for the pre-acquired standby run, read the registry, yield.",
+    closedWave
+      ? "Begin: use `cto_state(operation: \"read\")` for the pre-acquired resident run, preserve its closed wave, and wait for the next inbox task."
+      : "Begin: use `cto_state(operation: \"read\")` for the pre-acquired standby run, read the registry, yield.",
   ].join("\n");
 }
 
@@ -340,6 +356,11 @@ export interface CtoPromptOptions {
   sessionId?: string;
   /** Exact canonical CTO id acquired before this prompt was sent. */
   runId?: string;
+  /**
+   * Resident prompt mode. `bootstrap` is the engine-created no-task inbox
+   * run; `closed-wave` preserves the completed task and waits for a new one.
+   */
+  standbyMode?: "bootstrap" | "closed-wave";
 }
 
 /** Persistence and lifecycle contract shared by the CTO standby/task/amend prompts. */
@@ -376,7 +397,8 @@ function persistenceContract(opts: CtoPromptOptions, includeClassification = tru
     "Before any standby wake, inbox, or amend task is routed, check for an unmistakable user request to end this resident run itself. Such a request takes precedence over normal task classification/new-wave routing: do not classify, amend, spawn leads, or start a wave for it. This does not include a completed wave, incidental `done` wording, or ordinary wave-close instructions. Settle genuine pending work first, then follow the terminal branch below.",
     "For a resident run, normal wave completion closes only the wave: settle integration, mark the wave",
     "`done`|`failed` with `finished_at`, clear `active_wave_id`, keep the run active in standby, and wait for the next task.",
-    "Wave closure is not run termination, and `pause.kind: \"none\"` remains nonterminal.",
+    "Registered task-backed `/cto` runs carry the same resident marker as the no-task standby bootstrap; all-teams-done plus integration-done closes their wave, not the run.",
+    "Wave closure is not run termination, and `pause.kind: \"none\"` remains nonterminal. A same-run continuation appends a new wave and dispatches only its new or still-unmet slices; completed-wave teams and artifacts are not repeated.",
     "Only an explicit user request to end the resident run may terminate it. First settle all genuine",
     "pending work (including workers, reservations, and barriers); never bypass guards or fabricate",
     "completion. Then read the exact run fresh, commit the full schema-2 candidate with the read's",
@@ -388,6 +410,68 @@ function persistenceContract(opts: CtoPromptOptions, includeClassification = tru
     "After that successful terminal commit, use its receipt and returned terminal state; do not require",
     "an additional authenticated read after the claim is released.",
     "",
+  ].join("\n");
+}
+
+/**
+ * Build the exact-resume prompt for an already active task-backed run. This
+ * path is deliberately separate from the new-task prompt: resuming work must
+ * preserve the canonical task, classification, wave cursor, and recovery
+ * context instead of creating a new PHASE-0 decision.
+ */
+export function buildCtoResumePrompt(
+  cwd: string,
+  active: { runId: string; state: CtoState },
+  opts: CtoPromptOptions = {},
+): string {
+  const state = active.state;
+  const teamStatuses = state.teams.map((team) => `${team.id}:${team.status}`).join(", ") || "(none)";
+  const initialClassificationPending = state.classification === undefined
+    && state.plan.teams.length === 0
+    && state.teams.length === 0
+    && (state.wave_history?.length ?? 0) === 0
+    && state.active_wave_id === undefined
+    && state.integration.status === "pending"
+    && (state.pause?.kind ?? "none") === "none";
+  const classificationInstruction = state.classification !== undefined
+    ? "The run already has a persisted classification: preserve it exactly and do not create a replacement PHASE-0 decision."
+    : initialClassificationPending
+      ? "The task has no persisted run classification and no work has started: complete the one unfinished PHASE-0 classification for this exact canonical task, commit it, and then preserve it; do not classify the same task again."
+      : "No run classification is persisted for this legacy/in-progress state. Preserve that absence and its existing autonomy/workflow/cursor context; do not invent a late PHASE-0 decision while finishing outstanding work.";
+  const pauseKind = state.pause?.kind ?? "none";
+  const pauseReason = state.pause?.reason || "no reason";
+  return [
+    "/cto RESUME — continue the exact active CTO run IN-SESSION; do not create or amend a run.",
+    "",
+    "### Exact active run",
+    `Run: \`${active.runId}\` (already acquired; use this exact id)`,
+    `Canonical task: ${state.task}`,
+    `Active wave: ${state.active_wave_id ?? "(none recorded)"}`,
+    `Integration: ${state.integration.status}`,
+    `Teams: ${teamStatuses}`,
+    `Pause: ${pauseKind} — ${pauseReason}`,
+    "",
+    "Read the exact canonical state with `cto_state(operation: \"read\", run_id: <exact-run-id>)` before",
+    "any action. This is an exact resume, not a new `/cto <task>` and not an amend:",
+    "preserve `task`, `classification`, `plan`, `wave_history`, `active_wave_id`, per-team statuses",
+    "and cursors, control-plane fields, artifacts, owner fields, and run identity exactly as read.",
+    classificationInstruction,
+    "Do not replace the canonical task, repeat completed slices, or reset recovery context. Continue",
+    "the active wave from its canonical cursor; if the run is blocked or failed, inspect its actual",
+    "recovery context and use the existing escalation route.",
+    "An unmistakable explicit request to end this resident run itself takes terminal precedence; it is",
+    "not a classification, amend, dispatch, or new-wave trigger.",
+    "",
+    "When a new ordinary inbox task is actually present, apply the resident lifecycle contract and",
+    "fold it into the same run as its own new wave only after reading the exact state again. Keep the",
+    "same run id and do not redo completed-wave work.",
+    residentNativeRouteContract(),
+    "",
+    renderChannelSection(cwd),
+    persistenceContract(opts, false),
+    "",
+    "Begin: read the exact run, preserve its canonical task/classification/cursor, then continue the",
+    "active or recovery path that the state proves; do not invent a fresh classification.",
   ].join("\n");
 }
 
@@ -902,8 +986,8 @@ export function buildAmendPrompt(
     "   run <= 8, depth <= 2. New leads spawn in PARALLEL with active teams; existing teams keep working.",
     "   Choose sub-profiles from the Workflow resolution matrix above — the SAME table as /do-work (resolveWorkflow):",
     "   LECTURE_RESEARCH slices resolve to the research-only, human-gated `lecture-research` profile (see below).",
-    "2. **Architecture**: if the new task adds cross-team surface, run the architect for the ADDITIONAL",
-    "   contract (or extend the existing architecture artifact); new leads consume it.",
+    "2. **Architecture**: if the new task adds cross-team surface, assign the additional contract to a",
+    "   configured `TeamDef.lead` already in the plan; that lead dispatches a worker from its `TeamDef.roster` before dependent consumer leads.",
     "3. **Persist**: read the exact candidate with `cto_state(operation: \"read\")`, append the new teams",
     "   and stamp `amended_at`, then commit with the returned `state_revision`; document the amend in",
     "   `decisions.md` as a supplemental artifact (why). Never write canonical CTO state with Write, Edit, or Bash.",

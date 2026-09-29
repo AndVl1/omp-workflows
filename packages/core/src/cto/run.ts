@@ -1075,15 +1075,18 @@ export function acquireCtoIngress(options: CtoIngressOptions): CtoIngressResult 
       throw new LifecycleError("run_selection_required", `active legacy CTO run '${legacyActive[0]}' requires an explicit --run selector`, { run_id: legacyActive[0], next_action: "use /cto --run <exact-cto-id>" });
     }
     runId = ctoRunId(options.task || "standby");
-    const standby = options.task.trim().length === 0;
-    const plan: TeamPlan = { id: runId, task: standby ? "standby — awaiting inbox tasks" : options.task, teams: [], created_at: new Date().toISOString() };
+    const noTask = options.task.trim().length === 0;
+    const plan: TeamPlan = { id: runId, task: noTask ? "standby — awaiting inbox tasks" : options.task, teams: [], created_at: new Date().toISOString() };
     state = newCtoState({
       id: runId,
       task: plan.task,
       branch: options.branch,
-      autonomous: standby,
+      autonomous: noTask,
       plan,
-      ...(standby ? { standby: true } : {}),
+      // Every newly created registered /cto ingress is a resident
+      // coordinator. A task-backed run may start wave 1 immediately; after
+      // that wave closes the same run remains claimable until explicit END.
+      standby: true,
       owner_session: context.session_id,
     });
     created = true;

@@ -30,7 +30,9 @@ import {
   pendingEscalations,
   activeTeams,
   appendWave,
+  finishWave,
   setIntegration,
+  isCtoRunTerminal,
   setCtoPause,
   integrationDoD,
   ctoBackstop,
@@ -59,7 +61,7 @@ import {
   acquireExecutionClaim,
   LifecycleError,
 } from "../src/index.js";
-import { acquireCtoIngress } from "../src/cto/run.js";
+import { acquireCtoIngress, commitCtoStateForModel, readCtoStateForModel } from "../src/cto/run.js";
 import type { TrustedExecutionContext } from "../src/engine/types.js";
 
 function sampleDefs(): Record<string, TeamDef> {
@@ -220,6 +222,89 @@ test("cto-engine: runCto persists state and returns the plan", () => {
     const reloaded = readCtoState(res.plan.id, root);
     assert.ok(reloaded);
     assert.equal(reloaded?.task, "Add OAuth");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("cto-engine: registered task ingress keeps resident claim through wave close and explicit END", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-resident-task-ingress-"));
+  try {
+    const controller = createWorkflowSessionController({
+      cwd: root,
+      context: executionContext(root, "resident-task-owner"),
+    });
+    const ingress = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "resident task wave",
+      controller,
+    });
+    assert.equal(ingress.created, true);
+    assert.equal(ingress.state.standby, true, "task-backed registered ingress is resident");
+    assert.equal(readRunControl(root).execution_claim?.token, ingress.claim.claim.token);
+
+    const initial = readCtoStateForModel(controller, root, ingress.run_id);
+    const wave = initial.state;
+    wave.plan.teams.push({
+      team: "frontend",
+      scope: ["frontend"],
+      slice: "small frontend slice",
+      profile: "lightweight",
+      worktree: "same_branch",
+      depends_on: [],
+    });
+    wave.teams.push({ id: "frontend", status: "done", escalations: {} });
+    appendWave(wave, {
+      id: "wave-1",
+      source: "command",
+      source_id: "resident-task-wave-1",
+      task: "resident task wave",
+      slice_ids: ["frontend"],
+      now: "2026-09-29T01:00:00.000Z",
+    });
+    finishWave(wave, { id: "wave-1", status: "done", now: "2026-09-29T02:00:00.000Z" });
+    setIntegration(wave, "done", "wave 1 integrated");
+    const closed = commitCtoStateForModel({
+      controller,
+      cwd: root,
+      run_id: ingress.run_id,
+      expected_state_revision: initial.state_revision,
+      state: wave,
+    });
+    assert.equal(closed.transition, "state", "wave close is a resident state transition");
+    assert.equal(isCtoRunTerminal(closed.state), false, "completed resident wave is not terminal");
+    assert.equal(closed.state.active_wave_id, undefined);
+    assert.equal(closed.state.wave_history?.[0]?.status, "done");
+    assert.equal(readRunControl(root).execution_claim?.token, ingress.claim.claim.token, "wave close retains the exact claim");
+
+    const continuation = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "continue with the next slice",
+      run_id: ingress.run_id,
+      controller,
+    });
+    assert.equal(continuation.created, false);
+    assert.equal(continuation.state.wave_history?.length, 1, "same-run continuation does not repeat the completed wave");
+    assert.equal(continuation.state.wave_history?.[0]?.status, "done");
+    assert.equal(continuation.state.teams.find((team) => team.id === "frontend")?.status, "done", "completed work remains done");
+    assert.equal(readRunControl(root).execution_claim?.token, ingress.claim.claim.token, "continuation reuses the current private claim");
+
+    const beforeEnd = readCtoStateForModel(controller, root, ingress.run_id);
+    const terminal = beforeEnd.state;
+    terminal.pause = { kind: "done", reason: "user explicitly requested END" };
+    const ended = commitCtoStateForModel({
+      controller,
+      cwd: root,
+      run_id: ingress.run_id,
+      expected_state_revision: beforeEnd.state_revision,
+      state: terminal,
+    });
+    assert.equal(ended.transition, "terminal", "explicit END records a terminal transition");
+    assert.equal(ended.state.pause.kind, "done");
+    assert.equal(isCtoRunTerminal(ended.state), true);
+    assert.equal(readRunControl(root).execution_claim, null, "terminal transition releases the common claim");
+    assert.equal(controller.activeCtoClaim(), undefined, "terminal transition retires the private binding");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

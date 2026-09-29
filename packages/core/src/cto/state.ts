@@ -124,14 +124,15 @@ export function newCtoState(opts: {
    * Model-first PHASE-0 classification (authority for `autonomous`). When
    * present, `classification.autonomous` is the decision and the top-level
    * `autonomous` field is mirrored from it for legacy readers — the two can
-   * never disagree by construction. Legacy callers and engine-created
-   * standby runs omit it and keep the explicit top-level flag verbatim.
+   * never disagree by construction. Legacy callers and the engine-created
+   * no-task standby bootstrap omit it and keep the explicit top-level flag
+   * verbatim.
    */
   classification?: ModelClassification;
   plan: TeamPlan;
-  /** Standby runs are adoptable cross-session (inbox continuity). */
+  /** Resident runs are adoptable cross-session (inbox continuity). */
   standby?: boolean;
-  /** Session that owns this interactive task run (foreign sessions do not amend it). */
+  /** Session associated with this interactive ingress (claim rules govern continuation). */
   owner_session?: string;
 }): CtoState {
   // Model-first: a well-formed classification carries ALL four PHASE-0
@@ -508,8 +509,8 @@ export function writeCtoState(state: CtoState, root: string): string {
  *   can never override it (new state mirrors the classification, so the two
  *   agree by construction; a legacy file with both must honor the model).
  * - The top-level `autonomous` field is the fallback ONLY when the
- *   classification is absent: legacy runs and the engine-created standby
- *   exception (no user task, nothing to classify).
+ *   classification is absent: legacy runs and the engine-created no-task
+ *   bootstrap exception (no user task, nothing to classify).
  */
 export function resolveCtoAutonomous(state: Pick<CtoState, "classification" | "autonomous">): boolean {
   const model = state.classification?.autonomous;
@@ -655,6 +656,53 @@ export function setTeamControlPlane(
  */
 export function isCtoResident(state: Pick<CtoState, "standby">): boolean {
   return state.standby === true;
+}
+type ResidentLifecycleState = Pick<
+  CtoState,
+  "standby" | "autonomous" | "task" | "classification" | "plan" | "teams" | "integration" | "pause" | "wave_history" | "active_wave_id"
+>;
+/**
+ * True only for the registered-ingress engine-created no-task inbox
+ * bootstrap. The fresh ingress invariant is `autonomous: true` plus the
+ * sentinel/no-history/no-classification shape; task-backed ingress starts
+ * with `autonomous: false`, even when its text equals the sentinel. Legacy
+ * states without that invariant are not treated as proof of no task.
+ */
+export function isCtoStandbyBootstrap(state: ResidentLifecycleState): boolean {
+  return state.standby === true
+    && state.autonomous === true
+    && state.task === "standby — awaiting inbox tasks"
+    && state.classification === undefined
+    && state.plan.teams.length === 0
+    && state.teams.length === 0
+    && (state.wave_history?.length ?? 0) === 0
+    && state.active_wave_id === undefined
+    && state.integration.status === "pending"
+    && state.pause?.kind === "none";
+}
+
+/**
+ * True when a resident is genuinely waiting for the next task: either the
+ * no-task bootstrap or a fully successful current wave closure. Earlier
+ * failed waves remain append-only history; only the current wave and current
+ * team/integration state decide whether the run is waiting. Active task
+ * progress and recovery remain in their resume context.
+ */
+export function isCtoResidentWaiting(state: ResidentLifecycleState): boolean {
+  if (isCtoStandbyBootstrap(state)) return true;
+  if (
+    state.standby !== true
+    || state.pause?.kind !== "none"
+    || state.active_wave_id !== undefined
+    || state.integration.status !== "done"
+  ) return false;
+  const history = state.wave_history ?? [];
+  if (
+    history.length === 0
+    || history.some((wave) => wave.status === "active")
+    || history[history.length - 1]?.status !== "done"
+  ) return false;
+  return state.teams.every((team) => team.status === "done");
 }
 
 /**

@@ -36,6 +36,12 @@ npm install @andvl1/omp-workflows-core
 npm install @andvl1/omp-workflows-fullstack
 ```
 
+For an existing npm-plugin installation, update **both packages to the same
+published version**, core first, using `omp plugin install ... --force`.
+`omp plugin upgrade` is for marketplace plugins, not npm-installed packages.
+Follow the [paired update instructions](packages/fullstack/README.md), then start
+a new OMP session to load the updated extensions.
+
 ### Slash command bootstrap and compatibility copies
 
 When the extension is loaded, its registered `/do-work`, `/team`, and `/cto`

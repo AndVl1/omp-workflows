@@ -19,6 +19,12 @@ omp plugin install @andvl1/omp-workflows-core
 (The package carries an `omp: {}` manifest — skills are discovered without
 an extension entry; see [`docs/adding-agents.md`](../../docs/adding-agents.md).)
 
+When updating an installed bundle, update core first and then the bundle to a
+compatible published version. For npm plugins, use
+`omp plugin install @andvl1/omp-workflows-core@<version> --force`, then start a new
+OMP session; `plugin upgrade` targets marketplace plugins. The fullstack bundle
+documents the [paired install/update procedure](../fullstack/README.md#install).
+
 ## Public API
 
 ```typescript
@@ -84,10 +90,19 @@ UUID не обязателен для обычного пользователь�
 ### CTO lifecycle and exact-run continuation
 
 `/cto` is a registered host ingress, not a prompt-only command. Use
-`/cto --run <exact-cto-id> <task>` only when continuing a known CTO run; the
+`/cto --run <exact-cto-id> [task]` only when continuing a known CTO run; the
 selector identifies the run but does not prove ownership. Ingress acquires the
 authenticated host claim and publishes the CTO state atomically before the
 prompt is sent. It never scans for a latest active run.
+
+`/cto <task>` также запускает resident-координатора: успешное закрытие волны
+не завершает весь CTO-run. `/cto --run <id>` без новой задачи продолжает
+канонический task, план и незавершённые slices, не повторяя уже записанную
+классификацию или выполненную работу. После успешной закрытой волны этот же
+run ждёт следующую задачу; новая задача создаёт следующую волну.
+Отдельный явный `END` завершает resident через revision-checked `cto_state`
+commit с `pause.kind: "done"` и освобождает claim/private binding.
+Ошибочная или заблокированная работа не считается ожиданием новой задачи.
 
 The claim is bound to the worktree, branch, host session, process and ownership
 epoch. A managed session release may retain pending worker slots, so a later
