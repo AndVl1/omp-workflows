@@ -783,7 +783,9 @@ function releaseWorkflowSession(event: unknown, ctx: unknown, teardown: boolean)
     if (!teardown) {
       // A turn-level stop is not a host teardown. Resident CTO ownership and
       // its dispatcher remain bound; ordinary workflow ownership may release.
-      if (!ctoClaim) controller.release("host-session-stop");
+      // Preserve an explicit command intent across the classifier turn so a
+      // later user boundary can perform the first prepare.
+      if (!ctoClaim) controller.release("host-session-stop", { preserveCommandIntent: true });
       return;
     }
     if (ctoClaim) {

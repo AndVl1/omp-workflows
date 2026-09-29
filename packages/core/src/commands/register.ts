@@ -807,7 +807,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 		if (options.resolveCwd) return options.resolveCwd(ctx);
 		return resolveCommandCwd(ctx);
 	};
-	const clearOwnProvenance = (event: unknown, ctx: unknown): void => {
+	const clearOwnProvenance = (event: unknown, ctx: unknown, clearTrackedIntent = true): void => {
 		const identity = sessionIdentityFromManager(ctx);
 		if (!identity) return;
 		const requestedSessionId = eventSessionId(event);
@@ -817,7 +817,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 		const requestedCwd = eventCwd(event);
 		if (requestedCwd && requestedCwd !== identity.cwd) return;
 		deleteExactProvenanceRecord(provenance, identity);
-		deleteTrackedIntentRecord(trackedIntentProvenance, identity);
+		if (clearTrackedIntent) deleteTrackedIntentRecord(trackedIntentProvenance, identity);
 	};
 	const registerProvenanceHooks = (): void => {
 		if (typeof pi.on !== "function") return;
@@ -864,7 +864,10 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 			if (record.intent) trackedIntentProvenance.set(provenanceBindingKey, record);
 			return { systemPrompt: [...incoming.systemPrompt, WORKFLOW_TURN_CONTRACT] };
 		});
-		pi.on("session_stop", clearOwnProvenance);
+		// The host's turn-level session_stop ends the classifier turn but not
+		// the trusted command intent. Keep only the private tracked record so
+		// a later CTO ingress can supersede it; teardown clears both records.
+		pi.on("session_stop", (event: unknown, ctx: unknown) => clearOwnProvenance(event, ctx, false));
 		pi.on("session_shutdown", clearOwnProvenance);
 	};
 	const claimForCommand = options.owner

@@ -26,6 +26,7 @@ import {
   prepareWorkflowState,
   runTarget,
   registerWorkflowTools as registerCoreWorkflowTools,
+  LifecycleError,
   type IssuedCapability,
 } from "@andvl1/omp-workflows-core";
 import {
@@ -1151,7 +1152,9 @@ function readExecutionClaim(root: string): Record<string, unknown> | null {
 function registerToolsWithSessionSink(): {
   tools: Map<string, RegisteredTool>;
   commands: Map<string, RegisteredCommand>;
+  sentPrompts: string[];
   hostContext: (ctx: Record<string, unknown>) => Record<string, unknown>;
+  fireBeforeAgentStart: (prompt: string, ctx: Record<string, unknown>) => Promise<unknown[]>;
   fireSessionStart: (ctx: Record<string, unknown>) => Promise<void>;
   fireSessionSwitch: (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<void>;
   fireSessionStop: (ctx: Record<string, unknown>, eventOverrides?: Record<string, unknown>) => Promise<void>;
@@ -1159,6 +1162,8 @@ function registerToolsWithSessionSink(): {
 } {
   const tools = new Map<string, RegisteredTool>();
   const commands = new Map<string, RegisteredCommand>();
+  const sentPrompts: string[] = [];
+  const beforeAgentStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const sessionStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const sessionStops: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const sessionSwitches: Array<(event: unknown, ctx: unknown) => unknown> = [];
@@ -1172,16 +1177,22 @@ function registerToolsWithSessionSink(): {
   // its unrelated commands/tools into this focused harness.
   ompWorkflowsFullstack({
     on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+      if (event === "before_agent_start") beforeAgentStarts.push(handler);
       if (event === "session_start" && !lifecycle.sessionStart) lifecycle.sessionStart = handler;
       if (event === "session_switch" && !lifecycle.sessionSwitch) lifecycle.sessionSwitch = handler;
-      if (event === "session_stop" && !lifecycle.sessionStop) lifecycle.sessionStop = handler;
+      if (event === "session_stop") {
+        if (!lifecycle.sessionStop) lifecycle.sessionStop = handler;
+        else sessionStops.push(handler);
+      }
       if (event === "session_shutdown" && !lifecycle.sessionShutdown) lifecycle.sessionShutdown = handler;
     },
     registerCommand(name: string, options: RegisteredCommand) {
       commands.set(name, options);
     },
     setLabel() {},
-    sendUserMessage() {},
+    sendUserMessage(prompt: string) {
+      sentPrompts.push(prompt);
+    },
   } as never);
   registerWorkflowTools({
     zod: { z },
@@ -1209,7 +1220,25 @@ function registerToolsWithSessionSink(): {
   return {
     commands,
     tools,
+    sentPrompts,
     hostContext,
+    fireBeforeAgentStart: async (prompt, ctx) => {
+      const normalized = hostContext(ctx);
+      const results: unknown[] = [];
+      let systemPrompt = ["base"];
+      for (const handler of beforeAgentStarts) {
+        const result = await handler({ type: "before_agent_start", prompt, systemPrompt }, normalized);
+        results.push(result);
+        if (result && typeof result === "object" && "systemPrompt" in result) {
+          const next = result.systemPrompt;
+          if (Array.isArray(next)) {
+            const nextPrompt = next.filter((entry): entry is string => typeof entry === "string");
+            if (nextPrompt.length === next.length) systemPrompt = nextPrompt;
+          }
+        }
+      }
+      return results;
+    },
     fireSessionStart: async (ctx) => {
       const normalized = hostContext(ctx);
       await lifecycle.sessionStart?.({ type: "session_start" }, normalized);
@@ -1238,6 +1267,194 @@ function registerToolsWithSessionSink(): {
     },
   };
 }
+
+test("fullstack: explicit command intent survives classifier turn stop and keeps lifecycle guards", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-command-intent-turn-stop-"));
+  const harness = registerToolsWithSessionSink();
+  const sessionId = "command-intent-turn-stop";
+  const manager = mutableSessionManagerFor(root, sessionId);
+  const hostContext = {
+    cwd: root,
+    mode: "tui",
+    hasUI: true,
+    session_id: sessionId,
+    sessionManager: manager,
+    ui: { notify() {} },
+  };
+  const classification = {
+    type: "FEATURE",
+    complexity: "QUICK",
+    confidence: "HIGH",
+    autonomous: false,
+    workflow: "lightweight",
+  };
+  const tokenFromPrompt = (prompt: string): string => {
+    const match = /Command intent token: `([0-9a-f-]{36})`/.exec(prompt);
+    assert.ok(match, "explicit command prompt must carry its opaque intent token");
+    return match[1]!;
+  };
+  const detailsOf = (value: { details: unknown }): { ok?: boolean; code?: string; error?: string; state?: { run_id?: string } } =>
+    value.details as { ok?: boolean; code?: string; error?: string; state?: { run_id?: string } };
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    publishMapping(root);
+    await harness.fireSessionStart(hostContext);
+    const prepare = harness.tools.get("workflow_prepare");
+    if (!prepare) throw new Error("workflow_prepare tool is unavailable");
+    const seed = await prepare.execute("command-intent-seed", {
+      mode: "new",
+      task: "seed existing run for turn-stop release",
+      branch: "main",
+      classification,
+    }, undefined, undefined, hostContext as never);
+    const seedDetails = detailsOf(seed);
+    assert.equal(seedDetails.ok, true, seedDetails.error);
+    const seedRunId = seedDetails.state?.run_id;
+    assert.ok(seedRunId, "seed prepare must establish an ordinary execution claim");
+    assert.ok(readExecutionClaim(root), "seed prepare must publish an active claim");
+
+    const command = harness.commands.get("do-work");
+    if (!command) throw new Error("registered do-work command is unavailable");
+    await command.handler("--new fresh explicit lifecycle", hostContext);
+    const prompt = harness.sentPrompts.at(-1);
+    assert.ok(prompt, "explicit command must send its generated prompt");
+    const firstToken = tokenFromPrompt(prompt!);
+    const firstHookResults = await harness.fireBeforeAgentStart(prompt!, hostContext);
+    assert.ok(
+      firstHookResults.some(result => result && typeof result === "object" && "systemPrompt" in result),
+      "the exact command prompt must be admitted by the registered before_agent_start hook",
+    );
+
+    // OMP emits session_stop at the end of the classifier turn. This releases
+    // the old ordinary claim but must leave the explicit command token for the
+    // next user boundary.
+    await harness.fireSessionStop(hostContext);
+    assert.equal(readExecutionClaim(root), null, "classifier turn stop must still release the old ordinary claim");
+
+    const modeMismatch = await prepare.execute("command-intent-mode-mismatch", {
+      mode: "resume",
+      run_id: seedRunId,
+      command_intent_id: firstToken,
+    }, undefined, undefined, hostContext as never);
+    const modeMismatchDetails = detailsOf(modeMismatch);
+    assert.equal(modeMismatchDetails.ok, false);
+    assert.equal(modeMismatchDetails.code, "WORKFLOW_PREPARE_FAILED");
+    assert.match(modeMismatchDetails.error ?? "", /does not match explicit command mode/);
+
+    const foreignManager = mutableSessionManagerFor(root, "foreign-command-session");
+    const foreignContext = {
+      cwd: root,
+      mode: "tui",
+      hasUI: true,
+      session_id: "foreign-command-session",
+      sessionManager: foreignManager,
+    };
+    const foreign = await prepare.execute("command-intent-foreign", {
+      mode: "new",
+      task: "foreign context must not consume intent",
+      branch: "main",
+      command_intent_id: firstToken,
+      classification,
+    }, undefined, undefined, foreignContext as never);
+    const foreignDetails = detailsOf(foreign);
+    assert.equal(foreignDetails.ok, false);
+    assert.equal(foreignDetails.code, "WORKFLOW_CONTEXT_REJECTED");
+
+    // A newer explicit ingress replaces the pending token; the old token
+    // cannot be replayed, while the replacement remains usable.
+    await command.handler("--new replacement explicit lifecycle", hostContext);
+    const replacementPrompt = harness.sentPrompts.at(-1);
+    assert.ok(replacementPrompt);
+    const replacementToken = tokenFromPrompt(replacementPrompt!);
+    assert.notEqual(replacementToken, firstToken);
+    const controllerBeforeReplacementStop = getFullstackWorkflowSessionController(hostContext, root);
+    if (!controllerBeforeReplacementStop) throw new Error("replacement controller is unavailable");
+    assert.throws(
+      () => controllerBeforeReplacementStop.consumeCommandIntent({ command_intent_id: firstToken, mode: "new" }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict",
+      "replacement ingress must reject the stale prior token",
+    );
+    await harness.fireBeforeAgentStart(replacementPrompt!, hostContext);
+    await harness.fireSessionStop(hostContext);
+    const replacement = await prepare.execute("command-intent-replacement", {
+      mode: "new",
+      task: "replacement explicit lifecycle",
+      branch: "main",
+      command_intent_id: replacementToken,
+      classification,
+    }, undefined, undefined, hostContext as never);
+    const replacementDetails = detailsOf(replacement);
+    assert.equal(replacementDetails.ok, true, replacementDetails.error);
+    const replacementRunId = replacementDetails.state?.run_id;
+    assert.ok(replacementRunId);
+    assert.notEqual(replacementRunId, seedRunId);
+
+    // A selector/run-id mismatch is read-only and keeps the replacement
+    // command token available for the corrected selector.
+    await command.handler("--resume", hostContext);
+    const resumePrompt = harness.sentPrompts.at(-1);
+    assert.ok(resumePrompt);
+    const resumeToken = tokenFromPrompt(resumePrompt!);
+    await harness.fireBeforeAgentStart(resumePrompt!, hostContext);
+    await harness.fireSessionStop(hostContext);
+    const selectorMismatch = await prepare.execute("command-intent-selector-mismatch", {
+      mode: "resume",
+      run_id: seedRunId,
+      selector: { run_id: replacementRunId },
+      command_intent_id: resumeToken,
+    }, undefined, undefined, hostContext as never);
+    const selectorMismatchDetails = detailsOf(selectorMismatch);
+    assert.equal(selectorMismatchDetails.ok, false);
+    assert.equal(selectorMismatchDetails.code, "WORKFLOW_PREPARE_FAILED");
+    assert.match(selectorMismatchDetails.error ?? "", /does not match the resolved selector run/);
+    const corrected = await prepare.execute("command-intent-selector-corrected", {
+      mode: "resume",
+      selector: { run_id: seedRunId },
+      command_intent_id: resumeToken,
+    }, undefined, undefined, hostContext as never);
+    const correctedDetails = detailsOf(corrected);
+    assert.equal(correctedDetails.ok, true, correctedDetails.error);
+    const replay = await prepare.execute("command-intent-stale-replay", {
+      mode: "resume",
+      selector: { run_id: seedRunId },
+      command_intent_id: resumeToken,
+    }, undefined, undefined, hostContext as never);
+    const replayDetails = detailsOf(replay);
+    assert.equal(replayDetails.ok, false);
+    assert.equal(replayDetails.code, "WORKFLOW_PREPARE_FAILED");
+    assert.match(replayDetails.error ?? "", /command intent token is not pending or has already been consumed/);
+
+    // A verified session replacement is a teardown boundary and must clear a
+    // pending token rather than carrying it into the successor controller.
+    await command.handler("--new replacement-boundary", hostContext);
+    const boundaryPrompt = harness.sentPrompts.at(-1);
+    assert.ok(boundaryPrompt);
+    const boundaryToken = tokenFromPrompt(boundaryPrompt!);
+    await harness.fireBeforeAgentStart(boundaryPrompt!, hostContext);
+    const previousSessionFile = manager.getSessionFile();
+    manager.switchTo("replacement-command-session");
+    const replacementContext = {
+      ...hostContext,
+      session_id: "replacement-command-session",
+    };
+    await harness.fireSessionSwitch({
+      type: "session_switch",
+      reason: "new",
+      previousSessionFile,
+    }, replacementContext);
+    assert.throws(
+      () => controllerBeforeReplacementStop.consumeCommandIntent({ command_intent_id: boundaryToken, mode: "new" }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict",
+      "session replacement must clear the prior controller's pending token",
+    );
+  } finally {
+    await harness.fireSessionShutdown({
+      ...hostContext,
+      session_id: manager.getSessionId(),
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("fullstack: workflow tools trust the authoritative host profile across TUI, RPC, rpc-ui, json, print, and worker contexts", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-workflow-context-eligibility-"));

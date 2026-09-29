@@ -331,13 +331,29 @@ diagnose) and put `gate: dod_complete` on the `summary` stage. The DoD fixes acc
 *before* code, each with a verification method and (on close) proof. See the **DEFINITION OF
 DONE** section in `commands/team.md` for the policy and per-type minimums.
 
+В ordinary workflow последующее обновление общего `dod.json` поручается ровно
+одному designated writer стадии `qa_tests` или `manual_qa`: первому resolved
+slot, либо одному явно назначенному child этого slot. Остальные участники
+возвращают evidence и предложенные изменения, но не редактируют sidecar.
+Закрывать критерий можно только с фактическим criterion-specific evidence;
+неподтверждённые пункты остаются `pending`. Sidecar не добавляется в `produces`
+или `workflow_complete.artifact_ids`.
+
+Если downstream `summary` уже связан с незавершённым DoD, он не получает права
+переписать consumed input. После явного запроса пользователя выполняется
+same-run `rework` от ответственной QA-стадии: engine переоткрывает её и
+downstream, инвалидирует зависимые hashes/receipts, а свежие
+`workflow_instructions` → `workflow_begin` → `workflow_instructions`
+связывают новые inputs. Gate `dod_complete` при этом не ослабляется.
+
 Enforcement is two-layered and **never wedges the session**:
 - **Primary**: the `dod_complete` gate (interpreter) and `root_cause_documented` gate (BUG_FIX,
   before implementation).
-- **Backstop**: `hooks/dod-gate.sh` (Stop) reads the typed `dod` artifact from the selected run's
-  `artifactsDir`, not from a branch-derived or legacy path. It blocks (exit 2) **only at a
-  done-claim** — `pause.kind == "done"` or `stage_cursor == "summary"` — with unmet or
-  evidence-less items.
+- **Backstop**: `src/gates/dod-backstop.ts` replaces the legacy shell Stop hook and
+  reads the typed `dod` artifact from the selected run's `artifactsDir`, not a
+  branch-derived or legacy path. It reports a blocking decision **only at a
+  done-claim** — `pause.kind == "done"` or `stage_cursor == "summary"` — with unmet
+  or evidence-less items.
 
 Stop is always allowed (no DoD enforcement) when: `pause.kind` ∈
 `background_wait | user_checkpoint | needs_human | failed`; the workflow is

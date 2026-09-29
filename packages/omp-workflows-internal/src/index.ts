@@ -468,6 +468,7 @@ function resetControllerForLifecycle(
 	binding: InternalSessionBinding,
 	receipt: string,
 	reason?: CtoSuspensionReason,
+	preserveCommandIntent = false,
 ): boolean {
 	const ctoClaim = hasActiveCtoClaim(binding);
 	if (reason && !suspendCtoBeforeReset(binding, reason)) return false;
@@ -477,7 +478,7 @@ function resetControllerForLifecycle(
 	// adapter binding.
 	if (ctoClaim) return true;
 	try {
-		binding.controller?.release(receipt);
+		binding.controller?.release(receipt, { preserveCommandIntent });
 		return true;
 	} catch {
 		console.warn(`[${COMMAND_NAME}]`, JSON.stringify({
@@ -507,14 +508,15 @@ function releaseSessionBinding(
 
 /**
  * Release the exact trusted interactive binding while retaining its profile,
- * controller and selected-run view. Core's canonical release semantics clear
- * only the private execution claim and pending command reservation. A resident
- * CTO claim is intentionally not released by an idle turn stop.
+ * controller and selected-run view. An idle turn stop releases only the
+ * ordinary execution claim and preserves a pending explicit command intent
+ * for the next user boundary. A resident CTO claim is intentionally not
+ * released by an idle turn stop.
  */
 function settleSessionBinding(pi: object, event: unknown, ctx: unknown): boolean {
 	const binding = sessionBindings.get(pi);
 	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
-	return resetControllerForLifecycle(binding, "host-session-stop");
+	return resetControllerForLifecycle(binding, "host-session-stop", undefined, true);
 }
 
 /**

@@ -79,7 +79,12 @@ export interface WorkflowSessionController {
   clearCommandIntent(): void;
   prepare(request: WorkflowControllerPrepareRequest): PreparedWorkflowState;
   bind(runId: string, token?: string): void;
-  release(receipt?: string): void;
+  /**
+   * Release the ordinary execution claim. By default this also clears any
+   * pending command intent; a verified turn-level stop may preserve that
+   * intent for the next user boundary while still releasing the claim.
+   */
+  release(receipt?: string, options?: { preserveCommandIntent?: boolean }): void;
 }
 
 export interface CtoClaimCredentials {
@@ -283,8 +288,8 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
     return prepared;
   }
 
-  function release(receipt?: string): void {
-    clearCommandIntent();
+  function release(receipt?: string, options: { preserveCommandIntent?: boolean } = {}): void {
+    if (!options.preserveCommandIntent) clearCommandIntent();
     if (!boundRunId || !boundToken) return;
     releaseExecutionClaim(cwd, { run_id: boundRunId, token: boundToken, ...(receipt ? { receipt } : {}) });
     boundToken = undefined;
