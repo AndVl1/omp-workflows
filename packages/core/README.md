@@ -145,6 +145,21 @@ Per-team DoD remains a supplemental file at the exact configured relative
 `teams[].dod_path` (default `.work-state/artifacts/<team>/dod.json`), never
 canonical CTO state.
 
+Для `before_advance` сначала завершаются работа стадии и её evidence, затем
+оценивается фактическая resolved checkpoint policy. Допустимый `policy_auto`
+lead фиксирует и применяет локально; обязательное human-решение или неразрешённый
+вопрос передаёт resident CTO до запуска следующей стадии. Предварительное согласие
+на план, autonomy и позднее approval не заменяют `required_human`. Без доступного
+двустороннего канала lead возвращает промежуточный handoff как результат task;
+root получает решение и снова вызывает тот же configured lead с точным scope,
+не повторяя завершённых workers.
+
+До dispatch root задаёт отдельный evidence-каталог для точного run/wave/slice.
+Канонические имена producer artifacts сохраняются внутри него; retry использует
+тот же каталог, новая волна — новый. Старые evidence и ссылки не перезаписываются.
+Пути изменяемых исходников, shared deliverables и `teams[].dod_path` задаются
+отдельно; существующий `scope_map` остаётся источником назначения ролей.
+
 For a claimless legacy **JSON** run whose coordinator session is no longer
 available, use `/cto --recover-legacy --run <exact-cto-id>` (or the internal
 bundle's `/omp-cto` equivalent). This is an explicit recovery operation, not

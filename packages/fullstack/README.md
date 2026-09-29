@@ -229,8 +229,7 @@ artifact tools; raw `Write`/`Edit`/`Bash` cannot publish canonical state.
 A stale revision or claim refusal leaves state and binding unchanged; the
 coordinator re-reads and resolves a legitimate conflict, without a blind
 retry. A terminal commit releases only the exact originating managed private
-binding atomically; completion of a wave alone is not terminal. Runtime
-acceptance of this model ingress remains pending Main validation.
+binding atomically; completion of a wave alone is not terminal.
 
 ### Native resident CTO route
 
@@ -249,6 +248,19 @@ Implementation, artifact recovery, review и QA выполняют roster-worker
 а не запускать такого worker напрямую из CTO-root или пропускать quality gate.
 Общая архитектура также проходит через назначенного lead → roster architect
 до запуска зависимых consumer leads.
+
+`before_advance` проверяется после готового результата стадии, до следующей
+стадии. Lead может локально применить только допустимое resolved policy
+автоматическое решение с evidence; `required_human` и неразрешённые вопросы
+передаются root для настоящего решения. Раннее согласие на план и позднее
+approval не заменяют эту границу. Если двусторонний канал недоступен, lead
+возвращает handoff результатом task; root продолжает через тот же configured
+lead с точным scope, без повторного запуска завершённых workers.
+
+Root передаёт явный evidence-каталог, уникальный для run/wave/slice, отдельно
+от путей исходников, shared deliverables и DoD. Producers сохраняют канонические
+имена файлов внутри него. Retry сохраняет каталог; новая волна получает новый
+и не перезаписывает evidence предыдущих волн или их ссылки.
 
 Запуск с задачей остаётся resident после закрытия волны. Exact resume без
 новой задачи сохраняет канонический task, классификацию и прогресс; успешная
