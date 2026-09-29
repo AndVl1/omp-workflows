@@ -7,8 +7,7 @@ import { resolveScope } from "./scope.js";
 import { resolveActiveBranch, resolveCanonicalRun, withWorkspaceRead } from "./state.js";
 import { readStageInputs, resolveStageDispatchSlots } from "./stage.js";
 import { sanitizeSlot } from "./fan-in.js";
-import { artifactSchemaFor, type JsonSchemaDef } from "./artifact-contract.js";
-import { validationContractForStage } from "../gates/validation.js";
+import { artifactSchemaForStage, type JsonSchemaDef } from "./artifact-contract.js";
 import {
   checkpointPolicyHash,
   findCurrentCheckpointDecision,
@@ -630,25 +629,7 @@ function slotArtifactsFor(stage: StageDef, slots: Array<{ role: string; agent: s
 
 function artifactSchemasFor(stage: StageDef): Record<string, JsonSchemaDef | null> {
   const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
-  const validation = validationContractForStage(stage.id);
-  return Object.fromEntries(produces.map((id) => {
-    const base = artifactSchemaFor(id);
-    if (!validation || id !== stage.id) return [id, base];
-
-    const validationProperties: Record<string, JsonSchemaDef> = {
-      ready: { enum: [...validation.properties.ready.enum] },
-      validation_run: { enum: [...validation.properties.validation_run.enum] },
-      validation_evidence: {
-        type: validation.properties.validation_evidence.type,
-        description: validation.properties.validation_evidence.description,
-      },
-    };
-    return [id, {
-      ...(base ?? { type: "object" }),
-      required: [...new Set([...(base?.required ?? []), ...validation.required])],
-      properties: { ...(base?.properties ?? {}), ...validationProperties },
-    } satisfies JsonSchemaDef];
-  }));
+  return Object.fromEntries(produces.map((id) => [id, artifactSchemaForStage(stage.id, id)]));
 }
 
 export interface WorkflowContract {

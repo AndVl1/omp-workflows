@@ -108,6 +108,19 @@ settle from the persisted CTO tool-call/slot identity, independently of
 ordinary workflow dispatch origins, and terminal claim settlement happens only
 on an actual terminal CTO state transition.
 
+Resident CTO dispatch is a separate native route from ordinary workflow
+selectors: the main session reads/commits the exact `CtoState` through
+`cto_state`, dispatches the configured team lead with the exact CTO
+`run=<id> slice=<id>` marker, and the lead dispatches only its configured
+workers with inherited authority. CTO/lead tasks must not call ordinary
+`workflow_prepare`/`workflow_status`/`workflow_instructions`/`workflow_begin`
+or completion/advance tools with the CTO slug. The resolved slice profile
+still supplies its stage, gate, checkpoint, typed-artifact, validation, and DoD
+obligations; they are checked through native evidence and CTO state commits.
+Per-team DoD remains a supplemental file at the exact configured relative
+`teams[].dod_path` (default `.work-state/artifacts/<team>/dod.json`), never
+canonical CTO state.
+
 For a claimless legacy **JSON** run whose coordinator session is no longer
 available, use `/cto --recover-legacy --run <exact-cto-id>` (or the internal
 bundle's `/omp-cto` equivalent). This is an explicit recovery operation, not

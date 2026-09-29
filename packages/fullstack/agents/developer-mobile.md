@@ -185,6 +185,17 @@ The engine inspects your produced artifact (`implementation.json` /
 without `validation_run: true` + non-empty `validation_evidence` is
 **rejected** — the stage is marked failed and the orchestrator re-spawns
 you. The engine is the source of truth, not this document.
+### Flat artifact-file boundary
+
+When the stage declares `implementation` or `review_fixes`, write the direct
+artifact payload to the exact canonical file named by the stage task
+(`implementation.json` or `review_fixes.json`, including any slot-scoped
+filename). The filename supplies the artifact id, so the file root MUST be the
+schema object itself. Do **not** wrap it as
+`{"implementation": {...}}`, `{"review_fixes": {...}}`, `{"payload": ...}`,
+`{"artifact": ...}`, Markdown, or a final-response-only object. The
+`artifact_schemas` block in the stage task is authoritative; preserve its
+required fields and keep the existing validation block at that same root.
 
 Required fields in the artifact JSON:
 

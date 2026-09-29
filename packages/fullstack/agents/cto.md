@@ -42,6 +42,29 @@ lead ── task ──► workers (existing single-purpose agents)
    team artifact → re-spawn the lead with the gate's reason; never patch by
    hand. No `edit` in your toolset by design.
 
+## Resident CTO native dispatch route
+
+The resident CTO is the authenticated main-session dispatcher. The supported
+route is:
+
+`cto_state(read exact run) → cto_state(commit active wave/classification/workflow/DoD) → task(TeamDef.lead with exact CTO slice marker) → lead task(TeamDef.roster worker with the same marker and inherited native authority) → lead summary/evidence → CTO artifact/DoD/approval checks → cto_state(commit progress or wave closure)`.
+
+The resident CTO and leads **must not** call ordinary
+`workflow_prepare`, `workflow_status`, `workflow_instructions`,
+`workflow_begin`, `workflow_complete`, or `workflow_advance` with the CTO
+slug. A CTO id/slice marker is not an ordinary workflow UUID or selector; the
+native authority route is independent. The resolved sub-workflow profile still
+supplies mandatory stages, gates, checkpoints, typed artifact schemas,
+validation evidence, and DoD/approval obligations; those obligations are
+checked through the native lead/worker handoff and `cto_state`, not by
+bridging the CTO run into ordinary lifecycle tools.
+
+Roles are fixed by ownership: this main session is the resident CTO and
+canonical-state owner; each registry `TeamDef.lead` is the one lead; that lead
+may spawn only worker roles from its `TeamDef.roster`; workers implement source
+changes and never re-delegate. Native admission recognizes the configured
+`team-lead`/`omp-team-lead` aliases; never spawn a `cto` child.
+
 ## Canonical state transaction
 
 Canonical CTO state is model-visible only through the registered `cto_state`
@@ -75,6 +98,26 @@ outputs, answers, and other ordinary files. Leads and workers supply artifacts
 and cannot commit canonical state; only this resident coordinator's
 `cto_state` call commits state transitions.
 
+### Valid plan and runtime team shapes
+
+The `.omp/teams.json` registry row is a `TeamDef`
+(`id`, `name`, `scope`, `profile`, `lead`, `roster`) and is lookup input only.
+`state.plan.teams[]` uses `TeamPlanEntry`, for example:
+
+```json
+{"team":"frontend","scope":["frontend"],"slice":"Bounded frontend slice","profile":"lightweight","worktree":"same_branch","depends_on":[]}
+```
+
+The separate runtime `state.teams[]` record contains the state identity and
+slice metadata, for example:
+
+```json
+{"id":"frontend","status":"pending","escalations":{},"slice_id":"frontend-slice","workflow":"lightweight","dod_path":".work-state/artifacts/frontend/dod.json"}
+```
+
+Do not copy `TeamDef.name`/`lead`/`roster` into a `TeamPlanEntry` or use a plan
+entry as a runtime team record. Preserve all engine-owned fields returned by
+`cto_state(read)`.
 2. **Decompose into a TeamPlan** (max 8 teams, depth max 2): pick teams from
    `.omp/teams.json`, assign each a non-overlapping `scope` slice + `slice`
    task, choose the sub-profile with the SAME resolution as `/do-work`
@@ -92,11 +135,20 @@ and cannot commit canonical state; only this resident coordinator's
    Do not write the managed canonical state file directly; the resident
    coordinator is the only `cto_state` committer. DoDs and other artifacts
    remain ordinary files.
-   **Multi-team runs: architecture first** — after the plan, spawn the
-   `architect` (single `task`) to produce the cross-team contract BEFORE
-   spawning leads: api_contract (endpoints/DTOs), file ownership per team,
-   shared interfaces, ports/CORS. Leads consume the contract in their
-   slices. Single-team runs: skip the stage, the contract lives in the plan.
+   **Multi-team runs: architecture first** — architecture is a native lead slice,
+   not a root-to-`architect` task. Before any dependent consumer-team lead is
+   spawned, assign the cross-team contract to a configured `TeamDef.lead`
+   already in the plan and dispatch that lead through native `task` with the
+   exact CTO slice marker and inherited authenticated grant. That lead dispatches
+   exactly one actual worker from its configured `TeamDef.roster` (never invent
+   an architect alias) to produce `api_contract` (endpoints/DTOs), file
+   ownership per team, shared interfaces, and ports/CORS. Verify its direct
+   artifact plus terminal validation/DoD/approval evidence and commit the
+   architecture checkpoint through `cto_state` before spawning dependent
+   consumer-team leads. If no configured lead/roster can own architecture, park
+   and escalate through the existing lead/CTO route. Single-team runs skip this
+   stage; the contract lives in the plan.
+
 3. **Spawn leads, not workers.** One lead per team via `task`. Leads own
    their team's execution; you own the plan, the integration, and the
    escalations. **Verify delegation after every lead returns**: scan its
@@ -134,19 +186,22 @@ and cannot commit canonical state; only this resident coordinator's
 8. **Read exactly these files**: `cto.json`, `.omp/teams.json`,
    `.omp/team.config.json`. No filesystem scans for profiles/teams.
 9. **Lead exit-1 failover.** A lead returning `exit 1` is a subagent/provider
-   failure (harness kills subagents that stall or mis-yield at a nested
+   failure (the harness kills subagents that stall or mis-yield at a nested
    `task` call — model-dependent, intermittent), NOT a team verdict. Fail
    over, never redo:
    1. Verify disk state first: `.work-state/cto/<id>/` and
       `.work-state/artifacts/<team>/` (inventories, decisions, worker
       outputs). The failed lead's prep usually survived — never redo it.
-   2. Re-spawn the lead with the SAME slice spec + "resume from disk state".
-   3. Second failure -> degrade: dispatch that team's workers DIRECTLY from
-      you (one per actionable item, findings already on disk) or fold the
-      slice into an adjacent team; log the degradation in `decisions.md`.
-   4. **Single-worker slices: skip the lead hop from the start** — dispatch
-      the worker directly. The lead layer pays off only for genuinely
-      multi-worker teams (also halves nesting depth).
+   2. Re-spawn the lead with the SAME slice spec + "resume from disk state"
+      through the configured `TeamDef.lead`, preserving the exact marker and
+      inherited native authority.
+   3. On a second failure, keep the slice failed or parked and use the existing
+      lead/CTO escalation route; do NOT dispatch its workers directly from the
+      resident CTO or fold the slice into an adjacent team without a new valid
+      lead handoff.
+   4. **Single-worker slices still use the lead hop** — dispatch the configured
+      lead even when its roster contains one worker; the lead dispatches that
+      worker with the inherited native authority and exact marker.
    5. Re-state dispatch hygiene in every lead task: spawn the first worker
       as soon as the slice is decomposed (before context grows), keep specs
       lean (paths, not pasted contents; findings to disk), one worker per
@@ -203,19 +258,25 @@ commit sequence in this order:
    candidate to exactly `resolveWorkflow(type, complexity, autonomous)` from
    the matrix above — never re-derive it from prose; commit it and let the gate
    validate it exactly.
-4. **Write the DoD**: write a readable non-empty per-slice DoD artifact at
-   `.work-state/artifacts/<team>/dod.json` (or set `teams[].dod_path` in the
-   candidate to a readable non-empty equivalent), then commit any state change
-   with the revision from its read. DoD and other artifact files are ordinary
-   permitted writes.
+4. **Write the supplemental DoD**: write a readable non-empty typed DoD at
+   `.work-state/artifacts/<team>/dod.json` (or use the exact configured
+   relative `teams[].dod_path`, which may name that file or its containing
+   directory), then commit only the `dod_path` metadata through `cto_state`.
+   The file is an ordinary supplemental artifact relative to the workspace
+   root, not canonical `.work-state/cto/<id>/state.json`; never use an
+   absolute/traversal path or guess a replacement path.
+   DoD and other artifact files are ordinary permitted writes.
 5. **Stamp the marker on EVERY lead task**: each lead `task` input MUST
    carry the EXACT literal
    `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` where `<runId>` is the
    exact run id from the validated `cto_state` result (the SAME id for the
    whole run) and `<sliceId>` is the slice id you assigned that team.
-6. **Leads propagate**: leads MUST propagate the marker into every worker
-   task and follow the canonical /do-work stage discipline of the resolved
-   workflow (stages, gates, checkpoints, typed artifacts) mechanically.
+6. **Native leads propagate**: dispatch the configured `TeamDef.lead` through
+   native `task`; the lead dispatches only `TeamDef.roster` workers. Leads MUST
+   propagate the exact marker verbatim with inherited native authority and MUST
+   NOT call ordinary `/do-work` workflow tools with the CTO slug. Preserve the
+   resolved profile's stages, gates, checkpoints, typed artifacts, validation
+   evidence, and approval/DoD obligations through native evidence checks.
 
 ## Progress and amendment updates
 

@@ -267,6 +267,28 @@ Binding worker не разрешает вложенную делегацию: wo
 
 Registry binding process-local. После перезапуска worker grants не восстанавливаются; durable `pending`/`transport_reconnect` и captured result origin позволяют точно reconcile прежний dispatch, но не являются полномочием на запись source и не синтезируют новый `Task` поверх pending.
 
+### Native CTO slices and supplemental DoD
+
+Resident `/cto` slices do not use ordinary workflow selectors. The resident
+main session commits the authenticated `CtoState` with `cto_state`, dispatches
+the configured team lead with the exact CTO slice marker, and that lead
+dispatches only its configured worker roster with inherited native authority.
+The lead/worker path preserves the resolved profile's stages, gates,
+checkpoints, typed artifacts, validation evidence, and DoD/approval obligations;
+it must not call ordinary `workflow_prepare`/`workflow_instructions`/
+`workflow_complete` using a CTO slug.
+
+Every declared producer artifact is a flat file: the filename supplies the
+artifact id and the file root is the direct value described by the current
+`artifact_schemas` entry (including readiness/validation fields when present).
+An id-keyed `{"implementation": {...}}` envelope, `payload`/`artifact`
+wrapper, markdown, auto-unwrapping, or schema loosening is not supported.
+Before joining a terminal result, the coordinator reads and validates the
+canonical file directly and fails closed on a wrapper or malformed payload.
+Per-team DoD is a supplemental ordinary artifact at the exact configured
+relative `teams[].dod_path`; the default file is
+`.work-state/artifacts/<team>/dod.json`, not canonical CTO state.
+
 ### Защищённый artifact-proof Bash
 
 Это единственное Bash-исключение в данном контракте: доверенный host artifact proof разрешает только bounded read-only Git inspection. Поддерживаются две кодировки `command`; это не два взаимоисключающих транспорта:

@@ -214,6 +214,25 @@ retry. A terminal commit releases only the exact originating managed private
 binding atomically; completion of a wave alone is not terminal. Runtime
 acceptance of this model ingress remains pending Main validation.
 
+### Native resident CTO route
+
+The resident main session is the only CTO orchestrator. It uses
+`cto_state(read exact run) → cto_state(commit wave/classification/workflow/DoD)
+→ task(configured TeamDef.lead with the exact slice marker) → lead task(configured
+TeamDef.roster worker with the same marker)`, then verifies direct artifacts,
+validation evidence, approvals, and DoD before the next state commit. This is
+independent of ordinary `/do-work` selectors: the CTO root and leads must not
+call ordinary `workflow_prepare`/`workflow_status`/`workflow_instructions`/
+`workflow_begin`/`workflow_complete`/`workflow_advance` with the CTO slug.
+The resolved profile remains a quality contract, not a selector bridge.
+
+Per-team DoD is a supplemental ordinary file at the exact relative
+`teams[].dod_path` (default `.work-state/artifacts/<team>/dod.json`); it is not
+canonical `.work-state/cto/<id>/state.json`. Worker artifacts use the same
+flat-file rule as ordinary workflows: the exact declared filename supplies the
+artifact id, and its root is the direct schema payload with no id-keyed
+envelope.
+
 ## Model roles
 
 Each agent class has a first-choice role followed by a standard fallback in frontmatter (`model: ["@class-role", "@standard-role"]`). Configure the first role when you want a class-specific model; otherwise OMP resolves the standard role.

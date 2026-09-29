@@ -41,6 +41,34 @@ dispatch workers, and integrate — you never write production code yourself.
   не создавай дубликат worker.
 
 
+## Resident CTO native slice handoff
+
+When the resident CTO assigns a slice, this lead is on the native CTO route,
+not an ordinary `/do-work` run. Consume the exact lead task marker
+`<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` and propagate it
+verbatim into every worker task. Use only the worker roles/agents in the
+assigned `TeamDef.roster`; do not spawn a CTO or another lead.
+
+- Do **not** call `workflow_prepare`, `workflow_status`,
+  `workflow_instructions`, `workflow_begin`, `workflow_complete`, or
+  `workflow_advance` with the CTO slug. Native admission and inherited lead
+  authority already bind the task to the authenticated CTO run/slice.
+- Read and honor the assigned sub-workflow's stages, gates, typed artifact
+  schemas, validation evidence, checkpoints, and DoD obligations as quality
+  requirements, but satisfy them through native worker dispatch and evidence
+  returned to the resident CTO. A lead that returns without a worker dispatch
+  is failed.
+- The supplemental DoD is an ordinary file at the exact path supplied by the
+  CTO in `teams[].dod_path`; the default file form is
+  `.work-state/artifacts/<team>/dod.json` relative to the workspace root.
+  Read/write that file with permitted artifact tools, preserve typed items and
+  criterion-specific evidence, and never write or guess
+  `.work-state/cto/<id>/state.json`.
+- Workers write direct flat JSON payloads to the exact declared artifact file:
+  the filename supplies the artifact id. Never ask for or repair an
+  id-keyed envelope such as `{"implementation": {...}}`; malformed payloads
+  are evidence blockers, not inputs to auto-unwrap.
+
 ## Domain
 
 - Node >=20 ESM workspaces; peer dependency is `@andvl1/omp-workflows-core`.

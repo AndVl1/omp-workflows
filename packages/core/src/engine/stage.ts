@@ -27,7 +27,7 @@ import { createHash } from "node:crypto";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { persistReturnedArtifacts, readArtifact, readArtifactInput, writeArtifact } from "./artifacts.js";
-import { validateProducedArtifact } from "./artifact-contract.js";
+import { artifactSchemaForStage, validateProducedArtifact } from "./artifact-contract.js";
 import { validateTypedDoD } from "../gates/dod-backstop.js";
 import { resolveConfig } from "./config.js";
 import { type ScopeFlags } from "./scope.js";
@@ -1044,6 +1044,24 @@ ${input.content}
   const produces = slotScoped
     ? rawProduces.map((id) => `${id}-${sanitizeSlot(role)}.json`).join(", ")
     : rawProduces.join(", ") || "(none)";
+  const producerContracts = rawProduces.map((id) => {
+    const file = slotScoped ? `${id}-${sanitizeSlot(role)}.json` : `${id}.json`;
+    const schema = artifactSchemaForStage(stage.id, id);
+    const schemaBlock = schema
+      ? `Schema for the file root (apply this object directly; do not add an artifact-id key):
+\`\`\`json
+${JSON.stringify(schema, null, 2)}
+\`\`\``
+      : "No schema is declared for this artifact id; still write one direct JSON value to the named file and do not add an envelope.";
+    return [
+      `- File: \`${file}\` (artifact id \`${id}\`)`,
+      "  The file content is the artifact payload itself. The filename supplies the artifact identity.",
+      "  Do NOT write `{ \""
+        + id
+        + "\": { ... } }`, `{ \"payload\": ... }`, `{ \"artifact\": ... }`, markdown, or any other envelope.",
+      `  ${schemaBlock.replace(/\n/g, "\n  ")}`,
+    ].join("\n");
+  }).join("\n\n");
   const resolvedSlots = resolvedSlotRoster ?? (stage.type === "single" || stage.type === "consilium"
     ? resolveStageDispatchSlots(stage, ctx)
     : []);
@@ -1101,8 +1119,11 @@ ${stage.prompt ?? "Follow the stage title and produce the declared artifact from
 
 ${qaDoDContract}
 
+### Producer artifact files
+${producerContracts || "This stage declares no producer artifact files."}
+
 ### Your job
-Execute this stage. Write your typed artifact to ${ctx.artifactsDir}/${slotScoped ? "<id>-<slot>.json" : "<id>.json"} matching the engine's schema (the engine reads only JSON, not prose).${slotScoped ? " This is a parallel consilium slot: write ONLY your own slot-scoped files (other slots write theirs). The engine deterministically synthesizes the shared artifacts at advance." : ""}
+Execute this stage. Write each declared artifact as the direct JSON value matching its file's schema above to the exact canonical artifact file under ${ctx.artifactsDir}. The filename supplies the artifact id; the engine reads only that flat JSON payload, never prose or a wrapper object.${slotScoped ? " This is a parallel consilium slot: write ONLY your own slot-scoped files (other slots write theirs). The engine deterministically synthesizes the shared artifacts at advance." : ""}
 
 Produces: ${produces}${readsBlock}${optionalReadsBlock}
 

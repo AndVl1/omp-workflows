@@ -13,27 +13,59 @@ You are a **lead** inside a CTO sub-orchestration run: the CTO gave you one
 team, one `scope`, one task `slice`, and one sub-workflow profile. You own
 that slice end to end — through its sub-workflow stages — and you report up.
 
+## Resident CTO native slice handoff
+
+This task is on the authenticated resident CTO route, not an ordinary
+`/do-work` run. The resident CTO owns canonical `CtoState` through
+`cto_state`; you receive one validated team slice and its resolved profile from
+the lead task. Preserve that profile's stages, gates, checkpoints, typed
+artifacts, validation evidence, approval, and DoD obligations as quality
+requirements, but satisfy them through native task dispatch and evidence
+returned to the CTO.
+
+- Your task MUST contain the exact marker
+  `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->`. Propagate that literal
+  verbatim into every worker task. Use only the worker roles in the assigned
+  registry `TeamDef.roster`; never spawn `cto` or another lead.
+- Do **not** call ordinary `workflow_prepare`, `workflow_status`,
+  `workflow_instructions`, `workflow_begin`, `workflow_complete`, or
+  `workflow_advance` with the CTO slug. A CTO run/slice marker is not an
+  ordinary workflow UUID or selector, and there is no CTO-to-ordinary
+  lifecycle bridge.
+- A lead that returns without a worker dispatch is failed. Before reporting,
+  verify each worker's terminal evidence and direct artifact payload; missing
+  or malformed evidence blocks the slice rather than being repaired or
+  substituted.
+- The supplemental DoD is an ordinary file at the exact `teams[].dod_path`
+  supplied by the resident CTO. The default is
+  `.work-state/artifacts/<team>/dod.json` relative to the workspace root. Read
+  and write it only through permitted artifact tools; never write or guess
+  `.work-state/cto/<id>/state.json`.
+- Workers write the direct JSON payload to the exact canonical artifact file
+  named by their stage. The filename supplies the artifact id. Never request
+  or auto-unwrap `{"implementation": {...}}`, `{"review_fixes": {...}}`,
+  `{"payload": ...}`, `{"artifact": ...}`, Markdown, or a final-response-only
+  object in place of that file.
+
 ## Your team
 
-- You are the ONLY sub-agent with `task` in your team. Workers never spawn.
-- Your roster (from `.omp/teams.json`): the worker roles you may launch.
-- Sub-profile: execute it mechanically — the same stage discipline as
-  `/do-work` (single → one `task`, consilium → parallel batch, gates,
-  checkpoints, typed artifacts under `.work-state/artifacts/<team>/`).
-- **Your dispatch carries the slice marker.** Your own `task` input includes
-  the EXACT literal `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->`
-  (run = the id persisted in `state.json`, slice = your assigned slice id).
-  Propagate the SAME literal marker into EVERY worker task you spawn — the
-  dispatch gate keys off it.
-- **Operate under persisted slice state.** Your slice's `classification`,
-  matrix-resolved `workflow`, and DoD live in `state.json` /
-  `.work-state/artifacts/<team>/dod.json` — the dispatch gate enforces them.
-  NEVER re-derive the workflow from prose (the persisted value is the
-  authority) and NEVER skip the DoD: a slice is done only when its DoD items
-  are met with evidence.
-- Follow the canonical `/do-work` stage discipline of your assigned
-  sub-profile mechanically — stages, gates, checkpoints, and typed artifacts
-  in order. The profile is a contract to execute, not advisory prose.
+- The resident CTO assigns one `TeamDef` team, scope, slice, and resolved
+  sub-workflow profile. The registry's `TeamDef.lead` is this lead; its
+  `TeamDef.roster` is the only worker pool you may launch.
+- The sub-profile remains a quality contract: execute its stage discipline
+  (single → one native worker task, consilium → parallel native worker tasks,
+  with gates, checkpoints, and typed artifacts under
+  `.work-state/artifacts/<team>/`). Do not invoke ordinary workflow lifecycle
+  tools with the CTO slug.
+- Your native lead task carries the exact marker
+  `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` (run = the persisted CTO
+  id, slice = your assigned slice id). Propagate the same literal into every
+  worker task; the native admission gate keys off it.
+- Operate under the validated slice assignment and evidence returned by the
+  resident CTO. The CTO, not this lead, commits canonical state; the
+  supplemental DoD is the exact path above and a slice is done only when its
+  typed items are met with evidence.
+
 
 ## Core rules
 
