@@ -50,6 +50,7 @@ import {
 	writeRuntimeConfig,
 	workflowOwnerFor,
 	type RegisterOptions,
+	type CtoClaimScope,
 	type TrustedExecutionContext,
 	type TrustedToolCallResolution,
 	type WorkflowCapability,
@@ -143,6 +144,14 @@ function sessionManagerFromContext(ctx: unknown): object | undefined {
 	return typeof value.getCwd === "function" && typeof value.getSessionId === "function"
 		? manager
 		: undefined;
+}
+
+function samePath(left: string, right: string): boolean {
+	try {
+		return resolve(left) === resolve(right);
+	} catch {
+		return false;
+	}
 }
 
 function sessionFileFromManager(manager: object | undefined): string | undefined {
@@ -459,6 +468,7 @@ function resetControllerForLifecycle(
 	binding: InternalSessionBinding,
 	receipt: string,
 	reason?: CtoSuspensionReason,
+	preserveCommandIntent = false,
 ): boolean {
 	const ctoClaim = hasActiveCtoClaim(binding);
 	if (reason && !suspendCtoBeforeReset(binding, reason)) return false;
@@ -468,7 +478,7 @@ function resetControllerForLifecycle(
 	// adapter binding.
 	if (ctoClaim) return true;
 	try {
-		binding.controller?.release(receipt);
+		binding.controller?.release(receipt, { preserveCommandIntent });
 		return true;
 	} catch {
 		console.warn(`[${COMMAND_NAME}]`, JSON.stringify({
@@ -498,14 +508,15 @@ function releaseSessionBinding(
 
 /**
  * Release the exact trusted interactive binding while retaining its profile,
- * controller and selected-run view. Core's canonical release semantics clear
- * only the private execution claim and pending command reservation. A resident
- * CTO claim is intentionally not released by an idle turn stop.
+ * controller and selected-run view. An idle turn stop releases only the
+ * ordinary execution claim and preserves a pending explicit command intent
+ * for the next user boundary. A resident CTO claim is intentionally not
+ * released by an idle turn stop.
  */
 function settleSessionBinding(pi: object, event: unknown, ctx: unknown): boolean {
 	const binding = sessionBindings.get(pi);
 	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
-	return resetControllerForLifecycle(binding, "host-session-stop");
+	return resetControllerForLifecycle(binding, "host-session-stop", undefined, true);
 }
 
 /**
@@ -673,60 +684,188 @@ function sharedSessionController(pi: object, ctx: unknown, cwd: string): Workflo
 	return controller;
 }
 
+type TrustedToolCallDenial = Extract<TrustedToolCallResolution, { readonly kind: "denied" }>;
+type TrustedToolCallDenialCode = TrustedToolCallDenial["code"];
+
+function deniedTrustedToolCall(code: TrustedToolCallDenialCode): TrustedToolCallResolution {
+	return { kind: "denied", code };
+}
+
+function internalRawHostContextDenial(
+	binding: InternalSessionBinding,
+	ctx: unknown,
+	cwd: string,
+): TrustedToolCallDenialCode | undefined {
+	if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return "invalid_host_context";
+	if (!trustedHostActor(ctx)) return "untrusted_actor_context";
+	const manager = sessionManagerFromContext(ctx);
+	if (!manager) return "invalid_host_context";
+	if (binding.sessionManager !== undefined && manager !== binding.sessionManager) {
+		return "session_identity_mismatch";
+	}
+
+	const managerValue = manager as { getCwd: () => unknown; getSessionId: () => unknown };
+	const value = ctx as Record<string, unknown>;
+	const suppliedCwd = value.cwd;
+	if (suppliedCwd !== undefined && (typeof suppliedCwd !== "string" || suppliedCwd.length === 0)) {
+		return "invalid_host_context";
+	}
+	if (typeof suppliedCwd === "string" && !samePath(suppliedCwd, binding.cwd)) {
+		return "worktree_mismatch";
+	}
+	const suppliedSessionId = value.session_id;
+	const suppliedSessionIdAlias = value.sessionId;
+	for (const supplied of [suppliedSessionId, suppliedSessionIdAlias]) {
+		if (supplied !== undefined && (typeof supplied !== "string" || supplied.length === 0)) {
+			return "invalid_host_context";
+		}
+	}
+	if (
+		typeof suppliedSessionId === "string"
+		&& typeof suppliedSessionIdAlias === "string"
+		&& suppliedSessionId !== suppliedSessionIdAlias
+	) {
+		return "session_identity_mismatch";
+	}
+	const suppliedId = typeof suppliedSessionId === "string" ? suppliedSessionId : suppliedSessionIdAlias;
+	if (suppliedId !== undefined && suppliedId !== binding.sessionId) {
+		return "session_identity_mismatch";
+	}
+
+	let managerCwd: unknown;
+	let managerSessionId: unknown;
+	try {
+		managerCwd = managerValue.getCwd();
+		managerSessionId = managerValue.getSessionId();
+	} catch {
+		return "invalid_host_context";
+	}
+	if (typeof managerCwd !== "string" || managerCwd.length === 0) return "invalid_host_context";
+	if (typeof managerSessionId !== "string" || managerSessionId.length === 0) {
+		return "invalid_host_context";
+	}
+	if (!samePath(managerCwd, binding.cwd)) return "worktree_mismatch";
+	if (binding.sessionId !== undefined && managerSessionId !== binding.sessionId) {
+		return "session_identity_mismatch";
+	}
+	if (typeof cwd !== "string" || cwd.length === 0) return "invalid_host_context";
+	if (!samePath(cwd, binding.cwd)) return "worktree_mismatch";
+
+	const profile = ctx as { mode?: unknown; hasUI?: unknown };
+	if (profile.hasUI === false) return "host_profile_mismatch";
+	if (profile.mode !== undefined && profile.mode !== binding.mode) return "host_profile_mismatch";
+	if (profile.hasUI !== undefined && profile.hasUI !== true) return "host_profile_mismatch";
+	return undefined;
+}
+
 /**
  * Resolve the narrow orchestrator capability for raw tool calls from the
  * already-captured host binding. The manager identity is re-read on every
  * call; a raw context cannot replace identity, while an idle branch drift
  * may refresh the controller from the actual host branch.
  */
-function resolveInternalTrustedToolCallActor(
+function resolveInternalTrustedToolCallActorUnsafe(
 	pi: object,
 	ctx: unknown,
 	cwd: string,
 	runId: string | undefined,
 ): TrustedToolCallResolution | undefined {
 	const binding = sessionBindings.get(pi);
-	if (!binding?.interactive || !binding.sessionId || !binding.controller) return undefined;
-	if (!matchesCapturedHostContext(binding, ctx, "raw")) return undefined;
-	const identity = capturedManagerIdentity(binding, ctx, cwd);
-	if (!identity || identity.sessionId !== binding.sessionId) return undefined;
+	if (!binding) return deniedTrustedToolCall("host_session_not_captured");
+	const hostContextDenial = internalRawHostContextDenial(binding, ctx, cwd);
+	if (hostContextDenial) {
+		if (!binding.interactive && hostContextDenial === "host_profile_mismatch") {
+			return deniedTrustedToolCall("headless_host_session");
+		}
+		return deniedTrustedToolCall(hostContextDenial);
+	}
+	if (!binding.interactive) return deniedTrustedToolCall("headless_host_session");
+	if (!binding.sessionId || !binding.controller) {
+		return deniedTrustedToolCall("session_controller_unavailable");
+	}
+
 	try {
 		const controllerContext = binding.controller.context();
 		if (
 			controllerContext.session_id !== binding.sessionId
-			|| resolve(controllerContext.worktree) !== resolve(binding.cwd)
-		) return undefined;
-
-		// CTO authority is the controller's exact current claim proof. It is
-		// intentionally resolved before ordinary selection/claim checks: a CTO
-		// run is not authorized by selectedRunId, owner_session, runTarget, or
-		// an ordinary run UUID.
-		const ctoClaim = binding.controller.activeCtoClaim();
-		if (ctoClaim !== undefined) {
-			if (
-				typeof ctoClaim.run_id !== "string"
-				|| ctoClaim.run_id.length === 0
-				|| typeof ctoClaim.ownership_epoch !== "string"
-				|| ctoClaim.ownership_epoch.length === 0
-			) return undefined;
-			return {
-				kind: "authenticated-interactive-host-cto",
-				run_id: ctoClaim.run_id,
-				ownership_epoch: ctoClaim.ownership_epoch,
-			};
+			|| !samePath(controllerContext.worktree, binding.cwd)
+		) {
+			return deniedTrustedToolCall("controller_context_mismatch");
 		}
-
-		const selectedRunId = binding.controller.selectedRunId();
-		const activeClaimRunId = binding.controller.activeClaimRunId();
-		if (selectedRunId !== runId || activeClaimRunId !== runId) return undefined;
-		if (runId === undefined) return { kind: "authenticated-interactive-host-no-run" };
-		const artifactsDir = runTarget(binding.cwd, runId).artifactsDir;
-		const expectedArtifactsDir = resolve(binding.cwd, ".work-state", "runs", runId, "artifacts");
-		return resolve(artifactsDir) === expectedArtifactsDir
-			? { actor: "orchestrator", artifactsDir }
-			: undefined;
 	} catch {
-		return undefined;
+		return deniedTrustedToolCall("controller_resolution_failed");
+	}
+
+	let ctoClaim: CtoClaimScope | undefined;
+	try {
+		ctoClaim = binding.controller.activeCtoClaim();
+	} catch {
+		return deniedTrustedToolCall("controller_resolution_failed");
+	}
+	// CTO authority is the controller's exact current claim proof. It is
+	// intentionally resolved before ordinary selection/claim checks: a CTO
+	// run is not authorized by selectedRunId, owner_session, runTarget, or
+	// an ordinary run UUID.
+	if (ctoClaim !== undefined) {
+		if (
+			typeof ctoClaim.run_id !== "string"
+			|| ctoClaim.run_id.length === 0
+			|| typeof ctoClaim.ownership_epoch !== "string"
+			|| ctoClaim.ownership_epoch.length === 0
+		) {
+			return deniedTrustedToolCall("execution_claim_mismatch");
+		}
+		return {
+			kind: "authenticated-interactive-host-cto",
+			run_id: ctoClaim.run_id,
+			ownership_epoch: ctoClaim.ownership_epoch,
+		};
+	}
+
+	let selectedRunId: string | undefined;
+	let activeClaimRunId: string | undefined;
+	try {
+		selectedRunId = binding.controller.selectedRunId();
+		if (selectedRunId !== runId) return deniedTrustedToolCall("selected_run_mismatch");
+		activeClaimRunId = binding.controller.activeClaimRunId();
+	} catch {
+		return deniedTrustedToolCall("controller_resolution_failed");
+	}
+	if (runId === undefined) {
+		if (activeClaimRunId !== undefined) return deniedTrustedToolCall("execution_claim_mismatch");
+		return { kind: "authenticated-interactive-host-no-run" };
+	}
+	if (!runId || activeClaimRunId !== runId) {
+		return deniedTrustedToolCall("execution_claim_mismatch");
+	}
+
+	let artifactsDir: string | undefined;
+	try {
+		artifactsDir = runTarget(binding.cwd, runId).artifactsDir;
+	} catch {
+		return deniedTrustedToolCall("artifacts_scope_mismatch");
+	}
+	const expectedArtifactsDir = resolve(binding.cwd, ".work-state", "runs", runId, "artifacts");
+	if (
+		typeof artifactsDir !== "string"
+		|| artifactsDir.length === 0
+		|| resolve(artifactsDir) !== expectedArtifactsDir
+	) {
+		return deniedTrustedToolCall("artifacts_scope_mismatch");
+	}
+	return { actor: "orchestrator", artifactsDir };
+}
+
+function resolveInternalTrustedToolCallActor(
+	pi: object,
+	ctx: unknown,
+	cwd: string,
+	runId: string | undefined,
+): TrustedToolCallResolution | undefined {
+	try {
+		return resolveInternalTrustedToolCallActorUnsafe(pi, ctx, cwd, runId);
+	} catch {
+		return deniedTrustedToolCall("controller_resolution_failed");
 	}
 }
 function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {

@@ -1,8 +1,26 @@
 # @andvl1/omp-workflows-fullstack
 
-Default fullstack bundle for `@andvl1/omp-workflows-core`. Ships 16 specialized agents, 27 domain skills, and 7 OMP custom-TS slash command adapters for Spring/Kotlin/React/KMP/Telegram-bot projects.
+Default fullstack bundle for `@andvl1/omp-workflows-core`. Ships 21 specialized agents, 28 domain skills, and 9 command surfaces for Spring/Kotlin/React/KMP/Telegram-bot projects.
 
 ## Install
+
+For normal OMP use, configure GitHub Packages access for the `@andvl1` scope, then
+install or update **both** packages to the same published version, core first:
+
+```bash
+VERSION="$(npm view @andvl1/omp-workflows-fullstack version --registry=https://npm.pkg.github.com)"
+omp plugin install "@andvl1/omp-workflows-core@$VERSION" --force
+omp plugin install "@andvl1/omp-workflows-fullstack@$VERSION" --force
+omp plugin list --json
+```
+
+Start a new OMP session after updating. For a pinned release, set `VERSION`
+explicitly instead of querying the registry. `plugin upgrade` is for marketplace
+plugins; npm plugins use `plugin install ... --force`. In OMP 18.4.2, npm installs
+use the global plugin store: `--scope=project` and `--local` do not isolate them.
+Updating fullstack alone is not an explicit update of core.
+
+For a project that imports the packages as dependencies:
 
 ```bash
 npm install @andvl1/omp-workflows-fullstack @andvl1/omp-workflows-core
@@ -211,8 +229,65 @@ artifact tools; raw `Write`/`Edit`/`Bash` cannot publish canonical state.
 A stale revision or claim refusal leaves state and binding unchanged; the
 coordinator re-reads and resolves a legitimate conflict, without a blind
 retry. A terminal commit releases only the exact originating managed private
-binding atomically; completion of a wave alone is not terminal. Runtime
-acceptance of this model ingress remains pending Main validation.
+binding atomically; completion of a wave alone is not terminal.
+
+### Native resident CTO route
+
+The resident main session is the only CTO orchestrator. It uses
+`cto_state(read exact run) → cto_state(commit wave/classification/workflow/DoD)
+→ task(configured TeamDef.lead with the exact slice marker) → lead task(configured
+TeamDef.roster worker with the same marker)`, then verifies direct artifacts,
+validation evidence, approvals, and DoD before the next state commit. This is
+independent of ordinary `/do-work` selectors: the CTO root and leads must not
+call ordinary `workflow_prepare`/`workflow_status`/`workflow_instructions`/
+`workflow_begin`/`workflow_complete`/`workflow_advance` with the CTO slug.
+The resolved profile remains a quality contract, not a selector bridge.
+
+Registered `/cto` получает scoped native system contract, а не ordinary-only
+требование `workflow_begin`. Его выбирает проверенная private provenance;
+похожий текст в обычном сообщении не заменяет зарегистрированный ingress.
+Сам prompt не выдаёт полномочий и не отменяет runtime или human gates.
+
+Implementation, artifact recovery, review и QA выполняют roster-workers
+назначенного lead. Отсутствующая роль требует исправить состав команды,
+а не запускать такого worker напрямую из CTO-root или пропускать quality gate.
+Общая архитектура также проходит через назначенного lead → roster architect
+до запуска зависимых consumer leads.
+
+Этот маршрут проверяется runtime, а не только инструкциями. `TeamDef.lead`
+задаёт конкретное имя agent; роли `roster` разрешаются через effective config.
+Недоступная mapped role не подменяется предпочтительным agent из config.
+Маркер должен точно совпадать с `teams[].slice_id`, а уникальный `teams[].id` —
+с `plan.teams[].team` и зарегистрированным `TeamDef.id`. Для новой волны
+переиспользуется завершённая binding с новым slice ID, без дубликата team ID.
+Смена configured lead прекращает delegation прежнего lead; root не может
+обойти проверку прямым вызовом worker или подменой display name.
+
+`before_advance` проверяется после готового результата стадии, до следующей
+стадии. Lead может локально применить только допустимое resolved policy
+автоматическое решение с evidence; `required_human` и неразрешённые вопросы
+передаются root для настоящего решения. Раннее согласие на план и позднее
+approval не заменяют эту границу. Если двусторонний канал недоступен, lead
+возвращает handoff результатом task; root продолжает через тот же configured
+lead с точным scope, без повторного запуска завершённых workers.
+
+Root передаёт явный evidence-каталог, уникальный для run/wave/slice, отдельно
+от путей исходников, shared deliverables и DoD. Producers сохраняют канонические
+имена файлов внутри него. Retry сохраняет каталог; новая волна получает новый
+и не перезаписывает evidence предыдущих волн или их ссылки.
+
+Запуск с задачей остаётся resident после закрытия волны. Exact resume без
+новой задачи сохраняет канонический task, классификацию и прогресс; успешная
+закрытая волна ждёт следующую задачу, а не запускается повторно.
+Для завершения всего CTO нужен отдельный явный `END`.
+Подробнее: [CTO lifecycle](../core/README.md#cto-lifecycle-and-exact-run-continuation).
+
+Per-team DoD is a supplemental ordinary file at the exact relative
+`teams[].dod_path` (default `.work-state/artifacts/<team>/dod.json`); it is not
+canonical `.work-state/cto/<id>/state.json`. Worker artifacts use the same
+flat-file rule as ordinary workflows: the exact declared filename supplies the
+artifact id, and its root is the direct schema payload with no id-keyed
+envelope.
 
 ## Model roles
 
@@ -275,9 +350,9 @@ In the interactive TUI, use /model without arguments to assign project/global ro
 
 ## What's inside
 
-- 15 agents (`analyst`, `architect`, `code-reviewer`, `cto`, `developer-{kotlin,go,mobile}`, `devops`, `diagnostics`, `discovery`, `frontend-developer`, `init-mobile`, `manual-qa`, `qa`, `security-tester`, `team-lead`, `tech-researcher`)
-- 27 domain skills
-- 7 custom-TS slash commands (see above)
+- 21 agents (`analyst`, `architect`, `code-reviewer`, `cto`, `developer-{kotlin,go,mobile}`, `devops`, `diagnostics`, `discovery`, `frontend-developer`, `init-mobile`, `manual-qa`, `product-{analyst,critic,researcher,strategist}`, `qa`, `security-tester`, `team-lead`, `tech-researcher`)
+- 28 domain skills
+- 9 command surfaces: 4 extension-registered commands and 5 compatibility custom-TS commands (see above)
 
 ## FAQ
 

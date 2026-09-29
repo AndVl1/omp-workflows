@@ -1729,8 +1729,9 @@ export function reopenFromFeedback(
 /**
  * Invalidate hash evidence owned by the affected profile suffix.  Declared
  * suffix outputs are regenerated on every re-entry; the shared DoD sidecar is
- * also mutable whenever that suffix contains qa_tests.  The declarations and
- * paths remain available for the next explicit workflow_begin to reread.
+ * also mutable whenever that suffix contains an explicit QA-owner stage
+ * (`qa_tests` or `manual_qa`).  The declarations and paths remain available
+ * for the next explicit workflow_begin to reread.
  *
  * Explicit rework and bounded loopback share this pure state projection.  It
  * is intentionally not re-exported from the package barrel.
@@ -1749,7 +1750,7 @@ export function invalidateReentryInputEvidence(
     const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
     for (const artifactId of produces) invalidatedArtifactIds.add(artifactId);
   }
-  if (suffixStageIds.has("qa_tests")) invalidatedArtifactIds.add("dod");
+  if (suffixStageIds.has("qa_tests") || suffixStageIds.has("manual_qa")) invalidatedArtifactIds.add("dod");
 
   let requiredInputsChanged = false;
   const retainedRequiredInputs = Object.fromEntries(

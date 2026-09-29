@@ -254,6 +254,7 @@ test("host admission resolves session-manager cwd for mounted read and workflow 
       observability: true,
       resolveCwd: resolveSessionCwd,
       getSessionController: getController,
+      resolveTrustedToolCallActor: () => undefined,
     });
     registerWorkflowTools(pi as never, {
       resolveCwd: resolveSessionCwd,
@@ -548,6 +549,7 @@ test("host admission blocks cwd-required tools when the resolver has no workspac
     getSessionController: () => {
       throw new Error("missing cwd must not resolve a session controller");
     },
+    resolveTrustedToolCallActor: () => undefined,
   });
   const toolCall = handlers.tool_call?.[0];
   assert.ok(toolCall, "registered tool_call hook is required");
@@ -558,10 +560,162 @@ test("host admission blocks cwd-required tools when the resolver has no workspac
   };
   for (const toolName of ["ask", "task", "write", "edit", "bash"]) {
     const result = toolCall!({ toolName, toolCallId: "missing-cwd-" + toolName, input: {} }, context);
-    assert.deepEqual(result, { block: true, reason: "workflow cwd unavailable" }, toolName);
+    assert.equal(result?.block, true, toolName);
+    assert.match(result?.reason ?? "", /\[workflow_admission:cwd_unavailable\]/, toolName);
   }
   const readResult = toolCall!({ toolName: "read", toolCallId: "missing-cwd-read", input: { path: "xd://workflow_instructions" } }, context);
   assert.equal(readResult, undefined, "read remains harmless without an authoritative workspace");
+});
+
+test("controller-only registration is rejected before host hooks are installed", () => {
+  let labels = 0;
+  let hooks = 0;
+  const pi = {
+    setLabel() {
+      labels += 1;
+    },
+    on() {
+      hooks += 1;
+    },
+  };
+  assert.throws(
+    () => registerTeamWorkflow(pi as never, {
+      label: "bundle label with unsafe\ntext",
+      getSessionController: () => undefined,
+    } as never),
+    /\[workflow_registration:missing_actor_resolver\]/,
+  );
+  assert.equal(labels, 0, "invalid registration must not publish a label");
+  assert.equal(hooks, 0, "invalid registration must not install partial hooks");
+});
+
+test("host admission diagnostics classify resolver failures and invalid adapter output safely", () => {
+  const root = mkdtempSync(join(tmpdir(), "host-admission-diagnostics-"));
+  try {
+    const throwingHandlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (throwingHandlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      resolveCwd: () => {
+        throw new Error("secret cwd resolver exception");
+      },
+      resolveTrustedToolCallActor: () => undefined,
+      label: "diagnostic-bundle",
+    });
+    const throwingResult = throwingHandlers.tool_call?.[0]?.(
+      { toolName: "write", toolCallId: "cwd-throw", input: { path: "src/app.ts", content: "x" } },
+      { cwd: root },
+    ) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(throwingResult?.block, true);
+    assert.match(throwingResult?.reason ?? "", /\[workflow_admission:cwd_resolution_failed\]/);
+    assert.doesNotMatch(throwingResult?.reason ?? "", /secret cwd resolver exception/);
+
+    const nullContextHandlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (nullContextHandlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      cwd: root,
+      resolveTrustedToolCallActor: () => undefined,
+      label: "diagnostic-bundle",
+    });
+    for (const context of [undefined, null]) {
+      let nullContextResult: { block?: boolean; reason?: string } | undefined;
+      assert.doesNotThrow(() => {
+        nullContextResult = nullContextHandlers.tool_call?.[0]?.(
+          { toolName: "write", toolCallId: "null-context", input: { path: "src/app.ts", content: "x" } },
+          context,
+        ) as { block?: boolean; reason?: string } | undefined;
+      });
+      assert.equal(nullContextResult?.block, true);
+      assert.match(nullContextResult?.reason ?? "", /\[workflow_admission:actor_unresolved\]/);
+    }
+
+    let invalidResolution: unknown = { actor: "orchestrator", artifactsDir: 42 };
+    const invalidHandlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (invalidHandlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      cwd: root,
+      resolveTrustedToolCallActor: () => invalidResolution as never,
+      label: "diagnostic-bundle",
+    });
+    for (const resolution of [
+      { actor: "orchestrator", artifactsDir: 42 },
+      { kind: "denied", code: "untrusted_actor_context", actor: "worker" },
+      { kind: "authenticated-interactive-host-no-run", actor: "worker" },
+    ]) {
+      invalidResolution = resolution;
+      const invalidResult = invalidHandlers.tool_call?.[0]?.(
+        { toolName: "write", toolCallId: "invalid-adapter", input: { path: "src/app.ts", content: "x" } },
+        { cwd: root },
+      ) as { block?: boolean; reason?: string } | undefined;
+      assert.equal(invalidResult?.block, true);
+      assert.match(invalidResult?.reason ?? "", /\[workflow_admission:actor_resolver_invalid_result\]/);
+    }
+
+    const deniedHandlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (deniedHandlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      cwd: root,
+      resolveTrustedToolCallActor: () => ({ kind: "denied", code: "host_profile_mismatch" }),
+      label: "diagnostic-bundle",
+    });
+    const deniedResult = deniedHandlers.tool_call?.[0]?.(
+      { toolName: "write", toolCallId: "adapter-denied", input: { path: "src/app.ts", content: "x" } },
+      { cwd: root },
+    ) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(deniedResult?.block, true);
+    assert.match(deniedResult?.reason ?? "", /\[workflow_admission:host_profile_mismatch\]/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable selected run reports state recovery without exposing or rewriting state", () => {
+  const root = mkdtempSync(join(tmpdir(), "admission-selected-recovery-"));
+  try {
+    const runId = writeWorkflowState(root, {});
+    const controller = selectedController(root);
+    const statePath = runTarget(root, runId).statePath;
+    const damagedState = "{ damaged private-state-sentinel";
+    writeFileSync(statePath, damagedState);
+    const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (handlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      cwd: root,
+      observability: false,
+      getSessionController: () => controller,
+      resolveTrustedToolCallActor: () => ({ kind: "authenticated-interactive-host-no-run" }),
+    });
+    const result = handlers.tool_call[0]!({
+      toolName: "write",
+      toolCallId: "selected-recovery",
+      input: { path: "src/app.ts", content: "x" },
+    }, { cwd: root }) as { block?: boolean; reason?: string };
+    assert.equal(result.block, true);
+    assert.match(result.reason ?? "", /\[workflow_admission:workflow_state_recovery_required\]/);
+    assert.doesNotMatch(result.reason ?? "", /private-state-sentinel/);
+    assert.equal(readFileSync(statePath, "utf8"), damagedState);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 function writeImplementationState(root: string): void {
@@ -2157,6 +2311,7 @@ test("native task hook leaves spawned and scheduled results pending", () => {
     } as never, {
       observability: false,
       getSessionController: (_ctx, cwd) => cwd === root ? controller : undefined,
+      resolveTrustedToolCallActor: () => undefined,
     });
     const invoke = (name: string, event: unknown): unknown[] => {
       const registered = handlers[name] ?? [];
@@ -2337,6 +2492,7 @@ test("native task result reconciles its immutable origin after the manager moves
     } as never, {
       observability: false,
       getSessionController: (_ctx, cwd) => controllers.get(cwd),
+      resolveTrustedToolCallActor: () => undefined,
     });
     const invoke = (name: string, event: unknown, ctx: unknown): unknown[] => {
       const registered = handlers[name] ?? [];
@@ -2472,6 +2628,7 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
     } as never, {
       observability: false,
       getSessionController: (_ctx, cwd) => cwd === root ? controller : undefined,
+      resolveTrustedToolCallActor: () => undefined,
     });
     const invoke = (name: string, event: unknown): unknown[] => {
       const registered = handlers[name] ?? [];

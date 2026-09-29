@@ -53,10 +53,19 @@ import { readDispatchOriginLocator, rememberDispatchOriginLocator } from "./disp
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
 import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, retainSelectionSnapshot, readRunControl, readRunControlNoRecovery, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, reserveExecutionClaimWorkers, settleExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector, CtoClaimScope, RunControl } from "./engine/types.js";
-import { createNativeWorkerAuthority, type NativeWorkerResolution } from "./native-worker-authority.js";
+import { createNativeWorkerAuthority, NativeWorkerRouteError, type NativeWorkerResolution } from "./native-worker-authority.js";
 import type { ScopeRuntimeClassTable } from "./engine/scope.js";
 import type { DispatchAuth, RosterBeginSelection } from "./engine/durable.js";
 import type { AgentMappingState } from "./engine/agent-mapping.js";
+import {
+  trustedToolCallAdmissionDiagnostic,
+  type AdmissionDiagnosticCode,
+  type TrustedToolCallDenialCode,
+  type TrustedToolCallAdmissionScenario,
+  type TrustedToolCallAdapterSignal,
+} from "./actor-admission-diagnostics.js";
+export type { TrustedToolCallDenialCode } from "./actor-admission-diagnostics.js";
+
 export type WorkflowCapability = "workflow_registration" | "workflow_tools" | "config_writer";
 
 export type WorkflowOwnerKind = "fullstack" | "private_omp" | (string & {});
@@ -228,7 +237,8 @@ export type TrustedToolCallResolution =
   | { readonly actor: "orchestrator"; readonly artifactsDir: string }
   | { readonly actor: "worker" | "lead" }
   | { readonly kind: "authenticated-interactive-host-no-run" }
-  | { readonly kind: "authenticated-interactive-host-cto"; readonly run_id: string; readonly ownership_epoch: string };
+  | { readonly kind: "authenticated-interactive-host-cto"; readonly run_id: string; readonly ownership_epoch: string }
+  | { readonly kind: "denied"; readonly code: TrustedToolCallDenialCode };
 /**
  * Bundle-owned adapter seam for the current authenticated tool-call context.
  * The callback receives host context only; model/tool input is never passed.
@@ -239,7 +249,7 @@ export type TrustedToolCallActorResolver = (
   runId: string | undefined,
 ) => TrustedToolCallResolution | undefined;
 
-export interface RegisterOptions {
+interface RegisterOptionsBase {
   label?: string;
   roles?: RoleConfig["roles"];
   rosterOverrides?: RoleConfig["roster_overrides"];
@@ -263,11 +273,29 @@ export interface RegisterOptions {
    * default — shipped workflows keep the single-writer model.
    */
   writeScope?: WorkerWriteScope;
-  /** Resolve the current authenticated host actor for raw tool-call hooks. */
-  resolveTrustedToolCallActor?: TrustedToolCallActorResolver;
-  /** Shared session controller used by command/tool ingress and lifecycle gates. */
-  getSessionController?: (ctx: unknown, cwd: string) => WorkflowSessionController | undefined;
 }
+
+type RegisterOptionsWithoutController = RegisterOptionsBase & {
+  /** A controller requires the authenticated actor resolver below. */
+  getSessionController?: never;
+  resolveTrustedToolCallActor?: TrustedToolCallActorResolver;
+};
+
+type RegisterOptionsWithController = RegisterOptionsBase & {
+  /** Shared session controller used by command/tool ingress and lifecycle gates. */
+  getSessionController: (ctx: unknown, cwd: string) => WorkflowSessionController | undefined;
+  /** Required whenever a shared session controller is registered. */
+  resolveTrustedToolCallActor: TrustedToolCallActorResolver;
+};
+
+/**
+ * Registering a controller without its bundle-owned actor resolver is unsafe:
+ * the controller alone cannot authenticate raw host tool calls. The union
+ * keeps legacy registrations (neither callback) and resolver-only no-run
+ * registrations valid while rejecting the incomplete combination at compile
+ * time.
+ */
+export type RegisterOptions = RegisterOptionsWithoutController | RegisterOptionsWithController;
 
 export type CommandId = "do-work" | "team" | "cto" | "init-team" | "interview" | "omp-model-roles";
 
@@ -362,6 +390,49 @@ function resolveCwdFromContext(ctx: unknown): string | undefined {
     }
   }
   return typeof value.cwd === "string" && value.cwd.length > 0 ? value.cwd : undefined;
+}
+
+function isTrustedToolCallDenialCode(value: unknown): value is TrustedToolCallDenialCode {
+  switch (value) {
+    case "invalid_host_context":
+    case "untrusted_actor_context":
+    case "host_session_not_captured":
+    case "headless_host_session":
+    case "session_identity_mismatch":
+    case "worktree_mismatch":
+    case "host_profile_mismatch":
+    case "session_controller_unavailable":
+    case "controller_context_mismatch":
+    case "selected_run_mismatch":
+    case "execution_claim_mismatch":
+    case "artifacts_scope_mismatch":
+    case "controller_resolution_failed":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function isTrustedToolCallResolution(value: unknown): value is TrustedToolCallResolution {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if ("actor" in record && "kind" in record) return false;
+  if (record.actor === "worker" || record.actor === "lead") return true;
+  if (record.actor === "orchestrator") return typeof record.artifactsDir === "string" && record.artifactsDir.length > 0;
+  if (record.kind === "authenticated-interactive-host-no-run") return true;
+  if (record.kind === "authenticated-interactive-host-cto") {
+    return typeof record.run_id === "string"
+      && record.run_id.length > 0
+      && typeof record.ownership_epoch === "string"
+      && record.ownership_epoch.length > 0;
+  }
+  return record.kind === "denied" && isTrustedToolCallDenialCode(record.code);
+}
+
+function safeRegistrationLabel(value: unknown): string {
+  if (typeof value !== "string") return "omp-workflows";
+  const normalized = value.replace(/[^A-Za-z0-9._:@/-]/g, "_").slice(0, 80);
+  return normalized || "omp-workflows";
 }
 
 function sessionIdFromContext(ctx: unknown): string | undefined {
@@ -1200,24 +1271,44 @@ function ctoReservationReuseBlocked(
 }
 
 export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
+  const label = opts.label ?? "omp-workflows";
+  const resolverConfigured = typeof opts.resolveTrustedToolCallActor === "function";
+  const controllerConfigured = typeof opts.getSessionController === "function";
+  const controllerProvided = opts.getSessionController !== undefined;
+  if (controllerProvided && !resolverConfigured) {
+    throw new Error(
+      `[workflow_registration:missing_actor_resolver] getSessionController requires ` +
+      `resolveTrustedToolCallActor, the bundle's authenticated actor resolver; update the compatible bundle without ` +
+      `weakening controller or gate authority, then report this code, bundle label, and ` +
+      `installed OMP/core/bundle versions if support is needed (bundle_label=${safeRegistrationLabel(label)})`,
+    );
+  }
   if (opts.cwd && opts.owner) {
     assertOwner(opts.cwd, ["workflow_registration", "config_writer"], opts.owner);
   }
-  const label = opts.label ?? "omp-workflows";
   pi.setLabel(label);
   if (opts.workflowProfiles?.length) registerWorkflowProfiles(opts.workflowProfiles);
 
   const resolveCwd = opts.resolveCwd ?? resolveCwdFromContext;
+  const resolveCwdForContext = (ctx: unknown): { cwd?: string; failed: boolean } => {
+    if (opts.cwd !== undefined) {
+      return { cwd: typeof opts.cwd === "string" && opts.cwd.length > 0 ? opts.cwd : undefined, failed: false };
+    }
+    try {
+      const cwd = resolveCwd(ctx);
+      return { cwd: typeof cwd === "string" && cwd.length > 0 ? cwd : undefined, failed: false };
+    } catch {
+      return { failed: true };
+    }
+  };
   const ctoReservations = new Map<string, CtoReservation>();
   // Retain consumed host-call identities for this registration lifetime.
   // Host result events expose no immutable generation discriminator, so
   // shutdown or session replacement cannot safely make a same-id replay
   // reusable while an older delayed result may still be delivered.
   const retiredCtoToolCalls = new Set<string>();
-  const resolverConfigured = typeof opts.resolveTrustedToolCallActor === "function";
-  const controllerConfigured = typeof opts.getSessionController === "function";
   const bindSession = (ctx: unknown): void => {
-    const cwd = opts.cwd ?? resolveCwd(ctx);
+    const cwd = resolveCwdForContext(ctx).cwd;
     if (!cwd) return;
     assertOwner(cwd, ["workflow_registration", "config_writer"], opts.owner);
     writeRuntimeConfig(opts, cwd);
@@ -1231,7 +1322,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   };
   let lifecycleBinding: LifecycleBinding | undefined;
   const resolveLifecycleBinding = (ctx: unknown): LifecycleBinding | undefined => {
-    const cwd = opts.cwd ?? resolveCwd(ctx);
+    const cwd = resolveCwdForContext(ctx).cwd;
     if (!cwd || !opts.getSessionController) return undefined;
     const hostIdentity = hostSessionIdentityFromContext(ctx);
     if (!hostIdentity.session_id || !hostIdentity.cwd) return undefined;
@@ -1464,7 +1555,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     nativeWorkerAuthority.observeToolExecutionEnd(event, ctx);
   });
   pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
-    const c = ctx as {
+    const c: {
       cwd?: string;
       hasUI?: boolean;
       actor?: TrustedToolCallActor;
@@ -1473,14 +1564,30 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       run_id?: unknown;
       cto_run_id?: unknown;
       cto_ownership_epoch?: unknown;
-    };
+    } = ctx && typeof ctx === "object" && !Array.isArray(ctx)
+      ? ctx as {
+        cwd?: string;
+        hasUI?: boolean;
+        actor?: TrustedToolCallActor;
+        session_id?: string;
+        sessionId?: string;
+        run_id?: unknown;
+        cto_run_id?: unknown;
+        cto_ownership_epoch?: unknown;
+      }
+      : {};
     const originSessionId = sessionIdFromContext(ctx);
     const originSessionFile = sessionFileFromContext(ctx);
     // Resolve admission exactly once. The configured bundle resolver is the
     // authority (fullstack resolves sessionManager.getCwd() before any stale
     // copied context value); never substitute the process cwd or selection.
-    const admissionCwd = opts.cwd ?? resolveCwd(ctx);
+    const cwdResolution = resolveCwdForContext(ctx);
+    const admissionCwd = cwdResolution.cwd;
+    const cwdResolverFailed = cwdResolution.failed;
     let admissionResolutionFailed = false;
+    let workflowStateRecoveryRequired = false;
+    let ctoClaimResolutionFailed = false;
+    let nativeResolutionFailed = false;
     let sharedController: WorkflowSessionController | undefined;
     let selectedRunId: string | undefined;
     let authorityRunId: string | undefined;
@@ -1490,22 +1597,34 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       try {
         const controller = opts.getSessionController?.(ctx, admissionCwd);
         sharedController = controller;
-        activeCtoScope = controller?.activeCtoClaim();
+        try {
+          activeCtoScope = controller?.activeCtoClaim();
+        } catch (error) {
+          ctoClaimResolutionFailed = true;
+          throw error;
+        }
         if (activeCtoScope) {
           // A live CTO claim is the exact target for CTO authority and native
           // resolution, but it is not an ordinary canonical workflow run.
           authorityRunId = activeCtoScope.run_id;
-          const ctoState = readCtoState(activeCtoScope.run_id, admissionCwd);
-          if (!ctoState || ctoState.branch !== controller?.context().branch) {
-            throw new Error("active CTO claim branch/state is unavailable");
+          try {
+            const ctoState = readCtoState(activeCtoScope.run_id, admissionCwd);
+            if (!ctoState || ctoState.branch !== controller?.context().branch) {
+              throw new Error("active CTO claim branch/state is unavailable");
+            }
+          } catch (error) {
+            ctoClaimResolutionFailed = true;
+            throw error;
           }
         } else {
           selectedRunId = controller?.selectedRunId();
           authorityRunId = selectedRunId;
           activeClaimRunId = controller?.activeClaimRunId();
         }
-      } catch {
+      } catch (error) {
         admissionResolutionFailed = true;
+        workflowStateRecoveryRequired = error instanceof LifecycleError
+          && (error.code === "recovery_required" || error.code === "run_state_invalid");
       }
     }
     const ctoMarkerIds = event.toolName === "task" ? ctoMarkerRunIds(event.input) : [];
@@ -1523,6 +1642,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         nativeActor = nativeWorkerAuthority.resolve(ctx, admissionCwd, authorityRunId);
       } catch {
         nativeActor = undefined;
+        nativeResolutionFailed = true;
       }
     }
     // Only an ordinary selected run or an ordinary native grant enters the
@@ -1538,13 +1658,36 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       ? c.actor
       : undefined;
     let adaptedActor: TrustedToolCallResolution | undefined;
+    let actorResolverSignal: TrustedToolCallAdapterSignal = "missing";
     if (admissionCwd && resolverConfigured && !admissionResolutionFailed) {
       try {
-        adaptedActor = opts.resolveTrustedToolCallActor!(ctx, admissionCwd, authorityRunId);
+        const candidate: unknown = opts.resolveTrustedToolCallActor!(ctx, admissionCwd, authorityRunId);
+        if (candidate === undefined) {
+          actorResolverSignal = "missing";
+        } else if (!isTrustedToolCallResolution(candidate)) {
+          actorResolverSignal = "invalid";
+        } else {
+          adaptedActor = candidate;
+          actorResolverSignal = "reported";
+        }
       } catch {
-        adaptedActor = undefined;
+        actorResolverSignal = "threw";
       }
     }
+    const actorResolverDiagnosticCode: AdmissionDiagnosticCode =
+      actorResolverSignal === "threw"
+        ? "actor_resolver_failed"
+        : actorResolverSignal === "invalid"
+          ? "actor_resolver_invalid_result"
+          : "actor_unresolved";
+    const adaptedDenialCode = adaptedActor
+      && "kind" in adaptedActor
+      && adaptedActor.kind === "denied"
+      ? adaptedActor.code
+      : undefined;
+    const authenticatedCtoProofPresented = adaptedActor
+      && "kind" in adaptedActor
+      && adaptedActor.kind === "authenticated-interactive-host-cto";
     const authenticatedCtoScope =
       adaptedActor
       && "kind" in adaptedActor
@@ -1575,6 +1718,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       }
       : undefined;
     let trustedProof: TrustedOrchestratorWriteProof | undefined;
+    let artifactsScopeMismatch = false;
+    const orchestratorClaimMismatch = adaptedActor
+      && "actor" in adaptedActor
+      && adaptedActor.actor === "orchestrator"
+      && (selectedRunId !== undefined || activeClaimRunId !== undefined)
+      && activeClaimRunId !== selectedRunId;
     if (
       !admissionResolutionFailed
       && controllerConfigured
@@ -1592,9 +1741,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         const expectedArtifactsDir = runTarget(admissionCwd, selectedRunId).artifactsDir;
         if (expectedArtifactsDir && resolve(expectedArtifactsDir) === resolve(adaptedActor.artifactsDir)) {
           trustedProof = createTrustedOrchestratorWriteProof(expectedArtifactsDir);
+        } else {
+          artifactsScopeMismatch = true;
         }
       } catch {
         trustedProof = undefined;
+        artifactsScopeMismatch = true;
       }
     }
     const adaptedTrustedActor = adaptedActor && "actor" in adaptedActor
@@ -1605,6 +1757,8 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         ? "orchestrator"
         : undefined;
     let authenticatedInteractiveHostNoRun = false;
+    let noRunClaimPresent = false;
+    let controlReadFailed = false;
     if (
       !admissionResolutionFailed
       && resolverConfigured
@@ -1616,11 +1770,18 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       && admissionCwd
     ) {
       try {
-        authenticatedInteractiveHostNoRun = readRunControlNoRecovery(admissionCwd).execution_claim === null;
+        const control = readRunControlNoRecovery(admissionCwd);
+        noRunClaimPresent = control.execution_claim !== null;
+        authenticatedInteractiveHostNoRun = !noRunClaimPresent;
       } catch {
+        controlReadFailed = true;
         authenticatedInteractiveHostNoRun = false;
       }
     }
+    const selectedNoRunConflict = selectedRunId !== undefined
+      && adaptedActor
+      && "kind" in adaptedActor
+      && adaptedActor.kind === "authenticated-interactive-host-no-run";
     const ctoMarkedTask = event.toolName === "task" && ctoMarkerIds.length > 0;
     const nativeCtoMarkerAdmission = nativeActor?.kind === "cto"
       && ctoMarkerIds.length > 0
@@ -1646,6 +1807,26 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       : undefined;
     let result: { block?: boolean; reason?: string } | undefined;
     const run = (candidate: { block?: boolean; reason?: string } | void) => { if (!result && candidate?.block) result = candidate; };
+    const admissionScenario: TrustedToolCallAdmissionScenario = activeCtoScope || ctoMarkerIds.length > 0
+      ? "cto"
+      : selectedRunId
+        ? "selected"
+        : admissionResolutionFailed || !admissionCwd ? "unknown" : "idle";
+    const runAdmission = (
+      code: AdmissionDiagnosticCode,
+      signal?: TrustedToolCallAdapterSignal,
+    ): void => {
+      if (result) return;
+      result = {
+        block: true,
+        reason: trustedToolCallAdmissionDiagnostic(code, {
+          bundleLabel: label,
+          toolName: event.toolName,
+          scenario: admissionScenario,
+          ...(signal ? { adapterSignal: signal } : {}),
+        }),
+      };
+    };
     let lifecycleDeviceWrite = false;
     if (event.toolName === "write") {
       try {
@@ -1663,7 +1844,10 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       && !legacyCtoRunId
       && !nativeCtoMarkerAdmission
     ) {
-      run({ block: true, reason: "CTO slice marker requires an exact authenticated CTO claim or trusted owned legacy run" });
+      runAdmission(
+        adaptedDenialCode ?? "cto_marker_unauthenticated",
+        adaptedDenialCode ? actorResolverSignal : undefined,
+      );
     }
     if (
       admissionResolutionFailed
@@ -1676,10 +1860,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         )
       )
     ) {
-      run({ block: true, reason: "workflow session admission resolution failed" });
+      runAdmission(workflowStateRecoveryRequired
+        ? "workflow_state_recovery_required"
+        : ctoClaimResolutionFailed ? "cto_claim_mismatch" : "session_controller_resolution_failed");
     }
     if (!admissionCwd && (event.toolName === "ask" || event.toolName === "task" || event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")) {
-      run({ block: true, reason: "workflow cwd unavailable" });
+      runAdmission(cwdResolverFailed ? "cwd_resolution_failed" : "cwd_unavailable");
     }
     if (
       !result
@@ -1689,7 +1875,22 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       && !lifecycleDeviceWrite
       && (event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")
     ) {
-      run({ block: true, reason: "trusted host actor unavailable" });
+      const code: AdmissionDiagnosticCode = adaptedDenialCode
+        ?? (artifactsScopeMismatch
+          ? "artifacts_scope_mismatch"
+          : orchestratorClaimMismatch
+            ? "execution_claim_mismatch"
+            : controlReadFailed
+              ? "run_control_unreadable"
+              : noRunClaimPresent
+                ? "no_run_claim_present"
+                : selectedNoRunConflict
+                  ? "execution_claim_mismatch"
+                  : actorResolverDiagnosticCode);
+      runAdmission(
+        code,
+        adaptedDenialCode || code === actorResolverDiagnosticCode ? actorResolverSignal : undefined,
+      );
     }
     if (
       !result
@@ -1702,7 +1903,17 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         || (selectedRunId !== undefined && activeClaimRunId !== selectedRunId)
       )
     ) {
-      run({ block: true, reason: "trusted host actor unavailable" });
+      const code: AdmissionDiagnosticCode = adaptedDenialCode
+        ?? (nativeResolutionFailed
+          ? "native_authority_resolution_failed"
+          : authenticatedCtoProofPresented
+            ? "cto_claim_mismatch"
+            : orchestratorClaimMismatch
+              ? "execution_claim_mismatch"
+              : !sharedController
+                ? "session_controller_unavailable"
+                : "selected_run_mismatch");
+      runAdmission(code, adaptedDenialCode ? actorResolverSignal : undefined);
     }
     if (nativeActor?.actor === "worker" && event.toolName === "task") {
       run({ block: true, reason: "native worker authority does not permit nested task delegation" });
@@ -1784,7 +1995,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         || credentials.run_id !== authenticatedCtoScope!.run_id
         || eventRunId !== undefined && eventRunId !== authenticatedCtoScope!.run_id
       ) {
-        run({ block: true, reason: "cto claim reservation requires the exact authenticated run and task call identity" });
+        runAdmission("cto_claim_mismatch");
       } else {
         // Native admission owns the locked reservation. Keep the exact
         // authenticated slot image here so the matching host result can
@@ -1824,13 +2035,17 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         );
         if (nativeCtoTargeted && !admitted) {
           pendingCtoReservation = undefined;
-          run({ block: true, reason: "native authority refused the CTO task admission" });
+          runAdmission("cto_claim_mismatch");
         } else if (pendingCtoReservation && event.toolCallId) {
           ctoReservations.set(event.toolCallId, pendingCtoReservation);
         }
-      } catch {
+      } catch (error) {
         if (pendingCtoReservation) pendingCtoReservation = undefined;
-        if (nativeCtoTargeted) run({ block: true, reason: "native authority failed the CTO task admission" });
+        if (error instanceof NativeWorkerRouteError) {
+          runAdmission("native_authority_route_denied");
+        } else if (nativeCtoTargeted) {
+          runAdmission("native_authority_resolution_failed");
+        }
         // Native authority is fail-closed; a malformed host context never
         // changes the already-allowed task decision or creates a grant.
       }

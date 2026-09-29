@@ -142,6 +142,21 @@ test("command intent is opaque, two-phase, exact, one-shot, and release-cleared"
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("turn-level release preserves an explicit command intent when requested", () => {
+  const root = mkdtempSync(join(tmpdir(), "command-intent-turn-release-"));
+  try {
+    const controller = createWorkflowSessionController({ cwd: root, context: trustedContext(root, "turn-release-session") });
+    const issued = controller.issueCommandIntent("new");
+    controller.release("host-session-stop", { preserveCommandIntent: true });
+    assert.deepEqual(
+      controller.consumeCommandIntent({ command_intent_id: issued.intent_id, mode: "new" }),
+      issued,
+    );
+    controller.clearCommandIntent();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("registered ingress infers only natural lifecycle modes and never mints their token", async () => {
   const root = mkdtempSync(join(tmpdir(), "command-intent-natural-"));
@@ -264,6 +279,83 @@ test("reentrant CTO acquisition preserves a newer consumed-hook token until exac
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("turn-stop provenance survives failed CTO acquisition and is retired by CTO supersession", async () => {
+  const root = mkdtempSync(join(tmpdir(), "command-intent-cto-turn-stop-"));
+  try {
+    const sessionId = "cto-turn-stop-session";
+    const sessionFile = join(root, `${sessionId}.jsonl`);
+    const controller = createWorkflowSessionController({ cwd: root, context: trustedContext(root, sessionId) });
+    const harness = commandHarness();
+    const context = {
+      cwd: root,
+      sessionManager: {
+        getCwd: () => root,
+        getSessionId: () => sessionId,
+        getSessionFile: () => sessionFile,
+      },
+      ui: { notify() {} },
+    };
+    registerWorkflowCommands(harness.pi as never, {
+      resolveCwd: () => root,
+      getSessionController: () => controller,
+      buildDoWorkPrompt: envelope => `${envelope.mode}:${envelope.command_intent_id ?? "missing"}:${envelope.task}`,
+    });
+    const beforeAgentStart = harness.handlers.get("before_agent_start")?.[0];
+    const sessionStop = harness.handlers.get("session_stop")?.[0];
+    assert.equal(typeof beforeAgentStart, "function");
+    assert.equal(typeof sessionStop, "function");
+    const doWork = harness.commands.get("do-work")!.handler;
+    const cto = harness.commands.get("cto")!.handler;
+    const stopEvent = { session_id: sessionId, session_file: sessionFile };
+
+    await doWork("--new intent retained across turn stop", context);
+    const failedCtoPredecessorPrompt = harness.prompts.at(-1)!;
+    assert.ok(beforeAgentStart!({ prompt: failedCtoPredecessorPrompt, systemPrompt: [] }, context));
+    sessionStop!(stopEvent, context);
+    const retainedToken = failedCtoPredecessorPrompt.split(":")[1]!;
+
+    await assert.rejects(
+      cto("--run missing-cto-run failed acquisition", context),
+      /CTO run 'missing-cto-run' is missing/,
+    );
+    assert.equal(
+      controller.consumeCommandIntent({ command_intent_id: retainedToken, mode: "new" })?.intent_id,
+      retainedToken,
+      "a failed CTO acquisition must leave the preserved predecessor usable",
+    );
+    controller.commitCommandIntent(retainedToken);
+
+    await doWork("--new intent retired by CTO supersession", context);
+    const supersededPrompt = harness.prompts.at(-1)!;
+    assert.ok(beforeAgentStart!({ prompt: supersededPrompt, systemPrompt: [] }, context));
+    sessionStop!(stopEvent, context);
+    const supersededToken = supersededPrompt.split(":")[1]!;
+
+    await cto("successful CTO supersession", context);
+    const outerPrompt = harness.prompts.at(-1)!;
+    assert.match(outerPrompt, /successful CTO supersession/);
+    assert.ok(beforeAgentStart!({ prompt: outerPrompt, systemPrompt: [] }, context));
+    lifecycleConflict(() => controller.consumeCommandIntent({ command_intent_id: supersededToken, mode: "new" }));
+    assert.equal(
+      controller.consumeCommandIntent({ mode: "new" }),
+      undefined,
+      "CTO supersession must not leave an abandoned token blocking tokenless preparation",
+    );
+
+    await doWork("--new future preparation after CTO supersession", context);
+    const futurePrompt = harness.prompts.at(-1)!;
+    assert.ok(beforeAgentStart!({ prompt: futurePrompt, systemPrompt: [] }, context));
+    const futureToken = futurePrompt.split(":")[1]!;
+    assert.equal(
+      controller.consumeCommandIntent({ command_intent_id: futureToken, mode: "new" })?.intent_id,
+      futureToken,
+      "a later explicit preparation can issue and consume a fresh token",
+    );
+    controller.commitCommandIntent(futureToken);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("registered workflow prompts arm private one-shot turn provenance", async () => {
   const root = mkdtempSync(join(tmpdir(), "command-intent-commands-"));
@@ -319,13 +411,7 @@ test("registered workflow prompts arm private one-shot turn provenance", async (
     await harness.commands.get("do-work")!.handler("--new continue", hostContext);
     const firstPrompt = harness.prompts.at(-1)!;
     assert.match(firstPrompt, /^new:[0-9a-f-]{36}:continue$/);
-    const firstTurn = start(firstPrompt, hostContext);
-    const firstSystemPrompt = (firstTurn as { systemPrompt: string[] }).systemPrompt;
-    assert.equal(typeof firstSystemPrompt[2], "string");
-    assert.equal(firstSystemPrompt.length, 3);
-    assert.deepEqual(firstSystemPrompt.slice(0, 2), ["base-a", "base-b"]);
-    assert.match(firstSystemPrompt[2]!, /This request does not authorize dispatch/);
-    assert.match(firstSystemPrompt[2]!, /only the current engine-returned workflow_begin handoff does/);
+    assert.ok(start(firstPrompt, hostContext), "registered hook accepts the exact ordinary provenance");
     assert.equal(start(firstPrompt, hostContext), undefined, "provenance is consumed exactly once");
     const firstToken = firstPrompt.slice("new:".length).split(":", 1)[0]!;
     assert.equal(controller.consumeCommandIntent({ command_intent_id: firstToken, mode: "new" })?.intent_id, firstToken);

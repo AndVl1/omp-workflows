@@ -37,10 +37,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z as zod } from "zod";
+import { advanceCursor, authorizeDispatch, completeDispatch, createCapability, recordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
 import { loadProfile, profileHash } from "../src/engine/profile.js";
-import { createCapability, recordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
-import { checkpointPolicyHash, recordTrustedCheckpointAnswer } from "../src/engine/checkpoints.js";
+import { checkpointAnswerBinding, checkpointDecisionKey, checkpointPolicyHash, findHistoricalCheckpointDecision, recordTrustedCheckpointAnswer, resolveCheckpointDeclaration } from "../src/engine/checkpoints.js";
 import { resolveCanonicalRun } from "../src/engine/state.js";
+import { writeArtifact } from "../src/engine/artifacts.js";
 import { persistCanonicalRun, readRunControl, runTarget } from "../src/engine/run-store.js";
 import { createWorkflowSessionController, type WorkflowSessionController } from "../src/engine/host-controller.js";
 import { registerWorkflowTools } from "../src/index.js";
@@ -759,4 +760,320 @@ withFixture("ask: exact decision replay stays idempotent and a mismatched replay
   assert.equal(replayDetails.decision, "proceed");
   assert.equal(calls.length, callsBefore, "the resolved checkpoint never re-raises the dialog");
   assert.equal((readStateFile(root).typed_checkpoint_decisions ?? []).length, 1, "the ledger keeps exactly one decision");
+});
+
+withFixture("ask: finalized pre-dispatch approval continues across worker identity materialization and retry", async (root, ask, tools) => {
+  const issued = writeAskFixture(root);
+  const calls: DialogCall[] = [];
+  const first = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
+  const firstDetails = first.details as { ok?: boolean; actor_provenance?: Record<string, unknown>; error?: string };
+  assert.equal(firstDetails.ok, true, firstDetails.error);
+  const firstActor = firstDetails.actor_provenance;
+  assert.ok(firstActor, "the pre-dispatch answer must return durable provenance");
+  if (
+    !firstActor
+    || !("proof" in firstActor)
+    || typeof firstActor.proof !== "object"
+    || firstActor.proof === null
+    || !("answer_id" in firstActor.proof)
+    || typeof firstActor.proof.answer_id !== "string"
+  ) throw new Error("the pre-dispatch answer proof is malformed");
+  const oldAnswerId = firstActor.proof.answer_id;
+
+  const checkpointTool = tools.get("workflow_checkpoint");
+  assert.ok(checkpointTool, "workflow_checkpoint must be registered");
+  const checkpoint = checkpointTool.execute as unknown as AskExecute;
+  const envelope = checkpointEnvelope(issued);
+  const recorded = await checkpoint("t", {
+    ...envelope,
+    actor_provenance: firstActor,
+    decision: "proceed",
+    rationale: "pre-dispatch approval",
+  }, undefined, undefined, trustedToolContext(root));
+  assert.equal((recorded.details as { ok?: boolean; error?: string }).ok, true, (recorded.details as { error?: string }).error);
+
+  // Before any worker identity exists, the exact finalized answer authorizes
+  // the same checkpoint decision without minting a second ledger row.
+  const beforeDispatchReplay = await checkpoint("t", {
+    ...envelope,
+    actor_provenance: firstActor,
+    decision: "proceed",
+    rationale: "pre-dispatch approval",
+  }, undefined, undefined, trustedToolContext(root));
+  assert.equal((beforeDispatchReplay.details as { ok?: boolean; error?: string }).ok, true, (beforeDispatchReplay.details as { error?: string }).error);
+
+  const dispatchAuth = {
+    run_id: RUN_ID,
+    token: issued.dispatch_token,
+    capability_id: issued.capability_id,
+    run_key: RUN_ID,
+    branch: "main",
+    workflow: "lightweight",
+    profile_hash: profileHash(loadProfile("lightweight")!),
+    stage_cursor: "implementation",
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: 1,
+    role: "developer-kotlin",
+    agent: "developer-kotlin",
+  };
+  const authorized = authorizeDispatch(root, dispatchAuth);
+  assert.equal(authorized.ok, true, authorized.ok ? "dispatch authorized" : authorized.error);
+  if (!authorized.ok || !authorized.record) throw new Error(authorized.ok ? "dispatch authorization produced no record" : authorized.error);
+
+  // Materialization changes the projected hash, but not the immutable
+  // decision window, so exact replay remains valid.
+  const materializedReplay = await checkpoint("t", {
+    ...envelope,
+    actor_provenance: firstActor,
+    decision: "proceed",
+    rationale: "pre-dispatch approval",
+  }, undefined, undefined, trustedToolContext(root));
+  assert.equal((materializedReplay.details as { ok?: boolean; error?: string }).ok, true, (materializedReplay.details as { error?: string }).error);
+
+  const completed = completeDispatch(root, {
+    ...dispatchAuth,
+    dispatch_id: authorized.record.id,
+    outcome: "failed",
+    evidence: "first worker attempt failed",
+  }, { runId: RUN_ID });
+  assert.equal(completed.ok, true, completed.ok ? "worker failed terminally" : completed.error);
+  const retried = authorizeDispatch(root, { ...dispatchAuth, retry_of: authorized.record.id });
+  assert.equal(retried.ok, true, retried.ok ? "retry authorized" : retried.error);
+
+  // The retry projects a different real identity, while the original exact
+  // final remains bound to this capability's retained dispatch history.
+  const retryReplay = await checkpoint("t", {
+    ...envelope,
+    actor_provenance: firstActor,
+    decision: "proceed",
+    rationale: "pre-dispatch approval",
+  }, undefined, undefined, trustedToolContext(root));
+  assert.equal((retryReplay.details as { ok?: boolean; error?: string }).ok, true, (retryReplay.details as { error?: string }).error);
+
+  const changedDecision = await checkpoint("t", {
+    ...envelope,
+    actor_provenance: firstActor,
+    decision: "reject",
+    rationale: "different decision must not replay",
+  }, undefined, undefined, trustedToolContext(root));
+  const changedDetails = changedDecision.details as { ok?: boolean; error?: string };
+  assert.equal(changedDetails.ok, false);
+  assert.match(changedDetails.error ?? "", /stale or mismatched|consumed|conflict/);
+
+  const callsBefore = calls.length;
+  const fresh = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
+  const freshDetails = fresh.details as { ok?: boolean; already_recorded?: boolean; actor_provenance?: Record<string, unknown>; error?: string };
+  assert.equal(freshDetails.ok, true, freshDetails.error);
+  assert.equal(freshDetails.already_recorded, true, "exact finalized continuity must not ask for undeclared second approval");
+  assert.equal(calls.length, callsBefore, "the exact finalized decision must not re-open the dialog");
+
+  writeArtifact(canonicalTarget(root).artifactsDir, "implementation", {
+    files_touched: ["checkpoint-ask-hardening.test.ts"],
+    ready: true,
+    validation_run: true,
+    validation_evidence: "pre-dispatch approval continuity test",
+  });
+  const retriedCompletion = completeDispatch(root, {
+    ...dispatchAuth,
+    dispatch_id: retried.record!.id,
+    outcome: "succeeded",
+    artifact_ids: ["implementation"],
+    evidence: "retry completed after the original approval",
+  }, { runId: RUN_ID });
+  assert.equal(retriedCompletion.ok, true, retriedCompletion.ok ? "retry worker completed" : retriedCompletion.error);
+  const advanced = advanceCursor(root, {
+    token: issued.advance_token,
+    capability_id: issued.capability_id,
+    run_key: RUN_ID,
+    branch: "main",
+    workflow: "lightweight",
+    profile_hash: profileHash(loadProfile("lightweight")!),
+    stage_cursor: "implementation",
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: 1,
+    evidence: "the pre-dispatch approval authorizes the real stage advance",
+  }, { runId: RUN_ID });
+  assert.equal(advanced.ok, true, advanced.ok ? "pre-dispatch approval advanced the completed worker" : advanced.error);
+  assert.equal(readStateFile(root).stage_cursor, "code_review", "advance consumed the existing finalized decision without a second approval");
+
+  const state = readStateFile(root);
+  assert.equal((state.typed_checkpoint_decisions ?? []).length, 1, "continuity does not append a replacement decision");
+  assert.ok((state.trusted_checkpoint_answers ?? []).some((answer) => answer.answer_id === oldAnswerId), "the original answer remains in the audit ledger");
+});
+
+withFixture("ask: finalized real-attempt proof survives failed dispatch retry", async (root, ask, tools) => {
+  const issued = writeAskFixture(root);
+  const checkpointTool = tools.get("workflow_checkpoint");
+  assert.ok(checkpointTool, "workflow_checkpoint must be registered");
+  const checkpoint = checkpointTool.execute as unknown as AskExecute;
+  const dispatchAuth = {
+    run_id: RUN_ID,
+    token: issued.dispatch_token,
+    capability_id: issued.capability_id,
+    run_key: RUN_ID,
+    branch: "main",
+    workflow: "lightweight",
+    profile_hash: profileHash(loadProfile("lightweight")!),
+    stage_cursor: "implementation",
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: 1,
+    role: "developer-kotlin",
+    agent: "developer-kotlin",
+  };
+  const authorized = authorizeDispatch(root, dispatchAuth);
+  assert.equal(authorized.ok, true, authorized.ok ? "dispatch authorized" : authorized.error);
+  if (!authorized.ok || !authorized.record) throw new Error(authorized.ok ? "dispatch authorization produced no record" : authorized.error);
+
+  const calls: DialogCall[] = [];
+  const answered = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
+  const answeredDetails = answered.details as { ok?: boolean; actor_provenance?: Record<string, unknown>; error?: string };
+  assert.equal(answeredDetails.ok, true, answeredDetails.error);
+  assert.ok(answeredDetails.actor_provenance, "the real-attempt answer must return durable provenance");
+  const realAnswer = readStateFile(root).trusted_checkpoint_answers?.find((answer) =>
+    answer.answer_id === (answeredDetails.actor_provenance?.proof as { answer_id?: string } | undefined)?.answer_id);
+  assert.ok(realAnswer?.work_identity_witness, "a real singular-root answer must retain the engine-minted identity witness");
+  const recorded = await checkpoint("t", {
+    ...checkpointEnvelope(issued),
+    actor_provenance: answeredDetails.actor_provenance,
+    decision: "proceed",
+    rationale: "approval while the first worker identity was active",
+  }, undefined, undefined, trustedToolContext(root));
+  assert.equal((recorded.details as { ok?: boolean; error?: string }).ok, true, (recorded.details as { error?: string }).error);
+
+  const completed = completeDispatch(root, {
+    ...dispatchAuth,
+    dispatch_id: authorized.record.id,
+    outcome: "failed",
+    evidence: "first attempt failed",
+  }, { runId: RUN_ID });
+  assert.equal(completed.ok, true, completed.ok ? "first attempt completed" : completed.error);
+  const retry = authorizeDispatch(root, { ...dispatchAuth, retry_of: authorized.record.id });
+  assert.equal(retry.ok, true, retry.ok ? "retry authorized" : retry.error);
+
+  const replay = await checkpoint("t", {
+    ...checkpointEnvelope(issued),
+    actor_provenance: answeredDetails.actor_provenance,
+    decision: "proceed",
+    rationale: "approval while the first worker identity was active",
+  }, undefined, undefined, trustedToolContext(root));
+  assert.equal((replay.details as { ok?: boolean; error?: string }).ok, true, (replay.details as { error?: string }).error);
+  const historicalState = readStateFile(root);
+  const historicalDecision = historicalState.typed_checkpoint_decisions?.[0];
+  assert.ok(historicalDecision, "the retry must retain the finalized decision");
+  const profile = loadProfile("lightweight");
+  const stage = profile?.stages.find((candidate) => candidate.id === "implementation");
+  assert.ok(profile && stage && profile.checkpoint_policy, "lightweight checkpoint declaration must exist");
+  if (!historicalDecision || !profile || !stage || !profile.checkpoint_policy) throw new Error("historical fixture declaration is incomplete");
+  const declaration = resolveCheckpointDeclaration(stage, profile.checkpoint_policy, historicalState, "authorize");
+  assert.ok(declaration.ok && declaration.declaration, "historical lookup declaration must resolve");
+  if (!declaration.ok || !declaration.declaration) throw new Error(declaration.error);
+  const historical = findHistoricalCheckpointDecision(historicalState, declaration.declaration, {
+    decision_key: checkpointDecisionKey(historicalDecision),
+  });
+  assert.equal(historical.ok, true, historical.ok ? "historical exact lookup" : historical.error);
+  if (!historical.ok) throw new Error(historical.error);
+  assert.equal(historical.decision_key, checkpointDecisionKey(historicalDecision));
+
+  const callsBefore = calls.length;
+  const fresh = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
+  const freshDetails = fresh.details as { ok?: boolean; already_recorded?: boolean; error?: string };
+  assert.equal(freshDetails.ok, true, freshDetails.error);
+  assert.equal(freshDetails.already_recorded, true);
+  assert.equal(calls.length, callsBefore);
+});
+withFixture("ask: a forged real identity witness cannot authorize the finalized decision", async (root, ask, tools) => {
+  const issued = writeAskFixture(root);
+  const dispatchAuth = {
+    run_id: RUN_ID,
+    token: issued.dispatch_token,
+    capability_id: issued.capability_id,
+    run_key: RUN_ID,
+    branch: "main",
+    workflow: "lightweight",
+    profile_hash: profileHash(loadProfile("lightweight")!),
+    stage_cursor: "implementation",
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: 1,
+    role: "developer-kotlin",
+    agent: "developer-kotlin",
+  };
+  const authorized = authorizeDispatch(root, dispatchAuth);
+  assert.equal(authorized.ok, true, authorized.ok ? "dispatch authorized" : authorized.error);
+  if (!authorized.ok || !authorized.record) throw new Error(authorized.ok ? "dispatch authorization produced no record" : authorized.error);
+
+  const answered = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), []));
+  const details = answered.details as { ok?: boolean; actor_provenance?: Record<string, unknown>; error?: string };
+  assert.equal(details.ok, true, details.error);
+  assert.ok(details.actor_provenance, "the real answer must return durable provenance");
+  const proof = details.actor_provenance?.proof as { answer_id?: string } | undefined;
+  assert.ok(proof?.answer_id, "the real answer proof must identify its durable answer");
+
+  overwriteStateFile(root, (raw) => {
+    const answers = raw.trusted_checkpoint_answers as Array<Record<string, unknown>>;
+    const answer = answers.find((candidate) => candidate.answer_id === proof?.answer_id);
+    assert.ok(answer?.work_identity_witness, "the answer must carry its engine witness before the forgery");
+    const witness = answer!.work_identity_witness as Record<string, unknown>;
+    witness.worker_id = "forged-worker";
+  });
+
+  const checkpointTool = tools.get("workflow_checkpoint");
+  assert.ok(checkpointTool, "workflow_checkpoint must be registered");
+  const checkpoint = checkpointTool.execute as unknown as AskExecute;
+  const response = await checkpoint("t", {
+    ...checkpointEnvelope(issued),
+    actor_provenance: details.actor_provenance,
+    decision: "proceed",
+    rationale: "forged witness must fail closed",
+  }, undefined, undefined, trustedToolContext(root));
+  const result = response.details as { ok?: boolean; error?: string };
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /stale or mismatched|binding/);
+});
+
+withFixture("ask: an impossible consilium witness is never accepted as a current root", async (root, ask, tools) => {
+  const issued = writeAskFixture(root);
+  const dispatchAuth = {
+    run_id: RUN_ID,
+    token: issued.dispatch_token,
+    capability_id: issued.capability_id,
+    run_key: RUN_ID,
+    branch: "main",
+    workflow: "lightweight",
+    profile_hash: profileHash(loadProfile("lightweight")!),
+    stage_cursor: "implementation",
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    loop_iteration: 1,
+    role: "developer-kotlin",
+    agent: "developer-kotlin",
+  };
+  const authorized = authorizeDispatch(root, dispatchAuth);
+  assert.equal(authorized.ok, true, authorized.ok ? "dispatch authorized" : authorized.error);
+  if (!authorized.ok) return;
+  const answered = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), []));
+  const details = answered.details as { ok?: boolean; actor_provenance?: Record<string, unknown>; error?: string };
+  assert.equal(details.ok, true, details.error);
+  assert.ok(details.actor_provenance, "the real answer must return durable provenance");
+
+  overwriteStateFile(root, (raw) => {
+    const capability = raw.dispatch_capability as Record<string, unknown>;
+    capability.kind = "consilium";
+    capability.expected_count = 1;
+    delete capability.work_identity;
+    delete raw.work_identity;
+    delete raw.pending;
+    delete raw.completion_envelope;
+  });
+
+  const checkpointTool = tools.get("workflow_checkpoint");
+  assert.ok(checkpointTool, "workflow_checkpoint must be registered");
+  const checkpoint = checkpointTool.execute as unknown as AskExecute;
+  const response = await checkpoint("t", {
+    ...checkpointEnvelope(issued),
+    actor_provenance: details.actor_provenance,
+    decision: "proceed",
+    rationale: "consilium cannot mint a root witness",
+  }, undefined, undefined, trustedToolContext(root));
+  const result = response.details as { ok?: boolean; error?: string };
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /stale or mismatched|binding|witness/);
 });

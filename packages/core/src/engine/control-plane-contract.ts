@@ -503,7 +503,7 @@ function validateTrustedAnswerInto(value: unknown, path: string, issues: Control
   }
   unknownKeys(value, [
     "answer_id", "nonce", "channel", "reference", "run_id", "stage_id", "checkpoint_id",
-    "work_identity_hash", "capability_id", "capability_epoch", "loop_iteration", "policy_hash",
+    "work_identity_hash", "work_identity_witness", "capability_id", "capability_epoch", "loop_iteration", "policy_hash",
     "decision", "binding", "issued_at", "consumed_at", "consumed_reason", "finalized_decision_key",
   ], path, issues);
   for (const key of [
@@ -512,6 +512,7 @@ function validateTrustedAnswerInto(value: unknown, path: string, issues: Control
     "decision", "binding", "issued_at",
   ]) requireString(value, key, path, issues);
   requireEnum(value, "channel", ["terminal", "escalation"], path, issues);
+  if (value.work_identity_witness !== undefined) validateWorkIdentityInto(value.work_identity_witness, `${path}.work_identity_witness`, issues);
   if (value.loop_iteration !== undefined && (!Number.isInteger(value.loop_iteration) || (value.loop_iteration as number) < 1)) {
     add(issues, `${path}.loop_iteration`, "must be an integer >= 1");
   }

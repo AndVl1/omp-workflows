@@ -27,7 +27,7 @@ import { createHash } from "node:crypto";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { persistReturnedArtifacts, readArtifact, readArtifactInput, writeArtifact } from "./artifacts.js";
-import { validateProducedArtifact } from "./artifact-contract.js";
+import { artifactSchemaForStage, validateProducedArtifact } from "./artifact-contract.js";
 import { validateTypedDoD } from "../gates/dod-backstop.js";
 import { resolveConfig } from "./config.js";
 import { type ScopeFlags } from "./scope.js";
@@ -618,7 +618,7 @@ interface QaDoDOwnership {
   orchestratorOwner: boolean;
   standaloneOrchestrator: boolean;
 }
-
+const QA_DOD_OWNER_STAGE_IDS: Record<string, true> = { qa_tests: true, manual_qa: true };
 
 const QA_DOD_ITEM_CONTRACT = [
   "Root value is an object with an `items` array.",
@@ -642,7 +642,12 @@ function readQaDoDSnapshot(ctx: StageContext): QaDoDSnapshot {
   return { path, raw: input.content };
 }
 
-function renderQaDoDContract(snapshot: QaDoDSnapshot, ownership: QaDoDOwnership): string {
+function renderQaDoDContract(
+  snapshot: QaDoDSnapshot,
+  ownership: QaDoDOwnership,
+  stageId: string,
+  declaredOutputIds: readonly string[],
+): string {
   const current = snapshot.raw === null
     ? `DoD content is unavailable. Reason: ${snapshot.reason ?? "unknown read failure"}. Do not fabricate criteria or close items.`
     : [
@@ -652,6 +657,9 @@ function renderQaDoDContract(snapshot: QaDoDSnapshot, ownership: QaDoDOwnership)
       "```",
       snapshot.reason ? `Typed-item validation note: ${snapshot.reason}` : "The current JSON satisfies validateTypedDoD.",
     ].join("\n");
+  const declaredOutputs = declaredOutputIds.length > 0
+    ? declaredOutputIds.map((id) => `\`${id}\``).join(", ")
+    : "(none declared)";
   const ownershipRule = ownership.orchestrator
     ? ownership.orchestratorOwner
       ? ownership.standaloneOrchestrator
@@ -666,10 +674,14 @@ function renderQaDoDContract(snapshot: QaDoDSnapshot, ownership: QaDoDOwnership)
       ? "Do not edit dod.json directly; designate exactly one child writer in stable child order and keep every other child read-only."
       : "Do not edit dod.json directly; this non-owner orchestration slot must designate no child writer, and it plus all children remain read-only."
     : ownership.writable
-      ? "Write and verify the declared qa_tests artifact and the shared DoD sidecar when available."
+      ? declaredOutputIds.length > 0
+        ? `Write and verify the current stage's declared QA output${declaredOutputIds.length === 1 ? "" : "s"} (${declaredOutputs}) and the shared DoD sidecar when available.`
+        : "This stage declares no QA output files; write and verify the shared DoD sidecar when available."
       : "Do not write the shared DoD sidecar; return evidence and proposed updates to the designated writer.";
   return [
-    "## Shared DoD sidecar contract (qa_tests)",
+    "## Shared DoD sidecar contract",
+    `Current QA-owner stage: \`${stageId}\``,
+    `Declared QA output IDs: ${declaredOutputs}`,
     `Canonical expected shared sidecar path: ${snapshot.path}`,
     "The DoD is shared mutable authored state, not a declared QA output or required-input receipt, and MUST NOT be added to workflow_complete artifact_ids.",
     "### Source-backed typed DoD item contract",
@@ -1044,6 +1056,24 @@ ${input.content}
   const produces = slotScoped
     ? rawProduces.map((id) => `${id}-${sanitizeSlot(role)}.json`).join(", ")
     : rawProduces.join(", ") || "(none)";
+  const producerContracts = rawProduces.map((id) => {
+    const file = slotScoped ? `${id}-${sanitizeSlot(role)}.json` : `${id}.json`;
+    const schema = artifactSchemaForStage(stage.id, id);
+    const schemaBlock = schema
+      ? `Schema for the file root (apply this object directly; do not add an artifact-id key):
+\`\`\`json
+${JSON.stringify(schema, null, 2)}
+\`\`\``
+      : "No schema is declared for this artifact id; still write one direct JSON value to the named file and do not add an envelope.";
+    return [
+      `- File: \`${file}\` (artifact id \`${id}\`)`,
+      "  The file content is the artifact payload itself. The filename supplies the artifact identity.",
+      "  Do NOT write `{ \""
+        + id
+        + "\": { ... } }`, `{ \"payload\": ... }`, `{ \"artifact\": ... }`, markdown, or any other envelope.",
+      `  ${schemaBlock.replace(/\n/g, "\n  ")}`,
+    ].join("\n");
+  }).join("\n\n");
   const resolvedSlots = resolvedSlotRoster ?? (stage.type === "single" || stage.type === "consilium"
     ? resolveStageDispatchSlots(stage, ctx)
     : []);
@@ -1054,7 +1084,7 @@ ${input.content}
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
   let qaDoDContract = "";
-  if (stage.id === "qa_tests") {
+  if (QA_DOD_OWNER_STAGE_IDS[stage.id] === true) {
     const ownerSlot = resolvedSlots[0]?.slot ?? role;
     const standaloneOrchestrator = orchestratorRole && resolvedSlots.length === 0;
     const ownership: QaDoDOwnership = {
@@ -1066,7 +1096,7 @@ ${input.content}
       standaloneOrchestrator,
     };
     const snapshot = readQaDoDSnapshot(ctx);
-    qaDoDContract = `\n\n${renderQaDoDContract(snapshot, ownership)}`;
+    qaDoDContract = `\n\n${renderQaDoDContract(snapshot, ownership, stage.id, rawProduces)}`;
   }
   const capability = ctx.state.dispatch_capability;
   const markerCapabilityId = capability?.capability_id;
@@ -1101,8 +1131,11 @@ ${stage.prompt ?? "Follow the stage title and produce the declared artifact from
 
 ${qaDoDContract}
 
+### Producer artifact files
+${producerContracts || "This stage declares no producer artifact files."}
+
 ### Your job
-Execute this stage. Write your typed artifact to ${ctx.artifactsDir}/${slotScoped ? "<id>-<slot>.json" : "<id>.json"} matching the engine's schema (the engine reads only JSON, not prose).${slotScoped ? " This is a parallel consilium slot: write ONLY your own slot-scoped files (other slots write theirs). The engine deterministically synthesizes the shared artifacts at advance." : ""}
+Execute this stage. Write each declared artifact as the direct JSON value matching its file's schema above to the exact canonical artifact file under ${ctx.artifactsDir}. The filename supplies the artifact id; the engine reads only that flat JSON payload, never prose or a wrapper object.${slotScoped ? " This is a parallel consilium slot: write ONLY your own slot-scoped files (other slots write theirs). The engine deterministically synthesizes the shared artifacts at advance." : ""}
 
 Produces: ${produces}${readsBlock}${optionalReadsBlock}
 

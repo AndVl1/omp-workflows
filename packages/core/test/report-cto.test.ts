@@ -338,27 +338,98 @@ test("cto: without a teams.json registry, team stages claim no lead (never inven
   }
 });
 
-test("cto: standby run derives pending cto_discovery and decomposition stages", () => {
+test("cto: no-task standby derives pending discovery and decomposition stages", () => {
   const cwd = tmpWorkspace();
   try {
-    // A standby CTO run has not started discovery or decomposition: the
-    // ctoStageStatus standby branches return "pending" for cto_discovery
-    // (standby) and decomposition (standby + no plan teams).
+    // Only the engine-created no-task bootstrap is still before discovery or
+    // decomposition. A task-backed resident uses the completed task context.
     writeRun(
       cwd,
       makeCtoState({
+        task: "standby — awaiting inbox tasks",
         standby: true,
-        plan: { id: "run-1", task: "Build the report feature", teams: [], created_at: "2026-08-08T09:00:00.000Z" },
+        autonomous: true,
+        classification: undefined,
+        plan: { id: "run-1", task: "standby — awaiting inbox tasks", teams: [], created_at: "2026-08-08T09:00:00.000Z" },
         teams: [],
+        integration: { status: "pending" },
+        pause: { kind: "none", reason: "" },
+        wave_history: [],
       }),
     );
 
     const report = buildSessionReport(cwd, { kind: "cto", id: "run-1" });
 
-    assert.equal(report.stages.find((s) => s.id === "cto_discovery")?.status, "pending", "standby keeps discovery pending");
-    assert.equal(report.stages.find((s) => s.id === "decomposition")?.status, "pending", "standby with no teams keeps decomposition pending");
+    assert.equal(report.stages.find((s) => s.id === "cto_discovery")?.status, "pending", "no-task bootstrap keeps discovery pending");
+    assert.equal(report.stages.find((s) => s.id === "decomposition")?.status, "pending", "no-task bootstrap keeps decomposition pending");
     assert.equal(report.stages.find((s) => s.id === "teams")?.status, "not_started", "no teams → not_started");
-    assert.ok(report.meta.standby === true, "standby flag surfaced in report meta");
+    assert.ok(report.meta.standby === true, "waiting bootstrap surfaced in report meta");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("cto: closed task-backed resident derives completed discovery and keeps waiting metadata", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeRun(
+      cwd,
+      makeCtoState({
+        standby: true,
+        teams: [
+          { id: "alpha", status: "done", escalations: {} },
+          { id: "beta", status: "done", escalations: {} },
+        ],
+        integration: { status: "done" },
+        pause: { kind: "none", reason: "" },
+        wave_history: [{
+          id: "wave-1",
+          source: "test",
+          source_id: "test-1",
+          task: "Build the report feature",
+          slice_ids: ["api", "ui"],
+          status: "done",
+          started_at: "2026-08-08T09:00:00.000Z",
+          finished_at: "2026-08-08T11:00:00.000Z",
+        }],
+      }),
+    );
+
+    const report = buildSessionReport(cwd, { kind: "cto", id: "run-1" });
+
+    assert.equal(report.stages.find((s) => s.id === "cto_discovery")?.status, "done");
+    assert.equal(report.stages.find((s) => s.id === "decomposition")?.status, "done");
+    assert.equal(report.stages.find((s) => s.id === "integration_review")?.status, "done");
+    assert.equal(report.meta.standby, true, "closed wave is genuinely waiting for the next task");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("cto: failed task-backed resident keeps recovery context out of standby metadata", () => {
+  const cwd = tmpWorkspace();
+  try {
+    writeRun(
+      cwd,
+      makeCtoState({
+        standby: true,
+        wave_history: [{
+          id: "wave-1",
+          source: "test",
+          source_id: "test-1",
+          task: "Build the report feature",
+          slice_ids: ["api", "ui"],
+          status: "failed",
+          started_at: "2026-08-08T09:00:00.000Z",
+          finished_at: "2026-08-08T11:00:00.000Z",
+        }],
+      }),
+    );
+
+    const report = buildSessionReport(cwd, { kind: "cto", id: "run-1" });
+
+    assert.equal(report.stages.find((s) => s.id === "cto_discovery")?.status, "done");
+    assert.equal(report.meta.standby, undefined, "failed/blocked work is not mislabeled as no-task standby");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

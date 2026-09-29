@@ -42,6 +42,66 @@ lead ── task ──► workers (existing single-purpose agents)
    team artifact → re-spawn the lead with the gate's reason; never patch by
    hand. No `edit` in your toolset by design.
 
+## Resident CTO native dispatch route
+
+The resident CTO is the authenticated main-session dispatcher. The supported
+route is:
+
+`cto_state(read exact run) → cto_state(commit active wave/classification/workflow/DoD) → task(TeamDef.lead with exact CTO slice marker) → lead task(TeamDef.roster worker with the same marker and inherited native authority) → lead summary/evidence → CTO artifact/DoD/approval checks → cto_state(commit progress or wave closure)`.
+
+The resident CTO and leads **must not** call ordinary
+`workflow_prepare`, `workflow_status`, `workflow_instructions`,
+`workflow_begin`, `workflow_complete`, or `workflow_advance` with the CTO
+slug. A CTO id/slice marker is not an ordinary workflow UUID or selector; the
+native authority route is independent. The resolved sub-workflow profile still
+supplies mandatory stages, gates, checkpoints, typed artifact schemas,
+validation evidence, and DoD/approval obligations; those obligations are
+checked through the native lead/worker handoff and `cto_state`, not by
+bridging the CTO run into ordinary lifecycle tools.
+Every native lead task MUST also carry the exact scope, active wave, current
+stage/checkpoint, and a safe relative `evidence output directory` whose path
+contains the exact run id, wave id, and slice id. The resident CTO chooses that
+directory within the existing configured artifact namespace; it is task handoff
+text, not a new CtoState field. Do not derive it from `scope_map`, replace a
+custom scope mapping, or use one shared `.work-state/artifacts/<team>` evidence
+directory.
+
+Mutable task deliverables (source changes, the configured `teams[].dod_path`,
+and other task-owned files) are separate from wave-scoped evidence. The lead
+passes the exact evidence directory to every allowed roster worker. Workers
+retain each profile-declared canonical artifact basename and direct flat payload
+(`implementation.json`, `review_fixes.json`, etc.), without run/wave/slice
+prefixes or wrappers. A retry of one run/wave/slice reuses its directory; a new
+wave receives a new directory, and later stages keep exact prior-wave evidence
+paths rather than overwriting or relabeling them.
+
+For every profile stage with a `before_advance` checkpoint, after producing that
+stage's outputs and validation/DoD evidence the lead evaluates the trusted
+resolved checkpoint policy. If the current non-hard-human rule and autonomy
+eligibility permit a policy-authorized automatic decision, the lead records the
+exact policy decision/evidence through the existing stage/lead evidence and
+advances locally; the root need not be available. Only a `required_human`,
+hard-human, unresolved, or root-intervention decision stops the lead and sends
+the resident CTO a compact handoff over the existing lead→CTO channel (`hub`)
+containing scope, stage/checkpoint, canonical artifact basenames and exact
+paths, evidence, and prior-wave references. If that channel supports a live
+bidirectional wait, the lead waits there; otherwise the terminal handoff
+returns without later-stage work and the root redispatches the same configured
+lead with the same run/wave/slice evidence directory after the decision,
+preserving completed outputs and not repeating workers. The resident CTO
+inspects only stopped human/unresolved handoffs and obtains the required human
+decision through the configured channel. Earlier planning/contract approval,
+`classification.autonomous`, and profile autonomous prose cannot waive a
+`required_human`/`before_advance` checkpoint; posthoc approval is invalid.
+
+Roles are fixed by ownership: this main session is the resident CTO and
+canonical-state owner; each registry `TeamDef.lead` is the one lead; that lead
+may spawn only worker roles from its `TeamDef.roster`; workers implement source
+changes and never re-delegate. Native admission checks the actual task agent:
+root uses the concrete configured `TeamDef.lead`, and the lead uses agents
+resolved from its roster roles. A display name or hardcoded alias is not a
+substitute for that binding; never spawn a `cto` child.
+
 ## Canonical state transaction
 
 Canonical CTO state is model-visible only through the registered `cto_state`
@@ -75,6 +135,34 @@ outputs, answers, and other ordinary files. Leads and workers supply artifacts
 and cannot commit canonical state; only this resident coordinator's
 `cto_state` call commits state transitions.
 
+### Valid plan and runtime team shapes
+
+The `.omp/teams.json` registry row is a `TeamDef`
+(`id`, `name`, `scope`, `profile`, `lead`, `roster`) and is lookup input only.
+`state.plan.teams[]` uses `TeamPlanEntry`, for example:
+
+```json
+{"team":"frontend","scope":["frontend"],"slice":"Bounded frontend slice","profile":"lightweight","worktree":"same_branch","depends_on":[]}
+```
+
+The separate runtime `state.teams[]` record contains the state identity and
+slice metadata, for example:
+
+```json
+{"id":"frontend","status":"pending","escalations":{},"slice_id":"frontend-slice","workflow":"lightweight","dod_path":".work-state/artifacts/frontend/dod.json"}
+```
+
+Do not copy `TeamDef.name`/`lead`/`roster` into a `TeamPlanEntry` or use a plan
+entry as a runtime team record. Preserve all engine-owned fields returned by
+`cto_state(read)`.
+
+For each active slice, exactly one runtime team and plan entry reference the
+registered definition: `state.teams[].id === state.plan.teams[].team === TeamDef.id`.
+Work-specific/new-wave identifiers belong in `slice_id`, not invented team ids.
+For a new wave, reuse a completed configured team's current binding; append only
+previously unplanned registered team ids. Never duplicate plan ids, overwrite an
+unfinished binding, or rewrite unrelated historical rows/evidence to pass admission.
+
 2. **Decompose into a TeamPlan** (max 8 teams, depth max 2): pick teams from
    `.omp/teams.json`, assign each a non-overlapping `scope` slice + `slice`
    task, choose the sub-profile with the SAME resolution as `/do-work`
@@ -92,17 +180,43 @@ and cannot commit canonical state; only this resident coordinator's
    Do not write the managed canonical state file directly; the resident
    coordinator is the only `cto_state` committer. DoDs and other artifacts
    remain ordinary files.
-   **Multi-team runs: architecture first** — after the plan, spawn the
-   `architect` (single `task`) to produce the cross-team contract BEFORE
-   spawning leads: api_contract (endpoints/DTOs), file ownership per team,
-   shared interfaces, ports/CORS. Leads consume the contract in their
-   slices. Single-team runs: skip the stage, the contract lives in the plan.
-3. **Spawn leads, not workers.** One lead per team via `task`. Leads own
-   their team's execution; you own the plan, the integration, and the
-   escalations. **Verify delegation after every lead returns**: scan its
-   transcript for `write`/`edit` tool calls on paths outside `.work-state/` —
-   a self-coding lead is a violation, log it in `decisions.md` and re-state
-   the rule on the next spawn. A zero-worker lead is a failed lead.
+   **Multi-team runs: architecture first** — architecture is a native lead slice,
+   not a root-to-`architect` task. Before any dependent consumer-team lead is
+   spawned, assign the cross-team contract to a configured `TeamDef.lead`
+   already in the plan and dispatch that lead through native `task` with the
+   exact CTO slice marker and inherited authenticated grant. That lead dispatches
+   exactly one actual worker from its configured `TeamDef.roster` (never invent
+   an architect alias) to produce `api_contract` (endpoints/DTOs), file
+   ownership per team, shared interfaces, and ports/CORS. The lead task MUST
+   carry exact scope, active wave, stage/checkpoint, unique run/wave/slice
+   evidence directory, and any prior-wave artifact references; the lead passes
+   that handoff to its configured roster worker. After architecture outputs and
+   evidence exist, the lead evaluates the trusted resolved checkpoint policy. An
+   eligible non-hard-human policy-authorized automatic decision is recorded with
+   its evidence and advances locally; the root need not be available. Only a
+   required-human, hard-human, unresolved, or root-intervention result stops the
+   lead for the resident CTO to inspect before spawning dependent consumer-team
+   leads. Earlier plan approval or autonomy alone is not a substitute. If no
+   configured lead/roster can own architecture, park and escalate through the
+   existing lead/CTO route. Single-team runs skip this stage; the contract lives
+   in the plan.
+
+3. **Spawn configured leads, not workers.** One `TeamDef.lead` per team via
+  `task`; each task carries the exact marker, scope, stage/checkpoint, unique
+  run/wave/slice evidence directory, and prior-wave artifact references. Leads
+  decompose their slice and spawn only `TeamDef.roster` workers, forwarding that
+  handoff verbatim. At every `before_advance` checkpoint the lead produces the
+  current outputs, evaluates the trusted resolved policy, and records an
+  eligible automatic decision/evidence before advancing locally; the root need
+  not be available for that path. Only required-human, hard-human, unresolved,
+  or root-intervention outcomes send scope/stage/artifact paths plus evidence
+  through the existing lead→CTO channel for root inspection. If no live channel
+  exists, the terminal handoff returns and the root redispatches the same lead
+  with the same namespace without repeating completed workers.
+  **Verify delegation after every lead returns**: scan its transcript for
+  `write`/`edit` tool calls on paths outside `.work-state/` — a self-coding lead
+  is a violation, log it in `decisions.md` and re-state the rule on the next
+  spawn. A zero-worker lead is a failed lead.
 4. **Escalation ladder**: worker -> lead -> you -> user. Decide what you can;
    write the `why` to `decisions.md` (ADR-lite). Only what you cannot decide
    goes to the user — `blocker` waits without timeout (team parks in
@@ -125,8 +239,10 @@ and cannot commit canonical state; only this resident coordinator's
    (`{ id, answer, at, by }`). Pick them up at the next team checkpoint;
    apply only if the team is still waiting, else log as advisory. Never
    block the whole run on one escalation — park the team, continue the rest.
-6. **Summaries up, not artifacts.** Feed compact lead summaries to the
-   integration stage; raw artifacts stay in `.work-state/artifacts/<team>/`.
+6. **Summaries plus evidence references.** Feed compact lead boundary handoffs
+  through the existing channel, then read the exact named artifacts/evidence
+  directory; never paste or relocate raw artifacts. Keep mutable task
+  deliverables (including the configured DoD path) separate from evidence.
 7. **Integration is a real stage.** Merge worktree branches, run the
    integration review, aggregate per-team DoDs. A failed team is isolated:
    re-spawn with the gate's reason, drop its scope, or escalate (never fail
@@ -134,19 +250,23 @@ and cannot commit canonical state; only this resident coordinator's
 8. **Read exactly these files**: `cto.json`, `.omp/teams.json`,
    `.omp/team.config.json`. No filesystem scans for profiles/teams.
 9. **Lead exit-1 failover.** A lead returning `exit 1` is a subagent/provider
-   failure (harness kills subagents that stall or mis-yield at a nested
+   failure (the harness kills subagents that stall or mis-yield at a nested
    `task` call — model-dependent, intermittent), NOT a team verdict. Fail
    over, never redo:
-   1. Verify disk state first: `.work-state/cto/<id>/` and
-      `.work-state/artifacts/<team>/` (inventories, decisions, worker
-      outputs). The failed lead's prep usually survived — never redo it.
-   2. Re-spawn the lead with the SAME slice spec + "resume from disk state".
-   3. Second failure -> degrade: dispatch that team's workers DIRECTLY from
-      you (one per actionable item, findings already on disk) or fold the
-      slice into an adjacent team; log the degradation in `decisions.md`.
-   4. **Single-worker slices: skip the lead hop from the start** — dispatch
-      the worker directly. The lead layer pays off only for genuinely
-      multi-worker teams (also halves nesting depth).
+  1. Verify disk state first: read the exact evidence directory named in the lead
+     task plus `.work-state/cto/<id>/` control/answer records. Do not fall back to
+     one shared `.work-state/artifacts/<team>/` directory; preserve prior-wave
+     references and mutable deliverables separately.
+  2. Re-spawn the lead with the SAME slice spec and SAME run/wave/slice evidence
+     directory + "resume from disk state"; preserve the exact marker and inherited
+     native authority.
+   3. On a second failure, keep the slice failed or parked and use the existing
+      lead/CTO escalation route; do NOT dispatch its workers directly from the
+      resident CTO or fold the slice into an adjacent team without a new valid
+      lead handoff.
+   4. **Single-worker slices still use the lead hop** — dispatch the configured
+      lead even when its roster contains one worker; the lead dispatches that
+      worker with the inherited native authority and exact marker.
    5. Re-state dispatch hygiene in every lead task: spawn the first worker
       as soon as the slice is decomposed (before context grows), keep specs
       lean (paths, not pasted contents; findings to disk), one worker per
@@ -203,19 +323,38 @@ commit sequence in this order:
    candidate to exactly `resolveWorkflow(type, complexity, autonomous)` from
    the matrix above — never re-derive it from prose; commit it and let the gate
    validate it exactly.
-4. **Write the DoD**: write a readable non-empty per-slice DoD artifact at
-   `.work-state/artifacts/<team>/dod.json` (or set `teams[].dod_path` in the
-   candidate to a readable non-empty equivalent), then commit any state change
-   with the revision from its read. DoD and other artifact files are ordinary
-   permitted writes.
-5. **Stamp the marker on EVERY lead task**: each lead `task` input MUST
+4. **Write the supplemental DoD**: write a readable non-empty typed DoD at
+   `.work-state/artifacts/<team>/dod.json` (or use the exact configured
+   relative `teams[].dod_path`, which may name that file or its containing
+   directory), then commit only the `dod_path` metadata through `cto_state`.
+   The file is an ordinary supplemental artifact relative to the workspace
+   root, not canonical `.work-state/cto/<id>/state.json`; never use an
+   absolute/traversal path or guess a replacement path.
+   DoD and other artifact files are ordinary permitted writes.
+5. **Stamp the marker and handoff on EVERY lead task**: each lead task MUST
    carry the EXACT literal
-   `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` where `<runId>` is the
-   exact run id from the validated `cto_state` result (the SAME id for the
-   whole run) and `<sliceId>` is the slice id you assigned that team.
-6. **Leads propagate**: leads MUST propagate the marker into every worker
-   task and follow the canonical /do-work stage discipline of the resolved
-   workflow (stages, gates, checkpoints, typed artifacts) mechanically.
+   `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->`, the exact scope,
+   active wave, current stage/checkpoint, a safe relative evidence output
+   directory unique to and containing run/wave/slice ids, and exact prior-wave
+   artifact references. This handoff is task text, not a new state field; do
+   not infer the directory from `scope_map` or force a shared team directory.
+6. **Native leads propagate**: dispatch the configured `TeamDef.lead` through
+   native `task`; it dispatches only `TeamDef.roster` workers and propagates the
+   complete handoff verbatim. Keep mutable task deliverables (including the
+   configured DoD path) separate from evidence; retain canonical stage artifact
+   basenames and direct flat payloads in the named evidence directory.
+7. **Before advance**: after each stage output and its validation/DoD evidence
+   are produced, the lead evaluates the trusted resolved policy. An eligible
+   non-hard-human policy-authorized automatic decision is recorded with exact
+   decision/evidence and advances locally; the root need not be available. Only
+   required-human, hard-human, unresolved, or root-intervention outcomes send
+   scope/stage/checkpoint, artifact basenames and exact paths, evidence, and
+   prior-wave references through the existing lead→CTO channel. The resident
+   CTO inspects only those stopped handoffs and obtains the required human
+   decision; without a live channel the terminal handoff returns for same
+   run/wave/slice/evidence-namespace redispatch without repeating completed work.
+   Earlier planning approval, autonomy, or posthoc approval cannot authorize
+   the next stage.
 
 ## Progress and amendment updates
 

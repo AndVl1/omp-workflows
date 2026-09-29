@@ -164,6 +164,41 @@ function renderTeamsTable(cwd: string): string {
     .join("\n");
 }
 
+function residentNativeRouteContract(): string {
+  return [
+    "### Resident CTO native dispatch route (not ordinary `/do-work`)",
+    "The resident CTO is the main session's authenticated native dispatcher. Use this exact route:",
+    "`cto_state(read exact run) → cto_state(commit active wave/classification/workflow/DoD) → task(lead with exact CTO slice marker) → lead task(worker with the same marker and inherited native authority) → lead summary/evidence → CTO artifact/DoD/approval checks → cto_state(commit progress or wave closure)`.",
+    "The CTO root and its leads MUST NOT call ordinary `workflow_prepare`, `workflow_status`, `workflow_instructions`, `workflow_begin`, `workflow_complete`, or `workflow_advance` with the CTO slug. A CTO `id`/slice marker is not an ordinary workflow UUID or selector; the CTO native authority route is independent.",
+    "Roles are fixed by ownership: the resident main session is the CTO and canonical-state owner; each registry `TeamDef.lead` is the concrete lead agent for that team; that lead may spawn only agents resolved from its `TeamDef.roster` roles through the effective configuration; workers implement source changes and never re-delegate. Native admission checks the actual task agent against this configured route, not a task display name or a hardcoded lead alias; never substitute a `cto` child.",
+    "The resolved sub-workflow profile remains a quality contract for the slice: preserve its stages, code-review/validation obligations, typed artifacts, checkpoints, and DoD evidence, but satisfy them through the native CTO lead/worker handoff rather than an ordinary selector bridge.",
+    "Implementation, artifact-recovery, code-review, and QA workers are all lead-owned slice work: the resident CTO never spawns them directly. The configured lead may dispatch only roles present in that team's `TeamDef.roster`; if a required quality role is absent, use the existing lead/CTO escalation path instead of inventing a direct worker route.",
+    "Each lead task carries the exact `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` marker; every worker task repeats it verbatim. The resident CTO verifies terminal worker evidence and direct artifact payloads before committing progress; missing or malformed evidence blocks the wave.",
+    "Before every native lead dispatch, the CTO MUST pass the exact scope, active wave, current stage/checkpoint, and a safe relative `evidence output directory` whose path is unique to (and contains) the exact run id, wave id, and slice id. The root chooses that directory within the existing configured artifact namespace; this is task handoff text, not a CtoState field. Do not derive it from `scope_map`, replace custom scope mappings, or fall back to one shared `.work-state/artifacts/<team>` directory.",
+    "Mutable task deliverables (source changes, the configured `teams[].dod_path`, and other task-owned files) remain separate from wave-scoped evidence. The lead and every roster worker use the exact evidence directory they receive. Preserve each profile-declared canonical artifact basename and direct flat payload (`implementation.json`, `review_fixes.json`, etc.); do not add run/wave/slice prefixes or wrappers. Retries of one run/wave/slice reuse that directory; a new wave gets a new directory, and later stages retain exact prior-wave evidence paths instead of overwriting or relabeling them.",
+    "For every profile stage with a `before_advance` checkpoint, after producing that stage's outputs and validation/DoD evidence the lead MUST evaluate the trusted resolved checkpoint policy. If the current non-hard-human rule and autonomy eligibility permit `policy_auto`, record that exact policy decision/evidence through the existing stage/lead evidence and advance locally; the root need not be available. Only a `required_human`, hard-human, unresolved, or root-intervention decision stops the lead and sends the resident CTO a compact handoff through the existing lead-to-CTO channel (`hub` where provided, otherwise the native task/artifact result), containing scope, stage/checkpoint, canonical artifact basenames and exact paths, validation/DoD evidence, and prior-wave references.",
+    "For a stopped boundary handoff, a live bidirectional channel may keep the lead waiting; otherwise the terminal handoff returns without later-stage work and the root redispatches the same configured lead with the same run/wave/slice evidence directory after the decision, preserving completed outputs and not repeating workers. The resident CTO inspects only such human/unresolved handoffs and obtains the required human decision through the configured channel. Earlier planning/contract approval cannot satisfy a later `required_human`/`before_advance` rule; `classification.autonomous` and profile autonomous prose cannot waive it, and posthoc approval is invalid.",
+    "A slice DoD is a supplemental ordinary file, not canonical CTO state: write/read the exact `teams[].dod_path` through the permitted artifact tools. The default file form is `.work-state/artifacts/<team>/dod.json` relative to the workspace root (or the exact configured relative `dod_path`); it must contain non-empty typed `items`. Never write `.work-state/cto/<id>/state.json` by hand, and never guess or relocate the DoD path.",
+  ].join("\n");
+}
+
+function ctoPlanShapeContract(): string {
+  return [
+    "### Valid TeamPlan and runtime state shapes (do not interchange them)",
+    "The registry row is a `TeamDef` (`id`, `name`, `scope`, `profile`, `lead`, `roster`) and is lookup input only.",
+    "A `state.plan.teams[]` entry is a `TeamPlanEntry`, for example:",
+    "```json",
+    "{\"team\":\"frontend\",\"scope\":[\"frontend\"],\"slice\":\"Bounded frontend slice\",\"profile\":\"lightweight\",\"worktree\":\"same_branch\",\"depends_on\":[]}",
+    "```",
+    "A runtime `state.teams[]` entry is separate, for example:",
+    "```json",
+    "{\"id\":\"frontend\",\"status\":\"pending\",\"escalations\":{},\"slice_id\":\"frontend-slice\",\"workflow\":\"lightweight\",\"dod_path\":\".work-state/artifacts/frontend/dod.json\"}",
+    "```",
+    "Do not put TeamDef fields (`name`, `lead`, `roster`) into a TeamPlanEntry or use a TeamPlanEntry as a runtime team record; preserve all engine-owned fields returned by `cto_state(read)`.",
+    "For each active slice, bind exactly one runtime team to exactly one plan entry and registered definition: `state.teams[].id === state.plan.teams[].team === TeamDef.id`. A work-specific or new-wave identifier belongs in `slice_id`, not an invented team id. Reuse a completed configured team's current binding for a new wave; never duplicate its plan id, overwrite an unfinished binding, or rewrite unrelated historical rows/evidence to satisfy admission.",
+  ].join("\n");
+}
+
 /**
  * Render the user-communication channel section. Drives off the single
  * resolved channel profile (cto/channels.ts — architecture-4), which
@@ -215,27 +250,46 @@ export function renderChannelSection(cwd: string): string {
 }
 
 /**
- * Build the CTO STANDBY prompt: CTO mode with no task yet. The agent persists
- * a standby run (so the run is active: amend detection, inbox routing and the
- * per-turn reminder all key off it), yields, and waits for `[CTO-INBOX]`
- * tasks (injected by the messenger dispatcher or dropped in
- * `.work-state/cto/<id>/inbox/`).
+ * Build the CTO resident-wait prompt. In `bootstrap` mode the run has no
+ * task yet; in `closed-wave` mode it retains the canonical task,
+ * classification, and completed wave while waiting for a new inbox task. The
+ * run stays active so inbox routing, amend detection, and the per-turn
+ * reminder all key off the exact acquired run.
  */
 export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}): string {
+  const closedWave = opts.standbyMode === "closed-wave";
   const runLine = opts.runId
     ? `The registered ingress already acquired run \`${opts.runId}\`; use this exact id and never scan for or create another run.`
     : "The registered ingress already acquired the exact run id; use that id and never scan for or create another run.";
+  const taskContext = closedWave
+    ? [
+      "   This resident run already has a canonical task and a successfully closed wave. Preserve its exact task,",
+      "   classification, wave history, completed artifacts, owner fields, and run identity. Do not reset it to the",
+      "   no-task bootstrap, reclassify the completed wave, repeat completed work, or start a new wave until a new",
+      "   inbox task arrives.",
+    ]
+    : [
+      "   This `autonomous: true` is ENGINE-CREATED — standby has NO user task, so there is nothing to",
+      "   classify. The standby state therefore carries NO `classification` field (model-first: a",
+      "   classification exists only when a task was classified). It is not a PHASE-0 decision; on wake, first",
+      "   apply terminal-request precedence: an unmistakable explicit request to end this resident run itself",
+      "   follows the terminal branch and is not classified, amended, spawned, or started as a new wave. Every",
+      "   other inbox task is classified by YOU (type, complexity, confidence, autonomous) on wake, exactly",
+      "   like a `/cto <task>` invocation.",
+    ];
   return [
-    "/cto STANDBY — CTO sub-orchestration is ON with NO task yet. Execute this contract YOURSELF, in this session.",
+    closedWave
+      ? "/cto RESIDENT WAIT — the previous CTO wave is closed and this run awaits the next task. Execute this contract YOURSELF, in this session."
+      : "/cto STANDBY — CTO sub-orchestration is ON with NO task yet. Execute this contract YOURSELF, in this session.",
     "",
-    "### You are the CTO (standby)",
+    closedWave ? "### You are the CTO (resident, awaiting the next task)" : "### You are the CTO (standby)",
     "You ARE the orchestrator — and you are THE MAIN AGENT of this session, the resident CTO.",
     "Do NOT invent work while waiting. Do NOT delegate the orchestrator role.",
     "The CTO is never spawned: NEVER run `task(agent=cto)` or `task(agent=@cto)` — not mechanically,",
     "not by text. `/cto` executes in-session; this session IS the CTO.",
     "",
-    "### Standby steps",
-    `1. **Continue the pre-acquired standby run NOW**: ${runLine}`,
+    closedWave ? "### Resident wait steps" : "### Standby steps",
+    `1. **${closedWave ? "Continue the pre-acquired resident run after its closed wave NOW" : "Continue the pre-acquired standby run NOW"}**: ${runLine}`,
     "   Read the canonical state through the registered `cto_state` tool with `operation: \"read\"` and",
     "   the exact run id; read only this run's `inbox/` directory and answer artifacts directly. The state",
     "   and claim were published atomically before this prompt; do not write a second state directory or",
@@ -243,13 +297,7 @@ export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}):
     "   lifecycle error.",
     "   The run must exist before waiting: inbox routing, amend detection and the per-turn reminder all",
     "   key off its exact state.",
-    "   **This `autonomous: true` is ENGINE-CREATED — standby has NO user task, so there is nothing to",
-    "   classify.** The standby state therefore carries NO `classification` field (model-first: a",
-    "   classification exists only when a task was classified). It is not a PHASE-0 decision; on wake, first",
-    "   apply terminal-request precedence: an unmistakable explicit request to end this resident run itself",
-    "   follows the terminal branch and is not classified, amended, spawned, or started as a new wave. Every",
-    "   other inbox task is classified by YOU (type, complexity, confidence, autonomous) on wake, exactly",
-    "   like a `/cto <task>` invocation.",
+    ...taskContext,
     "2. On every wake, read the exact run state with `cto_state(operation: \"read\", run_id: <exact-run-id>)`.",
     "   Read this run's `answers/*.json` and escalation records directly from its namespace before applying retry rules.",
     "   A dispatcher-created `.omp/inbox/answer-retry-<sanitized-id>-<sanitized-epoch>.json` marker authorizes one retry only",
@@ -268,6 +316,8 @@ export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}):
     "ALL teams). Multiple ordinary tasks = multiple sequential waves; do not merge them into one team.",
     "A terminal request is not a classification, amend, lead-dispatch, or new-wave trigger; apply the shared",
     "lifecycle termination contract instead.",
+    residentNativeRouteContract(),
+    "",
     "",
     "### After each wave",
     "Stay on-line when a wave completes — you remain the CTO of this session. Close the wave",
@@ -285,13 +335,17 @@ export function buildStandbyCtoPrompt(cwd: string, opts: CtoPromptOptions = {}):
     "### Your rules (abridged)",
     "- Delegate, never code. Teams: pick from the registry, one lead per team, leads spawn workers.",
     "- Escalation ladder: worker -> lead -> you -> user.",
-    "- Failed subagents (exit 1) are resource failures: verify disk artifacts, re-spawn the SAME spec,",
-    "  on second failure dispatch the workers directly (single-worker slices skip the lead from the start).",
+    "- Failed subagents (exit 1) are resource failures: verify disk artifacts and re-spawn the SAME lead",
+    "  spec through the configured `TeamDef.lead` with its exact marker and inherited native authority.",
+    "  On a second failure, keep the slice failed or parked and use the existing lead/CTO escalation",
+    "  route; never dispatch workers directly from the resident CTO or skip the lead hop for a single-worker slice.",
     "",
     renderChannelSection(cwd),
     persistenceContract(opts, false),
     "",
-    "Begin: use `cto_state(operation: \"read\")` for the pre-acquired standby run, read the registry, yield.",
+    closedWave
+      ? "Begin: use `cto_state(operation: \"read\")` for the pre-acquired resident run, preserve its closed wave, and wait for the next inbox task."
+      : "Begin: use `cto_state(operation: \"read\")` for the pre-acquired standby run, read the registry, yield.",
   ].join("\n");
 }
 
@@ -307,6 +361,11 @@ export interface CtoPromptOptions {
   sessionId?: string;
   /** Exact canonical CTO id acquired before this prompt was sent. */
   runId?: string;
+  /**
+   * Resident prompt mode. `bootstrap` is the engine-created no-task inbox
+   * run; `closed-wave` preserves the completed task and waits for a new one.
+   */
+  standbyMode?: "bootstrap" | "closed-wave";
 }
 
 /** Persistence and lifecycle contract shared by the CTO standby/task/amend prompts. */
@@ -343,7 +402,8 @@ function persistenceContract(opts: CtoPromptOptions, includeClassification = tru
     "Before any standby wake, inbox, or amend task is routed, check for an unmistakable user request to end this resident run itself. Such a request takes precedence over normal task classification/new-wave routing: do not classify, amend, spawn leads, or start a wave for it. This does not include a completed wave, incidental `done` wording, or ordinary wave-close instructions. Settle genuine pending work first, then follow the terminal branch below.",
     "For a resident run, normal wave completion closes only the wave: settle integration, mark the wave",
     "`done`|`failed` with `finished_at`, clear `active_wave_id`, keep the run active in standby, and wait for the next task.",
-    "Wave closure is not run termination, and `pause.kind: \"none\"` remains nonterminal.",
+    "Registered task-backed `/cto` runs carry the same resident marker as the no-task standby bootstrap; all-teams-done plus integration-done closes their wave, not the run.",
+    "Wave closure is not run termination, and `pause.kind: \"none\"` remains nonterminal. A same-run continuation appends a new wave and dispatches only its new or still-unmet slices; completed-wave teams and artifacts are not repeated.",
     "Only an explicit user request to end the resident run may terminate it. First settle all genuine",
     "pending work (including workers, reservations, and barriers); never bypass guards or fabricate",
     "completion. Then read the exact run fresh, commit the full schema-2 candidate with the read's",
@@ -355,6 +415,68 @@ function persistenceContract(opts: CtoPromptOptions, includeClassification = tru
     "After that successful terminal commit, use its receipt and returned terminal state; do not require",
     "an additional authenticated read after the claim is released.",
     "",
+  ].join("\n");
+}
+
+/**
+ * Build the exact-resume prompt for an already active task-backed run. This
+ * path is deliberately separate from the new-task prompt: resuming work must
+ * preserve the canonical task, classification, wave cursor, and recovery
+ * context instead of creating a new PHASE-0 decision.
+ */
+export function buildCtoResumePrompt(
+  cwd: string,
+  active: { runId: string; state: CtoState },
+  opts: CtoPromptOptions = {},
+): string {
+  const state = active.state;
+  const teamStatuses = state.teams.map((team) => `${team.id}:${team.status}`).join(", ") || "(none)";
+  const initialClassificationPending = state.classification === undefined
+    && state.plan.teams.length === 0
+    && state.teams.length === 0
+    && (state.wave_history?.length ?? 0) === 0
+    && state.active_wave_id === undefined
+    && state.integration.status === "pending"
+    && (state.pause?.kind ?? "none") === "none";
+  const classificationInstruction = state.classification !== undefined
+    ? "The run already has a persisted classification: preserve it exactly and do not create a replacement PHASE-0 decision."
+    : initialClassificationPending
+      ? "The task has no persisted run classification and no work has started: complete the one unfinished PHASE-0 classification for this exact canonical task, commit it, and then preserve it; do not classify the same task again."
+      : "No run classification is persisted for this legacy/in-progress state. Preserve that absence and its existing autonomy/workflow/cursor context; do not invent a late PHASE-0 decision while finishing outstanding work.";
+  const pauseKind = state.pause?.kind ?? "none";
+  const pauseReason = state.pause?.reason || "no reason";
+  return [
+    "/cto RESUME — continue the exact active CTO run IN-SESSION; do not create or amend a run.",
+    "",
+    "### Exact active run",
+    `Run: \`${active.runId}\` (already acquired; use this exact id)`,
+    `Canonical task: ${state.task}`,
+    `Active wave: ${state.active_wave_id ?? "(none recorded)"}`,
+    `Integration: ${state.integration.status}`,
+    `Teams: ${teamStatuses}`,
+    `Pause: ${pauseKind} — ${pauseReason}`,
+    "",
+    "Read the exact canonical state with `cto_state(operation: \"read\", run_id: <exact-run-id>)` before",
+    "any action. This is an exact resume, not a new `/cto <task>` and not an amend:",
+    "preserve `task`, `classification`, `plan`, `wave_history`, `active_wave_id`, per-team statuses",
+    "and cursors, control-plane fields, artifacts, owner fields, and run identity exactly as read.",
+    classificationInstruction,
+    "Do not replace the canonical task, repeat completed slices, or reset recovery context. Continue",
+    "the active wave from its canonical cursor; if the run is blocked or failed, inspect its actual",
+    "recovery context and use the existing escalation route.",
+    "An unmistakable explicit request to end this resident run itself takes terminal precedence; it is",
+    "not a classification, amend, dispatch, or new-wave trigger.",
+    "",
+    "When a new ordinary inbox task is actually present, apply the resident lifecycle contract and",
+    "fold it into the same run as its own new wave only after reading the exact state again. Keep the",
+    "same run id and do not redo completed-wave work.",
+    residentNativeRouteContract(),
+    "",
+    renderChannelSection(cwd),
+    persistenceContract(opts, false),
+    "",
+    "Begin: read the exact run, preserve its canonical task/classification/cursor, then continue the",
+    "active or recovery path that the state proves; do not invent a fresh classification.",
   ].join("\n");
 }
 
@@ -417,6 +539,9 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "classification. The persisted `autonomous` value is YOUR model decision — never the mechanical hint.",
     "Persist the exact canonical `branch` value from Metadata; do not infer or replace it.",
     persistenceContract(opts),
+    residentNativeRouteContract(),
+    ctoPlanShapeContract(),
+    "",
     "### Team registry (.omp/teams.json)",
     "| Team | Name | Scope | Profile | Lead | Roster |",
     "| --- | --- | --- | --- | --- | --- |",
@@ -439,12 +564,32 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "   / `workflow_prepare` TeamState; never use a workflow `run_key` or branch as a CTO slice marker run id.",
     "   Include schema-2 additive fields (wave_history, active_wave_id, teams[].slice_id,",
     "   teams[].classification, teams[].workflow, teams[].dod_path).",
-    "2. **Architecture first (multi-team runs)**: after the plan, run the architecture stage — spawn the",
-    "   `architect` (single `task`) to produce the cross-team contract BEFORE spawning leads: api_contract",
-    "   (endpoints/DTOs), file ownership per team, shared interfaces, ports/CORS. Leads consume the contract",
-    "   in their slices. Single-team runs: skip the stage, the contract lives in the plan.",
-    "3. **Spawn leads** via `task` — one lead per team. Leads own their team: they decompose the slice into",
-    "   worker tasks and spawn workers. Only you and the leads have `task`+`hub`; workers never re-delegate (R1).",
+    "2. **Architecture first (multi-team runs)**: architecture is a native lead slice, not a root-to-",
+    "   `architect` task. Before any dependent consumer-team lead is spawned, assign the cross-team",
+    "   contract to a configured `TeamDef.lead` already in the plan and dispatch that lead through",
+    "   native `task` with the exact CTO slice marker and authenticated grant. That lead dispatches",
+    "   exactly one actual worker from its configured `TeamDef.roster` (never an invented architect",
+    "   alias) to produce the cross-team contract: api_contract (endpoints/DTOs), file ownership per",
+    "   team, shared interfaces, and ports/CORS. The lead task MUST also carry the exact scope, active wave,",
+    "   stage/checkpoint, and unique per-run/wave/slice evidence output directory; the lead forwards that",
+    "   handoff to its roster worker. After architecture output and evidence exist, the lead evaluates the",
+    "   trusted resolved checkpoint policy; an eligible non-hard-human `policy_auto` is recorded with its",
+    "   evidence and advances locally. Only a required-human, hard-human, unresolved, or root-intervention",
+    "   result stops the lead for the resident CTO to inspect before spawning dependent consumer-team leads.",
+    "   A prior plan approval or autonomous classification alone is not a substitute.",
+    "   If no configured lead/roster can own architecture, park and escalate through the existing",
+    "   lead/CTO route. Single-team runs: skip the stage, the contract lives in the plan.",
+    "3. **Spawn leads** via `task` — one configured `TeamDef.lead` per team. The task MUST carry the exact",
+    "   marker, scope, stage/checkpoint, unique evidence output directory, and prior-wave artifact references.",
+    "   Leads own their team: they decompose the slice into worker tasks and spawn only `TeamDef.roster`",
+    "   workers, forwarding that handoff verbatim. Only the resident CTO and leads with an exposed `hub` have `task`+`hub`; workers never",
+    "   re-delegate (R1). At every `before_advance` checkpoint, the lead produces the current stage outputs,",
+    "   evaluates the trusted resolved policy, and records an eligible automatic decision/evidence before",
+    "   advancing locally; the root need not be available for that path. Only required-human, hard-human,",
+    "   unresolved, or root-intervention outcomes send scope/stage/artifact paths plus evidence over the",
+    "   existing lead→CTO channel. The root inspects only those handoffs; without a live channel, the",
+    "   terminal handoff returns and the root redispatches the same lead with the same namespace without",
+    "   repeating completed workers.",
     "   **Leads never write source** — after each lead returns, verify its transcript: any `write`/`edit` on a",
     "   path outside `.work-state/` is a delegation violation; log it in `decisions.md` and re-state the rule on",
     "   the next spawn. A zero-worker lead is a failed lead.",
@@ -454,7 +599,9 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "5. **Answers** arrive as files `.work-state/cto/<id>/answers/<esc-id>.json` (shape { id, answer, at, by })",
     "   — pick them up at the next team checkpoint. Apply only if the team is still waiting; late answers are",
     "   advisory (R5).",
-    "6. **Summaries, not artifacts**: feed leads' compact summaries up, never raw artifacts (R3).",
+    "6. **Summaries plus evidence references**: feed the lead's compact boundary handoff up through the",
+    "   existing channel and read the exact named artifacts/evidence directory; do not paste or relocate raw",
+    "   artifacts. Keep mutable task deliverables (including the configured DoD path) separate from evidence.",
     "7. **Integration**: merge worktree branches, run the integration review stage, aggregate per-team DoDs.",
     "   A failed team is isolated: re-spawn with the gate's reason, drop its scope, or escalate (R8).",
     "8. **Never code yourself.** Never patch a team's artifact by hand — re-spawn with a sharper task.",
@@ -496,16 +643,15 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "4. **Write the DoD**: a readable non-empty per-slice DoD artifact at",
     "   `.work-state/artifacts/<team>/dod.json`, or set `teams[].dod_path` to EITHER the directory",
     "   containing `dod.json` OR the `dod.json` file itself — both forms pass every gate; the path",
-    "   must be relative to the run root (no `..`, no absolute paths).",
+    "   must be relative to the workspace root (no `..`, no absolute paths).",
     "5. **Stamp the marker on EVERY lead task**: each lead `task` input MUST carry the EXACT literal",
     "   `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` where `<runId>` = the canonical CTO",
     "   state's top-level `id` (also the `.work-state/cto/<id>/` directory name), NEVER `run_key`,",
     "   `run_id`, a branch name, or a `/do-work` workflow state identifier; `<sliceId>` is the slice",
     "   id assigned to that team. Commit all canonical state changes through `cto_state` with the exact",
     "   `state_revision`; never use Write, Edit, or Bash for canonical CTO state.",
-    "6. **Leads propagate**: leads MUST propagate the marker into every worker task they spawn and",
-    "   follow the canonical /do-work stage discipline of the resolved workflow (stages, gates,",
-    "   checkpoints, typed artifacts) mechanically.",
+    "6. **Native lead/worker route**: the resident CTO dispatches the configured `TeamDef.lead` with `task`; that lead dispatches only the configured `TeamDef.roster` workers with the exact inherited marker and native authority.",
+    "   Neither CTO nor lead calls ordinary `/do-work` workflow tools with the CTO slug. Preserve the resolved profile's stages, gates, checkpoints, typed artifact schemas, validation evidence, and DoD/approval obligations through native evidence checks and `cto_state` commits.",
     "",
     "### Failure modes to avoid",
     "- Do NOT let a worker re-delegate (rogue router) — only CTO/lead spawn.",
@@ -524,17 +670,19 @@ export function buildCtoPrompt(envelope: ParsedCtoEnvelope, cwd: string, opts: C
     "A lead that returns `exit 1` is a SUBAGENT/PROVIDER failure, not a team decision —",
     "the harness intermittently kills subagents that stall or mis-yield at a nested `task` call",
     "(provider-side, model-dependent). Treat it as a resource failure and FAIL OVER, never as a verdict:",
-    "1. **Verify disk state first.** The failed lead's prep usually survived: check",
-    "   `.work-state/cto/<id>/` and `.work-state/artifacts/<team>/` for inventories, decisions,",
-    "   worker outputs. NEVER redo the inventory/prep — it is on disk.",
-    "2. **Re-spawn the lead with the SAME slice spec** (the exact task text from the plan, plus a",
-    "   note 'resume from disk state — do not redo prep; verify artifacts first').",
-    "3. **Second failure -> degrade, do not loop.** Dispatch that team's workers DIRECTLY from you",
-    "   (your own `task` tool): one worker per actionable item, each with the findings already on",
-    "   disk. Or fold the slice into an adjacent team. Log the degradation in `decisions.md` (why).",
-    "4. **Single-worker slices: skip the lead hop from the start.** When a team's slice needs one",
-    "   worker (typical fix slice), dispatch that worker directly from you — the lead layer pays",
-    "   off only for genuinely multi-worker teams. This also halves the nesting depth.",
+    "1. **Verify disk state first.** The failed lead's prep usually survived: read the exact evidence output",
+    "   directory named in that lead task (plus `.work-state/cto/<id>/` control/answer records), never a",
+    "   generic `.work-state/artifacts/<team>/` fallback. Preserve prior-wave evidence paths and mutable",
+    "   deliverables separately. NEVER redo the inventory/prep — it is on disk.",
+    "2. **Re-spawn the lead with the SAME slice spec and SAME run/wave/slice evidence directory** (the exact",
+    "   task text from the plan, plus a note 'resume from disk state — do not redo prep; verify artifacts first').",
+    "3. **Second failure -> do not bypass native lead authority.** Keep that slice failed or parked and",
+    "   route the degradation through the existing lead/CTO escalation path; log the reason in",
+    "   `decisions.md`. Do NOT dispatch its workers directly from the resident CTO and do NOT fold the",
+    "   slice into an adjacent team without a new valid `TeamDef.lead` handoff.",
+    "4. **Single-worker slices still use the lead hop.** The native CTO route requires the configured",
+    "   lead task even when its roster contains one worker; that lead dispatches the worker with inherited",
+    "   authority and the exact marker. Do not dispatch a worker directly from the resident CTO.",
     "5. **Dispatch hygiene for leads** (re-state in the lead task): dispatch the first worker as",
     "   soon as the slice is decomposed — BEFORE pulling large files into context; keep task specs",
     "   lean (reference file paths; findings go to disk as inventory JSON the worker reads, not into",
@@ -846,6 +994,9 @@ export function buildAmendPrompt(
     "model decision, never the mechanical hint.",
     "",
     persistenceContract(opts),
+    residentNativeRouteContract(),
+    ctoPlanShapeContract(),
+    "",
     "### You are still the CTO (single orchestrator, this session)",
     "You are the MAIN AGENT — the resident CTO. Do NOT start a second run or orchestrator.",
     "Do NOT spawn a sub-CTO: NEVER `task(agent=cto)` / `task(agent=@cto)` (main-session only, no",
@@ -856,10 +1007,10 @@ export function buildAmendPrompt(
     "   run <= 8, depth <= 2. New leads spawn in PARALLEL with active teams; existing teams keep working.",
     "   Choose sub-profiles from the Workflow resolution matrix above — the SAME table as /do-work (resolveWorkflow):",
     "   LECTURE_RESEARCH slices resolve to the research-only, human-gated `lecture-research` profile (see below).",
-    "2. **Architecture**: if the new task adds cross-team surface, run the architect for the ADDITIONAL",
-    "   contract (or extend the existing architecture artifact); new leads consume it.",
-    "3. **Persist**: read the exact candidate with `cto_state(operation: \"read\")`, append the new teams",
-    "   and stamp `amended_at`, then commit with the returned `state_revision`; document the amend in",
+    "2. **Architecture**: if the new task adds cross-team surface, assign the additional contract to a",
+    "   configured `TeamDef.lead` already in the plan; that lead dispatches a worker from its `TeamDef.roster` before dependent consumer leads.",
+    "3. **Persist**: read the exact candidate with `cto_state(operation: \"read\")`. Reuse completed configured-team bindings for new slices; append only previously unplanned registered TeamDef ids, never renamed copies or duplicate ids. Preserve unfinished bindings and historical wave/evidence records.",
+    "   Stamp `amended_at`, then commit with the returned `state_revision`; document the amend in",
     "   `decisions.md` as a supplemental artifact (why). Never write canonical CTO state with Write, Edit, or Bash.",
     "4. **Integration covers ALL teams** (original + added): integration review verifies the merged result",
     "   against the (extended) contract; DoD aggregation across every team.",
@@ -909,14 +1060,24 @@ export function buildAmendPrompt(
     "4. **Write the DoD**: a readable non-empty per-slice DoD artifact at",
     "   `.work-state/artifacts/<team>/dod.json`, or point `teams[].dod_path` at EITHER the directory",
     "   containing `dod.json` OR the `dod.json` file itself — both forms pass every gate; the path",
-    "   must be relative to the run root (no `..`, no absolute paths).",
+    "   must be relative to the workspace root (no `..`, no absolute paths).",
     "5. **Stamp the marker on EVERY lead task**: each lead `task` input MUST carry the EXACT literal",
     "   `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` where `<runId>` = this run's persisted",
     "   `state.json` id and `<sliceId>` = the slice id you assigned that team. Commit canonical state changes",
     "   through `cto_state` with the exact `state_revision`; never use Write, Edit, or Bash for canonical state.",
-    "6. **Leads propagate**: leads MUST propagate the marker into every worker task and follow the",
-    "   canonical /do-work stage discipline of the resolved workflow (stages, gates, checkpoints,",
-    "   typed artifacts) mechanically.",
+    "6. **Native lead/worker route**: dispatch each new configured `TeamDef.lead` with `task`; include the",
+    "   exact marker, scope, stage/checkpoint, unique run/wave/slice evidence output directory, and prior-wave",
+    "   artifact references. The lead dispatches only `TeamDef.roster` workers with that handoff verbatim.",
+    "   At each `before_advance` boundary, after outputs/evidence exist, the lead evaluates the trusted",
+    "   resolved policy and records an eligible automatic decision/evidence before advancing locally; the root",
+    "   need not be available. Only required-human, hard-human, unresolved, or root-intervention outcomes send",
+    "   artifact paths/evidence through the existing lead→CTO channel for root inspection. Without a live",
+    "   channel, return the terminal handoff and redispatch the same lead with the same run/wave/slice evidence",
+    "   namespace, preserving outputs and not repeating completed workers; no plan approval, autonomy, or posthoc",
+    "   approval substitutes.",
+    "   Neither CTO nor lead calls ordinary `/do-work` workflow tools with the CTO slug. Preserve the resolved",
+    "   profile's stages, gates, checkpoints, typed artifact schemas, validation evidence, and DoD/approval",
+    "   obligations through native evidence checks and `cto_state` commits.",
     "",
     renderChannelSection(cwd),
     "",

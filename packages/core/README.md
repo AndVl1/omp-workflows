@@ -19,6 +19,12 @@ omp plugin install @andvl1/omp-workflows-core
 (The package carries an `omp: {}` manifest — skills are discovered without
 an extension entry; see [`docs/adding-agents.md`](../../docs/adding-agents.md).)
 
+When updating an installed bundle, update core first and then the bundle to a
+compatible published version. For npm plugins, use
+`omp plugin install @andvl1/omp-workflows-core@<version> --force`, then start a new
+OMP session; `plugin upgrade` targets marketplace plugins. The fullstack bundle
+documents the [paired install/update procedure](../fullstack/README.md#install).
+
 ## Public API
 
 ```typescript
@@ -34,6 +40,37 @@ export default function (pi: ExtensionAPI) {
   });
 }
 ```
+
+Этот короткий пример регистрирует только gates/config. Он не создаёт
+session-aware workflow-бандл и не регистрирует workflow tools или команды.
+Полная интеграция использует общий session controller и доверенный host
+adapter на всех трёх поверхностях:
+[`контракт и пример`](../../docs/adding-agents.md#4-регистрация-workflow).
+
+### Trusted host admission и миграция бандла
+
+В `registerTeamWorkflow` передача `getSessionController` требует
+`resolveTrustedToolCallActor`: TypeScript запрещает неполную комбинацию, а
+JS-потребитель получает `[workflow_registration:missing_actor_resolver]`
+до установки hooks. Если после обновления обычный `bash`/`write`/`edit`
+блокируется в свежей сессии, проверь именно host adapter бандла; отсутствие
+workflow не отменяет проверку личности. Не удаляй controller для обхода
+ошибки и не используй `actor`/`hasUI` как credentials.
+
+`TrustedToolCallResolution` поддерживает
+`{ kind: "denied", code: TrustedToolCallDenialCode }` для объяснимого отказа.
+Положительный no-run результат допустим только для аутентифицированного
+host; core отдельно проверяет отсутствие selected run и execution claim.
+Ordinary run, CTO и native worker сохраняют свои проверки полномочий.
+
+Отказы содержат стабильный `[workflow_admission:<code>]`, объяснение,
+безопасное действие и состав репорта. Известный отказ адаптера, отсутствие
+результата, исключение и ошибка canonical state не должны интерпретироваться
+как одна и та же проблема. В репорт включай сообщение, версии OMP/core/bundle,
+имя инструмента и сценарий idle/selected/CTO/worker, но не секреты, raw context
+или полный transcript. Подробности и действия:
+[`диагностика интеграции`](../../docs/adding-agents.md#как-разбирать-отказ-admission).
+
 ## Жизненный цикл обычного workflow
 
 Обычные запуски имеют явный режим `new`, `resume` или `rework`. Наличие старых файлов состояния само по себе не превращает новую задачу в продолжение. Для `/team` действует тот же контракт: это alias `/do-work`.
@@ -48,15 +85,33 @@ export default function (pi: ExtensionAPI) {
 /do-work --list --all-branches
 ```
 
+В fullstack и internal одноразовая привязка явной команды сохраняется между
+ответами агента в той же host-сессии: завершение ответа с классификацией не
+отменяет ещё не выполненный `workflow_prepare`. При этом ordinary execution
+claim по-прежнему освобождается на границе turn. Новая заменяющая команда,
+завершение host-сессии или её замена отменяют прежнюю привязку; переносить её
+в другую сессию или подменять token нельзя. Адаптеры используют
+`controller.release(receipt, { preserveCommandIntent: true })` только для
+проверенного turn-level stop, не для teardown.
+
 UUID не обязателен для обычного пользовательского сценария: имя задачи, однозначный фрагмент или пункт показанного списка разрешаются в точный `run_id` до мутации. `--run <run-id>` остаётся техническим selector для автоматизации и диагностики. `--` завершает разбор options, поэтому флаги внутри текста задачи не интерпретируются. Неоднозначный выбор возвращает список с названием, веткой, статусом и этапом; ошибочный явный selector не получает fallback.
 
 ### CTO lifecycle and exact-run continuation
 
 `/cto` is a registered host ingress, not a prompt-only command. Use
-`/cto --run <exact-cto-id> <task>` only when continuing a known CTO run; the
+`/cto --run <exact-cto-id> [task]` only when continuing a known CTO run; the
 selector identifies the run but does not prove ownership. Ingress acquires the
 authenticated host claim and publishes the CTO state atomically before the
 prompt is sent. It never scans for a latest active run.
+
+`/cto <task>` также запускает resident-координатора: успешное закрытие волны
+не завершает весь CTO-run. `/cto --run <id>` без новой задачи продолжает
+канонический task, план и незавершённые slices, не повторяя уже записанную
+классификацию или выполненную работу. После успешной закрытой волны этот же
+run ждёт следующую задачу; новая задача создаёт следующую волну.
+Отдельный явный `END` завершает resident через revision-checked `cto_state`
+commit с `pause.kind: "done"` и освобождает claim/private binding.
+Ошибочная или заблокированная работа не считается ожиданием новой задачи.
 
 The claim is bound to the worktree, branch, host session, process and ownership
 epoch. A managed session release may retain pending worker slots, so a later
@@ -76,6 +131,50 @@ the marker in a task prompt alone is never authority. Native child reservations
 settle from the persisted CTO tool-call/slot identity, independently of
 ordinary workflow dispatch origins, and terminal claim settlement happens only
 on an actual terminal CTO state transition.
+
+Resident CTO dispatch is a separate native route from ordinary workflow
+selectors: the main session reads/commits the exact `CtoState` through
+`cto_state`, dispatches the configured team lead with the exact CTO
+`run=<id> slice=<id>` marker, and the lead dispatches only its configured
+workers with inherited authority. CTO/lead tasks must not call ordinary
+`workflow_prepare`/`workflow_status`/`workflow_instructions`/`workflow_begin`
+or completion/advance tools with the CTO slug. The resolved slice profile
+still supplies its stage, gate, checkpoint, typed-artifact, validation, and DoD
+obligations; they are checked through native evidence and CTO state commits.
+Per-team DoD remains a supplemental file at the exact configured relative
+`teams[].dod_path` (default `.work-state/artifacts/<team>/dod.json`), never
+canonical CTO state.
+
+Зарегистрированный CTO ingress получает отдельный system turn-contract для
+native-маршрута; ordinary-команды сохраняют требование текущего `workflow_begin`.
+Выбор основан на private provenance успешного ingress и проходит те же проверки
+session/controller, точного prompt и однократного использования. Текст `/cto`
+в обычном сообщении не создаёт binding или dispatch authority; сам contract
+не заменяет runtime guards и обязательные human checkpoints.
+
+Native admission проверяет фактическое имя agent: root вызывает только
+`TeamDef.lead`, а lead — только разрешённый effective config состав `roster`.
+Маркер совпадает с `teams[].slice_id`; `teams[].id` должен однозначно связывать
+runtime team с `plan.teams[].team` и зарегистрированным `TeamDef.id`.
+Team ID не служит псевдонимом другого slice ID. Новая волна переиспользует
+завершённую team binding с новым `slice_id`, не добавляя дубликат team ID.
+Неоднозначная binding, недоступная mapped role или сменившийся configured lead
+блокируют delegation до резервирования workers; display name не даёт полномочий.
+
+Для `before_advance` сначала завершаются работа стадии и её evidence, затем
+оценивается фактическая resolved checkpoint policy. Допустимый `policy_auto`
+lead фиксирует и применяет локально; обязательное human-решение или неразрешённый
+вопрос передаёт resident CTO до запуска следующей стадии. Предварительное согласие
+на план, autonomy и позднее approval не заменяют `required_human`. Без доступного
+двустороннего канала lead возвращает промежуточный handoff как результат task;
+root получает решение и снова вызывает тот же configured lead с точным scope,
+не повторяя завершённых workers.
+
+До dispatch root задаёт отдельный evidence-каталог для точного run/wave/slice.
+Канонические имена producer artifacts сохраняются внутри него; retry использует
+тот же каталог, новая волна — новый. Старые evidence и ссылки не перезаписываются.
+Пути изменяемых исходников, shared deliverables и `teams[].dod_path` задаются
+отдельно; существующий `scope_map` остаётся источником назначения ролей.
 
 For a claimless legacy **JSON** run whose coordinator session is no longer
 available, use `/cto --recover-legacy --run <exact-cto-id>` (or the internal

@@ -36,6 +36,7 @@ import type { Profile, RoleConfig, StageDef, TeamState } from "../engine/types.j
 import { assessRunHealth } from "../cto/health.js";
 import { loadTeamDefs } from "../cto/plan.js";
 import type { CtoState, RunHealth, TeamDef, TeamRunStatus } from "../cto/types.js";
+import { isCtoResidentWaiting, isCtoStandbyBootstrap } from "../cto/state.js";
 import { readCanonicalObservabilityPointer } from "../observability/recorder.js";
 import type { ObservabilityEvent, ObservabilityPointer } from "../observability/events.js";
 import { redactReportBody } from "./redact.js";
@@ -513,7 +514,7 @@ function assembleCto(cwd: string, r: ResolvedCto, options: BuildSessionReportOpt
     updated_at: state.updated_at,
     generated_at: new Date().toISOString(),
     autonomous: state.autonomous,
-    ...(state.standby === true ? { standby: true } : {}),
+    ...(isCtoResidentWaiting(state) ? { standby: true } : {}),
     ...(state.owner_session ? { owner_session: state.owner_session } : {}),
     ...(state.amended_at ? { amended_at: state.amended_at } : {}),
   };
@@ -576,12 +577,13 @@ function assembleCto(cwd: string, r: ResolvedCto, options: BuildSessionReportOpt
 
 /** Deterministic CTO workflow-stage status derived from CtoState (no stages array). */
 function ctoStageStatus(state: CtoState, stageId: string): StageInfo["status"] {
+  const bootstrap = isCtoStandbyBootstrap(state);
   switch (stageId) {
     case "cto_discovery":
-      return state.standby ? "pending" : "done";
+      return bootstrap ? "pending" : "done";
     case "decomposition":
       if (state.plan.teams.length > 0) return "done";
-      return state.standby ? "pending" : "in_progress";
+      return bootstrap ? "pending" : "in_progress";
     case "architecture":
       return state.teams.some((t) => t.status !== "pending") ? "done" : "pending";
     case "teams":

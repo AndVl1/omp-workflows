@@ -56,7 +56,10 @@ import {
   type IssuedCapability,
 } from "../src/engine/durable.js";
 import {
+  checkpointAnswerBinding,
+  checkpointDecisionKey,
   checkpointPolicyHash,
+  findHistoricalCheckpointDecision,
   recordTrustedCheckpointAnswer,
   resolveCheckpointDeclaration,
   validateCheckpointForAdvance,
@@ -329,6 +332,51 @@ function productProfile(): Profile {
     ],
   };
 }
+/** A single-worker approval stage used to prove real witness history at the later product gate. */
+function realProductProfile(): Profile {
+  return {
+    name: "final-real-product",
+    title: "Final real product",
+    description: "real approval handoff",
+    match: { type: ["PRODUCT_DISCOVERY"] },
+    stages: [
+      {
+        id: "product_approval",
+        title: "Approval",
+        type: "single",
+        role: "product-owner",
+        produces: "product_approval_record",
+        checkpoint: "product_approval",
+        gate: "product_approval_recorded",
+        checkpoint_policy: productPolicy(),
+      },
+      { id: "product_handoff", title: "Handoff", type: "orchestrator", produces: "product_handoff", gate: "product_approval_recorded" },
+    ],
+  };
+}
+
+/** A consilium checkpoint whose synthetic answer must survive pending fan-in. */
+function consiliumCheckpointProfile(): Profile {
+  return {
+    name: "final-consilium-checkpoint",
+    title: "Final consilium checkpoint",
+    description: "pending fan-in checkpoint",
+    match: { type: ["OPS"] },
+    checkpoint_policy: clarificationPolicy("required_human"),
+    stages: [
+      {
+        id: "research",
+        title: "Research",
+        type: "consilium",
+        roles: ["analyst", "qa"],
+        parallel: true,
+        produces: "research",
+        checkpoint: "gate_ok",
+      },
+      { id: "next", title: "Next", type: "orchestrator", produces: "summary" },
+    ],
+  };
+}
 
 /** Same checkpoint id on both stages, DIFFERENT policies. */
 function stalePolicyProfile(): Profile {
@@ -381,7 +429,7 @@ function seedState(root: string, opts: SeedOptions): void {
     rework_generation: 0,
     branch: "main",
     title: "final corrections",
-    classification: { type: opts.profile.name === "final-product" ? "PRODUCT_DISCOVERY" : "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: opts.profile.name },
+    classification: { type: opts.profile.name === "final-product" || opts.profile.name === "final-real-product" ? "PRODUCT_DISCOVERY" : "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: opts.profile.name },
     task: "final corrections",
     workflow_override: false,
     issue: null,
@@ -1023,6 +1071,176 @@ test("final: the product_approval decision authorizes the product_handoff gate a
     const decisions = after.typed_checkpoint_decisions ?? [];
     assert.equal(decisions.length, 1);
     assert.equal(decisions[0]!.capability_epoch, issued.state.issued_for!.cursor_epoch, "the decision keeps its mint-time binding as audit scope");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("final: a new real product approval survives advance and satisfies the later historical product gate", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-real-product-"));
+  try {
+    initGit(root);
+    const profile = realProductProfile();
+    registerWorkflowProfiles([profile]);
+    const issued = singleCapability(profile, "product_approval", "product-owner");
+    seedState(root, { profile, stageCursor: "product_approval", slug: "final", capability: issued.state });
+    const issuedFor = issued.state.issued_for!;
+    const dispatchAuth: DispatchAuth = {
+      token: issued.dispatch_token,
+      capability_id: issued.capability_id,
+      run_key: RUN_ID,
+      branch: "main",
+      workflow: profile.name,
+      profile_hash: issuedFor.profile_hash,
+      stage_cursor: issuedFor.stage_cursor,
+      cursor_epoch: issuedFor.cursor_epoch,
+      loop_iteration: issuedFor.loop_iteration,
+      role: "product-owner",
+      agent: "product-owner",
+    };
+    const dispatched = authorizeDispatch(root, dispatchAuth);
+    assert.equal(dispatched.ok, true, dispatched.ok ? "approval worker authorized" : dispatched.error);
+    if (!dispatched.ok || !dispatched.record) return;
+
+    const trusted = mintAnswer(root, "final", "product_approval", "product_approval", "proceed", "final/real-product-answer");
+    assert.ok(trusted.answer.work_identity_witness, "the real approval must retain its engine witness");
+    const recorded = recordDecision(root, advanceAuthOf(issued), "product_approval", "product_approval", "proceed", { ref: trusted.answer.reference, proof: trusted.proof }, "real product owner approved");
+    assert.equal(recorded.ok, true, recorded.ok ? "real approval recorded" : recorded.error);
+
+    writeArtifacts(root, "final", {
+      product_approval_record: {
+        decision: "proceed",
+        approved_by: "product owner",
+        rationale: "real product owner approved",
+        decided_at: new Date().toISOString(),
+      },
+    });
+    const completed = completeDispatch(root, {
+      ...dispatchAuth,
+      dispatch_id: dispatched.record.id,
+      outcome: "succeeded",
+      artifact_ids: ["product_approval_record"],
+      evidence: "approval worker completed",
+    });
+    assert.equal(completed.ok, true, completed.ok ? "approval worker completed" : completed.error);
+
+    const toHandoff = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "real approval done" });
+    assert.equal(toHandoff.ok, true, toHandoff.ok ? "cursor moved to product_handoff" : toHandoff.error);
+    if (!toHandoff.ok || !toHandoff.handoff) return;
+
+    writeArtifacts(root, "final", {
+      product_handoff: {
+        decision: "proceed",
+        next_workflow: "spec-preparation",
+        product_spec_artifact: "product_spec",
+        instructions: "spec the approved direction",
+      },
+    });
+    const advanced = advanceCursor(root, { ...advanceAuthOfHandoff(toHandoff.handoff), evidence: "handoff done" });
+    assert.equal(advanced.ok, true, advanced.ok ? "the real historical approval authorizes the handoff gate" : advanced.error);
+    const after = readState(root, "final");
+    assert.equal(after.typed_checkpoint_decisions?.length, 1);
+    const retainedAnswer = after.trusted_checkpoint_answers?.[0];
+    assert.ok(retainedAnswer?.work_identity_witness, "the historical witness remains in the answer audit record");
+    const retainedDecision = after.typed_checkpoint_decisions?.[0];
+    assert.ok(retainedDecision, "the historical decision remains in the typed ledger");
+    if (!retainedAnswer || !retainedAnswer.work_identity_witness || !retainedDecision) return;
+    // Recompute the witness hash and answer binding, but do not rewrite the
+    // immutable proof/final key. Historical authorization must reject this
+    // self-redigested metadata rather than treating it as engine provenance.
+    const forgedWitness = { ...retainedAnswer.work_identity_witness, worker_id: "forged-worker" };
+    const forgedWitnessJson = JSON.stringify(Object.fromEntries(
+      Object.entries(forgedWitness).sort(([left], [right]) => left.localeCompare(right)),
+    ));
+    const forgedAnswer = {
+      ...retainedAnswer,
+      work_identity_witness: forgedWitness,
+      work_identity_hash: createHash("sha256").update(forgedWitnessJson).digest("hex"),
+      binding: "",
+    };
+    forgedAnswer.binding = checkpointAnswerBinding(forgedAnswer);
+    const forgedState: TeamState = {
+      ...after,
+      trusted_checkpoint_answers: [forgedAnswer],
+    };
+    const approvalStage = profile.stages.find((candidate) => candidate.id === "product_approval");
+    assert.ok(approvalStage?.checkpoint_policy, "real product approval declaration must remain available");
+    if (!approvalStage?.checkpoint_policy) return;
+    const declaration = resolveCheckpointDeclaration(approvalStage, profile.checkpoint_policy, forgedState, "authorize");
+    assert.ok(declaration.ok && declaration.declaration, "forged historical declaration must resolve before proof validation");
+    if (!declaration.ok || !declaration.declaration) return;
+    const historical = findHistoricalCheckpointDecision(forgedState, declaration.declaration, {
+      decision_key: checkpointDecisionKey(retainedDecision),
+    });
+    assert.equal(historical.ok, false, "self-redigested historical witness metadata must fail closed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("final: synthetic consilium approval remains valid while fan-in slots are pending", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-consilium-checkpoint-"));
+  try {
+    initGit(root);
+    const profile = consiliumCheckpointProfile();
+    registerWorkflowProfiles([profile]);
+    const issued = createCapability({
+      run_key: RUN_ID,
+      branch: "main",
+      workflow: profile.name,
+      profile_hash: profileHash(profile),
+      stage_cursor: "research",
+      kind: "consilium",
+      expected_roster: [
+        { role: "analyst", agent: "analyst" },
+        { role: "qa", agent: "qa" },
+      ],
+    });
+    seedState(root, { profile, stageCursor: "research", slug: "final", capability: issued.state });
+
+    // No singular root exists for this capability, so this is the ordinary
+    // deterministic synthetic answer path.
+    const trusted = mintAnswer(root, "final", "research", "gate_ok", "proceed", "final/consilium-answer");
+    assert.equal(trusted.answer.work_identity_witness, undefined);
+    const recorded = recordDecision(
+      root,
+      advanceAuthOf(issued),
+      "gate_ok",
+      "clarification",
+      "proceed",
+      { ref: trusted.answer.reference, proof: trusted.proof },
+      "consilium checkpoint approved",
+    );
+    assert.equal(recorded.ok, true, recorded.ok ? "synthetic consilium approval recorded" : recorded.error);
+
+    const dispatched = authorizeDispatch(root, {
+      ...advanceAuthOf(issued),
+      token: issued.dispatch_token,
+      role: "analyst",
+      agent: "analyst",
+    });
+    assert.equal(dispatched.ok, true, dispatched.ok ? "first consilium slot dispatched" : dispatched.error);
+    if (!dispatched.ok) return;
+
+    const pendingState = readState(root, "final");
+    const researchStage = profile.stages.find((candidate) => candidate.id === "research");
+    assert.ok(researchStage, "consilium research stage must remain declared");
+    if (!researchStage) return;
+    const declaration = resolveCheckpointDeclaration(researchStage, profile.checkpoint_policy, pendingState, "authorize");
+    assert.ok(declaration.ok && declaration.declaration, "pending consilium declaration must resolve");
+    if (!declaration.ok || !declaration.declaration) return;
+    const checkpoint = validateCheckpointForAdvance(
+      { id: "research", checkpoint: "gate_ok" },
+      pendingState,
+      declaration.declaration,
+    );
+    assert.equal(checkpoint.ok, true, checkpoint.ok ? "synthetic approval remains valid" : checkpoint.error);
+
+    // Fan-in completion is independent: the pending slot blocks the cursor,
+    // but does not invalidate the already-finalized synthetic approval.
+    const premature = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "one slot still pending" });
+    assert.equal(premature.ok, false, premature.ok ? "pending fan-in must not advance" : premature.error);
+    assert.equal(readState(root, "final").stage_cursor, "research");
+    assert.equal(readState(root, "final").typed_checkpoint_decisions?.length, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

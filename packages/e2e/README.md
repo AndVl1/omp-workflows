@@ -135,11 +135,34 @@ manually edit or delete those files. A live pass is **not** implied by scenario
 loading or package tests: run these commands after core/fullstack/internal
 integration and attach the resulting transcript/report paths.
 
+## Приёмка host admission
+
+Сценарий [`host-admission.json`](scenarios/host-admission.json) и
+операторский [`host-admission-task.md`](scenarios/host-admission-task.md)
+покрывают обычные `bash`/`write`/`edit`, selected workflow, native worker,
+terminal/restart, CTO, неполную регистрацию bundle, диагностику отказов,
+границы host-контекста, recovery повреждённого run и internal activation.
+
+Это **ручной checklist, не prompt модели**: стартуйте независимые scratch
+sessions без `--scenario` и `--task`. Перед первым заданием подтвердите
+фактическую Luna-модель host/worker и единственного владельца workflow.
+Отрицательные fault fixtures разрешены только в disposable scratch;
+их результаты не заменяют проверки настоящего foreign host context.
+Совпадения `expect` — подсказки наблюдения, не автоматический PASS.
+Отчёт обязан отдельно перечислять PASS/FAIL/BLOCKED для A1–A9,
+runtime evidence и cleanup. Недоступное внешнее Android-окружение
+нельзя объявлять проверенным по результатам локального fullstack.
+
+Первый live-прогон описан в
+[отчёте PR #72](../../vibe-report/host-admission-pr72-manual-qa-2026-09-29.md):
+5 PASS, 2 FAIL, 2 BLOCKED. Наличие сценария не означает зелёную приёмку;
+открытые workflow/CTO и shutdown-проблемы перечислены в отчёте.
+
 ## Subcommands
 
 | Command | Purpose |
 |---|---|
-| `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire the plugin via `npm link` (NOT `file:` — the unpublished peer would fail with ETARGET), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
+| `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire core/fullstack with scratch-local symlinks (no global npm/plugin mutation), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
 | `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. Honours the optional user-supplied overlay at `<scratch>/.omp/ux-e2e-overlay.user.json` (see [User-supplied overlay](#user-supplied-overlay)). |
 | `stop <scratch-dir>` | SIGTERM → SIGKILL the recorded process tree (see session.json `pid`). |
 | `transcript <scratch-dir>` | Render transcript.jsonl as text; `--tail N`, `--follow`. |

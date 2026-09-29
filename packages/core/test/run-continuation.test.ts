@@ -597,6 +597,157 @@ test("QA rework invalidates only downstream DoD evidence and rebinds a fresh sum
   }
 });
 
+test("manual_qa rework invalidates shared DoD evidence and rebinds summary while preserving upstream inputs", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-run-rework-manual-qa-dod-"));
+  try {
+    initGit(root);
+    const workflow = "manual-qa-rework-dod-evidence";
+    const manualQaProfile: Profile = {
+      name: workflow,
+      title: "Manual QA DoD rework",
+      description: "Manual QA shared DoD re-entry regression",
+      match: { type: ["FEATURE"] },
+      stages: [
+        { id: "implementation", title: "Implementation", type: "orchestrator", produces: "implementation" },
+        { id: "manual_qa", title: "Manual QA", type: "single", role: "manual-qa", consumes: ["implementation"], produces: "manual_qa" },
+        { id: "summary", title: "Summary", type: "orchestrator", consumes: ["implementation", "manual_qa", "dod"], produces: "summary" },
+      ],
+    };
+    registerWorkflowProfiles([manualQaProfile]);
+    const execution = trustedContext(root, BRANCH, "manual-qa-rework-session");
+    const created = prepareWorkflowState({
+      task: "Manual QA DoD rework evidence",
+      cwd: root,
+      branch: BRANCH,
+      autonomous: false,
+      classification: { ...CLASSIFICATION, workflow },
+      files: [],
+      issue: null,
+      mode: "new",
+      request_id: "manual-qa-rework-new",
+      execution,
+    });
+    const runId = created.state.run_id!;
+    const target = runTarget(root, runId);
+    const artifactsDir = target.artifactsDir!;
+    mkdirSync(artifactsDir, { recursive: true });
+    const implementation = JSON.stringify({ files_touched: ["src/example.ts"], build_status: "pass" });
+    const manualQa = JSON.stringify({ verdict: "PASS", evidence: ["manual QA v1"] });
+    const dod = JSON.stringify({
+      items: [{
+        id: "criterion-1",
+        criterion: "Shared DoD evidence is current",
+        verify_method: "Manual QA mutation",
+        status: "pending",
+        evidence: "",
+      }],
+    });
+    const implementationHash = createHash("sha256").update(implementation, "utf8").digest("hex");
+    const manualQaHash = createHash("sha256").update(manualQa, "utf8").digest("hex");
+    const dodHash = createHash("sha256").update(dod, "utf8").digest("hex");
+    writeFileSync(join(artifactsDir, "implementation.json"), implementation);
+    writeFileSync(join(artifactsDir, "manual_qa.json"), manualQa);
+    writeFileSync(join(artifactsDir, "dod.json"), dod);
+    writeFileSync(join(artifactsDir, "summary.json"), JSON.stringify({ source: "summary-v1" }));
+    const input = (artifact_id: string, path: string, sha256: string) => ({ artifact_id, path, sha256 });
+    const implementationInput = input("implementation", "implementation.json", implementationHash);
+    const manualQaInput = input("manual_qa", "manual_qa.json", manualQaHash);
+    const dodInput = input("dod", "dod.json", dodHash);
+    const manualQaInputs = [implementationInput];
+    const summaryInputs = [implementationInput, manualQaInput, dodInput];
+    updateCanonicalRun(root, runId, (state) => ({
+      ...state,
+      stage_cursor: "summary",
+      stages: manualQaProfile.stages.map((stage) => ({ id: stage.id, status: "done" as const })),
+      lifecycle_status: "complete",
+      pause: { kind: "done", reason: "" },
+      artifacts: {
+        implementation: "artifacts/implementation.json",
+        manual_qa: "artifacts/manual_qa.json",
+        dod: "artifacts/dod.json",
+        summary: "artifacts/summary.json",
+      },
+      required_inputs: {
+        implementation: [],
+        manual_qa: manualQaInputs,
+        summary: summaryInputs,
+      },
+      required_input_receipts: {
+        summary: {
+          stage_id: "summary",
+          capability_id: "old-capability",
+          cursor_epoch: "old-epoch",
+          rework_generation: 0,
+          read_at: "2026-09-20T00:00:00.000Z",
+          inputs: summaryInputs,
+        },
+      },
+    }));
+
+    const reopened = prepareWorkflowState({
+      task: "ignored for explicit rework",
+      cwd: root,
+      branch: BRANCH,
+      autonomous: true,
+      classification: { ...CLASSIFICATION, workflow },
+      mode: "rework",
+      run_id: runId,
+      request_id: "manual-qa-rework",
+      feedback: "Manual QA must refresh shared DoD evidence",
+      affected_stage: "manual_qa",
+      execution,
+    });
+    assert.equal(reopened.state.run_id, runId, "manual_qa rework must continue the same canonical run");
+    assert.equal(reopened.state.rework_generation, 1);
+    assert.equal(reopened.state.stages.find((stage) => stage.id === "implementation")?.status, "done");
+    assert.equal(reopened.state.stages.find((stage) => stage.id === "manual_qa")?.status, "pending");
+    assert.equal(reopened.state.stages.find((stage) => stage.id === "summary")?.status, "pending");
+    assert.equal(reopened.state.required_inputs?.manual_qa?.find((entry) => entry.artifact_id === "implementation")?.sha256, implementationHash);
+    assert.equal(reopened.state.required_inputs?.summary?.find((entry) => entry.artifact_id === "implementation")?.sha256, implementationHash);
+    assert.equal(reopened.state.required_inputs?.summary?.find((entry) => entry.artifact_id === "manual_qa")?.sha256, undefined);
+    assert.equal(reopened.state.required_inputs?.summary?.find((entry) => entry.artifact_id === "dod")?.sha256, undefined);
+    assert.equal(reopened.state.required_inputs?.summary?.find((entry) => entry.artifact_id === "manual_qa")?.path, "manual_qa.json");
+    assert.equal(reopened.state.required_input_receipts?.summary, undefined);
+    assert.equal(reopened.state.artifacts?.dod, "artifacts/dod.json", "shared DoD path remains declared for the refreshed sidecar");
+    assert.equal(readFileSync(join(artifactsDir, "implementation.json"), "utf8"), implementation, "unaffected upstream content remains intact");
+
+    const refreshedManualQa = JSON.stringify({ verdict: "PASS", evidence: ["manual QA v2"] });
+    const refreshedManualQaHash = createHash("sha256").update(refreshedManualQa, "utf8").digest("hex");
+    const refreshedDod = JSON.stringify({
+      items: [{
+        id: "criterion-1",
+        criterion: "Shared DoD evidence is current",
+        verify_method: "Manual QA mutation",
+        status: "met",
+        evidence: "Manual QA refreshed the criterion",
+      }],
+    });
+    const refreshedDodHash = createHash("sha256").update(refreshedDod, "utf8").digest("hex");
+    writeFileSync(join(artifactsDir, "manual_qa.json"), refreshedManualQa);
+    writeFileSync(join(artifactsDir, "dod.json"), refreshedDod);
+    updateCanonicalRun(root, runId, (state) => ({
+      ...state,
+      stage_cursor: "summary",
+      stages: manualQaProfile.stages.map((stage) => ({ id: stage.id, status: stage.id === "summary" ? "pending" as const : "done" as const })),
+    }));
+
+    const instructions = resolveWorkflowContract(root, { runId, branch: BRANCH });
+    assert.equal(instructions.stage.id, "summary");
+    assert.equal(instructions.stage.required_input_contents.find((entry) => entry.artifact_id === "implementation")?.sha256, implementationHash);
+    assert.equal(instructions.stage.required_input_contents.find((entry) => entry.artifact_id === "manual_qa")?.sha256, refreshedManualQaHash);
+    assert.equal(instructions.stage.required_input_contents.find((entry) => entry.artifact_id === "dod")?.sha256, refreshedDodHash);
+    const began = rawBeginCapability(root, undefined, { runId });
+    assert.equal(began.ok, true, began.ok ? "summary begin reads refreshed manual QA and DoD" : began.error);
+    if (!began.ok) return;
+    const afterBegin = resolveWorkflowContract(root, { runId, branch: BRANCH });
+    assert.equal(afterBegin.stage.input_read_receipt?.inputs.find((entry) => entry.artifact_id === "implementation")?.sha256, implementationHash);
+    assert.equal(afterBegin.stage.input_read_receipt?.inputs.find((entry) => entry.artifact_id === "manual_qa")?.sha256, refreshedManualQaHash);
+    assert.equal(afterBegin.stage.input_read_receipt?.inputs.find((entry) => entry.artifact_id === "dod")?.sha256, refreshedDodHash);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("legacy continuation payloads are rejected instead of selecting a branch-scoped state", () => {
   const root = mkdtempSync(join(tmpdir(), "omp-run-legacy-continuation-"));
   try {

@@ -255,9 +255,9 @@ export interface CtoState extends CtoControlPlaneFields {
    * LEGACY / engine-created autonomy flag. For task runs this is read-compat
    * only: new state mirrors `classification.autonomous` here so old readers
    * keep working, and the top-level flag NEVER overrides a present
-   * classification. Standby runs are the documented engine-created exception
-   * (no user task to classify): they carry `autonomous: true` and NO
-   * `classification` field.
+   * classification. The no-task standby bootstrap is the documented
+   * engine-created exception: it carries `autonomous: true` and no
+   * `classification` because there is no user task to classify.
    */
   autonomous: boolean;
   /**
@@ -265,7 +265,8 @@ export interface CtoState extends CtoControlPlaneFields {
    * task runs: `classification.autonomous` is the AUTHORITY for the run's
    * autonomy; the top-level `autonomous` field is mirrored (never
    * independent) when a classification is present. Absent on legacy runs and
-   * on engine-created standby runs (nothing to classify).
+   * on the engine-created no-task bootstrap (nothing to classify); a
+   * task-backed resident run retains its classification across closed waves.
    */
   classification?: ModelClassification;
   plan: TeamPlan;
@@ -314,16 +315,18 @@ export interface CtoState extends CtoControlPlaneFields {
   /** Set when a mid-run task was folded into this run (br-k19 amend protocol). */
   amended_at?: string;
   /**
-   * Standby run marker (schema-2 optional). Set by the inbox bootstrap and
-   * the standby prompt; standby runs are adoptable cross-session so queued
-   * inbox tasks are never lost when a new session starts.
+   * Resident run marker (schema-2 optional). The registered `/cto` ingress
+   * sets this for both task-backed runs and the no-task inbox bootstrap.
+   * Resident runs are adoptable cross-session after a wave closes; explicit
+   * terminal state still releases their claim.
    */
   standby?: boolean;
   /**
-   * OMP session id that owns an interactive task run (schema-2 optional).
-   * Foreign sessions must not amend an owned run (fresh contract instead);
-   * standby runs have no owner. Absent on legacy runs — they remain
-   * amendable (status quo).
+   * OMP session id associated with the interactive task ingress (schema-2
+   * optional). It remains provenance for task-backed resident runs and for
+   * the no-task bootstrap; resident claim/binding rules, not a caller's
+   * session label, govern cross-session continuation. Absent on legacy runs —
+   * they remain amendable (status quo).
    */
   owner_session?: string;
   pause: {

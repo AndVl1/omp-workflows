@@ -451,6 +451,156 @@ test("exact stop settles the host claim but retains command/controller binding u
 	);
 });
 
+test("internal turn stop preserves an explicit new intent for the next prepare", async () => {
+	resetWorkflowOwners();
+	const root = markedRoot();
+	const host = makePi({ tools: true });
+	ompWorkflowsInternal(host.pi as never);
+	initGit(root);
+	const owner = interactiveContext(root, "internal-command-intent-session");
+	host.fireSessionStart(owner);
+	const command = host.commands.get("omp-do-work");
+	assert.ok(command);
+	await command.handler("--new internal explicit lifecycle", owner);
+	const prompt = host.sent.at(-1);
+	assert.match(prompt ?? "", /Command intent token: `[0-9a-f-]{36}`/);
+	const token = /Command intent token: `([0-9a-f-]{36})`/.exec(prompt ?? "")?.[1];
+	assert.ok(token);
+	assert.equal(
+		host.fireBeforeAgentStart({ prompt, systemPrompt: ["base"] }, owner) !== undefined,
+		true,
+		"internal command provenance must be admitted before the classifier turn",
+	);
+	host.fireSessionStop(
+		{
+			type: "session_stop",
+			messages: [],
+			turn_id: 0,
+			session_id: owner.session_id,
+			session_file: owner.sessionManager.getSessionFile(),
+			stop_hook_active: false,
+			signal: new AbortController().signal,
+		},
+		owner,
+	);
+	const executePrepare = host.toolHandlers.get("workflow_prepare") as
+		| ((id: string, params: unknown, signal: unknown, update: unknown, ctx: unknown) => Promise<unknown>)
+		| undefined;
+	assert.equal(typeof executePrepare, "function");
+	const prepared = await executePrepare!(
+		"internal-command-intent-prepare",
+		{
+			mode: "new",
+			task: "internal explicit lifecycle after classifier boundary",
+			command_intent_id: token,
+			classification: {
+				type: "FEATURE",
+				complexity: "QUICK",
+				confidence: "HIGH",
+				autonomous: false,
+				workflow: "lightweight",
+			},
+		},
+		undefined,
+		undefined,
+		owner,
+	);
+	const details = (prepared as { details?: { ok?: boolean; error?: string } }).details;
+	assert.equal(details?.ok, true, details?.error ?? JSON.stringify(prepared));
+	host.fireSessionShutdown({ type: "session_shutdown" }, owner);
+});
+test("internal classifier stop preserves CTO supersession provenance", async () => {
+	resetWorkflowOwners();
+	const root = markedRoot();
+	const host = makePi({ tools: true });
+	ompWorkflowsInternal(host.pi as never);
+	initGit(root);
+	const owner = interactiveContext(root, "internal-cto-turn-stop-session");
+	host.fireSessionStart(owner);
+	const command = host.commands.get("omp-do-work");
+	const cto = host.commands.get("omp-cto");
+	assert.ok(command);
+	assert.ok(cto);
+	const stopEvent = {
+		type: "session_stop",
+		messages: [],
+		turn_id: 0,
+		session_id: owner.session_id,
+		session_file: owner.sessionManager.getSessionFile(),
+		stop_hook_active: false,
+		signal: new AbortController().signal,
+	};
+	const classification = {
+		type: "FEATURE" as const,
+		complexity: "QUICK" as const,
+		confidence: "HIGH" as const,
+		autonomous: false,
+		workflow: "lightweight",
+	};
+
+	await command.handler("--new internal predecessor for failed CTO", owner);
+	const failedPredecessorPrompt = host.sent.at(-1) ?? "";
+	const failedPredecessorToken = /Command intent token: `([0-9a-f-]{36})`/.exec(failedPredecessorPrompt)?.[1];
+	assert.ok(failedPredecessorToken);
+	assert.equal(host.fireBeforeAgentStart({ prompt: failedPredecessorPrompt, systemPrompt: ["base"] }, owner) !== undefined, true);
+	host.fireSessionStop(stopEvent, owner);
+	await assert.rejects(
+		cto.handler("--run missing-internal-cto failed acquisition", owner),
+		/CTO run 'missing-internal-cto' is missing/,
+	);
+	const executePrepare = host.toolHandlers.get("workflow_prepare") as
+		| ((id: string, params: unknown, signal: unknown, update: unknown, ctx: unknown) => Promise<unknown>)
+		| undefined;
+	assert.equal(typeof executePrepare, "function");
+	const recovered = await executePrepare!(
+		"internal-cto-failed-acquisition-prepare",
+		{
+			mode: "new",
+			task: "internal predecessor remains usable after failed CTO acquisition",
+			command_intent_id: failedPredecessorToken,
+			classification,
+		},
+		undefined,
+		undefined,
+		owner,
+	);
+	assert.equal((recovered as { details?: { ok?: boolean } }).details?.ok, true, JSON.stringify(recovered));
+	host.fireSessionStop(stopEvent, owner);
+
+	await command.handler("--new internal predecessor for CTO supersession", owner);
+	const supersededPrompt = host.sent.at(-1) ?? "";
+	const supersededToken = /Command intent token: `([0-9a-f-]{36})`/.exec(supersededPrompt)?.[1];
+	assert.ok(supersededToken);
+	assert.equal(host.fireBeforeAgentStart({ prompt: supersededPrompt, systemPrompt: ["base"] }, owner) !== undefined, true);
+	host.fireSessionStop(stopEvent, owner);
+	await cto.handler("internal successful CTO supersession", owner);
+	const outerPrompt = host.sent.at(-1) ?? "";
+	assert.match(outerPrompt, /internal successful CTO supersession/);
+	assert.equal(host.fireBeforeAgentStart({ prompt: outerPrompt, systemPrompt: ["base"] }, owner) !== undefined, true);
+	const rejected = await executePrepare!(
+		"internal-cto-supersession-rejected-prepare",
+		{
+			mode: "new",
+			task: "old CTO predecessor must be rejected",
+			command_intent_id: supersededToken,
+			classification,
+		},
+		undefined,
+		undefined,
+		owner,
+	);
+	const rejectedDetails = (rejected as { details?: { ok?: boolean; error?: string } }).details;
+	assert.equal(rejectedDetails?.ok, false, JSON.stringify(rejected));
+	assert.match(rejectedDetails?.error ?? "", /command intent token/);
+
+	await command.handler("--new internal future preparation after CTO supersession", owner);
+	const futurePrompt = host.sent.at(-1) ?? "";
+	const futureToken = /Command intent token: `([0-9a-f-]{36})`/.exec(futurePrompt)?.[1];
+	assert.ok(futureToken);
+	assert.equal(host.fireBeforeAgentStart({ prompt: futurePrompt, systemPrompt: ["base"] }, owner) !== undefined, true);
+	host.fireSessionShutdown({ type: "session_shutdown" }, owner);
+});
+
 test("same-identity headless start revokes internal authority and trusted start restores it", async () => {
 	resetWorkflowOwners();
 	const root = markedRoot();

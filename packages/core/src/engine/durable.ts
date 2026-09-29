@@ -3323,7 +3323,7 @@ export function commitCheckpointAnswer(cwd: string, input: CheckpointAnswerCommi
     // Validate EVERY record in the current immutable scope before any replay
     // result is returned. A malformed sibling or two conflicting finals is
     // ledger corruption and fails closed; array order never chooses a winner.
-    const currentRecords = [
+    const scopedRecords = [
       ...(state.typed_checkpoint_decisions ?? []),
       ...(state.checkpoint_decisions ?? []),
     ].filter((candidate) => {
@@ -3337,7 +3337,7 @@ export function commitCheckpointAnswer(cwd: string, input: CheckpointAnswerCommi
         && candidateScope.policy_hash === active.policy_hash;
     });
     const finalized = new Map<string, TypedCheckpointDecision>();
-    for (const candidate of currentRecords) {
+    for (const candidate of scopedRecords) {
       const validated = validateCheckpointDecision(state, candidate, { stage, declaration, mode: "current" });
       if (!validated.ok) {
         return {

@@ -3,11 +3,13 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-
 import {
 	buildAmendPrompt,
 	buildCtoPrompt,
+	buildCtoResumePrompt,
 	buildStandbyCtoPrompt,
 	parseCtoCommand,
 	parseEnvelope as parseCtoEnvelope,
 } from "./cto.js";
 import { acquireCtoIngress, recoverLegacyCtoIngress, suspendCtoSession, type CtoIngressResult } from "../cto/run.js";
+import { isCtoResidentWaiting } from "../cto/state.js";
 import { buildDoWorkPrompt, parseWorkEnvelope, type ParsedWorkEnvelope } from "./do-work.js";
 import { parseWorkflowCommand, type WorkflowCommandMode } from "./envelope.js";
 import { createSelectionSnapshot } from "../engine/run-store.js";
@@ -82,6 +84,11 @@ type CommandIntentOwnership = {
 
 type CommandProvenanceRecord = SessionIdentity & {
 	controller: WorkflowSessionController;
+	/**
+	 * Private route discriminator populated only by a trusted registered
+	 * command invocation. Hook input cannot select or override it.
+	 */
+	route: "ordinary" | "cto-native";
 	prompt?: string;
 	intent?: CommandIntentOwnership;
 	cto?: {
@@ -112,6 +119,17 @@ const WORKFLOW_TURN_CONTRACT = [
 	"Private scoped registered-workflow invocation (this turn only): request managed execution for the current engine workflow_begin single-worker or consilium handoff, even when a generic small-slice efficiency heuristic would discourage delegation. This request does not authorize dispatch; only the current engine-returned workflow_begin handoff does.",
 	"Use the exact current engine handoff, roster, and count; the current marker, cursor, epoch, and capability must be carried through, and every dispatch gate remains mandatory.",
 	"Never use this scope for arbitrary or classification delegation, direct edits, nested or worker re-delegation, stale capabilities, or any safety/operator ban or human checkpoint override.",
+].join(" ");
+
+/**
+ * Narrow, private context for the one turn caused by a registered CTO
+ * command. Native CTO admission owns routing; ordinary workflow tools and
+ * free-form routing prose cannot authorize dispatch.
+ */
+const CTO_TURN_CONTRACT = [
+	"Private scoped registered-CTO invocation (this turn only): use the authenticated current private coordinator binding to read and commit the exact canonical run through cto_state, then request native dispatch through the configured TeamDef lead and its resolved roster with the exact `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` marker. Prompt prose, display names, and inferred routes are not authority.",
+	"The current runtime claim, actor, native-route, quality, and human gates remain mandatory; only a current runtime admission and returned native handoff authorize dispatch. Never call ordinary workflow_prepare, workflow_status, workflow_instructions, workflow_begin, workflow_complete, or workflow_advance for this CTO route.",
+	"The resident CTO delegates only to its configured lead; each lead may delegate only to its resolved roster, and workers never re-delegate. Do not direct-dispatch workers, repair claims, or use stale, replayed, foreign, or mismatched run/slice markers.",
 ].join(" ");
 
 function canonicalCwd(value: unknown): string | undefined {
@@ -534,13 +552,25 @@ function buildCtoCommandPrompt(
 	const command = parseCtoCommand(args);
 	if (!command.ok) return `ERROR [${command.code}]: ${command.error}`;
 	const sessionId = ctx.sessionManager.getSessionId();
-	const task = command.task || (ingress.state.standby ? "" : ingress.state.task);
+	const hasRequestedTask = command.task.trim().length > 0;
+	const waiting = isCtoResidentWaiting(ingress.state);
+	const task = hasRequestedTask ? command.task : (waiting ? "" : ingress.state.task);
 	if (!task) {
-		ctx.ui.notify(`${ctoName}: standby mode — awaiting tasks via messenger inbox`, "info");
-		return buildStandbyCtoPrompt(cwd, { runId: ingress.run_id });
+		ctx.ui.notify(
+			`${ctoName}: ${waiting && (ingress.state.wave_history?.length ?? 0) > 0 ? "resident wave closed — awaiting next task" : "standby mode — awaiting tasks via messenger inbox"}`,
+			"info",
+		);
+		return buildStandbyCtoPrompt(cwd, {
+			runId: ingress.run_id,
+			standbyMode: waiting && (ingress.state.wave_history?.length ?? 0) > 0 ? "closed-wave" : "bootstrap",
+		});
 	}
 	const envelope = parseCtoEnvelope(task, cwd);
 	if (!envelope.task) return "ERROR: empty task after stripping prefix.";
+	if (!ingress.created && !hasRequestedTask) {
+		ctx.ui.notify(`${ctoName}: resuming run ${ingress.run_id} (canonical task and lifecycle state preserved)`, "info");
+		return buildCtoResumePrompt(cwd, { runId: ingress.run_id, state: ingress.state }, { sessionId, runId: ingress.run_id });
+	}
 	if (!ingress.created) {
 		ctx.ui.notify(`${ctoName}: amending run ${ingress.run_id} with: ${envelope.task.slice(0, 50)}`, "info");
 		return buildAmendPrompt(
@@ -637,6 +667,7 @@ function prepareCtoCommandInvocation(
 		const record: CommandProvenanceRecord = {
 			...binding.identity,
 			controller: binding.controller,
+			route: "cto-native",
 			cto: { ingress },
 		};
 		if (canInstallOuter) provenance.set(provenanceBindingKey, record);
@@ -743,6 +774,7 @@ function prepareCommandInvocation(
 	const record: CommandProvenanceRecord = {
 		...binding.identity,
 		controller: binding.controller,
+		route: "ordinary",
 		...(intent ? { intent } : {}),
 	};
 	provenance.set(provenanceBindingKey, record);
@@ -793,7 +825,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 		if (options.resolveCwd) return options.resolveCwd(ctx);
 		return resolveCommandCwd(ctx);
 	};
-	const clearOwnProvenance = (event: unknown, ctx: unknown): void => {
+	const clearOwnProvenance = (event: unknown, ctx: unknown, clearTrackedIntent = true): void => {
 		const identity = sessionIdentityFromManager(ctx);
 		if (!identity) return;
 		const requestedSessionId = eventSessionId(event);
@@ -803,7 +835,7 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 		const requestedCwd = eventCwd(event);
 		if (requestedCwd && requestedCwd !== identity.cwd) return;
 		deleteExactProvenanceRecord(provenance, identity);
-		deleteTrackedIntentRecord(trackedIntentProvenance, identity);
+		if (clearTrackedIntent) deleteTrackedIntentRecord(trackedIntentProvenance, identity);
 	};
 	const registerProvenanceHooks = (): void => {
 		if (typeof pi.on !== "function") return;
@@ -848,9 +880,13 @@ export function registerWorkflowCommands(pi: ExtensionAPI, options: WorkflowComm
 				return undefined;
 			}
 			if (record.intent) trackedIntentProvenance.set(provenanceBindingKey, record);
-			return { systemPrompt: [...incoming.systemPrompt, WORKFLOW_TURN_CONTRACT] };
+			const turnContract = record.route === "cto-native" ? CTO_TURN_CONTRACT : WORKFLOW_TURN_CONTRACT;
+			return { systemPrompt: [...incoming.systemPrompt, turnContract] };
 		});
-		pi.on("session_stop", clearOwnProvenance);
+		// The host's turn-level session_stop ends the classifier turn but not
+		// the trusted command intent. Keep only the private tracked record so
+		// a later CTO ingress can supersede it; teardown clears both records.
+		pi.on("session_stop", (event: unknown, ctx: unknown) => clearOwnProvenance(event, ctx, false));
 		pi.on("session_shutdown", clearOwnProvenance);
 	};
 	const claimForCommand = options.owner
