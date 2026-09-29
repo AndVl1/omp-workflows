@@ -38,11 +38,42 @@ production-код, host credentials, глобальные plugins/config или 
    доказательство actual model: до первой задачи получить session/model evidence.
    При Sol/Astra остановить только собственную сессию, исключить попытку из
    приёмки и исправить setup до продолжения. Не запускать LLM-задачи без проверки.
+   В wrapper явно задать `--thinking=high` и `--no-prewalk`, подтвердить
+   `thinking_level_change` вместе с `model_change`. Служебный auto-thinking
+   request или его ошибка не доказывает переключение primary model.
 5. Сохранить baseline `.work-state` до каждого негативного случая и наблюдать
    реальные tool results/файлы. Не создавать положительные evidence вручную.
 6. Для подачи terminal input использовать семантику настоящего Enter (`\r` /
    `pressEnter()`), не считать доставку `\n` выполнением команды. Не отправлять
    следующий шаг, пока предыдущий не завершён или явно не отказал.
+7. Для длительных прогонов задавать оба независимых ограничения harness:
+   `--max-time 90m --idle-ms 5400000`. Default idle watchdog закрывает PTY
+   после 20 минут без inbound traffic, даже когда модель или worker работает.
+   Для уже открытого соединения допустим authenticated same-size resize
+   `{t:"r",cols:<current>,rows:<current>}`: это heartbeat без user/model input.
+8. Не считать spinner, повторный TUI redraw или промежуточный `toolResult`
+   естественным завершением turn. Реальные calls и matching results считать
+   по JSONL `tool_call_id`; различать pending tool, следующий provider turn,
+   настоящий pending Ask и final/error. `idle-timeout` — harness-aborted
+   попытка, не product FAIL; сохранить её и исправить setup перед новым run.
+
+### Изоляция установки npm-пакетов
+
+В OMP 18.4.2 `plugin install <npm-target> --scope=project` предупреждает об
+игнорировании scope и всё равно использует user plugin store. `--local` также
+не передаётся npm installer. Не считать эти flags доказательством изоляции.
+
+Для package QA задать owned `HOME=<scratch-home>` и `PI_CONFIG_DIR=omp-config`.
+`PI_CONFIG_DIR` соединяется с home как имя каталога, поэтому не подставлять
+туда абсолютный путь в предположении, что он заменяет home. До любой установки
+с тем же environment выполнить `omp plugin doctor --json` без `--fix`:
+`plugins_directory` должен находиться внутри `<scratch-home>/omp-config/plugins`.
+`omp plugin list --json` в пустом store не должен показывать глобальные plugins.
+`PI_CODING_AGENT_DIR` сам по себе меняет agent data, а не npm plugin store.
+Все install/launch операции должны сохранять доказанную изоляцию; auth не
+копировать в отчёт и не менять глобальные credentials/config. Owned store,
+helpers и raw sessions исключить из app Git diff до первого model input.
+
 
 Для A2 минимальная существующая fullstack-конфигурация
 `<scratch>/.omp/team.config.json`:

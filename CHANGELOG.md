@@ -10,6 +10,8 @@ All notable changes to `omp-workflows` are documented here.
 
 ### Fixed
 - **Actionable host admission failures (#71)** — core distinguishes missing/unresolved/invalid/throwing adapters, unavailable workspace, identity/profile/worktree drift, controller/claim/artifact mismatches, unreadable run control, and CTO/native authority failures. Messages include a stable `workflow_admission` code, a safe next action, and report guidance without raw exceptions, credentials, claims, tool inputs, or transcripts. Fullstack/internal adapters report structured denial causes; authenticated native authority and existing claim checks are preserved. The external Android bundle still requires its own compatible host adapter.
+- **Producer artifact handoff** — native worker assignments now include the exact canonical filename and the same gate-aware JSON schema exposed by workflow instructions. Producers write the schema value directly at the JSON root, not inside an artifact-name or payload envelope; readiness and validation fields remain enforced. Consilium joins preserve slot-scoped output IDs while resolving schemas by the corresponding base produced artifact.
+- **Resident CTO routing** — fresh, standby and amendment instructions consistently route work through the configured team lead and its roster, without passing CTO slugs to ordinary workflow tools. Lead failures use configured-lead retry or park/escalation rather than direct-worker fallback; shared architecture is delegated through a configured lead before dependent teams. State examples and DoD paths follow the existing native contract, and closing a wave does not implicitly terminate the resident run.
 
 ## [0.29.0] — 2026-09-28
 ### Changed
