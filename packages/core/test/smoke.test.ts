@@ -95,6 +95,19 @@ test("core: loadAllProfiles returns reusable core profiles", async () => {
   }
 });
 
+test("core: shipped profiles do not consume artifacts before first production", async () => {
+  const profiles = await loadAllProfiles();
+  for (const profile of profiles) {
+    const produced = new Set<string>();
+    for (const stage of profile.stages) {
+      for (const artifact of stage.consumes ?? []) {
+        assert.ok(produced.has(artifact), `${profile.name}/${stage.id} consumes ${artifact} before it is produced`);
+      }
+      const outputs = typeof stage.produces === "string" ? [stage.produces] : stage.produces ?? [];
+      for (const artifact of outputs) produced.add(artifact);
+    }
+  }
+});
 test("core: resolveWorkflow matrix", () => {
   assert.equal(resolveWorkflow("FEATURE", "QUICK", false), "lightweight");
   assert.equal(resolveWorkflow("FEATURE", "MEDIUM", false), "standard");
