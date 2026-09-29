@@ -3,6 +3,9 @@ import { isAbsolute, resolve } from "node:path";
 import { hasStrictOrchestratorState } from "./gates/orchestrator-write.js";
 import { assertCtoSliceDispatchable, parseCtoSliceMarker } from "./cto/slice-gate.js";
 import { isCtoRunTerminal, readCtoState } from "./cto/state.js";
+import type { TeamDef } from "./cto/types.js";
+import { loadTeamDefs } from "./cto/plan.js";
+import { resolveAgentForRole, resolveConfig, type ResolvedConfig } from "./engine/config.js";
 import { readRunControlNoRecovery, readRunState, reserveExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
 type ManagedCtoGrantAuthority = {
   run_id: string;
@@ -28,6 +31,14 @@ type LegacyAuthorityResolver = (ctx: unknown, cwd: string, runId: string | undef
 const REGISTRY_SYMBOL = Symbol.for("omp-workflows.native-worker-authority");
 const REGISTRY_VERSION = 3 as const;
 const LIFECYCLE_CHANNEL = "task:subagent:lifecycle";
+export class NativeWorkerRouteError extends Error {
+  readonly code = "native_authority_route_denied" as const;
+
+  constructor() {
+    super("native worker configured CTO route denied");
+    this.name = "NativeWorkerRouteError";
+  }
+}
 
 type NativeActor = "worker" | "lead";
 type ParentActor = "orchestrator" | "lead";
@@ -69,6 +80,18 @@ type TaskItem = {
   task?: unknown;
   [key: string]: unknown;
 };
+type CtoTeamRoute = {
+  runId: string;
+  sliceId: string;
+  teamId: string;
+  lead: string;
+  roster: ReadonlySet<string>;
+};
+type CtoRouteResolution =
+  | { ok: true; route: CtoTeamRoute }
+  | { ok: false; kind: "canonical" | "binding" };
+
+
 type Candidate = {
   key: string;
   slotKey: string;
@@ -81,12 +104,14 @@ type Candidate = {
   ctoRunId?: string;
   ctoAuthority?: CtoGrantAuthority;
   ctoWorkerId?: string;
+  ctoTeamId?: string;
   input: unknown;
   inputShape: string;
   item: TaskItem;
   index: number;
   expectedAgent?: string;
   ctoSlice?: { runId: string; sliceId: string };
+  ctoActor?: NativeActor;
   dispatchOrigin?: DispatchOrigin;
   lifecycle?: StartedLifecycle;
   executionShape?: string;
@@ -104,6 +129,7 @@ type Grant = {
   ctoRunId?: string;
   ctoAuthority?: CtoGrantAuthority;
   ctoWorkerId?: string;
+  ctoTeamId?: string;
   index: number;
   agent: string;
   sessionFile: string;
@@ -355,6 +381,69 @@ function snapshotMatchesContext(snapshot: SessionSnapshot, ctx: unknown, cwd: st
 function samePath(left: string, right: string): boolean {
   return resolve(left) === resolve(right);
 }
+function resolvedRosterAgent(role: string, config: ResolvedConfig): string | undefined {
+  if (typeof role !== "string" || role.length === 0) return undefined;
+  if (config.agent_mapping) {
+    const mapped = config.agent_mapping.resolved_roles[role];
+    return typeof mapped === "string" && mapped.length > 0 ? mapped : undefined;
+  }
+  if (!Object.prototype.hasOwnProperty.call(config.roles, role)) return undefined;
+  const configured = resolveAgentForRole(role, config);
+  return typeof configured === "string" && configured.length > 0 ? configured : undefined;
+}
+
+/**
+ * Resolve a CTO slice through the same canonical links used to construct
+ * runtime state: runtime team id -> plan.team -> consumer TeamDef. The
+ * marker, title, scope, and agent names are never used as substitutes for
+ * those links.
+ */
+function configuredCtoRoute(cwd: string, runId: string, sliceId: string): CtoRouteResolution {
+  if (
+    !/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === ".."
+    || !/^[A-Za-z0-9._-]+$/.test(sliceId) || sliceId === "." || sliceId === ".."
+  ) return { ok: false, kind: "canonical" };
+  try {
+    const state = readCtoState(runId, cwd);
+    if (!state || state.id !== runId || isCtoRunTerminal(state)) return { ok: false, kind: "canonical" };
+    if (!assertCtoSliceDispatchable(state, { sliceId, root: cwd, markerRunId: runId }).ok) {
+      return { ok: false, kind: "canonical" };
+    }
+    const runtimeMatches = state.teams.filter((team) => team && team.slice_id === sliceId);
+    if (runtimeMatches.length !== 1) return { ok: false, kind: "binding" };
+    const runtimeTeam = runtimeMatches[0]!;
+    const runtimeIdMatches = state.teams.filter((team) => team && team.id === runtimeTeam.id);
+    if (runtimeIdMatches.length !== 1) return { ok: false, kind: "binding" };
+    const planMatches = state.plan.teams.filter((entry) => entry && entry.team === runtimeTeam.id);
+    if (planMatches.length !== 1) return { ok: false, kind: "binding" };
+    const defMatches = loadTeamDefs(cwd).filter((def) => def.id === planMatches[0]!.team);
+    if (defMatches.length !== 1) return { ok: false, kind: "binding" };
+    const def: TeamDef = defMatches[0]!;
+    if (typeof def.lead !== "string" || def.lead.length === 0 || !Array.isArray(def.roster)) {
+      return { ok: false, kind: "binding" };
+    }
+    const config = resolveConfig(cwd);
+    const roster = new Set<string>();
+    for (const role of def.roster) {
+      const agent = resolvedRosterAgent(role, config);
+      if (!agent) return { ok: false, kind: "binding" };
+      roster.add(agent);
+    }
+    return {
+      ok: true,
+      route: {
+        runId,
+        sliceId,
+        teamId: runtimeTeam.id,
+        lead: def.lead,
+        roster,
+      },
+    };
+  } catch {
+    return { ok: false, kind: "canonical" };
+  }
+}
+
 
 function structuralShape(value: unknown, stack = new Set<object>()): string | undefined {
   if (value === null) return "null";
@@ -700,8 +789,7 @@ export function createNativeWorkerAuthority(
     if (prior) revokeGrant(registry, prior);
     const generation = (registry.generations.get(candidate.slotKey) ?? 0) + 1;
     registry.generations.set(candidate.slotKey, generation);
-    const leadAgent = candidate.expectedAgent === "team-lead" || candidate.expectedAgent === "omp-team-lead";
-    const actor: NativeActor = leadAgent && candidate.ctoSlice ? "lead" : "worker";
+    const actor: NativeActor = candidate.ctoActor ?? "worker";
     const grant: Grant = {
       slotKey: candidate.slotKey,
       generation,
@@ -716,6 +804,7 @@ export function createNativeWorkerAuthority(
         ctoAuthority: candidate.ctoAuthority,
         ...(candidate.ctoWorkerId ? { ctoWorkerId: candidate.ctoWorkerId } : {}),
       } : {}),
+      ...(candidate.ctoTeamId ? { ctoTeamId: candidate.ctoTeamId } : {}),
       index: candidate.index,
       agent: candidate.lifecycle.agent,
       sessionFile: candidate.lifecycle.sessionFile,
@@ -853,20 +942,46 @@ export function createNativeWorkerAuthority(
       const parent = readSnapshot(ctx);
       if (!inputShape || !items || !parent) return false;
       const leadMarkers = items.map((item) => parseCtoSliceMarker(typeof item.task === "string" ? item.task : ""));
+      const routeCache = new Map<string, CtoRouteResolution>();
+      const routeResolutions = leadMarkers.map((marker) => {
+        if (!marker) return undefined;
+        const key = `${marker.runId}\u0000${marker.sliceId}`;
+        if (!routeCache.has(key)) routeCache.set(key, configuredCtoRoute(parent.cwd, marker.runId, marker.sliceId));
+        return routeCache.get(key);
+      });
+      const leadRoutes = routeResolutions.map((resolution) => resolution?.ok ? resolution.route : undefined);
       const allLeadItems = actor === "orchestrator" && items.every((item, index) => {
         const agent = typeof item.agent === "string" ? item.agent : "";
         const marker = leadMarkers[index];
-        return (agent === "team-lead" || agent === "omp-team-lead") && !!marker;
+        const route = leadRoutes[index];
+        return !!marker && !!route && agent === route.lead;
       });
-      const leadItemsHaveMarkers = items.every((item, index) => {
-        const agent = typeof item.agent === "string" ? item.agent : "";
-        return (agent !== "team-lead" && agent !== "omp-team-lead") || !!leadMarkers[index];
-      });
-      if (!leadItemsHaveMarkers || runId && (!/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === "..")) return false;
+      if (runId && (!/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === "..")) return false;
       if (!runId && !allLeadItems) return false;
-      const markerRunIds = leadMarkers.filter((marker): marker is { runId: string; sliceId: string } => !!marker).map((marker) => marker.runId);
+      const markerRunIds = leadMarkers
+        .filter((marker): marker is { runId: string; sliceId: string } => !!marker)
+        .map((marker) => marker.runId);
+      const routeBindingFailure = leadMarkers.some((marker, index) => {
+        if (!marker) return false;
+        const resolution = routeResolutions[index];
+        return !!resolution && !resolution.ok && resolution.kind === "binding";
+      });
+      const routeCanonicalFailure = leadMarkers.some((marker, index) => {
+        if (!marker) return false;
+        const resolution = routeResolutions[index];
+        return !!resolution && !resolution.ok && resolution.kind === "canonical";
+      });
+      const routeRoleMismatch = items.some((item, index) => {
+        const marker = leadMarkers[index];
+        const resolution = routeResolutions[index];
+        if (!marker || !resolution?.ok) return false;
+        const agent = typeof item.agent === "string" ? item.agent : "";
+        return agent !== resolution.route.lead;
+      });
       const authorityRunId = runId ?? markerRunIds[0];
       let parentBinding: Binding | undefined;
+      let inheritedRoute: CtoTeamRoute | undefined;
+      let inheritedRouteResolution: CtoRouteResolution | undefined;
       if (actor === "lead") {
         // A lead runs in its own session, so coordinator-session lookup cannot
         // authenticate this call. Inherit only the original grant's live
@@ -888,14 +1003,34 @@ export function createNativeWorkerAuthority(
           || !ctoAuthorityCurrent(parentGrant, false)
           || !parentGrant.ctoSlice
         ) return false;
+        const inheritedSlice = parentGrant.ctoSlice;
+        if (!inheritedSlice) return false;
         const everyMarkerMatches = items.every((item) => {
           const text = typeof item.task === "string" ? item.task : "";
           const marker = parseCtoSliceMarker(text);
           return !!marker
-            && marker.runId === parentBinding!.grant.ctoSlice!.runId
-            && marker.sliceId === parentBinding!.grant.ctoSlice!.sliceId;
+            && marker.runId === inheritedSlice.runId
+            && marker.sliceId === inheritedSlice.sliceId;
         });
         if (!everyMarkerMatches) return false;
+        inheritedRouteResolution = configuredCtoRoute(
+          parent.cwd,
+          inheritedSlice.runId,
+          inheritedSlice.sliceId,
+        );
+        if (!inheritedRouteResolution.ok) {
+          if (inheritedRouteResolution.kind === "binding") throw new NativeWorkerRouteError();
+          return false;
+        }
+        inheritedRoute = inheritedRouteResolution.route;
+        if (
+          parentBinding.grant.agent !== inheritedRoute.lead
+          || parentBinding.grant.ctoTeamId !== inheritedRoute.teamId
+        ) throw new NativeWorkerRouteError();
+        if (!items.every((item) => {
+          const agent = typeof item.agent === "string" ? item.agent : "";
+          return agent.length > 0 && inheritedRoute!.roster.has(agent);
+        })) throw new NativeWorkerRouteError();
       }
       const inheritedCtoSlice = actor === "lead" ? parentBinding?.grant.ctoSlice : undefined;
       const inheritedCtoAuthority = actor === "lead" ? parentBinding?.grant.ctoAuthority : undefined;
@@ -926,6 +1061,12 @@ export function createNativeWorkerAuthority(
         && (!ctoAuthority || markerRunIds.some((markerRunId) => markerRunId !== ctoAuthority.run_id))
       ) return false;
       if (requestedCtoState && (!ctoAuthority || ctoAuthority.run_id !== runId)) return false;
+      if (actor === "orchestrator" && ctoAuthority && !allLeadItems) {
+        if (markerRunIds.length > 0 && !routeCanonicalFailure && (routeBindingFailure || routeRoleMismatch)) {
+          throw new NativeWorkerRouteError();
+        }
+        return false;
+      }
       if (allLeadItems && (!ctoAuthority || ctoAuthority.run_id !== authorityRunId)) return false;
       if (ctoAuthority && !("legacy" in ctoAuthority)) {
         try {
@@ -949,7 +1090,8 @@ export function createNativeWorkerAuthority(
         const marker = parseCtoSliceMarker(text);
         const leadCandidate = actor === "orchestrator"
           && !!marker
-          && (expectedAgent === "team-lead" || expectedAgent === "omp-team-lead");
+          && !!leadRoutes[index]
+          && expectedAgent === leadRoutes[index]!.lead;
         const candidateRunId = ctoAuthority?.run_id
           ?? inheritedCtoSlice?.runId
           ?? (leadCandidate ? marker!.runId : runId);
@@ -977,6 +1119,9 @@ export function createNativeWorkerAuthority(
           index,
           ...(expectedAgent ? { expectedAgent } : {}),
           ...(inheritedCtoSlice ? { ctoSlice: inheritedCtoSlice } : leadCandidate ? { ctoSlice: marker! } : {}),
+          ...(leadCandidate
+            ? { ctoActor: "lead" as const, ctoTeamId: leadRoutes[index]!.teamId }
+            : inheritedRoute ? { ctoTeamId: inheritedRoute.teamId } : {}),
           ...(dispatchOrigin && samePath(dispatchOrigin.cwd, parent.cwd) ? { dispatchOrigin } : {}),
         };
         registry.candidates.set(candidate.key, candidate);

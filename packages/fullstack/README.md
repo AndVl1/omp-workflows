@@ -249,6 +249,15 @@ Implementation, artifact recovery, review и QA выполняют roster-worker
 Общая архитектура также проходит через назначенного lead → roster architect
 до запуска зависимых consumer leads.
 
+Этот маршрут проверяется runtime, а не только инструкциями. `TeamDef.lead`
+задаёт конкретное имя agent; роли `roster` разрешаются через effective config.
+Недоступная mapped role не подменяется предпочтительным agent из config.
+Маркер должен точно совпадать с `teams[].slice_id`, а уникальный `teams[].id` —
+с `plan.teams[].team` и зарегистрированным `TeamDef.id`. Для новой волны
+переиспользуется завершённая binding с новым slice ID, без дубликата team ID.
+Смена configured lead прекращает delegation прежнего lead; root не может
+обойти проверку прямым вызовом worker или подменой display name.
+
 `before_advance` проверяется после готового результата стадии, до следующей
 стадии. Lead может локально применить только допустимое resolved policy
 автоматическое решение с evidence; `required_human` и неразрешённые вопросы

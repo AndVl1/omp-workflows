@@ -53,7 +53,7 @@ import { readDispatchOriginLocator, rememberDispatchOriginLocator } from "./disp
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
 import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, retainSelectionSnapshot, readRunControl, readRunControlNoRecovery, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, reserveExecutionClaimWorkers, settleExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector, CtoClaimScope, RunControl } from "./engine/types.js";
-import { createNativeWorkerAuthority, type NativeWorkerResolution } from "./native-worker-authority.js";
+import { createNativeWorkerAuthority, NativeWorkerRouteError, type NativeWorkerResolution } from "./native-worker-authority.js";
 import type { ScopeRuntimeClassTable } from "./engine/scope.js";
 import type { DispatchAuth, RosterBeginSelection } from "./engine/durable.js";
 import type { AgentMappingState } from "./engine/agent-mapping.js";
@@ -2039,9 +2039,13 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         } else if (pendingCtoReservation && event.toolCallId) {
           ctoReservations.set(event.toolCallId, pendingCtoReservation);
         }
-      } catch {
+      } catch (error) {
         if (pendingCtoReservation) pendingCtoReservation = undefined;
-        if (nativeCtoTargeted) runAdmission("native_authority_resolution_failed");
+        if (error instanceof NativeWorkerRouteError) {
+          runAdmission("native_authority_route_denied");
+        } else if (nativeCtoTargeted) {
+          runAdmission("native_authority_resolution_failed");
+        }
         // Native authority is fail-closed; a malformed host context never
         // changes the already-allowed task decision or creates a grant.
       }

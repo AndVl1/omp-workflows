@@ -3,13 +3,15 @@ import { test } from "node:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { createNativeWorkerAuthority, type NativeWorkerAuthority } from "../src/native-worker-authority.js";
+import { createNativeWorkerAuthority, NativeWorkerRouteError, type NativeWorkerAuthority } from "../src/native-worker-authority.js";
 import { newCtoState, appendWave, writeCtoState, readCtoState } from "../src/cto/state.js";
 import { buildCtoSliceMarker } from "../src/cto/slice-gate.js";
+import { resolveConfig } from "../src/engine/config.js";
 import { resolveWorkflow } from "../src/engine/profile.js";
 import { registerTeamWorkflow } from "../src/index.js";
-import { createWorkflowSessionController } from "../src/engine/host-controller.js";
+import { createWorkflowSessionController, type WorkflowSessionController } from "../src/engine/host-controller.js";
 import { acquireCtoIngress, suspendCtoSession } from "../src/cto/run.js";
+import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import { readRunControl } from "../src/engine/run-store.js";
 const RUN_ID = "123e4567-e89b-12d3-a456-426614174000";
 const CTO_RUN_ID = "run-lifecycle-full-resume";
@@ -50,6 +52,22 @@ class TestBus {
 
 function fixture() {
   const root = `/tmp/omp-native-worker-authority-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  mkdirSync(join(root, ".omp"), { recursive: true });
+  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({
+    roles: {
+      go: "developer-go",
+      architect: "architect",
+      qa: "qa",
+    },
+  }) + "\n");
+  writeFileSync(join(root, ".omp", "teams.json"), JSON.stringify([{
+    id: "lead-a",
+    name: "Lead A",
+    scope: ["backend-kotlin"],
+    profile: "lightweight",
+    lead: "team-lead",
+    roster: ["go", "qa", "architect"],
+  }]) + "\n");
   mkdirSync(join(root, ".work-state", "runs", RUN_ID), { recursive: true });
   writeFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), JSON.stringify({ policy: { strict_orchestrator: true } }));
   const cto = newCtoState({
@@ -93,6 +111,33 @@ function fixture() {
     parentContext,
     close: () => rmSync(root, { recursive: true, force: true }),
   };
+}
+function configureFixtureLead(f: { root: string }, lead: string): void {
+  writeFileSync(join(f.root, ".omp", "teams.json"), JSON.stringify([{
+    id: "lead-a",
+    name: "Lead A",
+    scope: ["backend-kotlin"],
+    profile: "lightweight",
+    lead,
+    roster: ["go", "qa", "architect"],
+  }]) + "\n");
+}
+function writeUnavailableArchitectMapping(f: { root: string }): void {
+  const config = resolveConfig(f.root);
+  const mapping = buildAgentMapping({
+    roles: config.roles,
+    availableAgents: ["developer-go", "qa", "team-lead"],
+    extraRoles: config.scope_map.map((entry) => entry.dev_agent),
+    scope_map: config.scope_map,
+    flags: config.flags,
+    roster_overrides: config.roster_overrides,
+    config_path: config.config_path,
+    config_source: config.config_source,
+    config_hash: config.config_hash,
+    config_version: config.config_version,
+    config_provenance: config.config_provenance,
+  });
+  writeAgentMapping(f.root, mapping);
 }
 function authorizeCtoFixture(f: { root: string; parentManager: { getSessionId: () => string } }) {
   const state = readCtoState(CTO_RUN_ID, f.root);
@@ -682,6 +727,11 @@ test("native lead binding arms only matching CTO-slice children", () => {
       index: 0,
     });
     assert.deepEqual(childAuthority.resolve(nested.context, f.root), { actor: "worker", kind: "cto", runId: CTO_RUN_ID });
+    const foreignInput = { agent: "security-tester", task: `${sliceMarker}\nforeign role` };
+    assert.throws(
+      () => childAuthority.admitTaskCall(lead.context, { toolName: "task", toolCallId: "call-foreign-role", input: foreignInput }, "lead", CTO_RUN_ID),
+      NativeWorkerRouteError,
+    );
 
     const mismatched = childSession(f.root, lead.file, "nested-mismatch");
     const mismatchInput = { agent: "developer-go", task: `${buildCtoSliceMarker(CTO_RUN_ID, "slice-b")}\nwrong slice` };
@@ -723,6 +773,260 @@ test("native lead binding arms only matching CTO-slice children", () => {
     f.close();
   }
 });
+test("native CTO root dispatch rejects direct configured roster workers", () => {
+  const f = fixture();
+  let controller: WorkflowSessionController | undefined;
+  try {
+    controller = authorizeCtoFixture(f);
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const marker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
+    const input = { agent: "developer-go", task: `${marker}\ndirect worker` };
+    const before = readRunControl(f.root);
+    assert.throws(
+      () => parent.admitTaskCall(f.parentContext, { toolName: "task", toolCallId: "root-worker", input }, "orchestrator", CTO_RUN_ID),
+      NativeWorkerRouteError,
+    );
+    assert.deepEqual(readRunControl(f.root), before, "route rejection reserves no CTO worker claim");
+  } finally {
+    if (controller) suspendCtoSession(controller, "session-shutdown");
+    f.close();
+  }
+});
+test("registered native route rejection reports a route diagnosis without claiming stale ownership", () => {
+  const f = fixture();
+  const controller = authorizeCtoFixture(f);
+  const bus = new TestBus();
+  type Handler = (event: unknown, ctx: unknown) => unknown;
+  const handlers: Record<string, Handler[]> = {};
+  registerTeamWorkflow({
+    events: bus,
+    setLabel() {},
+    on(name: string, handler: Handler) {
+      (handlers[name] ??= []).push(handler);
+    },
+  } as never, {
+    cwd: f.root,
+    observability: false,
+    resolveCwd: () => f.root,
+    getSessionController: (ctx) => ctx === f.parentContext ? controller : undefined,
+    resolveTrustedToolCallActor: (ctx, _cwd, runId) => {
+      if (ctx !== f.parentContext || runId !== CTO_RUN_ID) return undefined;
+      const scope = controller.activeCtoClaim();
+      return scope
+        ? { kind: "authenticated-interactive-host-cto", run_id: scope.run_id, ownership_epoch: scope.ownership_epoch }
+        : undefined;
+    },
+  });
+  try {
+    handlers.session_start?.[0]?.({ type: "session_start" }, f.parentContext);
+    const marker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
+    const result = handlers.tool_call?.[0]?.({
+      toolName: "task",
+      toolCallId: "registered-root-worker",
+      input: { tasks: [{ agent: "developer-go", task: `${marker}\ndirect worker` }] },
+    }, f.parentContext) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /\[workflow_admission:native_authority_route_denied\]/);
+    assert.doesNotMatch(result?.reason ?? "", /cto_claim_mismatch/);
+  } finally {
+    for (const handler of handlers.session_shutdown ?? []) handler({ type: "session_shutdown" }, f.parentContext);
+    f.close();
+  }
+});
+
+
+test("native CTO custom configured lead receives lead grant and may launch its configured roster role", () => {
+  const f = fixture();
+  let controller: WorkflowSessionController | undefined;
+  try {
+    configureFixtureLead(f, "architect");
+    controller = authorizeCtoFixture(f);
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const childAuthority = createNativeWorkerAuthority(bus);
+    const marker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
+    const lead = childSession(f.root, f.parentFile, "custom-architect-lead");
+    const leadInput = { agent: "architect", task: `${marker}\ncustom lead` };
+    startGrant(bus, parent, f.parentContext, leadInput, "custom-architect-root", lead.file, "architect", 0, CTO_RUN_ID);
+    assert.deepEqual(childAuthority.resolve(lead.context, f.root), { actor: "lead", kind: "cto", runId: CTO_RUN_ID });
+
+    const worker = childSession(f.root, lead.file, "architect-roster-worker");
+    const workerInput = { agent: "architect", task: `${marker}\narchitect roster work` };
+    assert.equal(
+      childAuthority.admitTaskCall(lead.context, { toolName: "task", toolCallId: "architect-roster-call", input: workerInput }, "lead", CTO_RUN_ID),
+      true,
+    );
+    childAuthority.observeToolExecutionStart({ toolName: "task", toolCallId: "architect-roster-call", args: workerInput }, lead.context);
+    bus.emit("task:subagent:lifecycle", {
+      id: "architect-roster-lifecycle",
+      agent: "architect",
+      status: "started",
+      sessionFile: worker.file,
+      parentToolCallId: "architect-roster-call",
+      index: 0,
+    });
+    assert.deepEqual(childAuthority.resolve(worker.context, f.root), { actor: "worker", kind: "cto", runId: CTO_RUN_ID });
+    configureFixtureLead(f, "security-tester");
+    const supersededInput = { agent: "architect", task: `${marker}\nsuperseded lead delegation` };
+    const beforeSuperseded = readRunControl(f.root);
+    assert.throws(
+      () => childAuthority.admitTaskCall(
+        lead.context,
+        { toolName: "task", toolCallId: "superseded-architect-lead", input: supersededInput },
+        "lead",
+        CTO_RUN_ID,
+      ),
+      NativeWorkerRouteError,
+      "a lead grant superseded by the current TeamDef cannot delegate",
+    );
+    assert.deepEqual(readRunControl(f.root), beforeSuperseded, "superseded lead delegation reserves no worker");
+  } finally {
+    if (controller) suspendCtoSession(controller, "session-shutdown");
+    f.close();
+  }
+});
+test("native CTO fails closed when the effective roster mapping marks a role unavailable", () => {
+  const f = fixture();
+  let controller: WorkflowSessionController | undefined;
+  try {
+    controller = authorizeCtoFixture(f);
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const childAuthority = createNativeWorkerAuthority(bus);
+    const marker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
+    const lead = childSession(f.root, f.parentFile, "unavailable-mapping-lead");
+    const leadInput = { agent: "team-lead", task: `${marker}\nlead before mapping refresh` };
+    startGrant(bus, parent, f.parentContext, leadInput, "unavailable-mapping-root", lead.file, "team-lead", 0, CTO_RUN_ID);
+    assert.deepEqual(childAuthority.resolve(lead.context, f.root), { actor: "lead", kind: "cto", runId: CTO_RUN_ID });
+
+    writeUnavailableArchitectMapping(f);
+    const nestedInput = { agent: "architect", task: `${marker}\narchitect now unavailable` };
+    const before = readRunControl(f.root);
+    assert.throws(
+      () => childAuthority.admitTaskCall(
+        lead.context,
+        { toolName: "task", toolCallId: "unavailable-mapping-nested", input: nestedInput },
+        "lead",
+        CTO_RUN_ID,
+      ),
+      NativeWorkerRouteError,
+      "an unavailable effective mapping cannot fall back to config.roles",
+    );
+    assert.deepEqual(readRunControl(f.root), before, "unavailable roster mapping reserves no worker");
+  } finally {
+    if (controller) suspendCtoSession(controller, "session-shutdown");
+    f.close();
+  }
+});
+
+test("native CTO validates a mixed lead batch atomically before reservation", () => {
+  const f = fixture();
+  let controller: WorkflowSessionController | undefined;
+  try {
+    controller = authorizeCtoFixture(f);
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const marker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
+    const input = {
+      tasks: [
+        { agent: "team-lead", task: `${marker}\nvalid lead` },
+        { agent: "developer-go", task: `${marker}\ninvalid direct worker` },
+      ],
+    };
+    const before = readRunControl(f.root);
+    assert.throws(
+      () => parent.admitTaskCall(f.parentContext, { toolName: "task", toolCallId: "mixed-root-batch", input }, "orchestrator", CTO_RUN_ID),
+      NativeWorkerRouteError,
+    );
+    assert.deepEqual(readRunControl(f.root), before, "one invalid item prevents every reservation");
+  } finally {
+    if (controller) suspendCtoSession(controller, "session-shutdown");
+    f.close();
+  }
+});
+
+test("native CTO follows an arbitrary active-wave slice and fails closed when its TeamDef binding disappears", () => {
+  const f = fixture();
+  let controller: WorkflowSessionController | undefined;
+  try {
+    const state = readCtoState(CTO_RUN_ID, f.root);
+    assert.ok(state);
+    const dynamicSlice = "slice.dynamic-2026";
+    state!.teams[0]!.slice_id = dynamicSlice;
+    state!.wave_history![0]!.slice_ids = [dynamicSlice];
+    writeCtoState(state!, f.root);
+    controller = authorizeCtoFixture(f);
+    const bus = new TestBus();
+    const parent = createNativeWorkerAuthority(bus);
+    const childAuthority = createNativeWorkerAuthority(bus);
+    const rawTeamIdState = readCtoState(CTO_RUN_ID, f.root);
+    assert.ok(rawTeamIdState);
+    rawTeamIdState!.wave_history![0]!.slice_ids = ["lead-a"];
+    writeCtoState(rawTeamIdState!, f.root);
+    const rawTeamIdInput = {
+      agent: "team-lead",
+      task: `${buildCtoSliceMarker(CTO_RUN_ID, "lead-a")}\nraw team id instead of slice id`,
+    };
+    const beforeRawTeamId = readRunControl(f.root);
+    assert.throws(
+      () => parent.admitTaskCall(
+        f.parentContext,
+        { toolName: "task", toolCallId: "raw-team-id-route", input: rawTeamIdInput },
+        "orchestrator",
+        CTO_RUN_ID,
+      ),
+      NativeWorkerRouteError,
+      "a runtime team id cannot substitute for its canonical slice_id",
+    );
+    assert.deepEqual(readRunControl(f.root), beforeRawTeamId, "raw team id route reserves no worker");
+
+    rawTeamIdState!.wave_history![0]!.slice_ids = [dynamicSlice];
+    writeCtoState(rawTeamIdState!, f.root);
+    const duplicateState = readCtoState(CTO_RUN_ID, f.root);
+    assert.ok(duplicateState);
+    const duplicateTeam = structuredClone(duplicateState!.teams[0]!);
+    duplicateTeam.slice_id = "slice.shadow";
+    duplicateState!.teams.push(duplicateTeam);
+    writeCtoState(duplicateState!, f.root);
+    const duplicateInput = {
+      agent: "team-lead",
+      task: `${buildCtoSliceMarker(CTO_RUN_ID, dynamicSlice)}\nduplicate runtime team id`,
+    };
+    const beforeDuplicate = readRunControl(f.root);
+    assert.throws(
+      () => parent.admitTaskCall(
+        f.parentContext,
+        { toolName: "task", toolCallId: "duplicate-runtime-team-id", input: duplicateInput },
+        "orchestrator",
+        CTO_RUN_ID,
+      ),
+      NativeWorkerRouteError,
+      "a duplicate runtime team id invalidates the exact slice binding",
+    );
+    assert.deepEqual(readRunControl(f.root), beforeDuplicate, "duplicate runtime team id reserves no worker");
+    duplicateState!.teams.pop();
+    writeCtoState(duplicateState!, f.root);
+
+    const marker = buildCtoSliceMarker(CTO_RUN_ID, dynamicSlice);
+    const lead = childSession(f.root, f.parentFile, "dynamic-slice-lead");
+    const input = { agent: "team-lead", task: `${marker}\ndynamic slice lead` };
+    startGrant(bus, parent, f.parentContext, input, "dynamic-slice-root", lead.file, "team-lead", 0, CTO_RUN_ID);
+    assert.deepEqual(childAuthority.resolve(lead.context, f.root), { actor: "lead", kind: "cto", runId: CTO_RUN_ID });
+
+    rmSync(join(f.root, ".omp", "teams.json"), { force: true });
+    const before = readRunControl(f.root);
+    assert.throws(
+      () => parent.admitTaskCall(f.parentContext, { toolName: "task", toolCallId: "missing-team-def", input }, "orchestrator", CTO_RUN_ID),
+      NativeWorkerRouteError,
+    );
+    assert.deepEqual(readRunControl(f.root), before, "missing TeamDef does not reserve another worker");
+  } finally {
+    if (controller) suspendCtoSession(controller, "session-shutdown");
+    f.close();
+  }
+});
+
 test("native CTO reservations keep handover epochs distinct for duplicate tool-call slots", () => {
   const f = fixture();
   try {
@@ -733,10 +1037,11 @@ test("native CTO reservations keep handover epochs distinct for duplicate tool-c
     const parentA = createNativeWorkerAuthority(bus);
     const childAuthority = createNativeWorkerAuthority(bus);
     const childA = childSession(f.root, f.parentFile, "epoch-a-child");
-    const input = { agent: "developer-go", task: "epoch collision" };
+    const marker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
+    const input = { agent: "team-lead", task: `${marker}\nepoch collision` };
     const callId = "epoch-collision-call";
-    startGrant(bus, parentA, f.parentContext, input, callId, childA.file, "developer-go", 0, CTO_RUN_ID);
-    assert.deepEqual(childAuthority.resolve(childA.context, f.root), { actor: "worker", kind: "cto", runId: CTO_RUN_ID });
+    startGrant(bus, parentA, f.parentContext, input, callId, childA.file, "team-lead", 0, CTO_RUN_ID);
+    assert.deepEqual(childAuthority.resolve(childA.context, f.root), { actor: "lead", kind: "cto", runId: CTO_RUN_ID });
 
     suspendCtoSession(controllerA, "session-replacement");
     const parentBFile = join(f.root, "parent-b.jsonl");
@@ -775,7 +1080,7 @@ test("native CTO reservations keep handover epochs distinct for duplicate tool-c
     );
 
     const replacementCallId = "epoch-b-independent-call";
-    const replacementInput = { agent: "developer-go", task: "replacement work" };
+    const replacementInput = { agent: "team-lead", task: `${marker}\nreplacement work` };
     assert.equal(
       parentB.admitTaskCall(parentBContext, { toolName: "task", toolCallId: replacementCallId, input: replacementInput }, "orchestrator", CTO_RUN_ID),
       true,
@@ -784,17 +1089,17 @@ test("native CTO reservations keep handover epochs distinct for duplicate tool-c
     const childB = childSession(f.root, parentBFile, "epoch-b-child");
     bus.emit("task:subagent:lifecycle", {
       id: "epoch-b-lifecycle",
-      agent: "developer-go",
+      agent: "team-lead",
       status: "started",
       sessionFile: childB.file,
       parentToolCallId: replacementCallId,
       index: 0,
     });
-    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", kind: "cto", runId: CTO_RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "lead", kind: "cto", runId: CTO_RUN_ID });
 
     bus.emit("task:subagent:lifecycle", {
       id: `${callId}-lifecycle-0`,
-      agent: "developer-go",
+      agent: "team-lead",
       status: "completed",
       sessionFile: childA.file,
       parentToolCallId: callId,
@@ -802,11 +1107,11 @@ test("native CTO reservations keep handover epochs distinct for duplicate tool-c
     });
     const afterA = readRunControl(f.root);
     assert.deepEqual(afterA.execution_claim?.worker_ids, [ctoWorkerId(ingressB.claim.claim.ownership_epoch, replacementCallId, 0)]);
-    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "worker", kind: "cto", runId: CTO_RUN_ID });
+    assert.deepEqual(childAuthority.resolve(childB.context, f.root), { actor: "lead", kind: "cto", runId: CTO_RUN_ID });
 
     bus.emit("task:subagent:lifecycle", {
       id: `${callId}-lifecycle-0`,
-      agent: "developer-go",
+      agent: "team-lead",
       status: "completed",
       sessionFile: childA.file,
       parentToolCallId: callId,
@@ -890,6 +1195,25 @@ test("registered native main lead worker chain settles async lifecycle slots by 
     assert.equal(call("tool_call", {
       toolName: "task", toolCallId: nestedCallId, input: nestedInput,
     }, lead.context), undefined);
+    const foreignCallId = "registered-lead-foreign-worker";
+    const foreignInput = { tasks: [{ agent: "security-tester", task: `${marker}\nforeign roster role` }] };
+    const beforeForeign = readRunControl(f.root);
+    const blockedForeign = call("tool_call", {
+      toolName: "task", toolCallId: foreignCallId, input: foreignInput,
+    }, lead.context) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(blockedForeign?.block, true, "registered nested foreign roster dispatch is blocked");
+    assert.match(blockedForeign?.reason ?? "", /\[workflow_admission:native_authority_route_denied\]/);
+    assert.deepEqual(readRunControl(f.root), beforeForeign, "blocked nested foreign dispatch reserves no CTO worker");
+    const foreignWorker = childSession(f.root, lead.file, "registered-foreign-worker");
+    await bus.emit("task:subagent:lifecycle", {
+      id: "registered-foreign-worker-lifecycle",
+      agent: "security-tester",
+      status: "started",
+      sessionFile: foreignWorker.file,
+      parentToolCallId: foreignCallId,
+      index: 0,
+    });
+    assert.equal(childAuthority.resolve(foreignWorker.context, f.root), undefined, "blocked nested foreign dispatch creates no child grant");
     call("tool_execution_start", { toolName: "task", toolCallId: nestedCallId, args: nestedInput }, lead.context);
     const workers = [
       childSession(f.root, lead.file, "registered-worker-zero"),
@@ -1089,7 +1413,7 @@ test("registered CTO task result classifier settles only pinned no-start and ori
   };
   const emptyDetails = { projectAgentsDir: null, results: [], totalDurationMs: 0 };
   try {
-    const staticInput = { task: task("static shape"), schema: { type: "object" } };
+    const staticInput = { agent: "team-lead", task: task("static shape"), schema: { type: "object" } };
     admit("registered-static-shape", staticInput);
     assert.deepEqual(
       readRunControl(f.root).execution_claim?.worker_ids,
@@ -1104,7 +1428,7 @@ test("registered CTO task result classifier settles only pinned no-start and ori
     );
     assert.deepEqual(readRunControl(f.root).execution_claim?.worker_ids, [], "static validation settles its original slot");
 
-    const flatPreflightInput = { agent: "developer-go", task: task("flat preflight") };
+    const flatPreflightInput = { agent: "team-lead", task: task("flat preflight") };
     admit("registered-flat-preflight", flatPreflightInput);
     result("registered-flat-preflight", flatPreflightInput, "Task execution failed: policy refused this agent", emptyDetails, true);
     assert.deepEqual(readRunControl(f.root).execution_claim?.worker_ids, [], "flat preflight refusal settles before spawn");
@@ -1112,8 +1436,8 @@ test("registered CTO task result classifier settles only pinned no-start and ori
     const batchPreflightInput = {
       context: "shared preflight context",
       tasks: [
-        { name: "first", agent: "developer-go", task: task("batch first") },
-        { agent: "qa", task: task("batch second") },
+        { name: "first", agent: "team-lead", task: task("batch first") },
+        { agent: "team-lead", task: task("batch second") },
       ],
     };
     const batchEpoch = admit("registered-batch-preflight", batchPreflightInput);
@@ -1130,21 +1454,21 @@ test("registered CTO task result classifier settles only pinned no-start and ori
     );
     assert.deepEqual(readRunControl(f.root).execution_claim?.worker_ids, [], "batch preflight refusal settles every original slot");
 
-    const evalInput = { task: task("eval failure"), tools: ["missing-eval-tool"] };
+    const evalInput = { agent: "team-lead", task: task("eval failure"), tools: ["missing-eval-tool"] };
     admit("registered-eval-failure", evalInput);
     result("registered-eval-failure", evalInput, "Task execution failed: Eval-defined tools are unavailable in plan mode.", emptyDetails, true);
     assert.deepEqual(readRunControl(f.root).execution_claim?.worker_ids, [], "eval failure settles before policy and spawn");
 
-    const allScheduleInput = { task: task("all schedule failure") };
+    const allScheduleInput = { agent: "team-lead", task: task("all schedule failure") };
     admit("registered-all-schedule", allScheduleInput);
     result("registered-all-schedule", allScheduleInput, "Failed to start background task job: agent-zero: scheduler unavailable", emptyDetails, true);
     assert.deepEqual(readRunControl(f.root).execution_claim?.worker_ids, [], "all-schedule failure has no progress and settles every slot");
 
     const partialInput = {
       tasks: [
-        { agent: "developer-go", task: task("partial zero") },
-        { agent: "qa", task: task("partial one") },
-        { agent: "developer-go", task: task("partial two") },
+        { agent: "team-lead", task: task("partial zero") },
+        { agent: "team-lead", task: task("partial one") },
+        { agent: "team-lead", task: task("partial two") },
       ],
     };
     const partialEpoch = admit("registered-partial-schedule", partialInput);
@@ -1184,8 +1508,8 @@ test("registered CTO task result classifier settles only pinned no-start and ori
 
     const unknownInput = {
       tasks: [
-        { agent: "developer-go", task: task("unknown zero") },
-        { agent: "qa", task: task("unknown one") },
+        { agent: "team-lead", task: task("unknown zero") },
+        { agent: "team-lead", task: task("unknown one") },
       ],
     };
     const unknownEpoch = admit("registered-unknown-async", unknownInput);
@@ -1302,7 +1626,7 @@ test("registered CTO same-id replay is rejected after A settlement while distinc
   assert.ok(sessionSwitchHandler, "registered session_switch hook is present");
   sessionStartHandler!({ type: "session_start" }, f.parentContext);
   const marker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
-  const input = { agent: "developer-go", task: `${marker}\nreplayable task` };
+  const input = { agent: "team-lead", task: `${marker}\nreplayable task` };
   const result = (toolCallId: string, ctx: unknown): void => {
     call("tool_result", {
       toolName: "task",
@@ -1400,7 +1724,7 @@ test("registered no-run host rejects CTO marker-only admission but keeps ordinar
   try {
     const parent = register();
     const marker = buildCtoSliceMarker(CTO_RUN_ID, "slice-a");
-    const ctoMarkerInput = { tasks: [{ agent: "omp-team-lead", task: `${marker}\nlead slice` }] };
+    const ctoMarkerInput = { tasks: [{ agent: "team-lead", task: `${marker}\nlead slice` }] };
     const blocked = parent.tool_call![0]!({ toolName: "task", toolCallId: "registered-no-run-lead", input: ctoMarkerInput }, f.parentContext) as { block?: boolean; reason?: string } | undefined;
     assert.equal(blocked?.block, true);
     assert.match(blocked?.reason ?? "", /\[workflow_admission:cto_marker_unauthenticated\]/);
@@ -1421,6 +1745,7 @@ test("registered no-run host rejects CTO marker-only admission but keeps ordinar
 
 test("registered exact legacy CTO owner passes both slice and actor admission", () => {
   const f = fixture();
+  configureFixtureLead(f, "omp-team-lead");
   const ownerSession = f.parentManager.getSessionId();
   const legacy = readCtoState(CTO_RUN_ID, f.root);
   assert.ok(legacy);
@@ -1674,6 +1999,7 @@ test("registered session start keeps the bound controller for an active managed 
 });
 test("registered legacy switch requires the captured previous session file", () => {
   const f = fixture();
+  configureFixtureLead(f, "omp-team-lead");
   let sessionId = "legacy-session-a";
   let sessionFile = f.parentFile;
   const manager = {

@@ -29,6 +29,7 @@ export type AdmissionDiagnosticCode =
   | "workflow_state_recovery_required"
   | "no_run_claim_present"
   | "native_authority_resolution_failed"
+  | "native_authority_route_denied"
   | "cto_claim_mismatch"
   | "cto_marker_unauthenticated"
   | "session_controller_resolution_failed";
@@ -136,6 +137,10 @@ const DIAGNOSTICS: Record<AdmissionDiagnosticCode, DiagnosticEntry> = {
   native_authority_resolution_failed: {
     explanation: "Core could not resolve native worker authority for this host call.",
     action: "Retry from the same supported host session and report this code with installed versions; do not use raw actor fields.",
+  },
+  native_authority_route_denied: {
+    explanation: "The CTO task does not match the configured lead/roster route for its exact canonical slice.",
+    action: "Re-enter through the configured TeamDef lead and its resolved roster workers for the exact slice; do not repair claims or substitute a role by name, title, or scope.",
   },
   cto_claim_mismatch: {
     explanation: "The presented CTO proof does not match the current live CTO claim.",

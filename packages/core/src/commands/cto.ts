@@ -170,7 +170,7 @@ function residentNativeRouteContract(): string {
     "The resident CTO is the main session's authenticated native dispatcher. Use this exact route:",
     "`cto_state(read exact run) → cto_state(commit active wave/classification/workflow/DoD) → task(lead with exact CTO slice marker) → lead task(worker with the same marker and inherited native authority) → lead summary/evidence → CTO artifact/DoD/approval checks → cto_state(commit progress or wave closure)`.",
     "The CTO root and its leads MUST NOT call ordinary `workflow_prepare`, `workflow_status`, `workflow_instructions`, `workflow_begin`, `workflow_complete`, or `workflow_advance` with the CTO slug. A CTO `id`/slice marker is not an ordinary workflow UUID or selector; the CTO native authority route is independent.",
-    "Roles are fixed by ownership: the resident main session is the CTO and canonical-state owner; each registry `TeamDef.lead` is the one team lead; that lead may spawn only worker roles from its `TeamDef.roster`; workers implement source changes and never re-delegate. Native admission recognizes the configured team-lead aliases `team-lead` and `omp-team-lead`; never substitute a `cto` child.",
+    "Roles are fixed by ownership: the resident main session is the CTO and canonical-state owner; each registry `TeamDef.lead` is the concrete lead agent for that team; that lead may spawn only agents resolved from its `TeamDef.roster` roles through the effective configuration; workers implement source changes and never re-delegate. Native admission checks the actual task agent against this configured route, not a task display name or a hardcoded lead alias; never substitute a `cto` child.",
     "The resolved sub-workflow profile remains a quality contract for the slice: preserve its stages, code-review/validation obligations, typed artifacts, checkpoints, and DoD evidence, but satisfy them through the native CTO lead/worker handoff rather than an ordinary selector bridge.",
     "Implementation, artifact-recovery, code-review, and QA workers are all lead-owned slice work: the resident CTO never spawns them directly. The configured lead may dispatch only roles present in that team's `TeamDef.roster`; if a required quality role is absent, use the existing lead/CTO escalation path instead of inventing a direct worker route.",
     "Each lead task carries the exact `<!-- omp-cto-slice run=<runId> slice=<sliceId> -->` marker; every worker task repeats it verbatim. The resident CTO verifies terminal worker evidence and direct artifact payloads before committing progress; missing or malformed evidence blocks the wave.",
@@ -195,6 +195,7 @@ function ctoPlanShapeContract(): string {
     "{\"id\":\"frontend\",\"status\":\"pending\",\"escalations\":{},\"slice_id\":\"frontend-slice\",\"workflow\":\"lightweight\",\"dod_path\":\".work-state/artifacts/frontend/dod.json\"}",
     "```",
     "Do not put TeamDef fields (`name`, `lead`, `roster`) into a TeamPlanEntry or use a TeamPlanEntry as a runtime team record; preserve all engine-owned fields returned by `cto_state(read)`.",
+    "For each active slice, bind exactly one runtime team to exactly one plan entry and registered definition: `state.teams[].id === state.plan.teams[].team === TeamDef.id`. A work-specific or new-wave identifier belongs in `slice_id`, not an invented team id. Reuse a completed configured team's current binding for a new wave; never duplicate its plan id, overwrite an unfinished binding, or rewrite unrelated historical rows/evidence to satisfy admission.",
   ].join("\n");
 }
 
@@ -1008,8 +1009,8 @@ export function buildAmendPrompt(
     "   LECTURE_RESEARCH slices resolve to the research-only, human-gated `lecture-research` profile (see below).",
     "2. **Architecture**: if the new task adds cross-team surface, assign the additional contract to a",
     "   configured `TeamDef.lead` already in the plan; that lead dispatches a worker from its `TeamDef.roster` before dependent consumer leads.",
-    "3. **Persist**: read the exact candidate with `cto_state(operation: \"read\")`, append the new teams",
-    "   and stamp `amended_at`, then commit with the returned `state_revision`; document the amend in",
+    "3. **Persist**: read the exact candidate with `cto_state(operation: \"read\")`. Reuse completed configured-team bindings for new slices; append only previously unplanned registered TeamDef ids, never renamed copies or duplicate ids. Preserve unfinished bindings and historical wave/evidence records.",
+    "   Stamp `amended_at`, then commit with the returned `state_revision`; document the amend in",
     "   `decisions.md` as a supplemental artifact (why). Never write canonical CTO state with Write, Edit, or Bash.",
     "4. **Integration covers ALL teams** (original + added): integration review verifies the merged result",
     "   against the (extended) contract; DoD aggregation across every team.",

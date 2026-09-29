@@ -97,8 +97,10 @@ decision through the configured channel. Earlier planning/contract approval,
 Roles are fixed by ownership: this main session is the resident CTO and
 canonical-state owner; each registry `TeamDef.lead` is the one lead; that lead
 may spawn only worker roles from its `TeamDef.roster`; workers implement source
-changes and never re-delegate. Native admission recognizes the configured
-`team-lead`/`omp-team-lead` aliases; never spawn a `cto` child.
+changes and never re-delegate. Native admission checks the actual task agent:
+root uses the concrete configured `TeamDef.lead`, and the lead uses agents
+resolved from its roster roles. A display name or hardcoded alias is not a
+substitute for that binding; never spawn a `cto` child.
 
 ## Canonical state transaction
 
@@ -153,6 +155,14 @@ slice metadata, for example:
 Do not copy `TeamDef.name`/`lead`/`roster` into a `TeamPlanEntry` or use a plan
 entry as a runtime team record. Preserve all engine-owned fields returned by
 `cto_state(read)`.
+
+For each active slice, exactly one runtime team and plan entry reference the
+registered definition: `state.teams[].id === state.plan.teams[].team === TeamDef.id`.
+Work-specific/new-wave identifiers belong in `slice_id`, not invented team ids.
+For a new wave, reuse a completed configured team's current binding; append only
+previously unplanned registered team ids. Never duplicate plan ids, overwrite an
+unfinished binding, or rewrite unrelated historical rows/evidence to pass admission.
+
 2. **Decompose into a TeamPlan** (max 8 teams, depth max 2): pick teams from
    `.omp/teams.json`, assign each a non-overlapping `scope` slice + `slice`
    task, choose the sub-profile with the SAME resolution as `/do-work`

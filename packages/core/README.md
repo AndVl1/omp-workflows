@@ -145,6 +145,15 @@ Per-team DoD remains a supplemental file at the exact configured relative
 `teams[].dod_path` (default `.work-state/artifacts/<team>/dod.json`), never
 canonical CTO state.
 
+Native admission проверяет фактическое имя agent: root вызывает только
+`TeamDef.lead`, а lead — только разрешённый effective config состав `roster`.
+Маркер совпадает с `teams[].slice_id`; `teams[].id` должен однозначно связывать
+runtime team с `plan.teams[].team` и зарегистрированным `TeamDef.id`.
+Team ID не служит псевдонимом другого slice ID. Новая волна переиспользует
+завершённую team binding с новым `slice_id`, не добавляя дубликат team ID.
+Неоднозначная binding, недоступная mapped role или сменившийся configured lead
+блокируют delegation до резервирования workers; display name не даёт полномочий.
+
 Для `before_advance` сначала завершаются работа стадии и её evidence, затем
 оценивается фактическая resolved checkpoint policy. Допустимый `policy_auto`
 lead фиксирует и применяет локально; обязательное human-решение или неразрешённый
