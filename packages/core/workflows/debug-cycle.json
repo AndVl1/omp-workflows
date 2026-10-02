@@ -33,7 +33,8 @@
       "title": "Diagnostics",
       "type": "single",
       "role": "diagnostics",
-      "consumes": ["discovery", "debug"],
+      "prompt": "On the first diagnosis use discovery. If returning after failed verification, read the latest debug artifact from this run and re-analyze the failure before proposing another fix.",
+      "consumes": ["discovery"],
       "gate": "root_cause_documented",
       "produces": ["diagnosis", "dod"]
     },

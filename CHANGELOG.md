@@ -14,6 +14,10 @@ All notable changes to `omp-workflows` are documented here.
   renewal and persistence without a real account; reports its component/process
   boundary separately from live provider and ordinary-client refresh coverage.
 
+## [0.29.1] — 2026-09-29
+### Fixed
+- **Debug-cycle first-pass artifact contract** — diagnostics now requires only discovery on its first pass and requests the latest debug artifact when revisiting a failed verification; verification produces debug later. A profile-wide regression check rejects artifacts consumed before their first producer.
+
 ## [0.29.0] — 2026-09-28
 ### Changed
 - **Breaking run-lifecycle cutover** — ordinary workflow state/API now use schema-2 canonical identity (`run_id = run_key = WorkIdentity.run_id`) and explicit `new`/`resume`/`rework`; existing runs resolve by human-readable name or read-only list (UUID remains technical). Branch is routing/compatibility context rather than run identity, so foreign-branch `resume`/`rework` is rejected. `workflow_prepare` emits committed transition receipts, while the transaction journal and lock/CAS protect state, artifact, and observability publication; execution claims and coordinator handover preserve worker/evidence identity and fail closed on busy or unknown ownership.
