@@ -96,6 +96,11 @@ Fullstack регистрирует `/do-work` и alias `/team`; они испо�
 
 Resume из новой host-сессии использует canonical state и required artifacts, а не историю чата: `workflow_instructions` восстанавливает задачу, classification, cursor, решения, ограничения и входы текущего этапа до следующего dispatch. `recovery_required` останавливает работу при отсутствующем или повреждённом обязательном input; сохранённый pending dispatch не дублируется и при недоступном транспорте остаётся `background_wait`/`transport_reconnect`. Rework сохраняет прежние результаты в immutable revision и переоткрывает затронутую часть, поэтому старые downstream proofs не завершают новую версию.
 
+Отсутствующий `.work-state/run-control.json` — корректный пустой control.
+Существующий schema-2 control обязан содержать `execution_claim`: пропуск поля
+даёт fail-closed `recovery_required`. `cto_releases` остаётся optional для
+совместимости и при отсутствии по умолчанию равен `{}`.
+
 В schema 2 ordinary `run_id`, `run_key` и `WorkIdentity.run_id` совпадают. Branch — контекст маршрутизации/проверки, не ключ запуска: новый запрос на другой ветке независим, а resume/rework на чужой ветке дают `run_context_mismatch`. Legacy state и старый `continuation` после cutover являются import-only; неизвестная schema, небезопасная ссылка или активное старое исполнение возвращают `migration_required`, `recovery_required` или `run_busy`, без legacy fallback. Lifecycle transaction восстанавливается автоматически: до canonical commit откатывается staging, после commit допустим только forward repair. Не удаляйте `.active-feature`/другие marker-файлы и не редактируйте canonical state вручную.
 
 ### Canonical report и viewer
@@ -199,6 +204,12 @@ Provider comparisons use the dependency-light API at `@andvl1/omp-workflows-full
 
 `/cto --run <exact-run-id> [task]` is the managed, explicit reacquisition path: it binds the selected CTO run to the current interactive controller and never scans for a latest run. A turn-level `session_stop` does not suspend that resident claim; verified host shutdown or replacement suspends it before the old controller/dispatcher is reset. OMP 18.2.2 replacement is a `session_switch` on the same mutable session manager, and an active claim is accepted only when the callback's interactive profile and `previousSessionFile` match the captured old session file. An independent manager, headless/worker callback, contradictory cwd/id/file/mode/UI, or stale old callback cannot release the current binding. Messenger tasks and answers remain durable under the exact current claim: write the outbox escalation, then use the real `read` tool on the exact `.work-state/cto/<run-id>/answers/<escId>.json` during reconciliation. Persisted answers are not replayed merely because an epoch changed; only a dispatcher-recorded pre-send rejection with its matching retry marker is automatically retryable on a fresh exact claim, while in-flight, unknown, accepted, or legacy delivery retains the original files and requires explicit reconciliation.
 
+An actorless idle-basic callback is a separate narrow path, not a fallback for a
+retained interactive controller. Drift of that same SDK manager into a no-UI
+context is denied without releasing the controller or claim; genuine interactive
+re-entry via that manager follows the ordinary authenticated path. A different
+manager cannot substitute or release it.
+
 The three workflow entry points are registered directly; `/init-team`, `/interview`, `/omp-model-roles`, `/session-report`, and `/workflow-view` remain custom-TS modules copied into project-local `.omp/commands/`. Most commands return prompts and do not dispatch subagents directly. `/session-report` and `/workflow-view` are deterministic read-only renderers: they require canonical selectors, read persisted state/artifacts, and write only under `.work-state`.
 
 ### CTO canonical state authority
@@ -236,12 +247,21 @@ binding atomically; completion of a wave alone is not terminal.
 The resident main session is the only CTO orchestrator. It uses
 `cto_state(read exact run) → cto_state(commit wave/classification/workflow/DoD)
 → task(configured TeamDef.lead with the exact slice marker) → lead task(configured
-TeamDef.roster worker with the same marker)`, then verifies direct artifacts,
-validation evidence, approvals, and DoD before the next state commit. This is
-independent of ordinary `/do-work` selectors: the CTO root and leads must not
-call ordinary `workflow_prepare`/`workflow_status`/`workflow_instructions`/
-`workflow_begin`/`workflow_complete`/`workflow_advance` with the CTO slug.
-The resolved profile remains a quality contract, not a selector bridge.
+TeamDef.roster worker with the same marker) → producer
+workflow_submit_result({ "outputs": { ... } })`, then the trusted engine validates
+schemas/field errors, returns an immutable receipt, and owns fan-in. A matching
+host terminal is required only for worker producers; orchestrator/tool/document
+producers have no worker terminal to wait for and use trusted result/callback or
+engine rendering. Receipt, terminal, readiness, DoD, fan-in, and approval remain
+separate. The resident root uses `cto_stage_advance({ "slice_id": "<sliceId>" })`
+for native transition; actual human approval uses
+`cto_checkpoint_ask({ "slice_id": "<sliceId>" })` first. This is independent of
+ordinary `/do-work` selectors: the CTO root and leads must not call ordinary
+`workflow_prepare`/`workflow_status`/`workflow_instructions`/
+`workflow_begin`/`workflow_advance` with the CTO slug.
+The resolved profile remains a quality contract, not a selector bridge; no
+producer writes workflow JSON, canonical output paths, manifests, or authority
+fields by hand.
 
 Registered `/cto` получает scoped native system contract, а не ordinary-only
 требование `workflow_begin`. Его выбирает проверенная private provenance;
@@ -263,18 +283,39 @@ Implementation, artifact recovery, review и QA выполняют roster-worker
 Смена configured lead прекращает delegation прежнего lead; root не может
 обойти проверку прямым вызовом worker или подменой display name.
 
-`before_advance` проверяется после готового результата стадии, до следующей
-стадии. Lead может локально применить только допустимое resolved policy
-автоматическое решение с evidence; `required_human` и неразрешённые вопросы
-передаются root для настоящего решения. Раннее согласие на план и позднее
-approval не заменяют эту границу. Если двусторонний канал недоступен, lead
-возвращает handoff результатом task; root продолжает через тот же configured
-lead с точным scope, без повторного запуска завершённых workers.
+`before_advance` is checked after the applicable producer result is ready and,
+for worker producers only, its matching host terminal is attested. Orchestrator,
+tool, and document producers have no worker terminal to wait for. The engine
+evaluates the resolved policy: eligible `policy_auto` proceeds through
+`cto_stage_advance({ "slice_id": "<sliceId>" })`; when actual human approval is
+required, the resident root calls
+`cto_checkpoint_ask({ "slice_id": "<sliceId>" })` and then
+`cto_stage_advance({ "slice_id": "<sliceId>" })`. These tools derive current
+scope and reject ordinary tokens or candidate-progress injection. Early plan
+consent and late/posthoc approval cannot replace this boundary. If a channel is
+unavailable, observe/reconcile/wait through supported recovery; do not fake a
+reconnect or redispatch a live/unknown worker.
 
-Root передаёт явный evidence-каталог, уникальный для run/wave/slice, отдельно
-от путей исходников, shared deliverables и DoD. Producers сохраняют канонические
-имена файлов внутри него. Retry сохраняет каталог; новая волна получает новый
-и не перезаписывает evidence предыдущих волн или их ссылки.
+Lead-owned `producer.kind="orchestrator"` может публиковать только собственные
+объявленные `outputs` через `workflow_submit_result`; accepted receipt подтверждает
+результат этого producer, но для него не ожидается worker terminal. `TeamDef.roster`
+обязателен только для worker slots, объявленных текущим stage: нельзя пропустить
+объявленный слот или запускать undeclared worker. Resident root применяет resolved
+checkpoint policy, вызывает `cto_stage_advance` (и `cto_checkpoint_ask`, только
+если этого требует policy), затем использует только текущий worker handoff.
+
+Bare/unknown process exit, включая `exit 1` без совпадающего host terminal, и
+файл на диске не являются accepted receipt или matching SDK worker terminal.
+Worker replacement допустим только после attested failure/cancel либо attested
+preflight-not-started result и authorized bounded recovery; иначе продолжайте
+observe/reconcile/wait для live/unknown worker.
+
+Root passes a supplemental evidence catalog unique to run/wave/slice, separate
+from source paths, shared deliverables, and DoD. It is validation/coordination
+context only; the submission engine owns immutable output references and
+canonical publication. Producers do not copy output paths or write canonical
+workflow artifacts into that catalog. Retry preserves evidence scope; a new wave
+gets a new catalog and never overwrites prior evidence or links.
 
 Запуск с задачей остаётся resident после закрытия волны. Exact resume без
 новой задачи сохраняет канонический task, классификацию и прогресс; успешная
@@ -284,10 +325,11 @@ Root передаёт явный evidence-каталог, уникальный �
 
 Per-team DoD is a supplemental ordinary file at the exact relative
 `teams[].dod_path` (default `.work-state/artifacts/<team>/dod.json`); it is not
-canonical `.work-state/cto/<id>/state.json`. Worker artifacts use the same
-flat-file rule as ordinary workflows: the exact declared filename supplies the
-artifact id, and its root is the direct schema payload with no id-keyed
-envelope.
+canonical `.work-state/cto/<id>/state.json` or a typed workflow output.
+Worker and non-worker producers publish declared values only through
+`workflow_submit_result({ "outputs": { ... } })`; the engine validates and
+persists immutable references. Do not submit flat files, id-keyed envelopes,
+manual JSON, copied paths, or authority fields.
 
 ## Model roles
 

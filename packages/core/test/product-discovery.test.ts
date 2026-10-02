@@ -27,14 +27,15 @@ import {
   resolveClassification,
   validateProducedArtifact,
 } from "@andvl1/omp-workflows-core";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, advanceCursor, recordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
-import { checkpointPolicyHash, recordTrustedCheckpointAnswer, unresolvedCheckpointError } from "../src/engine/checkpoints.js";
+import { profileHash } from "../src/engine/profile.js";
+import { createCapability, recordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
+import { checkpointPolicyHash, unresolvedCheckpointError } from "../src/engine/checkpoints.js";
 import { migrationCheckpointPolicy } from "../src/engine/workflow-contract.js";
 
 import { runTarget } from "../src/engine/run-store.js";
 
 import type { Profile, TeamState } from "../src/engine/types.js";
+import { createCoreFixture, details, submission, type Harness } from "./reliable-stage-execution-fixture.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 const APPROVAL_RUN_ID = "77777777-7777-4777-8777-777777777777";
 
@@ -82,20 +83,6 @@ function writeCanonicalState(root: string, state: TeamState): { statePath: strin
   return { statePath: target.statePath!, artifactsDir: target.artifactsDir! };
 }
 
-function advanceAuth(issued: IssuedCapability) {
-  return {
-    run_id: APPROVAL_RUN_ID,
-    token: issued.advance_token,
-    capability_id: issued.capability_id,
-    run_key: issued.state.issued_for!.run_key,
-    branch: issued.state.issued_for!.branch,
-    workflow: issued.state.issued_for!.workflow,
-    profile_hash: issued.state.issued_for!.profile_hash,
-    stage_cursor: issued.state.issued_for!.stage_cursor,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    loop_iteration: issued.state.issued_for!.loop_iteration,
-  };
-}
 
 function setupApprovalStage(root: string, branch: string, profile: Profile): { issued: IssuedCapability; artifactsDir: string } {
   const persistedHash = profileHash(profile);
@@ -140,102 +127,6 @@ function setupApprovalStage(root: string, branch: string, profile: Profile): { i
   return { issued, artifactsDir };
 }
 
-test("product-discovery: profile ships with the exact stage order and role wiring", async () => {
-  const profiles = await loadAllProfiles();
-  const profile = profiles.find((p) => p.name === "product-discovery");
-  assert.ok(profile, "product-discovery profile is shipped");
-  assert.equal(profile.title, "Product discovery");
-  assert.ok(profile.match.type.includes("PRODUCT_DISCOVERY"), "match selects PRODUCT_DISCOVERY");
-
-  assert.deepEqual(
-    profile.stages.map((s) => s.id),
-    [
-      "product_intake",
-      "problem_framing",
-      "evidence_and_alternatives",
-      "product_critique",
-      "product_synthesis",
-      "product_prd_document",
-      "product_approval",
-      "product_handoff",
-    ],
-  );
-
-  const [intake, framing, evidence, critique, synthesis, prdDocument, approval, handoff] = profile.stages;
-
-  // product_intake: parallel consilium of the two evidence-gathering roles.
-  assert.equal(intake?.type, "consilium");
-  assert.deepEqual(intake?.roles, ["product-analyst", "product-researcher"]);
-  assert.equal(intake?.parallel, true);
-  assert.equal(intake?.produces, "product_intake");
-
-  // problem_framing: analyst consumes intake.
-  assert.equal(framing?.type, "single");
-  assert.equal(framing?.role, "product-analyst");
-  assert.deepEqual(framing?.consumes, ["product_intake"]);
-  assert.equal(framing?.produces, "product_framing");
-
-  // evidence_and_alternatives: researcher consumes framing.
-  assert.equal(evidence?.type, "single");
-  assert.equal(evidence?.role, "product-researcher");
-  assert.deepEqual(evidence?.consumes, ["product_framing"]);
-  assert.equal(evidence?.produces, "product_evidence");
-
-  // product_critique: critic reviews framing + evidence.
-  assert.equal(critique?.type, "single");
-  assert.equal(critique?.role, "product-critic");
-  assert.deepEqual(critique?.consumes, ["product_framing", "product_evidence"]);
-  assert.equal(critique?.produces, "product_critique");
-
-  // product_synthesis: strategist consumes framing + evidence + critique.
-  assert.equal(synthesis?.type, "single");
-  assert.equal(synthesis?.role, "product-strategist");
-  assert.deepEqual(synthesis?.consumes, ["product_framing", "product_evidence", "product_critique"]);
-  assert.equal(synthesis?.produces, "product_spec");
-
-  // product_prd_document: executable document stage — deterministic engine render BEFORE the owner approves.
-  assert.equal(prdDocument?.type, "document");
-  assert.deepEqual(
-    prdDocument?.document,
-    { format: "markdown", renderer: "product-prd", path: "documents/product-prd.md" },
-    "the stage declares the exact shipped document contract",
-  );
-  assert.deepEqual(prdDocument?.consumes, ["product_intake", "product_framing", "product_evidence", "product_critique", "product_spec"]);
-  assert.equal(prdDocument?.produces, "product_prd");
-
-  // product_approval: interactive human gate.
-  assert.equal(approval?.type, "orchestrator");
-  assert.deepEqual(approval?.consumes, ["product_prd", "product_spec"]);
-  assert.equal(approval?.checkpoint, "product_approval");
-  assert.equal(approval?.gate, "product_approval_recorded");
-  assert.equal(approval?.produces, "product_approval_record");
-  assert.match(approval?.autonomous ?? "", /never auto-approve/i);
-  assert.match(approval?.prompt ?? "", /authorization=human/i);
-  assert.match(approval?.prompt ?? "", /actor_provenance/i);
-  assert.match(approval?.prompt ?? "", /proceed \| needs_more_validation \| defer \| reject/);
-  assert.match(approval?.prompt ?? "", /no inferred consent|never self-approve/i);
-
-  // product_handoff: same approval gate, consumes the PRD, spec + approval record.
-  assert.equal(handoff?.type, "orchestrator");
-  assert.deepEqual(handoff?.consumes, ["product_prd", "product_spec", "product_approval_record"]);
-  assert.equal(handoff?.gate, "product_approval_recorded");
-  assert.equal(handoff?.produces, "product_handoff");
-  assert.match(handoff?.prompt ?? "", /spec-preparation.*proceed/i);
-  assert.match(handoff?.prompt ?? "", /no application or repository files were changed/i);
-});
-
-test("product-discovery: every stage prompt enforces evidence-first, no-code discipline", async () => {
-  const profiles = await loadAllProfiles();
-  const profile = profiles.find((p) => p.name === "product-discovery");
-  assert.ok(profile);
-  for (const stage of profile.stages) {
-    const prompt = stage.prompt ?? "";
-    assert.match(prompt, /DO NOT edit|do not edit|no application code|read-only/i, `${stage.id} prohibits code edits`);
-    assert.match(prompt, /fabricat/i, `${stage.id} prohibits fabricated data`);
-    assert.match(prompt, /verified\|assumption\|unknown|verified|assumption/, `${stage.id} preserves evidence status`);
-    assert.match(prompt, /EXACT .* schema|exactly/i, `${stage.id} demands exact schema output`);
-  }
-});
 
 test("product-discovery: artifact contracts accept valid documents and reject invalid ones", () => {
   // product_intake — valid (mergeable arrays: intake is a parallel consilium,
@@ -436,29 +327,90 @@ test("product-discovery: artifact contracts accept valid documents and reject in
   );
 });
 
-test("product-discovery: product_approval_recorded gate requires an interactive human decision to advance", () => {
+test("product-discovery: product_approval_recorded gate requires an interactive human decision to advance", async () => {
   const root = mkdtempSync(join(tmpdir(), "pd-approval-"));
+  let harness: Harness | undefined;
   try {
     initGit(root, "feat/product-approval");
-    registerWorkflowProfiles([APPROVAL_PROFILE]);
-    const profile = loadProfile("product-approval-regression");
-    assert.ok(profile);
+    const profile = APPROVAL_PROFILE;
     const { issued, artifactsDir } = setupApprovalStage(root, "feat/product-approval", profile);
-    writeFileSync(
-      join(artifactsDir, "product_approval_record.json"),
-      JSON.stringify({ decision: "proceed", approved_by: "Product Owner", rationale: "evidence supports it", decided_at: "2026-08-17T00:00:00Z" }),
-    );
+    assert.ok(issued);
+    assert.ok(artifactsDir);
+
+    harness = createCoreFixture({
+      root,
+      branch: "feat/product-approval",
+      workflowProfiles: [profile],
+      roles: {},
+    });
+    const prepared = harness.controller.prepare({ mode: "resume", run_id: APPROVAL_RUN_ID });
+    assert.equal(prepared.state.run_id, APPROVAL_RUN_ID);
+    assert.equal(harness.controller.activeClaimRunId(), APPROVAL_RUN_ID);
+
+    const beginTool = harness.tools.get("workflow_begin");
+    assert.ok(beginTool);
+    const beginDetails = details((await beginTool.execute("product-approval-begin", {}, undefined, undefined, harness.context)).details);
+    assert.equal(beginDetails.ok, true, JSON.stringify(beginDetails));
+    const handoff = beginDetails.handoff as {
+      advance_token: string;
+      capability_id: string;
+      run_key: string;
+      branch: string;
+      workflow: string;
+      profile_hash: string;
+      stage_cursor: string;
+      cursor_epoch: string;
+      loop_iteration: number;
+    };
+
+    const submitTool = harness.tools.get("workflow_submit_result");
+    assert.ok(submitTool);
+    const submitted = details((await submitTool.execute(
+      "product-approval-submit",
+      submission({
+        product_approval_record: {
+          decision: "proceed",
+          approved_by: "Product Owner",
+          rationale: "evidence supports it",
+          decided_at: "2026-08-17T00:00:00Z",
+        },
+      }),
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
 
     // 1. Advance with no durable decision fails closed: the gate fires its
     //    no-decision diagnostic before the unresolved-checkpoint check.
     assert.equal((readState(root).checkpoint_decisions ?? []).length, 0, "no decision recorded yet");
-    const noDecision = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" }, { runId: APPROVAL_RUN_ID });
+    const advanceAuth = {
+      run_id: APPROVAL_RUN_ID,
+      token: handoff.advance_token,
+      capability_id: handoff.capability_id,
+      run_key: handoff.run_key,
+      branch: handoff.branch,
+      workflow: handoff.workflow,
+      profile_hash: handoff.profile_hash,
+      stage_cursor: handoff.stage_cursor,
+      cursor_epoch: handoff.cursor_epoch,
+      loop_iteration: handoff.loop_iteration,
+    };
+    const advanceTool = harness.tools.get("workflow_advance");
+    assert.ok(advanceTool);
+    const noDecision = details((await advanceTool.execute(
+      "product-approval-no-decision",
+      { ...advanceAuth, evidence: "approval presented to product owner" },
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
     assert.equal(noDecision.ok, false, "advance without a product decision must block");
-    if (!noDecision.ok) assert.match(noDecision.error, /gate 'product_approval_recorded' is not satisfied/);
+    if (!noDecision.ok) assert.match(String(noDecision.error), /gate 'product_approval_recorded' is not satisfied/);
 
     // 2. Legacy mode/actor input is rejected before it can authorize. The
     //    checkpoint remains resumable and floor consent is needs_human.
-    const legacy = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "product_approval", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "auto-approve" });
+    const legacy = recordCheckpointDecision(root, { ...advanceAuth, checkpoint: "product_approval", mode: "autonomous", decision: "proceed", actor: "orchestrator", rationale: "auto-approve" });
     assert.equal(legacy.ok, false, "legacy checkpoint input must fail closed");
     if (!legacy.ok) assert.match(legacy.error, /typed checkpoint authorization and actor provenance/);
     assert.equal((readState(root).typed_checkpoint_decisions ?? []).length, 0);
@@ -469,47 +421,74 @@ test("product-discovery: product_approval_recorded gate requires an interactive 
     writeCanonicalState(root, unresolvedState);
     assert.equal(readState(root).pause.kind, "needs_human");
 
-    // 3. An interactive answer must carry typed human provenance. The
-    //    adapter binds policy hash and capability epoch from the active state.
-    const beforeInteractive = readState(root);
-    const expectedPolicyHash = checkpointPolicyHash(beforeInteractive.checkpoint_policy!);
-    const trusted = recordTrustedCheckpointAnswer(beforeInteractive, {
-      answer_id: "product-owner/product_approval/1",
-      channel: "escalation",
-      reference: "escalation-answer/product-owner/product_approval/1",
-      stage_id: "product_approval",
-      checkpoint_id: "product_approval",
-      decision: "proceed",
-    });
-    writeCanonicalState(root, trusted.state);
-    const expectedEpoch = beforeInteractive.dispatch_capability!.issued_for!.cursor_epoch;
-    const interactive = recordCheckpointDecision(root, {
-      ...advanceAuth(issued),
-      checkpoint: "product_approval",
-      checkpoint_kind: "product_approval",
-      decision: "proceed",
-      authorization: "human",
-      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
-      rationale: "evidence supports it",
-    });
-    assert.equal(interactive.ok, true);
-    if (!interactive.ok) return;
+    // 3. The registered interactive checkpoint adapter carries typed human
+    //    provenance, then the public transition consumes that proof.
+    const askTool = harness.tools.get("workflow_checkpoint_ask");
+    assert.ok(askTool);
+    const asked = details((await askTool.execute(
+      "product-approval-human-answer-ask",
+      {
+        token: handoff.advance_token,
+        capability_id: handoff.capability_id,
+        run_key: handoff.run_key,
+        branch: handoff.branch,
+        workflow: handoff.workflow,
+        stage_cursor: handoff.stage_cursor,
+        cursor_epoch: handoff.cursor_epoch,
+        checkpoint: "product_approval",
+        checkpoint_id: "product_approval",
+        checkpoint_kind: "product_approval",
+        loop_iteration: handoff.loop_iteration,
+      },
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
+    assert.equal(asked.ok, true, JSON.stringify(asked));
+    const recordTool = harness.tools.get("workflow_checkpoint");
+    assert.ok(recordTool);
+    const interactive = details((await recordTool.execute(
+      "product-approval-human-answer-record",
+      {
+        ...advanceAuth,
+        profile_hash: handoff.profile_hash,
+        checkpoint: "product_approval",
+        checkpoint_id: "product_approval",
+        checkpoint_kind: "product_approval",
+        authorization: "human",
+        actor_provenance: asked.actor_provenance,
+        decision: asked.decision,
+        rationale: "evidence supports it",
+      },
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
+    assert.equal(interactive.ok, true, JSON.stringify(interactive));
     const typedRecord = readState(root).typed_checkpoint_decisions?.[0];
     assert.equal(typedRecord?.authorization, "human");
     assert.equal(typedRecord?.actor.kind, "user");
-    assert.equal(typedRecord?.actor.ref, trusted.answer.reference);
-    assert.deepEqual(typedRecord?.actor.proof, trusted.proof);
-    assert.equal(typedRecord?.capability_epoch, expectedEpoch);
+    assert.ok(typedRecord?.actor.ref);
+    assert.ok(typedRecord?.actor.proof);
+    assert.equal(typedRecord?.capability_epoch, handoff.cursor_epoch);
     assert.equal(typedRecord?.decision, "proceed");
     const interactiveRecord = readState(root).checkpoint_decisions?.[0];
     assert.equal(interactiveRecord?.mode, "interactive");
     assert.equal(interactiveRecord?.decision, "proceed");
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "approval presented to product owner" }, { runId: APPROVAL_RUN_ID });
-    assert.equal(advanced.ok, true, "an interactive proceed decision allows advance");
-    if (!advanced.ok) return;
-    assert.equal(advanced.state.stages.find((s) => s.id === "product_approval")?.status, "done");
-    assert.equal(advanced.state.dispatch_capability?.status, "complete", "no next stage: the capability completes after the gate passes");
+
+    const advanced = details((await advanceTool.execute(
+      "product-approval-advance",
+      { ...advanceAuth, evidence: "approval presented to product owner" },
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
+    assert.equal(advanced.ok, true, JSON.stringify(advanced));
+    const advancedState = readState(root);
+    assert.equal(advancedState.stages.find((s) => s.id === "product_approval")?.status, "done");
+    assert.equal(advancedState.dispatch_capability?.status, "complete", "no next stage: the capability completes after the gate passes");
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

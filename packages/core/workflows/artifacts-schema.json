@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "fullstack-team/workflows/artifacts-schema.json",
   "title": "Handoff Artifacts",
-  "description": "Typed handoff contracts between workflow stages. Each stage with a `produces` field writes .work-state/artifacts/<id>.json matching the schema below. Downstream stages declare these ids in `consumes` and read them from disk instead of receiving pasted prose. Artifacts survive context compaction and make the inter-stage contract explicit.",
+  "description": "Typed handoff contracts between workflow stages. Producers submit each declared output id's direct schema payload through workflow_submit_result({\"outputs\":{\"<artifact_id>\":<payload>}}); the host derives producer, slot, and dispatch identity, and core publishes immutable canonical references. Downstream stages declare these ids in consumes and read them through workflow instructions. Artifacts survive context compaction and make the inter-stage contract explicit.",
   "definitions": {
     "discovery": {
       "type": "object",
@@ -349,7 +349,7 @@
     },
     "dod": {
       "type": "object",
-      "description": "Definition of Done — acceptance criteria fixed BEFORE code by the declared early producer (clarify/discovery/diagnose), each with a verification method and criterion-specific evidence when met. Later shared-sidecar updates belong to the designated sole writer of qa_tests or manual_qa; other participants return evidence and proposed updates without editing the sidecar. Preserve unrelated criteria and keep unsupported items pending. The sidecar is not an additional declared QA output or workflow_complete artifact_id. The dod_complete gate and the runtime DoD backstop require every item met WITH evidence before a task may claim done.",
+      "description": "Definition of Done — acceptance criteria fixed BEFORE code by the declared early producer (clarify/discovery/diagnose), each with a verification method and criterion-specific evidence when met. Later shared-sidecar updates belong to the designated sole writer of qa_tests or manual_qa; other participants return evidence and proposed updates without editing the sidecar. Preserve unrelated criteria and keep unsupported items pending. The sidecar is supplemental evidence: never include it in workflow_submit_result.outputs or treat it as a legacy workflow_complete artifact_id. The dod_complete gate and the runtime DoD backstop require every item met WITH evidence before a task may claim done.",
       "required": ["items"],
       "properties": {
         "items": {

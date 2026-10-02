@@ -75,6 +75,7 @@ import {
 	defaultOmpInternalScopeUiClasses,
 	refreshInternalAgentMappings,
 	waitForInternalAgentMappings,
+	type InternalAgentDiscovery,
 } from "./pool.js";
 import { loadOmpWorkflowProfiles } from "./profiles.js";
 
@@ -933,6 +934,15 @@ export function resolveGatedCommandCwd(ctx: unknown): string | undefined {
 	return detectWorkspaceMarkers(cwd).ok ? cwd : undefined;
 }
 
+export interface InternalRegistrationOptions {
+	/**
+	 * Optional host-owned discovery seam. Production defaults to the pinned
+	 * OMP task discovery import; deterministic hosts may provide the same
+	 * provenance-bearing inventory explicitly.
+	 */
+	readonly discoverAgents?: InternalAgentDiscovery;
+}
+
 export type ActivationOutcome =
 	| { ok: true }
 	| { ok: false; code: "activation_markers_missing"; missing: string[] }
@@ -953,7 +963,7 @@ export type ActivationOutcome =
  *     role config on its very first session (never overwrites a custom one);
  *  5. engine registration and adapter wiring.
  */
-export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): ActivationOutcome {
+export function ensureEngineActivation(pi: ExtensionAPI, cwd: string, options: InternalRegistrationOptions = {}): ActivationOutcome {
 	const gate = detectWorkspaceMarkers(cwd);
 	if (!gate.ok) {
 		return { ok: false, code: gate.code, missing: gate.missing.map((marker) => marker.path) };
@@ -1020,7 +1030,7 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 			// authorizes from this session's discovery — in memory, never from the
 			// persisted mapping file. A failed refresh rejects here, which blocks
 			// the begin (fail closed) instead of letting a stale roster stand in.
-			beforeBegin: (sessionCwd) => waitForInternalAgentMappings(sessionCwd),
+			beforeBegin: (sessionCwd) => waitForInternalAgentMappings(sessionCwd, options.discoverAgents),
 		});
 		adapter.register(pi);
 	} catch (error) {
@@ -1096,7 +1106,7 @@ function buildValidateReport(cwd: string): string {
 }
 
 
-export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
+export default function ompWorkflowsInternal(pi: ExtensionAPI, options: InternalRegistrationOptions = {}): void {
 	// Diagnostic/command surface — registered unconditionally. This is NOT
 	// workflow-engine registration: it performs zero claims, zero tool
 	// registrations and zero config writes, and is the only channel through
@@ -1114,7 +1124,7 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 				pi.sendUserMessage(buildValidateReport(cwd));
 				return;
 			}
-			const outcome = ensureEngineActivation(pi, cwd);
+			const outcome = ensureEngineActivation(pi, cwd, options);
 			if (!outcome.ok) {
 				pi.sendUserMessage(formatDiagnostic(outcome));
 				return;
@@ -1199,7 +1209,7 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 		// the default omp-* role config (write-if-absent), so the refresh
 		// kicked below resolves real roles on the very first session instead
 		// of failing closed on empty config until a second session_start.
-		const outcome = ensureEngineActivation(pi, cwd);
+		const outcome = ensureEngineActivation(pi, cwd, options);
 		if (!outcome.ok) {
 			// SEC-BUNDLE-003: no absolute paths in host logs — marker names and
 			// typed codes only.
@@ -1217,7 +1227,7 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 		// resolveConfig. Fire and forget — a rejected refresh fails closed
 		// without blocking activation.
 		if (detectWorkspaceMarkers(cwd).ok) {
-			void refreshInternalAgentMappings(cwd).catch((error: unknown) => {
+			void refreshInternalAgentMappings(cwd, options.discoverAgents).catch((error: unknown) => {
 				// SEC-BUNDLE-003: no absolute paths in host logs — typed code plus
 				// the typed error text (agent names) only.
 				console.warn(`[${COMMAND_NAME}]`, JSON.stringify({

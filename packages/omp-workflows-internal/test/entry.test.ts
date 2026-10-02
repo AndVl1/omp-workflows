@@ -78,6 +78,9 @@ function makePi(options: { tools?: boolean } = {}) {
 		fireSessionSwitch(event: unknown, ctx: unknown): void {
 			for (const handler of hooks.get("session_switch") ?? []) handler(event, ctx);
 		},
+		async fireSessionSwitchAsync(event: unknown, ctx: unknown): Promise<void> {
+			for (const handler of hooks.get("session_switch") ?? []) await handler(event, ctx);
+		},
 		fireBeforeAgentStart(event: unknown, ctx: unknown): unknown {
 			let result: unknown;
 			for (const handler of hooks.get("before_agent_start") ?? []) {
@@ -1121,7 +1124,7 @@ test("verified replacement isolates the old host while headless ingress preserve
 	const newSessionId = "entry-replacement-new";
 	const newSessionFile = hostSessionFile(root, newSessionId);
 	ownerSession.setSession(newSessionId, newSessionFile);
-	host.fireSessionSwitch(
+	await host.fireSessionSwitchAsync(
 		{ type: "session_switch", reason: "new", previousSessionFile: oldSessionFile },
 		owner,
 	);
@@ -1145,7 +1148,7 @@ test("verified replacement isolates the old host while headless ingress preserve
 		{ mode: "new", task: "replacement host run", classification },
 		owner,
 	);
-	assert.equal(second.ok, true);
+	assert.equal(second.ok, true, JSON.stringify(second));
 	assert.equal(typeof second.run_id, "string");
 	const replacementRunId = second.run_id as string;
 	assert.notEqual(replacementRunId, oldRunId, "replacement prepare starts a fresh run");

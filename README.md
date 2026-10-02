@@ -317,6 +317,68 @@ resume.
 [`core lifecycle contract`](packages/core/README.md) и
 [`fullstack command guide`](packages/fullstack/README.md).
 
+### Сдача результата, approvals и recovery
+
+Producer сдаёт результат через `workflow_submit_result({ outputs })`: ключи
+`outputs` — объявленные артефакты текущего назначения, значения — данные их
+схем. Identity, роль, slot, run и authority не задаются в model input: core
+выводит их из подтверждённого host binding. Запись JSON вручную не заменяет
+сдачу результата.
+
+- **Producer ownership.** Worker публикует только собственный slot;
+  orchestrator — объявленный ему этап. Tool producer использует
+  `registerStageProducerTool` и publisher, действующий только внутри
+  зарегистрированного callback. Обычный model call не может присвоить себе
+  tool authority. `lecture_acquire` сохраняет main-session restriction.
+- **Receipt и terminal — разные факты.** Core проверяет схему и evidence,
+  публикует immutable payload вместе с receipt и различает точный повтор
+  от конфликтующей сдачи. Worker terminal без принятого результата не
+  завершает этап; receipt не заменяет worker terminal, DoD или approval.
+  Orchestrator/tool не требуют фиктивного worker terminal.
+- **Переходы.** Ordinary route использует `workflow_checkpoint_ask` и
+  `workflow_advance`. В native CTO root вызывает
+  `cto_checkpoint_ask({ slice_id })` и `cto_stage_advance({ slice_id })`;
+  configured lead и roster сохраняют собственные границы authority.
+  Planning consent не является approval завершённой реализации.
+- **Recovery.** `workflow_recover` диагностирует и согласует текущее
+  canonical состояние без model-supplied stage token. Неизвестный исход
+  worker не является подтверждённым завершением и не разрешает второго
+  writer. Format repair возвращается тому же producer, а replacement
+  требует подтверждённого исхода и bounded budget.
+  Budget привязан к canonical stage/slot lineage, а не к новому SDK session/task:
+  restart и повторная доставка не обнуляют использованные попытки. Историческое
+  `running` после смены owner не доказывает liveness без свежего host evidence;
+  поздний terminal прежнего worker не снимает reservation его replacement.
+- **Граница OMP 18.** Continuation через `sendMessage` означает
+  `queued`/`not_started`, не запуск worker. Новый dispatch проходит обычный
+  admission; только runtime подтверждает start/terminal. Неподтверждённые
+  inspect/resume/reconnect capabilities не выдаются за поддерживаемые.
+- **Standalone API.** `run`, `runStage` и `createTaskCaller` остаются
+  низкоуровневыми API исполнения. `TaskResult` содержит только transport result,
+  без `artifacts`; worker публикует `outputs` через свой зарегистрированный
+  `workflow_submit_result`. Orchestrator callback возвращает `outputs`, которые
+  engine публикует через trusted current-stage binding.
+  Registered interpreter передаёт `sessionController` и
+  `execution: sessionController.context()`: lifecycle preparation обновляет
+  canonical claim и приватную привязку одного controller вместе.
+  Несовпадающий controller/context/workspace отклоняется до записи.
+  Executor сохраняет реальные SDK admission hooks и child lineage; standalone
+  caller без зарегистрированного producer не получает synthetic worker binding.
+
+Для автоматической проверки из корня доступны `npm run test:workflow-scenarios`
+(D) и `npm run test:workflow-process` (P). Они используют изолированные roots,
+no-network окружение и scenario report с фактическими событиями и source
+locators; missing/skipped cases и trace gaps не считаются PASS. Целевые
+длительности — D ≤ 60 секунд и P ≤ 180 секунд; фактическое время и соблюдение
+бюджета записываются в report. Превышение бюджета завершает команду с ошибкой,
+даже если все сценарии прошли. Эти проверки не заменяют отдельные H1/H2/H3
+на установленном OMP.
+D ограничивает одновременное выполнение тремя test files, P — одним;
+длинные файлы запускаются первыми через стандартный `node:test.run`.
+Build/typecheck и отдельные тяжёлые команды запускаются последовательно.
+Безопасные промежуточные строки содержат только scenario ID, outcome и время,
+поэтому зависший gate не скрывает уже завершённые cases до итогового report.
+
 ### Bootstrap custom-TS commands into your project
 
 Bootstrapping is automatic for both install paths — see *Slash command bootstrap — works for both install paths* above. The CLI script below remains available for explicit re-sync (for example, after editing a shipped command in the source repo and wanting to refresh a downstream checkout before the next session).

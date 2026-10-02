@@ -135,6 +135,54 @@ manually edit or delete those files. A live pass is **not** implied by scenario
 loading or package tests: run these commands after core/fullstack/internal
 integration and attach the resulting transcript/report paths.
 
+## Reliable-stage: закреплённые H1/H2/H3
+
+План `scenarios/reliable-stage-host-smoke.json` использует OMP **18.0.6**
+и собранные candidate core/fullstack packages. Live cases запускаются только
+после зелёных D/P; `validate` проверяет план, но не означает H PASS:
+
+```bash
+npm run host-smoke -w @andvl1/omp-workflows-e2e -- validate
+npm run host-smoke -w @andvl1/omp-workflows-e2e -- prepare \
+  --root <owned-root> --core <core.tgz> --fullstack <fullstack.tgz>
+```
+Подготовка передаёт один allowlisted environment установке, bootstrap и baseline
+commit собственных scratch repos. Родительские `INIT_CWD`, `OMP_PROJECT_DIR`,
+`npm_config_*`, `GIT_DIR` и `GIT_WORK_TREE` не выбирают каталоги записи:
+пути HOME/cache/config и postinstall target принадлежат `<owned-root>`.
+Проверяйте изоляцию с selectors, направленными только в собственный canary,
+не в пользовательский repo.
+
+
+Для запуска используйте binary из `runtime-manifest.json`, приватный
+`HOME=<owned-root>/home` и `PI_CODING_AGENT_DIR=<owned-root>/agent-data`.
+`PI_CONFIG_DIR` — имя каталога относительно HOME, а не абсолютный путь:
+при запуске оставьте `.omp`, чтобы обнаруживались bootstrap project plugins.
+Не наследуйте `OMP_PROFILE`/`PI_PROFILE` или пользовательские plugins.
+Приватный host config содержит только несекретные `modelRoles`; pinned catalog
+поддерживает `openai-codex/gpt-5.5`. Закрепите main/default и используемые
+agent roles, затем проверьте фактически выбранные модели в host evidence.
+
+Исходное хранилище credentials читается только read-only. Для Codex допустим
+официальный static `api_key` в отдельном приватном SDK store, содержащий
+неизменённый действующий access token: request adapter получает account identity
+из самого JWT. OAuth rows/refresh tokens не копируются; истечение или 401
+останавливает попытку без refresh fallback. Перед каждой 15-минутной попыткой
+проверяется достаточный срок действия. Credentials не передаются в argv,
+scratch, transcripts или evidence; приватный auth store удаляется после smoke.
+
+На case разрешены исходная попытка и один повтор после установленной причины;
+лимит каждой — 15 минут. Slash-команды вводятся через настоящий PTY по плану,
+не через `--scenario`/`--task`. H3 восстанавливает pending checkpoint без
+повторной реализации. Дополнительное наблюдение SDK cold revive использует
+только настоящий persisted worker этого case: `ensurePersistedRoster` и
+`AgentLifecycleManager.ensureLive` в новом host восстанавливают parked session,
+не прежний executor, workflow grant или authoritative running status.
+Новый prompt/task для доказательства revive не подставляется.
+
+Останавливайте только собственные sessions через существующий `stop`;
+`host-smoke cleanup --root <owned-root>` сохраняет evidence.
+
 ## Приёмка host admission
 
 Сценарий [`host-admission.json`](scenarios/host-admission.json) и

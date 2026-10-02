@@ -22,8 +22,9 @@ import {
   type TeamPlan,
   type WaveRecord,
 } from "./types.js";
-import { validateTypedControlPlane } from "../engine/workflow-contract.js";
 import type { ControlPlaneProvenance, WorkIdentity, WorktreeExecutionClaim } from "../engine/types.js";
+import { validateTypedControlPlane } from "../engine/workflow-contract.js";
+import { validateWorkIdentityValue } from "../engine/control-plane-contract.js";
 
 /**
  * A read witness is deliberately private to the in-memory object. It is a
@@ -188,6 +189,94 @@ function defaultBudgetShape(): BudgetState {
 /** Schema-2 fields a canonical state must carry (default-filled by migrateCtoState). */
 const SCHEMA2_CANONICAL_FIELDS = ["budget", "leases", "decisions", "inbox_quarantine", "wave_history"] as const;
 
+export type CtoMigrationErrorCode =
+  | "unsupported_schema"
+  | "invalid_schema"
+  | "non_quiescent"
+  | "incompatible_ledger";
+
+/**
+ * A migration refusal is deliberately distinguishable from a malformed state.
+ * Callers can report the reason while the canonicalization boundary leaves the
+ * source bytes untouched.
+ */
+export class CtoMigrationError extends Error {
+  readonly code: CtoMigrationErrorCode;
+  readonly sourcePreserved = true;
+
+  constructor(code: CtoMigrationErrorCode, message: string) {
+    super(message);
+    this.name = "CtoMigrationError";
+    this.code = code;
+  }
+}
+
+function ctoSourceSchema(raw: Record<string, unknown>): number {
+  if (raw.schema === undefined) return 1;
+  if (!Number.isSafeInteger(raw.schema) || (raw.schema as number) < 1) {
+    throw new CtoMigrationError("invalid_schema", "CTO state schema must be a positive integer");
+  }
+  return raw.schema as number;
+}
+
+function hasPersistedNativeLedger(raw: Record<string, unknown>): boolean {
+  // These fields were introduced after the schema-1 image.  Promoting a
+  // schema-1 source containing one would silently downgrade active/history
+  // information if an older writer later read it.
+  return raw.native_stage_progress !== undefined
+    || raw.stage_receipts !== undefined
+    || raw.stage_recovery !== undefined;
+}
+
+function hasIdentityProjection(value: unknown): boolean {
+  if (!isCtoStateRecord(value)) return false;
+  if (value.work_identity !== undefined || value.pending !== undefined || value.child_join !== undefined) return true;
+  return false;
+}
+
+/**
+ * Quiescence is checked only from authoritative persisted lifecycle fields.
+ * A receipt or a historical recovery operation is never treated as proof that
+ * a worker stopped; accepted/reserved/running assignments therefore block a
+ * source-changing migration.
+ */
+function ctoSourceIsQuiescent(raw: Record<string, unknown>): boolean {
+  if (Array.isArray(raw.teams)) {
+    for (const team of raw.teams) {
+      if (!isCtoStateRecord(team)) return false;
+      if (team.status === "in_progress" || team.status === "parked") return false;
+      if (team.status === "pending" && hasIdentityProjection(team)) return false;
+      if (team.status !== "pending" && team.status !== "done" && team.status !== "failed") return false;
+    }
+  }
+  if (isCtoStateRecord(raw.integration) && raw.integration.status === "in_progress") return false;
+  if (isCtoStateRecord(raw.native_stage_progress)) {
+    for (const progress of Object.values(raw.native_stage_progress)) {
+      if (!isCtoStateRecord(progress)) return false;
+      if (progress.status === "running" || progress.status === "accepted") return false;
+      if (!isCtoStateRecord(progress.assignments)) return false;
+      for (const assignment of Object.values(progress.assignments)) {
+        if (!isCtoStateRecord(assignment) || assignment.status !== "terminal") return false;
+      }
+    }
+  }
+  return true;
+}
+
+function assertCtoMigrationAllowed(raw: Record<string, unknown>, requireQuiescent: boolean): number {
+  const schema = ctoSourceSchema(raw);
+  if (schema > 2) {
+    throw new CtoMigrationError("unsupported_schema", `unsupported CTO state schema ${schema}; expected schema 2`);
+  }
+  if (schema < 2 && hasPersistedNativeLedger(raw)) {
+    throw new CtoMigrationError("incompatible_ledger", "schema-1 CTO state contains a newer native stage or recovery ledger");
+  }
+  if (requireQuiescent && !ctoSourceIsQuiescent(raw)) {
+    throw new CtoMigrationError("non_quiescent", "CTO state migration requires quiescent workers and no active stage assignment");
+  }
+  return schema;
+}
+
 /**
  * Typed control-plane fields are validated (never trusted) on every
  * migration: values present on disk must parse against the shared contract,
@@ -224,7 +313,8 @@ function normalizeControlPlaneFields(state: Record<string, unknown>): void {
  * their owners (wave lifecycle / channel resolver).
  */
 export function migrateCtoState(raw: Record<string, unknown>): CtoState {
-  const schema = typeof raw.schema === "number" ? raw.schema : 1;
+  const schema = assertCtoMigrationAllowed(raw, false);
+  if (schema < 2) assertCtoMigrationAllowed(raw, true);
   const state: Record<string, unknown> = { ...raw };
   if (schema < 2) state.schema = 2;
   if (state.budget === undefined) state.budget = defaultBudgetShape();
@@ -272,7 +362,9 @@ const CTO_STATE_KEYS: Record<string, true> = {
   roster_policy: true,
   roster_selection: true,
   roster_selections: true,
-  work_identity: true,
+  native_stage_progress: true,
+  stage_receipts: true,
+  stage_recovery: true,
   pending: true,
   child_join: true,
   child_joins: true,
@@ -289,6 +381,103 @@ function nonEmptyStateString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function validateNativeStageProgress(value: unknown, path: string, issues: string[]): void {
+  if (!isCtoStateRecord(value)) {
+    issues.push(`${path} must be an object`);
+    return;
+  }
+  if (value.schema !== 1) issues.push(`${path}.schema must be 1`);
+  for (const key of ["run_id", "wave_id", "slice_id", "team_id", "workflow", "stage_id", "stage_cursor", "profile_hash", "capability_id", "capability_epoch", "updated_at"]) {
+    if (!nonEmptyStateString(value[key])) issues.push(`${path}.${key} must be a non-empty string`);
+  }
+  if (!Number.isInteger(value.iteration) || (value.iteration as number) < 1) issues.push(`${path}.iteration must be an integer >= 1`);
+  if (!Number.isInteger(value.revision) || (value.revision as number) < 0) issues.push(`${path}.revision must be an integer >= 0`);
+  if (!["ready", "running", "accepted", "complete"].includes(String(value.status))) issues.push(`${path}.status has an unknown value`);
+  if (!Array.isArray(value.declared_outputs) || value.declared_outputs.some((id) => !nonEmptyStateString(id) || !/^[A-Za-z0-9._-]+$/.test(id))) {
+    issues.push(`${path}.declared_outputs must be an array of safe artifact ids`);
+  }
+  if (!Array.isArray(value.declared_slots)) {
+    issues.push(`${path}.declared_slots must be an array`);
+  } else {
+    const slots = new Set<string>();
+    value.declared_slots.forEach((slot, index) => {
+      const slotPath = `${path}.declared_slots[${index}]`;
+      if (!isCtoStateRecord(slot)) {
+        issues.push(`${slotPath} must be an object`);
+        return;
+      }
+      for (const key of ["slot_id", "role", "agent"]) {
+        if (!nonEmptyStateString(slot[key])) issues.push(`${slotPath}.${key} must be a non-empty string`);
+      }
+      if (!Number.isInteger(slot.occurrence) || (slot.occurrence as number) < 1) issues.push(`${slotPath}.occurrence must be an integer >= 1`);
+      if (slot.facet !== undefined && slot.facet !== null && !nonEmptyStateString(slot.facet)) issues.push(`${slotPath}.facet must be a non-empty string or null`);
+      if (typeof slot.slot_id === "string" && slots.has(slot.slot_id)) issues.push(`${slotPath}.slot_id is duplicated`);
+      if (typeof slot.slot_id === "string") slots.add(slot.slot_id);
+    });
+  }
+  if (!isCtoStateRecord(value.assignments)) {
+    issues.push(`${path}.assignments must be an object`);
+  } else {
+    for (const [dispatchId, assignment] of Object.entries(value.assignments)) {
+      const assignmentPath = `${path}.assignments.${dispatchId}`;
+      if (!/^[A-Za-z0-9._-]+$/.test(dispatchId) || !isCtoStateRecord(assignment)) {
+        issues.push(`${assignmentPath} has an invalid assignment`);
+        continue;
+      }
+      if (!nonEmptyStateString(assignment.slot_id) || !nonEmptyStateString(assignment.role) || !nonEmptyStateString(assignment.agent)) {
+        issues.push(`${assignmentPath} requires slot_id, role and agent`);
+      }
+      if (!["reserved", "running", "accepted", "terminal"].includes(String(assignment.status))) issues.push(`${assignmentPath}.status has an unknown value`);
+      if (assignment.terminal_signal !== undefined
+        && assignment.terminal_signal !== "preflight:missing_prompt"
+        && assignment.terminal_signal !== "preflight:invalid_arguments") {
+        issues.push(`${assignmentPath}.terminal_signal has an unknown value`);
+      }
+      if (assignment.terminal_signal !== undefined && assignment.status !== "terminal") {
+        issues.push(`${assignmentPath}.terminal_signal requires terminal status`);
+      }
+      const identity = validateWorkIdentityValue(assignment.identity, `${assignmentPath}.identity`);
+      if (!identity.ok) issues.push(...identity.issues.map((issue) => `${issue.path} ${issue.message}`));
+      if (isCtoStateRecord(assignment.identity) && assignment.identity.dispatch_id !== dispatchId) {
+        issues.push(`${assignmentPath}.identity.dispatch_id must equal its assignment key`);
+      }
+    }
+  }
+  if (value.approval !== undefined) {
+    const approval = value.approval;
+    if (!isCtoStateRecord(approval)) {
+      issues.push(`${path}.approval must be an object`);
+    } else {
+      for (const key of ["approval_id", "stage_id", "checkpoint", "decision", "receipt_digest", "at"]) {
+        if (!nonEmptyStateString(approval[key])) issues.push(`${path}.approval.${key} must be a non-empty string`);
+      }
+      if (!Number.isInteger(approval.iteration) || (approval.iteration as number) < 1) issues.push(`${path}.approval.iteration must be an integer >= 1`);
+      if (!Number.isInteger(approval.progress_revision) || (approval.progress_revision as number) < 0) issues.push(`${path}.approval.progress_revision must be an integer >= 0`);
+      if (approval.phase !== "before_dispatch" && approval.phase !== "before_advance") issues.push(`${path}.approval.phase has an unknown value`);
+      if (approval.source !== "human" && approval.source !== "policy-auto") issues.push(`${path}.approval.source has an unknown value`);
+    }
+  }
+  if (value.advance_history !== undefined) {
+    if (!Array.isArray(value.advance_history)) {
+      issues.push(`${path}.advance_history must be an array`);
+    } else {
+      const operationIds = new Set<string>();
+      value.advance_history.forEach((record, index) => {
+        const recordPath = `${path}.advance_history[${index}]`;
+        if (!isCtoStateRecord(record)) {
+          issues.push(`${recordPath} must be an object`);
+          return;
+        }
+        if (!nonEmptyStateString(record.operation_id) || !/^[A-Za-z0-9._-]+$/.test(String(record.operation_id))) issues.push(`${recordPath}.operation_id must be a safe non-empty id`);
+        if (typeof record.operation_id === "string" && operationIds.has(record.operation_id)) issues.push(`${recordPath}.operation_id is duplicated`);
+        if (typeof record.operation_id === "string") operationIds.add(record.operation_id);
+        for (const key of ["from_stage_id", "to_stage_id", "at"]) if (!nonEmptyStateString(record[key])) issues.push(`${recordPath}.${key} must be a non-empty string`);
+        for (const key of ["from_revision", "to_revision"]) if (!Number.isInteger(record[key]) || (record[key] as number) < 0) issues.push(`${recordPath}.${key} must be an integer >= 0`);
+      });
+    }
+  }
+}
+
 /**
  * Validate the supported canonical CTO image before terminality is inspected.
  * Legacy images may omit schema-2 additive fields, but they still need the
@@ -301,7 +490,12 @@ export function parseCtoState(
   options: { strict?: boolean } = {},
 ): CtoStateValidation {
   if (!isCtoStateRecord(raw)) return { ok: false, error: "CTO state must be a JSON object" };
-  const state = migrateCtoState(raw);
+  let state: CtoState;
+  try {
+    state = migrateCtoState(raw);
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
   const issues: string[] = [];
   const typedValidation = validateTypedControlPlane(raw);
   if (!typedValidation.ok) {
@@ -354,6 +548,39 @@ export function parseCtoState(
       }
     });
   }
+  if (state.stage_receipts !== undefined) {
+    if (!isCtoStateRecord(state.stage_receipts)) {
+      issues.push("$.stage_receipts must be an object");
+    } else {
+      for (const [dispatchId, receipt] of Object.entries(state.stage_receipts)) {
+        if (!/^[A-Za-z0-9._-]+$/.test(dispatchId) || !isCtoStateRecord(receipt)
+          || !nonEmptyStateString(receipt.receipt_id)
+          || !nonEmptyStateString(receipt.submission_id)
+          || !nonEmptyStateString(receipt.digest)
+          || receipt.dispatch_id !== dispatchId
+          || !Number.isInteger(receipt.attempt)
+          || !nonEmptyStateString(receipt.accepted_at)
+          || !isCtoStateRecord(receipt.work_identity)
+          || !Array.isArray(receipt.outputs)
+          || !Array.isArray(receipt.evidence)) {
+          issues.push(`$.stage_receipts.${dispatchId} has an invalid receipt`);
+        }
+      }
+    }
+  }
+  if (state.native_stage_progress !== undefined) {
+    if (!isCtoStateRecord(state.native_stage_progress)) {
+      issues.push("$.native_stage_progress must be an object");
+    } else {
+      for (const [teamId, progress] of Object.entries(state.native_stage_progress)) {
+        if (!/^[A-Za-z0-9._-]+$/.test(teamId)) issues.push(`$.native_stage_progress.${teamId} has an unsafe team id`);
+        validateNativeStageProgress(progress, `$.native_stage_progress.${teamId}`, issues);
+        if (isCtoStateRecord(progress) && progress.team_id !== teamId) {
+          issues.push(`$.native_stage_progress.${teamId}.team_id must equal its map key`);
+        }
+      }
+    }
+  }
   if (!isCtoStateRecord(state.integration)
     || !["pending", "in_progress", "done", "failed"].includes(String(state.integration.status))) {
     issues.push("$.integration has an invalid status");
@@ -391,17 +618,20 @@ export function validateCtoStateCandidate(raw: unknown, expectedId?: string): Ct
  * second call on an already-canonical state performs no write.
  */
 export function canonicalizeState(runId: string, root: string): CtoState {
+  let raw: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(ctoStatePath(runId, root), "utf8"));
+    if (!isCtoStateRecord(parsed)) throw new Error("CTO state must be a JSON object");
+    raw = parsed;
+  } catch {
+    throw new Error(`canonicalizeState: no readable CtoState at ${ctoStatePath(runId, root)}`);
+  }
+  const schema = assertCtoMigrationAllowed(raw, false);
+  const needsWrite = schema < 2 || SCHEMA2_CANONICAL_FIELDS.some((field) => raw[field] === undefined);
+  if (needsWrite) assertCtoMigrationAllowed(raw, true);
   const state = readCtoState(runId, root);
   if (!state) {
     throw new Error(`canonicalizeState: no readable CtoState at ${ctoStatePath(runId, root)}`);
-  }
-  let needsWrite = true;
-  try {
-    const raw = JSON.parse(readFileSync(ctoStatePath(runId, root), "utf8")) as Record<string, unknown>;
-    const schema = typeof raw.schema === "number" ? raw.schema : 1;
-    needsWrite = schema < 2 || SCHEMA2_CANONICAL_FIELDS.some((field) => raw[field] === undefined);
-  } catch {
-    // unreadable file — persist the migrated in-memory state
   }
   if (needsWrite) writeCtoState(state, root);
   return state;
@@ -420,10 +650,10 @@ export function readCtoState(runId: string, root: string): CtoState | null {
   }
 }
 
-export function writeCtoState(state: CtoState, root: string): string {
+export function writeCtoState(state: CtoState, root: string, options: { assumeWorkspaceLock?: boolean } = {}): string {
   const path = ctoStatePath(state.id, root);
   const dir = ctoStateDir(state.id, root);
-  return withWorkspaceTransaction(root, () => {
+  const write = (): string => {
     mkdirSync(dir, { recursive: true });
     let before: string | null;
     try {
@@ -499,7 +729,8 @@ export function writeCtoState(state: CtoState, root: string): string {
     }
     ctoStateSnapshots.set(state, serialized);
     return path;
-  });
+  };
+  return options.assumeWorkspaceLock ? write() : withWorkspaceTransaction(root, write);
 }
 
 /**
