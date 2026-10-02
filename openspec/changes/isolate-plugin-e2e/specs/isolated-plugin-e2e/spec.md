@@ -62,6 +62,22 @@ Provider-backed прогон SHALL использовать реальную в�
 - **WHEN** cleanup одного run проходит при живом shared native broker или другой сессии
 - **THEN** он удаляет только run-owned caches/processes; broker и host token file остаются, а отдельный stop требует подтверждённую manager ownership и отсутствие активных клиентов
 
+### Requirement: Контролируемая проверка native OAuth refresh
+
+Harness SHALL предоставлять отдельный явно запускаемый regression-сценарий с синтетическими OAuth credentials, loopback token endpoint и временным credential store. Сценарий SHALL использовать настоящие native broker, AuthStorage, client и SQLite store из закреплённой тестовой зависимости; допускается внедрить synthetic refresh callback через штатный API. Harness MUST NOT менять установленный omp, реальные credentials или production provider allowlist. Результат SHALL указывать native package version и границу component/process integration; MUST NOT объявляться live provider smoke, проверкой unchanged CLI serve либо межпроцессного single-flight обычных omp-клиентов.
+
+#### Scenario: Конкурентное обновление synthetic authorization
+- **WHEN** несколько независимых broker clients одновременно запрашивают synthetic authorization после контролируемого перевода записи в native refresh window
+- **THEN** один native broker выполняет один refresh для этой волны запросов, все успешные клиенты используют обновлённый access token, а результат сохраняется и доступен после открытия store заново без дополнительного refresh
+
+#### Scenario: Ошибка synthetic token endpoint
+- **WHEN** локальный token endpoint возвращает временную ошибку обновления
+- **THEN** клиент наблюдает отказ без выдачи устаревшей авторизации; сохранённая credential не заменяется неуспешным результатом и не отключается как при окончательном invalid grant
+
+#### Scenario: Изолированный и воспроизводимый regression
+- **WHEN** оператор запускает standalone refresh regression без настоящих provider credentials
+- **THEN** сценарий сначала подтверждает действующий access token без refresh, не обращается к реальным провайдерам, очищает временный store/listeners/processes и выдаёт несекретный receipt; отсутствие совместимого Bun/native package приводит к ненулевому отказу, а не пропуску
+
 ### Requirement: Отделение прогона от сессии
 
 Один прогон SHALL поддерживать несколько последовательных omp-сессий с неизменной идентичностью runtime/плагинов и сохранённым workspace/state. Выход процесса, отключение клиента и команда остановки сессии MUST NOT автоматически удалять окружение или evidence. Повторный старт SHALL сохранять evidence предыдущих сессий и получать отдельную идентичность сессии. Без явного безопасного завершения прежней сессии конкурирующий старт SHALL отклоняться.

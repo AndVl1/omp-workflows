@@ -28,6 +28,12 @@ isolates child configuration/workspace but is **not** a host OS sandbox. See
 [the E2E runbook](packages/e2e/README.md) for broker prerequisites, manual
 restart, evidence and cleanup commands.
 
+For a deterministic OAuth refresh regression without a real account or model
+request, run `npm --silent run test:oauth-refresh` (Bun >=1.3.14 and development
+dependencies required). It exercises real native broker/storage/client components
+from pinned `pi-ai@18.0.6` against a synthetic local token endpoint; it does not
+replace the live workflow smoke or verify ordinary-client cross-process refresh.
+
 ## Install
 
 Packages are published to **GitHub Packages** under `@andvl1`. Configure npm once:

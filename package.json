@@ -29,6 +29,8 @@
 		"e2e:cleanup": "npm --silent run e2e -- cleanup",
 		"e2e:verify": "npm --silent run e2e -- verify",
 		"e2e:auth-broker": "npm --silent run e2e -- auth-broker",
+		"e2e:oauth-refresh": "npm --silent run e2e -- oauth-refresh",
+		"test:oauth-refresh": "npm --silent run e2e:oauth-refresh -- --json",
 		"clean": "rm -rf packages/*/dist"
 	},
 	"engines": {

@@ -9,6 +9,10 @@ All notable changes to `omp-workflows` are documented here.
   smoke suites, restart/cleanup lifecycle, scoped redacted evidence, and root
   `e2e:*` commands. Removed the scratch/bootstrap host-overlay launch contract.
   See [the E2E runbook](packages/e2e/README.md) for prerequisites and limits.
+- Standalone synthetic OAuth refresh regression (`npm --silent run test:oauth-refresh`)
+  exercises real pinned native broker/storage/client components, concurrent token
+  renewal and persistence without a real account; reports its component/process
+  boundary separately from live provider and ordinary-client refresh coverage.
 
 ## [0.29.0] — 2026-09-28
 ### Changed

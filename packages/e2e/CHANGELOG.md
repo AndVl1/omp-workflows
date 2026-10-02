@@ -36,6 +36,14 @@
   while preserving the opted-in native broker profile.
 - Native broker ownership reads Linux `/proc/<pid>/cwd` rather than procps'
   `-` placeholder, retaining exact cwd matching when launched in CI.
+- Added standalone `oauth-refresh` / `test:oauth-refresh` regression using real
+  native broker, SQLite storage and remote clients from pinned `pi-ai@18.0.6`
+  with an injected synthetic loopback OAuth endpoint. Assertions cover concurrent
+  single refresh, rotated-token consumption, persisted reuse, refresh-secret
+  redaction, transient errors and cleanup without real credentials or LLM calls.
+  Bun >=1.3.14 is required; missing prerequisites fail rather than skip.
+  This component/process proof does not claim unchanged CLI `serve`, real provider
+  protocol, background refresh or ordinary-client cross-process coverage.
 
 ### Security
 

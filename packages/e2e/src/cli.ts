@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Manifest-only ux-e2e lifecycle CLI. */
+/** Isolated ux-e2e lifecycle and native component regression CLI. */
 
 import { randomBytes } from 'node:crypto';
 import { closeSync, existsSync, openSync, readFileSync, readdirSync, writeSync } from 'node:fs';
@@ -46,6 +46,7 @@ import {
   stopManagedBroker,
 } from './broker.js';
 import { deferred } from './util.js';
+import { runOAuthRefreshScenario } from './oauth-refresh.js';
 
 const USAGE = `ux-e2e — isolated manifest-backed E2E lifecycle
 
@@ -63,6 +64,7 @@ Subcommands:
   cleanup --manifest <file> [--keep-failed] [--json]
   verify --manifest <file> --suite isolation|live-smoke [--keep-failed] [--json]
   auth-broker ensure|status|stop --manifest <file> [--json]
+  oauth-refresh [--json]  (synthetic OAuth; no manifest or real credentials)
 
 A scratch directory or bootstrap command is no longer accepted. Prepare a new
 run from a secret-free config, then use its manifest for every lifecycle command.`;
@@ -1044,6 +1046,16 @@ export async function main(argv: string[]): Promise<number> {
       case 'cleanup': return await runCleanup(parseCleanupArgs(argv.slice(1)));
       case 'verify': return await runVerify(parseVerifyArgs(argv.slice(1)));
       case 'auth-broker': return await runAuthBroker(argv.slice(1));
+      case 'oauth-refresh': {
+        const { values, positionals } = parseArgsOrThrow(argv.slice(1), {
+          json: { type: 'boolean', default: false },
+        });
+        if (positionals.length > 0) throw new CliError('invalid_argument', 'oauth-refresh accepts only --json');
+        const receipt = await runOAuthRefreshScenario();
+        if (booleanValue(values, 'json')) outputJson(receipt);
+        else outputHuman(`oauth-refresh: ${receipt.status}${receipt.error === undefined ? '' : ` — ${receipt.error.message}`}`);
+        return receipt.ok ? 0 : 1;
+      }
       default:
         throw new CliError('unknown_subcommand', `unknown subcommand "${subcommand}"`);
     }

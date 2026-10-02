@@ -267,6 +267,44 @@ shared with the operator's normal sessions. The pinned model in the committed
 live config must be available on that authorization; otherwise doctor/live smoke
 fails rather than silently switching providers.
 
+### Controlled synthetic OAuth refresh regression
+
+From a repository checkout with development dependencies and **Bun >=1.3.14**:
+
+```bash
+npm --silent run e2e:oauth-refresh -- --json
+# Standalone permanent regression entrypoint; runs the same asserted scenario:
+npm --silent run test:oauth-refresh
+```
+
+This command needs no manifest, installed `omp`, real account, or LLM request.
+It uses the exact locked E2E test dependency `@oh-my-pi/pi-ai@18.0.6`, not the
+operator's installed CLI. A Bun child runs the real native `AuthStorage`, SQLite
+credential store, broker server, remote stores and clients. Only the OAuth
+refresh callback/token endpoint is synthetic, using the native injection API.
+The production `native-host-broker` provider allowlist remains unchanged.
+
+The permanent assertions cover three clients consuming the original access token
+with zero refresh calls; moving only the disposable synthetic record into the
+native 60-second refresh window; three overlapping client HTTP requests to the
+broker producing exactly one provider refresh; all clients consuming the rotated
+access token; refresh-token redaction in remote snapshots; SQLite reopen/reuse
+without another refresh; and a transient token-endpoint HTTP 503 yielding a
+broker error and no stale access-token fallback while leaving the stored
+credential active/unchanged. There is no long expiry wait or global clock patch.
+
+JSON stdout contains a validated, token-free receipt with imported native package
+and Bun versions, per-case observations and cleanup status. Missing/old Bun,
+incompatible native dependency, failed assertions or cleanup produce a nonzero
+exit, never a skipped PASS. All state/listeners are disposable; host credentials,
+profiles and installed runtime are untouched.
+
+**Coverage boundary:** native component/process integration with an injected
+provider. It does not test unchanged `omp auth-broker serve` provider registration,
+real xAI/OpenAI OAuth protocols, model/workflow `live-smoke`, background scheduled
+refresh, or cross-process single-flight between broker and ordinary host clients.
+Those claims must not be inferred from this regression.
+
 ## Isolation and evidence
 
 `prepare` snapshots the current working-tree source (including uncommitted edits),

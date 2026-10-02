@@ -13,6 +13,7 @@
 - Переиспользовать текущую авторизацию установленного omp для реальных provider-backed прогонов: явный opt-in поднимает штатный shared `omp auth-broker serve` над существующей локальной auth DB; альтернативы — внешний native broker и allowlist API-key env. Не копировать OAuth credentials в тестовое окружение. Конкурирующие обычные omp-клиенты вне broker остаются отмеченным refresh-риском, а не ложной гарантией.
 - Сохранять окружение между сессиями одного прогона для resume, но отделять его от других прогонов. Очистка завершает только принадлежащие прогону процессы, удаляет временные секреты и оставляет очищенное evidence.
 - Добавить исполняемые рецепты smoke/isolation/resume и короткий операторский runbook: повторный запуск по manifest, а не импровизированные shell-инструкции.
+- Добавить отдельный synthetic OAuth regression без аккаунта и LLM: настоящие native AuthStorage/store/broker/client из закреплённой тестовой зависимости, управляемый loopback token endpoint и temporary DB. Проверять конкурентное обновление и сохранение credentials, явно отделяя component/process integration от неизменённого CLI serve, live provider smoke и межпроцессного single-flight обычного omp.
 
 ## Capabilities
 
