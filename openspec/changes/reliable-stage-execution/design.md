@@ -485,3 +485,47 @@ admission возвращает committed transition без второго advanc
 consumer regression; handback завершён, `Main` — sole writer core integration,
 документации и итоговых проверок.
 Новый H-прогон без отдельного разрешения не запускается.
+
+### Последний разрешённый tranche: фактический результат
+
+Exact candidate `46da973d23fddf1b2a91f62a2538c6008538535c`, SDK 18.0.6 и
+единая модель `openai-codex/gpt-5.5`: actual native `task` запустил трёх
+отдельных QA workers, все matching SDK lifecycle завершились `completed`.
+Каждый case использовал ровно один новый immutable deadline до startup,
+не более 900 секунд без автоматического retry; прежние 2/2 и предыдущие
+дополнительные 1/1 сохранены.
+
+Независимый oracle подтвердил H1 PASS: natural PHASE0 turn-stop, literal
+`Proceed` в той же root-сессии, accepted implementation + matching terminal,
+актуальное human approval, canonical complete/release и новый ordinary bash.
+H2 PASS: configured lead own orchestrator receipt, resident-root SDK-hashed
+advance, actual declared roster, human checkpoints, wave done/active_wave=null
+в committed canonical transaction **до** буквального `END`, terminal release
+и новый ordinary bash. Неверный label terminal-turn end в исходном H2 report
+сохранён как ошибка отчёта; actual events и canonical receipt задают порядок.
+Model-written future `wave.started_at` не используется как доказательство
+порядка; отдельно наблюдавшийся failed summary-lead lifecycle имеет unknown
+cause и не считается implementation replay.
+
+H3 original checkpoint остался pending до stop; original SDK root восстановлена
+из того же session file новым PID. Exact `/do-work --resume`, current checkpoint
+approval и один соответствующий advance наблюдались. Typed lifecycle journals
+с manifest-verified prepared bytes подтверждают одинаковые run, generation,
+implementation stage, receipt, digest, worker lineage и immutable output hash
+до stop и до/после resume. ColdRootRestore и scopedImplementationNoReplay PASS;
+последующий reviewer — разрешённый downstream, а не повторная реализация.
+
+Общий H3 остаётся FAIL: видимая строка исходного parked worker в Agent Hub,
+её выбор, actual `r` и результат действия **не наблюдались**. Это gap live proof,
+не доказанная runtime ошибка или `unsupported`. Source-level UI entry описан
+в e2e README, но не заменяет runtime acceptance. Условие fallback на нового
+linked worker не установлено; unknown не разрешает второго writer.
+
+Readonly projection canonical/input/termination metadata закрыл первоначальные
+ACCESS gaps независимого review, без нового H/runtime. Original reports, FAIL
+и история сохранены; raw SDK sessions, grants, credentials и payloads не
+публикуются. Все owned case/coordinator процессы, listeners, watchdogs и
+browsers остановлены, private auth удалён; global stores не менялись.
+Прогресс 29/30, 8.2 BLOCKED только по actual Hub revive proof. Следующая
+попытка/restart/revive требует отдельного явного bounded разрешения;
+повторять H1/H2 не требуется. Merge/release/archive не выполняются.

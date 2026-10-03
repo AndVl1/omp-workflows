@@ -73,6 +73,15 @@
 приёмку, scripted registered-tool smoke и remote CI exact code commit
 `6659b7e843c0ee824e54838101e99b6da71de135` (run `37134697043`: install/build/types/D/P/full Test SUCCESS).
 CI финального evidence-only head фиксируется в PR #77; production delta нет.
-Прогресс остаётся 29/30; 8.2 BLOCKED: новую 1/1 live-приёмку
-провели, но H1/H3 INVALID_QA и actual cold restore/worker revive NOT_VERIFIED.
+Прогресс остаётся 29/30. Последний разрешённый tranche exact `46da973`
+завершён: H1/H2 PASS с независимым oracle; H3 coldRootRestore и
+scopedImplementationNoReplay PASS, но общий H3 FAIL: actual parked-worker
+Agent Hub row selection + `r` + result NOT_VERIFIED. Исходный pending checkpoint
+не отвечен до stop; original-root session восстановлена новым PID, accepted
+run/generation/stage/receipt/digest/output-hash tuple сохранён до/после resume.
+Все три latest attempts израсходованы `1/1`, historical 2/2 и предыдущие 1/1
+сохранены. 8.2 BLOCKED только по реальному Hub revive proof; runtime refusal
+не наблюдался, `unsupported` не утверждается. Все owned процессы/listeners/
+browsers остановлены, private auth удалён. Новый H/restart/revive требует нового
+явного bounded разрешения; H1/H2 не требуют повторной приёмки.
 Merge/release/archive и пользовательские version/release-правки не выполняются.

@@ -206,10 +206,10 @@ Warning о missing `modelRoles` для quoted JSON-as-YAML key сам по се�
 scratch, transcripts или evidence; приватный auth store удаляется после smoke.
 
 Исторический бюджет составлял исходную попытку и один диагностированный повтор
-на case; обе прежние попытки сохранены в evidence. Отдельно разрешённый новый
-бюджет — ровно одна попытка на H1/H2/H3, без автоматического повтора, максимум
-900 секунд включая startup и H3 restore. Все три новые попытки израсходованы
-`1/1`; следующий запуск или retry требует нового явного разрешения.
+на case; обе прежние попытки сохранены в evidence. После него отдельно проведены
+два разрешённых tranche: по одной попытке H1/H2/H3 в каждом, без автоматического
+повтора, максимум 900 секунд включая startup и H3 restore. Все эти попытки
+израсходованы `1/1`; следующий запуск или retry требует нового явного разрешения.
 Slash-команды вводятся через настоящий PTY по плану,
 не через `--scenario`/`--task`. H3 восстанавливает pending checkpoint без
 повторной реализации. Дополнительное наблюдение SDK cold revive использует
@@ -217,6 +217,12 @@ Slash-команды вводятся через настоящий PTY по п�
 `AgentLifecycleManager.ensureLive` в новом host восстанавливают parked session,
 не прежний executor, workflow grant или authoritative running status.
 Новый prompt/task для доказательства revive не подставляется.
+В закреплённом SDK 18.0.6 исходники Agent Hub задают default `Alt+A`
+(`app.agents.hub`) либо `Ctrl+S` (`app.session.observe`); учитывайте overrides.
+Для live-доказательства откройте именно Hub overlay, выберите строку исходного
+parked worker, нажмите `r` и сохраните видимую строку и результат. Вызов `hub`
+как model tool или обычный workflow resume этого доказательства не заменяет.
+Поддержка в исходниках не считается runtime PASS и не доказывает `unsupported`.
 У каждого case один deadline, начиная **до** startup; H3 restore получает
 оставшееся время, не новый `15m`. Native `workflow_checkpoint_ask` может показать
 selection dialog без `[ask_user]` transcript marker: проверяйте pending call,
