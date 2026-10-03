@@ -324,7 +324,7 @@ function validateCompletionEnvelope(value: unknown, path: string, issues: TypedC
   if (value.schema_version !== 1) addIssue(issues, `${path}.schema_version`, "must be 1");
   validateWorkIdentity(value.identity, `${path}.identity`, issues);
   requireEnum(value, "outcome", ["pending", "succeeded", "failed", "cancelled"], path, issues);
-  if (!hasOwn(value, "terminal_signal") || (value.terminal_signal !== null && value.terminal_signal !== undefined && !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure"].includes(value.terminal_signal as string))) {
+  if (!hasOwn(value, "terminal_signal") || (value.terminal_signal !== null && value.terminal_signal !== undefined && !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure", "preflight:missing_prompt", "preflight:invalid_arguments"].includes(value.terminal_signal as string))) {
     addIssue(issues, `${path}.terminal_signal`, "unknown or missing terminal signal");
   }
   if (!Array.isArray(value.artifact_refs)) {
@@ -533,6 +533,7 @@ export interface WorkflowProfileStageContract {
   consumes?: string[];
   optional_consumes?: string[];
   produces?: StageDef["produces"];
+  producer?: StageDef["producer"];
 }
 
 function profileStagesFor(stages: StageDef[]): WorkflowProfileStageContract[] {
@@ -547,6 +548,7 @@ function profileStagesFor(stages: StageDef[]): WorkflowProfileStageContract[] {
     ...(stage.produces !== undefined
       ? { produces: Array.isArray(stage.produces) ? [...stage.produces] : stage.produces }
       : {}),
+    ...(stage.producer !== undefined ? { producer: { ...stage.producer } } : {}),
   }));
 }
 
@@ -556,6 +558,7 @@ export interface WorkflowStageContract {
   type: StageDef["type"];
   description: string;
   prompt: string;
+  producer: StageDef["producer"] | null;
   roles: Array<{ role: string; agent: string }>;
   parallel: boolean;
   consumes: string[];
@@ -1070,6 +1073,7 @@ function resolveWorkflowContractLocked(cwd: string, options: WorkflowContractOpt
     type: stage.type,
     description: stage.description ?? "",
     prompt: stage.prompt ?? "",
+    producer: stage.producer ?? null,
     roles: roleAgents,
     parallel: stage.parallel ?? stage.type === "consilium",
     consumes: stage.consumes ?? [],

@@ -1,4 +1,4 @@
-import { readArtifact, writeArtifact, type TeamState, type WorkflowSessionController } from "@andvl1/omp-workflows-core";
+import { readArtifact, registerStageProducerTool, type TeamState, type WorkflowSessionController } from "@andvl1/omp-workflows-core";
 import { createDefaultLectureAcquisitionService, isLectureAcquisitionError } from "../lecture-acquisition/service.js";
 import { loadLectureResearchConfig } from "../lecture-acquisition/config.js";
 
@@ -44,7 +44,7 @@ function readCanonicalLectureSource(
 }
 
 export function registerLectureAcquireTool(pi: Pi, z: Z, callbacks: Callbacks): void {
-  pi.registerTool({ name: "lecture_acquire", label: "Acquire lecture evidence", description: "Acquire bounded lecture evidence from the single URL and prompt in lecture_intake. Rights and media mode are read explicitly from intake; absent approval is metadata-only/fail-closed.", parameters: z.object({}), async execute(_id: string, _params: unknown, signal?: AbortSignal, _update?: unknown, ctx?: ToolContext) {
+  registerStageProducerTool(pi, { name: "lecture_acquire", label: "Acquire lecture evidence", description: "Acquire bounded lecture evidence from the single URL and prompt in lecture_intake. Rights and media mode are read explicitly from intake; absent approval is metadata-only/fail-closed.", parameters: z.object({}), async execute(_id: string, _params: unknown, signal: AbortSignal | undefined, _update: unknown, ctx: ToolContext, publish) {
     let value: Result;
     try {
       if (!callbacks.isMainSessionContext(ctx)) value = fail("WORKFLOW_CONTEXT_REJECTED");
@@ -85,8 +85,14 @@ export function registerLectureAcquireTool(pi: Pi, z: Z, callbacks: Callbacks): 
                 const request = { sourceUrl: location, prompt: task, limits: config.limits, mediaMode, rights };
                 const service = await createDefaultLectureAcquisitionService(cwd, process.env, { ompRuntime: field(ctx, "ompRuntime") });
                 const artifact = await service.acquire(request, signal ?? contextSignal(ctx) ?? new AbortController().signal);
-                const artifactPath = writeArtifact(resolved.artifactsDir, "lecture_acquisition", artifact);
-                value = { ok: artifact.status === "succeeded" || artifact.status === "partial", code: artifact.status === "succeeded" ? "ACQUISITION_COMPLETED" : artifact.status === "partial" ? "ACQUISITION_PARTIAL" : "ACQUISITION_FAILED", status: artifact.status, artifact_id: "lecture_acquisition", source_count: artifact.sourceSet.items.length, evidence_count: artifact.evidence.length, failure_count: artifact.failures.length, artifact_path: artifactPath };
+                const publication = publish({ lecture_acquisition: artifact });
+                if (!publication.ok) {
+                  value = { ok: false, code: publication.code, error: publication.error, ...(publication.field_errors ? { field_errors: publication.field_errors } : {}) };
+                } else {
+                  const output = publication.receipt.outputs.find((entry) => entry.artifact_id === "lecture_acquisition");
+                  if (!output) value = fail("WORKFLOW_ACQUISITION_FAILED", "Lecture acquisition publication returned no lecture_acquisition receipt output");
+                  else value = { ok: artifact.status === "succeeded" || artifact.status === "partial", code: artifact.status === "succeeded" ? "ACQUISITION_COMPLETED" : artifact.status === "partial" ? "ACQUISITION_PARTIAL" : "ACQUISITION_FAILED", status: artifact.status, artifact_id: "lecture_acquisition", source_count: artifact.sourceSet.items.length, evidence_count: artifact.evidence.length, failure_count: artifact.failures.length, receipt: publication.receipt, artifact_ref: output.immutable_ref };
+                }
               }
             }
           }

@@ -1,36 +1,22 @@
 /**
- * root_cause_documented gate + diagnosis artifact contract regressions:
- *   - the artifact schema, the diagnose-stage expectations and the gate agree
- *     on ONE explicit contract: non-empty `root_cause` (what) AND non-empty
- *     `explanation` (why the fix closes the cause);
- *   - a schema-conforming diagnosis passes the gate through advanceCursor
- *     (the exact path workflow_advance exercises);
- *   - an invalid diagnosis rejects the advance with the EXACT gate reason
- *     preserved through the named-gate evaluation, never a generic
- *     "not satisfied";
- *   - a diagnosis missing the explanation field fails at the schema contract
- *     first, with the required-field diagnostic;
- *   - missing or unparseable diagnosis.json fails closed with a reason
- *     instead of throwing through the advance boundary.
+ * Registered diagnosis publication and root-cause gate regressions:
+ * accepted payloads still need a meaningful cause and explanation, malformed
+ * payloads receive field diagnostics without a receipt, and failed gates do
+ * not move the cursor.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadProfile, profileHash, registerWorkflowProfiles } from "../src/engine/profile.js";
-import { advanceCursor, createCapability, type IssuedCapability } from "../src/engine/durable.js";
 import { isRootCauseDocumented } from "../src/engine/dod.js";
-
-import { runTarget } from "../src/engine/run-store.js";
-import type { Profile, TeamState } from "../src/engine/types.js";
-import type { ScopeFlags } from "../src/engine/scope.js";
-
-const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
-const RUN_ID = "88888888-8888-4888-8888-888888888888";
-
+import { readRunState } from "../src/engine/run-store.js";
+import type { Profile } from "../src/engine/types.js";
+import {
+  details, ordinaryHarness, ordinaryIngress, requireTool,
+  type Harness, type Handoff,
+} from "./reliable-stage-execution-fixture.js";
 
 const PROBE_PROFILE: Profile = {
   name: "root-cause-gate-probe",
@@ -43,135 +29,103 @@ const PROBE_PROFILE: Profile = {
   ],
 };
 
-registerWorkflowProfiles([PROBE_PROFILE]);
-
-function initGit(root: string): void {
-  execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "feat/probe"], { stdio: "ignore" });
+async function setupStage(): Promise<{ harness: Harness; runId: string; handoff: Handoff }> {
+  const harness = ordinaryHarness({ branch: "feat/probe", workflowProfiles: [PROBE_PROFILE] });
+  try {
+    const started = await ordinaryIngress(harness, {
+      task: "root cause gate regression",
+      classification: {
+        type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH",
+        autonomous: false, workflow: PROBE_PROFILE.name,
+      },
+    });
+    return { harness, ...started };
+  } catch (error) {
+    await harness.close();
+    throw error;
+  }
 }
 
-function advanceAuthOf(issued: IssuedCapability) {
-  return {
-    run_id: RUN_ID,
-    branch: issued.state.issued_for!.branch,
-    token: issued.advance_token,
-    capability_id: issued.capability_id,
-    run_key: issued.state.issued_for!.run_key,
-    workflow: issued.state.issued_for!.workflow,
-    profile_hash: issued.state.issued_for!.profile_hash,
-    stage_cursor: issued.state.issued_for!.stage_cursor,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    loop_iteration: issued.state.issued_for!.loop_iteration,
-  };
+async function submitDiagnosis(harness: Harness, diagnosis: Record<string, unknown>) {
+  const result = await requireTool(harness, "workflow_submit_result").execute(
+    "submit-diagnosis", { outputs: { diagnosis } }, undefined, undefined, harness.context,
+  );
+  return details(result.details);
 }
 
-function setupStage(root: string): { issued: IssuedCapability; artifactsDir: string } {
-  const profile = loadProfile("root-cause-gate-probe");
-  assert.ok(profile);
-  const persistedHash = profileHash(profile);
-  const issued = createCapability({
-    run_key: RUN_ID,
+async function advanceDiagnosis(harness: Harness, handoff: Handoff) {
+  const result = await requireTool(harness, "workflow_advance").execute("advance-diagnosis", {
+    token: handoff.advance_token,
+    capability_id: handoff.capability_id,
+    run_key: handoff.run_key,
     branch: "feat/probe",
-    workflow: "root-cause-gate-probe",
-    profile_hash: persistedHash,
-    stage_cursor: "diagnose",
-    kind: "none",
-    expected_roster: [],
-  });
-  const target = runTarget(root, RUN_ID);
-  mkdirSync(target.stateDir!, { recursive: true });
-  const artifactsDir = target.artifactsDir!;
-  writeFileSync(target.statePath!, JSON.stringify({
-    schema: 2,
-    run_id: RUN_ID,
-    run_key: RUN_ID,
-    lifecycle_status: "active",
-    title: "root cause gate regression",
-    branch: "feat/probe",
-    classification: { type: "BUG_FIX", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "root-cause-gate-probe" },
-    task: "root cause gate regression",
-    workflow_override: false,
-    issue: null,
-    stage_cursor: "diagnose",
-    stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "diagnose" ? "in_progress" as const : "pending" as const })),
-    artifacts: {},
-    pause: { kind: "none", reason: "" },
-    policy: { strict_orchestrator: true },
-    profile_hash: persistedHash,
-    scope: NO_SCOPE,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    dispatch_capability: issued.state,
-    updated_at: new Date().toISOString(),
-  }, null, 2) + "\n");
-  mkdirSync(artifactsDir, { recursive: true });
-  return { issued, artifactsDir };
-}
-function persistedStageCursor(root: string): string {
-  const statePath = join(root, ".work-state", "runs", RUN_ID, "state.json");
-  return (JSON.parse(readFileSync(statePath, "utf8")) as TeamState).stage_cursor;
+    workflow: PROBE_PROFILE.name,
+    profile_hash: handoff.profile_hash,
+    stage_cursor: handoff.stage_cursor,
+    cursor_epoch: handoff.cursor_epoch,
+    loop_iteration: handoff.loop_iteration,
+    evidence: "diagnosis documented",
+  }, undefined, undefined, harness.context);
+  return details(result.details);
 }
 
 function writeDiagnosis(artifactsDir: string, diagnosis: Record<string, unknown>): void {
   writeFileSync(join(artifactsDir, "diagnosis.json"), JSON.stringify(diagnosis));
 }
 
-test("schema-conforming diagnosis passes root_cause_documented through workflow advance", () => {
-  const root = mkdtempSync(join(tmpdir(), "root-cause-pass-"));
+test("schema-conforming diagnosis passes root_cause_documented through workflow advance", async () => {
+  const { harness, runId, handoff } = await setupStage();
   try {
-    initGit(root);
-    const { issued, artifactsDir } = setupStage(root);
-    writeDiagnosis(artifactsDir, {
+    const submitted = await submitDiagnosis(harness, {
       root_cause: "artifact mtime leaked into the content digest",
       explanation: "hashing file contents only closes the cause instead of masking the symptom",
       evidence: ["repro: touch file, digest changes"],
       proposed_fix: "hash file contents",
       verification_checklist: ["touch file, digest stays stable"],
     });
-    const advanced = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "diagnosis documented" }, { runId: RUN_ID });
-    assert.equal(advanced.ok, true, advanced.ok ? "advance accepted" : advanced.error);
-    if (advanced.ok) assert.equal(advanced.state.stage_cursor, "wrap");
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
+    const advanced = await advanceDiagnosis(harness, handoff);
+    assert.equal(advanced.ok, true, JSON.stringify(advanced));
+    assert.equal(readRunState(harness.root, runId)?.stage_cursor, "wrap");
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    await harness.close();
   }
 });
 
-test("invalid diagnosis rejects workflow advance with the exact gate reason", () => {
+test("accepted diagnosis with an empty cause or explanation cannot advance", async () => {
   const cases = [
-    {
-      diagnosis: { root_cause: "digest drift", explanation: "   " },
-      expected: /gate 'root_cause_documented' is not satisfied: diagnosis\.explanation is empty \(why does this fix close the root cause\?\)/,
-    },
-    {
-      diagnosis: { root_cause: "   ", explanation: "hashing contents closes it" },
-      expected: /gate 'root_cause_documented' is not satisfied: diagnosis\.root_cause is empty/,
-    },
+    { diagnosis: { root_cause: "digest drift", explanation: "   " }, field: "explanation" },
+    { diagnosis: { root_cause: "   ", explanation: "hashing contents closes it" }, field: "root_cause" },
   ] as const;
-  for (const { diagnosis, expected } of cases) {
-    const root = mkdtempSync(join(tmpdir(), "root-cause-reject-"));
+  for (const { diagnosis, field } of cases) {
+    const { harness, runId, handoff } = await setupStage();
     try {
-      initGit(root);
-      const { issued, artifactsDir } = setupStage(root);
-      writeDiagnosis(artifactsDir, diagnosis);
-      const blocked = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "diagnosis documented" }, { runId: RUN_ID });
-      assert.equal(blocked.ok, false, "an invalid diagnosis must block the advance");
-      if (!blocked.ok) assert.match(blocked.error, expected);
-      assert.equal(persistedStageCursor(root), "diagnose", "a blocked advance never moves the cursor");
+      const submitted = await submitDiagnosis(harness, diagnosis);
+      assert.equal(submitted.ok, true, JSON.stringify(submitted));
+      const blocked = await advanceDiagnosis(harness, handoff);
+      assert.equal(blocked.ok, false);
+      assert.match(String(blocked.error), /root_cause_documented/);
+      assert.ok(String(blocked.error).includes(`diagnosis.${field}`));
+      assert.equal(readRunState(harness.root, runId)?.stage_cursor, "diagnose");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      await harness.close();
     }
   }
 });
 
-test("diagnosis missing the explanation field fails at the schema contract first", () => {
-  const root = mkdtempSync(join(tmpdir(), "root-cause-schema-"));
+test("diagnosis missing explanation is rejected before receipt publication", async () => {
+  const { harness, runId } = await setupStage();
   try {
-    initGit(root);
-    const { issued, artifactsDir } = setupStage(root);
-    writeDiagnosis(artifactsDir, { root_cause: "digest drift" });
-    const blocked = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "diagnosis documented" }, { runId: RUN_ID });
-    assert.equal(blocked.ok, false);
-    if (!blocked.ok) assert.match(blocked.error, /produced artifact 'diagnosis' violates its contract: \$\.explanation: .*required field 'explanation' is missing/);
+    const rejected = await submitDiagnosis(harness, { root_cause: "digest drift" });
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.code, "invalid_outputs");
+    assert.ok(Array.isArray(rejected.field_errors));
+    assert.ok(rejected.field_errors.some((entry) => String(details(entry).field).endsWith(".explanation")));
+    const state = readRunState(harness.root, runId);
+    assert.deepEqual(state?.stage_receipts ?? {}, {});
+    assert.equal(state?.stage_cursor, "diagnose");
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    await harness.close();
   }
 });
 

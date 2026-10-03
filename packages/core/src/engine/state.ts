@@ -23,7 +23,7 @@ import {
   publishAfterStateCommit,
   rollbackArtifactJournal,
 } from "./artifacts.js";
-import { assertNoUnresolvedLifecycleTransactions, beginLifecycleTransaction, commitLifecycleTransaction, recoverLifecycleTransactions } from "./lifecycle-journal.js";
+import { assertNoUnresolvedLifecycleTransactions, beginLifecycleTransaction, commitLifecycleTransaction, recoverLifecycleTransactions, type LifecycleFileContent } from "./lifecycle-journal.js";
 import { activeWave, readCtoState } from "../cto/state.js";
 import {
   loadProfile,
@@ -210,7 +210,7 @@ function validateStateCompletion(value: unknown, path: string, issues: string[])
   if (value.schema_version !== 1) issues.push(`${path}.schema_version must be 1`);
   validateStateIdentity(value.identity, `${path}.identity`, issues);
   if (!["pending", "succeeded", "failed", "cancelled"].includes(String(value.outcome))) issues.push(`${path}.outcome has an unknown value`);
-  if (value.terminal_signal !== null && value.terminal_signal !== undefined && !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure"].includes(String(value.terminal_signal))) issues.push(`${path}.terminal_signal has an unknown value`);
+  if (value.terminal_signal !== null && value.terminal_signal !== undefined && !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure", "preflight:missing_prompt", "preflight:invalid_arguments"].includes(String(value.terminal_signal))) issues.push(`${path}.terminal_signal has an unknown value`);
   if (!Array.isArray(value.artifact_refs)) {
     issues.push(`${path}.artifact_refs must be an array`);
   } else {
@@ -256,6 +256,118 @@ function validateStateMigration(value: unknown, path: string, issues: string[]):
   if (value.source_policy_hash !== null && value.source_policy_hash !== undefined && !nonEmptyStateString(value.source_policy_hash)) issues.push(`${path}.source_policy_hash must be a non-empty string or null`);
   for (const key of ["legacy_inputs", "warnings"]) if (!Array.isArray(value[key]) || value[key].some((entry) => !nonEmptyStateString(entry))) issues.push(`${path}.${key} must be an array of non-empty strings`);
   if (!["complete", "blocked"].includes(String(value.status))) issues.push(`${path}.status has an unknown value`);
+}
+
+function validateStateStageReceiptBinding(value: unknown, path: string, issues: string[]): void {
+  if (!isStateRecord(value)) {
+    issues.push(`${path} must be an object`);
+    return;
+  }
+  strictStateKeys(value, ["authority", "identity", "host", "producer"], path, issues);
+  if (value.authority !== "ordinary" && value.authority !== "cto") issues.push(`${path}.authority must be ordinary or cto`);
+  validateStateIdentity(value.identity, `${path}.identity`, issues);
+  if (!isStateRecord(value.host)) {
+    issues.push(`${path}.host must be an object`);
+  } else {
+    strictStateKeys(value.host, ["session_id", "worktree", "branch"], `${path}.host`, issues);
+    for (const key of ["session_id", "worktree", "branch"]) if (!nonEmptyStateString(value.host[key])) issues.push(`${path}.host.${key} must be a non-empty string`);
+  }
+  if (!isStateRecord(value.producer)) {
+    issues.push(`${path}.producer must be an object`);
+    return;
+  }
+  const kind = value.producer.kind;
+  if (kind === "worker") {
+    strictStateKeys(value.producer, ["kind", "profile", "role", "slot_id", "agent", "generation", "wave_id", "slice_id", "stage_id", "iteration", "lineage"], `${path}.producer`, issues);
+  } else if (kind === "orchestrator") {
+    strictStateKeys(value.producer, ["kind", "profile", "stage_id", "iteration", "generation", "wave_id", "slice_id", "owner"], `${path}.producer`, issues);
+  } else if (kind === "tool") {
+    strictStateKeys(value.producer, ["kind", "profile", "stage_id", "iteration", "generation", "wave_id", "slice_id", "tool_name"], `${path}.producer`, issues);
+  } else {
+    issues.push(`${path}.producer.kind must be worker, orchestrator, or tool`);
+  }
+}
+
+function validateStateStageReceipts(value: unknown, path: string, issues: string[]): void {
+  if (!isStateRecord(value)) {
+    issues.push(`${path} must be an object`);
+    return;
+  }
+  for (const [dispatchId, rawReceipt] of Object.entries(value)) {
+    const receiptPath = `${path}.${dispatchId}`;
+    if (!isSafeStateSegment(dispatchId) || !isStateRecord(rawReceipt)) {
+      issues.push(`${receiptPath} has an invalid receipt key or value`);
+      continue;
+    }
+    strictStateKeys(rawReceipt, ["receipt_id", "submission_id", "digest", "dispatch_id", "attempt", "accepted_at", "work_identity", "binding", "outputs", "evidence"], receiptPath, issues);
+    for (const key of ["receipt_id", "submission_id", "digest", "dispatch_id", "accepted_at"]) {
+      if (!nonEmptyStateString(rawReceipt[key])) issues.push(`${receiptPath}.${key} must be a non-empty string`);
+    }
+    if (nonEmptyStateString(rawReceipt.digest) && !/^[a-f0-9]{64}$/i.test(rawReceipt.digest)) issues.push(`${receiptPath}.digest must be a SHA-256 hex digest`);
+    if (!Number.isInteger(rawReceipt.attempt) || (rawReceipt.attempt as number) < 1) issues.push(`${receiptPath}.attempt must be an integer >= 1`);
+    validateStateIdentity(rawReceipt.work_identity, `${receiptPath}.work_identity`, issues);
+    if (Object.prototype.hasOwnProperty.call(rawReceipt, "binding")) validateStateStageReceiptBinding(rawReceipt.binding, `${receiptPath}.binding`, issues);
+    if (!Array.isArray(rawReceipt.outputs)) {
+      issues.push(`${receiptPath}.outputs must be an array`);
+    } else {
+      rawReceipt.outputs.forEach((output, index) => {
+        const outputPath = `${receiptPath}.outputs[${index}]`;
+        if (!isStateRecord(output)) {
+          issues.push(`${outputPath} must be an object`);
+          return;
+        }
+        strictStateKeys(output, ["artifact_id", "immutable_ref", "sha256"], outputPath, issues);
+        for (const key of ["artifact_id", "immutable_ref", "sha256"]) {
+          if (!nonEmptyStateString(output[key])) issues.push(`${outputPath}.${key} must be a non-empty string`);
+        }
+        if (nonEmptyStateString(output.sha256) && !/^[a-f0-9]{64}$/i.test(output.sha256)) issues.push(`${outputPath}.sha256 must be a SHA-256 hex digest`);
+        if (nonEmptyStateString(output.immutable_ref) && (isAbsolute(String(output.immutable_ref)) || String(output.immutable_ref).split(/[\\/]/).includes(".."))) {
+          issues.push(`${outputPath}.immutable_ref must be a safe relative reference`);
+        }
+      });
+    }
+    if (!Array.isArray(rawReceipt.evidence)) {
+      issues.push(`${receiptPath}.evidence must be an array`);
+    } else {
+      rawReceipt.evidence.forEach((evidence, index) => {
+        const evidencePath = `${receiptPath}.evidence[${index}]`;
+        if (!isStateRecord(evidence)) {
+          issues.push(`${evidencePath} must be an object`);
+          return;
+        }
+        strictStateKeys(evidence, ["artifact_id", "relative_path", "immutable_ref", "sha256"], evidencePath, issues);
+        for (const key of ["artifact_id", "relative_path", "immutable_ref", "sha256"]) {
+          if (!nonEmptyStateString(evidence[key])) issues.push(`${evidencePath}.${key} must be a non-empty string`);
+        }
+        if (nonEmptyStateString(evidence.sha256) && !/^[a-f0-9]{64}$/i.test(evidence.sha256)) issues.push(`${evidencePath}.sha256 must be a SHA-256 hex digest`);
+        for (const key of ["relative_path", "immutable_ref"]) {
+          if (nonEmptyStateString(evidence[key]) && (isAbsolute(String(evidence[key])) || String(evidence[key]).split(/[\\/]/).includes(".."))) {
+            issues.push(`${evidencePath}.${key} must be a safe relative reference`);
+          }
+        }
+      });
+    }
+  }
+}
+function validateStateAdvanceReceipts(value: unknown, path: string, issues: string[]): void {
+  if (!isStateRecord(value)) {
+    issues.push(`${path} must be an object`);
+    return;
+  }
+  for (const [capabilityId, rawReceipt] of Object.entries(value)) {
+    const receiptPath = `${path}.${capabilityId}`;
+    if (!isSafeStateSegment(capabilityId) || !isStateRecord(rawReceipt)) {
+      issues.push(`${receiptPath} has an invalid capability key or receipt value`);
+      continue;
+    }
+    strictStateKeys(rawReceipt, ["request_hash", "from_stage_cursor", "from_cursor_epoch", "to_stage_cursor", "to_cursor_epoch", "committed_at"], receiptPath, issues);
+    if (!nonEmptyStateString(rawReceipt.request_hash) || !/^[a-f0-9]{64}$/i.test(String(rawReceipt.request_hash))) {
+      issues.push(`${receiptPath}.request_hash must be a SHA-256 hex digest`);
+    }
+    for (const key of ["from_stage_cursor", "from_cursor_epoch", "to_stage_cursor", "to_cursor_epoch", "committed_at"]) {
+      if (!nonEmptyStateString(rawReceipt[key])) issues.push(`${receiptPath}.${key} must be a non-empty string`);
+    }
+  }
 }
 
 /**
@@ -346,7 +458,8 @@ function validateTypedStateFields(state: StateRecord): string[] {
     validateStateTrustedCheckpointAnswers(state.trusted_checkpoint_answers, "$.trusted_checkpoint_answers", issues);
   }
   if (Object.prototype.hasOwnProperty.call(state, "completion_envelope")) validateStateCompletion(state.completion_envelope, "$.completion_envelope", issues);
-  if (Object.prototype.hasOwnProperty.call(state, "migration")) validateStateMigration(state.migration, "$.migration", issues);
+  if (Object.prototype.hasOwnProperty.call(state, "stage_receipts")) validateStateStageReceipts(state.stage_receipts, "$.stage_receipts", issues);
+  if (Object.prototype.hasOwnProperty.call(state, "advance_receipts")) validateStateAdvanceReceipts(state.advance_receipts, "$.advance_receipts", issues);
   const classification = isStateRecord(state.classification) ? state.classification : null;
   if (classification) {
     const classificationFields: StateRecord = {};
@@ -534,7 +647,7 @@ export function normalizePersistedState(raw: unknown, rejectionIssues?: string[]
     const receipt: MigrationReceipt = {
       id: `migration-${stableStateHash(`${String(state.run_key ?? state.branch)}|${workflow}`).slice(0, 24)}`,
       from_schema: 1,
-      to_schema: 3,
+      to_schema: 2,
       source_profile_hash: nonEmptyStateString(state.profile_hash) ? state.profile_hash : "unresolved-profile",
       target_profile_hash: targetProfileHash,
       source_policy_hash: null,
@@ -809,8 +922,8 @@ interface CommittedState {
 
 export interface StatePublication {
   operation: "new" | "resume" | "rework" | "migration" | "claim";
-  before: Record<string, string | null>;
-  after: Record<string, string | null>;
+  before: Record<string, LifecycleFileContent>;
+  after: Record<string, LifecycleFileContent>;
 }
 type StatePublicationFactory = (stamped: TeamState) => StatePublication | undefined;
 

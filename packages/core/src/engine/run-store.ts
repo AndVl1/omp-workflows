@@ -12,7 +12,7 @@ import {
   type CanonicalRunTarget,
   type StatePublication,
 } from "./state.js";
-import { ctoStateDir, parseCtoState } from "../cto/state.js";
+import { ctoStateDir, ctoStatePath, parseCtoState } from "../cto/state.js";
 import type { CtoState } from "../cto/types.js";
 import { beginLifecycleTransaction, commitLifecycleTransaction, type LifecycleFileContent } from "./lifecycle-journal.js";
 import { LifecycleError, lifecyclePayloadHash, selectRunCandidate } from "./run-lifecycle.js";
@@ -28,6 +28,7 @@ import type {
   RunSelectionSnapshot,
   TeamState,
   TrustedExecutionContext,
+  WorkIdentity,
   WorktreeExecutionClaim,
   CtoReleaseProvenance,
 } from "./types.js";
@@ -401,6 +402,7 @@ function readControlRaw(cwd: string): RunControl {
   const revision = value.revision;
   if (value.schema !== 2 || !Number.isInteger(revision) || (revision as number) < 0
     || !isRecord(value.runs) || !isRecord(value.selections) || (value.cto_releases !== undefined && !isRecord(value.cto_releases))
+    || !Object.prototype.hasOwnProperty.call(value, "execution_claim")
     || !isRecord(value.prepare_receipts) || !isRecord(value.selection_snapshots)) {
     throw new LifecycleError("recovery_required", "run-control.json has an unknown schema or incomplete fields", { next_action: "recover lifecycle transaction before mutating" });
   }
@@ -412,8 +414,16 @@ function readControlRaw(cwd: string): RunControl {
   return control;
 }
 
+function sameCoordinatorProcess(claim: WorktreeExecutionClaim, context: TrustedExecutionContext): boolean {
+  return !claim.released_at
+    && claim.coordinator_session_id === context.session_id
+    && claim.coordinator_process_id !== undefined
+    && context.process_id !== undefined
+    && claim.coordinator_process_id === context.process_id;
+}
+
 function claimCoordinatorIsBusy(claim: WorktreeExecutionClaim, context: TrustedExecutionContext): boolean {
-  if (claim.coordinator_session_id === context.session_id && !claim.released_at) return false;
+  if (sameCoordinatorProcess(claim, context)) return false;
   if (claim.released_at) return claim.worker_ids.length > 0;
   if (!claim.coordinator_process_id) return true;
   try {
@@ -451,6 +461,10 @@ export function readRunControl(cwd: string): RunControl {
 
 export function readRunControlNoRecovery(cwd: string): RunControl {
   return withWorkspaceReadNoRecovery(cwd, () => readControlRaw(cwd), () => defaultControl());
+}
+/** Read the already-validated run-control image while a state transaction owns the workspace lock. */
+export function readRunControlHeldLock(cwd: string): RunControl {
+  return readControlRaw(cwd);
 }
 
 export function updateRunControl<T>(cwd: string, mutate: RunControlMutation<T>): T {
@@ -784,7 +798,7 @@ function hasOutstandingDispatches(cwd: string, runId: string, ownerKind: "workfl
 }
 
 function claimBusy(claim: WorktreeExecutionClaim, context: TrustedExecutionContext): boolean {
-  if (claim.coordinator_session_id === context.session_id && !claim.released_at) return false;
+  if (sameCoordinatorProcess(claim, context)) return false;
   if (claim.released_at) return claim.worker_ids.length > 0;
   if (!claim.coordinator_process_id) return true;
   try {
@@ -867,7 +881,7 @@ function canReplaceCrossRunClaim(
   context: TrustedExecutionContext,
 ): CrossRunClaimAdmission | null {
   if (claim.owner_kind !== "workflow" || claim.worker_ids.length > 0) return null;
-  if (!claim.released_at && claim.coordinator_session_id !== context.session_id) {
+  if (!claim.released_at && !sameCoordinatorProcess(claim, context)) {
     if (!claim.coordinator_process_id) return null;
     try {
       process.kill(claim.coordinator_process_id, 0);
@@ -911,7 +925,7 @@ export function acquireExecutionClaim(cwd: string, input: { run_id: string; cont
         throw new LifecycleError("run_busy", `worktree execution is owned by run '${current.run_id}'`, { run_id: current.run_id, next_action: "resume or reconcile the existing run" });
       }
     }
-    if (current && current.run_id === input.run_id && current.coordinator_session_id === input.context.session_id && !current.released_at) {
+    if (current && current.run_id === input.run_id && sameCoordinatorProcess(current, input.context)) {
       return { claim: current, idempotent: true };
     }
     const claim: WorktreeExecutionClaim = {
@@ -1124,13 +1138,15 @@ export function publishCtoClaim(cwd: string, input: CtoClaimPublication): ClaimR
     if (current && current.run_id !== input.run_id) {
       throw new LifecycleError("run_busy", `worktree execution is owned by run '${current.run_id}'`, { run_id: current.run_id, next_action: "resume or reconcile the existing run" });
     }
-    if (current && current.run_id === input.run_id && current.coordinator_session_id === input.context.session_id && !current.released_at) {
+    if (current && current.run_id === input.run_id && sameCoordinatorProcess(current, input.context)) {
       return { claim: current, idempotent: true };
     }
     if (current && !current.released_at && claimBusy(current, input.context)) {
       throw new LifecycleError("run_busy", `coordinator for CTO run '${input.run_id}' is still live`, { run_id: input.run_id, next_action: "wait for a release receipt or reconcile the owner" });
     }
-    let pendingWorkers = input.worker_ids ?? current?.worker_ids ?? [];
+    let pendingWorkers = current?.run_id === input.run_id && !current.released_at
+      ? current.worker_ids
+      : input.worker_ids ?? current?.worker_ids ?? [];
     let resumedReleaseReceipt: string | undefined;
     if (current?.released_at) {
       const release = control.cto_releases[input.run_id];
@@ -1305,11 +1321,109 @@ function parseCtoWorkerSlot(workerId: string): CtoWorkerSlot | undefined {
   return { worker_id: workerId, ownership_epoch, tool_call_id: toolCallId, index };
 }
 
+export type NativeRecoveryReservationPermit = {
+  readonly operation_id: string;
+  readonly retry_of: string;
+  readonly generation: number;
+  readonly original: WorkIdentity;
+  readonly replacement_identity: WorkIdentity;
+};
+
+function canonicalNativeRecoveryValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalNativeRecoveryValue);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, canonicalNativeRecoveryValue(entry)]),
+  );
+}
+
+function sameNativeRecoveryValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonicalNativeRecoveryValue(left)) === JSON.stringify(canonicalNativeRecoveryValue(right));
+}
+
+function nativeRecoveryPermitMatchesState(state: CtoState, permit: NativeRecoveryReservationPermit): boolean {
+  if (
+    !permit
+    || typeof permit.operation_id !== "string"
+    || permit.operation_id.length === 0
+    || typeof permit.retry_of !== "string"
+    || permit.retry_of.length === 0
+    || !Number.isSafeInteger(permit.generation)
+    || permit.generation < 0
+    || !isRecord(permit.original)
+    || !isRecord(permit.replacement_identity)
+    || permit.retry_of !== permit.original.dispatch_id
+    || permit.replacement_identity.dispatch_id === permit.original.dispatch_id
+    || permit.replacement_identity.worker_id === permit.original.worker_id
+  ) return false;
+  const ledger = (state as unknown as Record<string, unknown>).stage_recovery;
+  if (!isRecord(ledger) || ledger.schema_version !== 1 || !isRecord(ledger.lineages)) return false;
+  for (const line of Object.values(ledger.lineages)) {
+    if (
+      !isRecord(line)
+      || line.generation !== permit.generation
+      || !sameNativeRecoveryValue(line.identity, permit.original)
+      || !Array.isArray(line.operations)
+    ) continue;
+    for (const operation of line.operations) {
+      if (
+        !isRecord(operation)
+        || operation.operation_id !== permit.operation_id
+        || operation.retry_of !== permit.retry_of
+        || (operation.status !== "prepared" && operation.status !== "acked")
+        || !isRecord(operation.replacement_identity)
+        || !sameNativeRecoveryValue(operation.replacement_identity, permit.replacement_identity)
+        || !isRecord(operation.admission)
+        || operation.admission.state !== "ready"
+      ) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+function preparedNativeRecoveryWorkers(
+  cwd: string,
+  runId: string,
+  permits: readonly NativeRecoveryReservationPermit[],
+  workerIds: readonly string[],
+): Set<string> {
+  const prepared = new Set<string>();
+  if (permits.length === 0) return prepared;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(ctoStatePath(runId, cwd), "utf8"));
+  } catch {
+    throw new LifecycleError("recovery_required", "native recovery reservation source is unavailable", { run_id: runId, next_action: "reconcile the canonical CTO state before dispatching" });
+  }
+  const validation = parseCtoState(parsed, runId);
+  if (!validation.ok) {
+    throw new LifecycleError("recovery_required", `native recovery reservation source is invalid: ${validation.error}`, { run_id: runId, next_action: "reconcile the canonical CTO state before dispatching" });
+  }
+  for (const permit of permits) {
+    if (
+      !nativeRecoveryPermitMatchesState(validation.state, permit)
+      || !isRecord(permit.replacement_identity)
+      || typeof permit.replacement_identity.worker_id !== "string"
+      || permit.replacement_identity.worker_id.length === 0
+      || !workerIds.includes(permit.replacement_identity.worker_id)
+    ) {
+      throw new LifecycleError("run_state_invalid", "native recovery reservation permit is not a current ready canonical operation", { run_id: runId });
+    }
+    prepared.add(permit.replacement_identity.worker_id);
+  }
+  return prepared;
+}
+
 function assertCtoWorkerIdsForCurrentEpoch(
   claim: WorktreeExecutionClaim,
   workerIds: readonly string[],
   runId: string,
+  preparedRecoveryWorkerIds: ReadonlySet<string> = new Set(),
 ): void {
+  const currentWorkerIds = new Set(claim.worker_ids);
   const seen = new Set<string>();
   for (const workerId of workerIds) {
     if (seen.has(workerId)) {
@@ -1317,7 +1431,15 @@ function assertCtoWorkerIdsForCurrentEpoch(
     }
     seen.add(workerId);
     const parsed = parseCtoWorkerSlot(workerId);
-    if (!parsed || (parsed.ownership_epoch !== undefined && parsed.ownership_epoch !== claim.ownership_epoch)) {
+    if (
+      !parsed
+      || (
+        !currentWorkerIds.has(workerId)
+        && parsed.ownership_epoch !== undefined
+        && parsed.ownership_epoch !== claim.ownership_epoch
+        && !preparedRecoveryWorkerIds.has(workerId)
+      )
+    ) {
       throw new LifecycleError("run_state_invalid", "CTO worker reservation identity is not authorized for the current ownership epoch", { run_id: runId });
     }
   }
@@ -1334,6 +1456,7 @@ function assertCtoWorkerIdsForCurrentEpoch(
     incomingSlots.push(parsed);
   }
   for (const incoming of incomingSlots) {
+    if (currentWorkerIds.has(incoming.worker_id)) continue;
     if (currentSlots.some((current) =>
       current !== undefined
       && current.tool_call_id === incoming.tool_call_id
@@ -1344,21 +1467,38 @@ function assertCtoWorkerIdsForCurrentEpoch(
   }
 }
 
-/** Add native child reservations without changing coordinator ownership. */
-export function reserveExecutionClaimWorkers(cwd: string, input: { run_id: string; token: string; worker_ids: string[] }): void {
+type NativeExecutionClaimReservationInput = {
+  readonly run_id: string;
+  readonly token: string;
+  readonly worker_ids: readonly string[];
+};
+
+function reserveExecutionClaimWorkersInternal(
+  cwd: string,
+  input: NativeExecutionClaimReservationInput,
+  recoveryPermits: readonly NativeRecoveryReservationPermit[] = [],
+): readonly string[] {
   if (!input.token || !Array.isArray(input.worker_ids) || input.worker_ids.some((workerId) => typeof workerId !== "string" || !workerId)) {
     throw new LifecycleError("run_state_invalid", "execution worker reservation is malformed", { run_id: input.run_id });
   }
-  withWorkspaceTransaction(cwd, () => {
+  return withWorkspaceTransaction(cwd, () => {
     const before = controlContent(cwd);
     const control = readControlRaw(cwd);
     const claim = control.execution_claim;
     if (!claim || claim.run_id !== input.run_id || claim.token !== input.token || claim.released_at !== null) {
       throw new LifecycleError("run_busy", "execution claim is not the current live owner", { run_id: input.run_id });
     }
-    if (claim.owner_kind === "cto") assertCtoWorkerIdsForCurrentEpoch(claim, input.worker_ids, input.run_id);
+    if (recoveryPermits.length > 0 && claim.owner_kind !== "cto") {
+      throw new LifecycleError("run_state_invalid", "native recovery permits require a CTO execution claim", { run_id: input.run_id });
+    }
+    const preparedRecoveryWorkerIds = claim.owner_kind === "cto"
+      ? preparedNativeRecoveryWorkers(cwd, input.run_id, recoveryPermits, input.worker_ids)
+      : new Set<string>();
+    if (claim.owner_kind === "cto") assertCtoWorkerIdsForCurrentEpoch(claim, input.worker_ids, input.run_id, preparedRecoveryWorkerIds);
+    const currentWorkerIds = new Set(claim.worker_ids);
     const nextWorkerIds = [...new Set([...claim.worker_ids, ...input.worker_ids])];
-    if (nextWorkerIds.length === claim.worker_ids.length) return;
+    const newlyAddedWorkerIds = nextWorkerIds.filter((workerId) => !currentWorkerIds.has(workerId));
+    if (newlyAddedWorkerIds.length === 0) return [];
     if (claim.owner_kind === "cto") {
       const release = control.cto_releases[input.run_id];
       if (release && !sameWorkerIds(release.pending_worker_ids, claim.worker_ids)) {
@@ -1378,11 +1518,37 @@ export function reserveExecutionClaimWorkers(cwd: string, input: { run_id: strin
         },
         "claim",
       );
-      return;
+      return newlyAddedWorkerIds;
     }
     const nextClaim: WorktreeExecutionClaim = { ...claim, worker_ids: nextWorkerIds };
     writeControlTransaction(cwd, before, { ...control, revision: control.revision + 1, execution_claim: nextClaim }, "claim");
+    return newlyAddedWorkerIds;
   });
+}
+
+/** Add native child reservations without changing coordinator ownership. */
+export function reserveExecutionClaimWorkers(cwd: string, input: { run_id: string; token: string; worker_ids: string[] }): void {
+  reserveExecutionClaimWorkersInternal(cwd, input);
+}
+
+/** @internal Native CTO handover; not exported through the package barrel. */
+export function reserveNativeExecutionClaimWorkers(
+  cwd: string,
+  input: NativeExecutionClaimReservationInput & {
+    readonly recovery_permits: readonly NativeRecoveryReservationPermit[];
+  },
+): readonly string[] {
+  if (!Array.isArray(input.recovery_permits)) {
+    throw new LifecycleError("run_state_invalid", "native recovery reservation permits are malformed", { run_id: input.run_id });
+  }
+  const seenOperationIds = new Set<string>();
+  for (const permit of input.recovery_permits) {
+    if (seenOperationIds.has(permit.operation_id)) {
+      throw new LifecycleError("run_state_invalid", "native recovery reservation permits contain a duplicate operation", { run_id: input.run_id });
+    }
+    seenOperationIds.add(permit.operation_id);
+  }
+  return reserveExecutionClaimWorkersInternal(cwd, input, input.recovery_permits);
 }
 
 /** Remove only settled native reservations; stale tokens cannot mutate claims. */
@@ -1457,7 +1623,6 @@ export function settleCtoExecutionClaimWorkersByToolCall(
     if (
       !parsed
       || parsed.tool_call_id !== input.tool_call_id
-      || parsed.ownership_epoch !== undefined && parsed.ownership_epoch !== input.ownership_epoch
       || slots.some((slot) => slot.tool_call_id === parsed.tool_call_id && slot.index === parsed.index)
     ) {
       throw new LifecycleError("run_state_invalid", "CTO tool-call settlement worker slots do not match the host tool call", { run_id: input.run_id });
@@ -1469,6 +1634,14 @@ export function settleCtoExecutionClaimWorkersByToolCall(
     const control = readControlRaw(cwd);
     const claim = control.execution_claim;
     if (!claim || claim.owner_kind !== "cto" || claim.run_id !== input.run_id) return;
+    const currentWorkerIds = new Set(claim.worker_ids);
+    if (slots.some((slot) =>
+      slot.ownership_epoch !== undefined
+      && slot.ownership_epoch !== input.ownership_epoch
+      && !currentWorkerIds.has(slot.worker_id)
+    )) {
+      throw new LifecycleError("run_state_invalid", "CTO tool-call settlement worker slots do not match the current ownership epoch or persisted reservation", { run_id: claim.run_id });
+    }
     const release = control.cto_releases[claim.run_id];
     if (release && !sameWorkerIds(release.pending_worker_ids, claim.worker_ids)) {
       throw new LifecycleError("recovery_required", "CTO reservation ledger does not match the current claim before settlement", { run_id: claim.run_id, next_action: "reconcile the managed CTO release before settling workers" });

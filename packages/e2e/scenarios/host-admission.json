@@ -19,9 +19,9 @@
     { "id": "foreign_context", "name": "A7: неподтверждённый caller не получает authority", "expect": ["workflow_admission:|BLOCKED"] },
     { "id": "state_recovery", "name": "A8: повреждённый selected run не исполняется", "expect": ["workflow_state_recovery_required|run_control_unreadable"] },
     { "id": "internal_activation", "name": "A9: internal marked/unmarked isolation", "expect": ["git status"] },
-    { "id": "bugfix", "name": "B1: bugfix и граничные проверки", "expect": ["workflow_prepare", "task", "workflow_complete"] },
+    { "id": "bugfix", "name": "B1: bugfix и граничные проверки", "expect": ["workflow_prepare", "task", "workflow_submit_result"] },
     { "id": "checkpoint_resume", "name": "B2: продолжение после checkpoint без прежнего чата", "expect": ["workflow_prepare", "workflow_checkpoint"] },
-    { "id": "installed_packages", "name": "B3: упакованные пакеты вне checkout", "expect": ["workflow_prepare", "task", "workflow_complete"] }
+    { "id": "installed_packages", "name": "B3: упакованные пакеты вне checkout", "expect": ["workflow_prepare", "task", "workflow_submit_result"] }
   ],
   "timing": { "startupTimeoutMs": 120000, "stageTimeoutMs": 900000, "checkpointPollMs": 2000 },
   "screenshots": { "on": ["stage_start", "stage_end", "error"] },

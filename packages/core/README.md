@@ -63,6 +63,14 @@ workflow не отменяет проверку личности. Не удал�
 host; core отдельно проверяет отсутствие selected run и execution claim.
 Ordinary run, CTO и native worker сохраняют свои проверки полномочий.
 
+Отдельный `{ kind: "authenticated-host-idle-basic-tools" }` — actorless
+capability только для generic `bash`/`write`/`edit`, привязанный к зафиксированной
+fullstack SDK identity из собственного `sessionManager`; `actor`, `hasUI` и
+скопированные поля контекста не служат credentials.
+Admission требует отсутствия selected run, любых selection records (active или
+inactive), `execution_claim` и конфликтующей controller/CTO/native/legacy authority.
+Этот путь не даёт `task`, `ask`, typed workflow/native, CTO или bootstrap rights.
+
 Отказы содержат стабильный `[workflow_admission:<code>]`, объяснение,
 безопасное действие и состав репорта. Известный отказ адаптера, отсутствие
 результата, исключение и ошибка canonical state не должны интерпретироваться
@@ -217,6 +225,12 @@ non-existent shutdown `session_id` field.
 
 В одном физическом worktree допускается один конфликтующий execution claim. Живой или неизвестно завершённый coordinator/worker даёт `run_busy`; ошибка и receipt `workflow_prepare` сохраняют state неизменным и указывают поддерживаемое следующее действие. `workflow_status` можно использовать для проверки текущего run/stage/capability state. Смерть coordinator не доказывает остановку workers: разрешается resume того же run или reconcile, но не независимый `new` и не force-unlock.
 
+Отсутствующий `.work-state/run-control.json` читается как корректный пустой
+control. В существующем schema-2 control обязательно поле `execution_claim`:
+его отсутствие даёт fail-closed `recovery_required`, а не означает свободный
+worktree. `cto_releases` остаётся optional для совместимости и при отсутствии
+по умолчанию равен `{}`.
+
 Lifecycle journal и lock/CAS восстанавливаются до следующей мутации. При прерывании **до** canonical commit откатывается только staging, исходные данные остаются нетронутыми; **после** commit выполняется только forward repair с сохранением canonical mapping. Backup — evidence для recovery, а не способ вернуть старую authority.
 
 Legacy root/feature state и прежняя форма `continuation` — только import boundary. Старый API должен быть заменён на явный `resume`/`rework`; неизвестная schema, повреждённая ссылка, активный или неизвестный legacy dispatch дают `migration_required`, `recovery_required` или `run_busy` без создания обходного пустого run. `.work-state/.active-feature` не является runtime authority после cutover. Не удаляйте marker, не перемещайте state вручную и не редактируйте canonical JSON: следуйте diagnostic `next_action` и повторите штатную операцию после устранения причины.
@@ -310,9 +324,34 @@ The engine surface is also available directly:
 - `loadAllProfiles()`, `loadProfile(name)`, `selectProfile(profiles, classification)`, `resolveWorkflow(type, complexity, autonomous)`
 - `resolveConfig(cwd)`, `resolveScope(files, config)`, `applyConditional(...)`, `shouldSkip(...)`
 - `updateStateAtomically(cwd, mutation)`, `setStageStatus(...)`, `setPause(...)`, `checkMonotonic(...)`, `resolveState(cwd)`
-- `writeArtifact(dir, id, data)`, `readArtifact(dir, id)`
+- `readArtifact(dir, id)` — чтение опубликованного результата; публичного raw writer нет
 - `appendDoDItem(dir, ...)`, `closeDoDItem(dir, ...)`, `readDoD(dir)`, `isDoDComplete(dod)`, `isRootCauseDocumented(dir)`
 - `defaultFullstackModelRoles`, `resolveRoleChain`, `isResearchRequest`, `isResearchResponse`, `validateResearchRequest`, `validateResearchResponse` (model-role taxonomy + research request/response validators, types `ModelRoleEntry`, `InventoryModel`, `RoleLookup`, `RoleResolution`, `ResearchRequest`, `Response`, `BenchmarkSource`, `ResearchRecommendation`)
+
+Worker сдаёт логические `outputs` через зарегистрированный
+`workflow_submit_result` из собственной SDK child-сессии. `TaskResult` описывает
+только transport completion и больше не содержит `artifacts`; exit 0 и ручной
+JSON не заменяют canonical receipt. `OrchestratorResult.outputs` публикуются
+engine через trusted current-stage binding, а не через произвольный файловый writer.
+
+В async-ack сценарии первоначальный ответ `task` оставляет ordinary dispatch в
+`pending`; сам ACK не является terminal. Поздний authoritative OMP 18.0.6
+subagent-lifecycle terminal также может reconciliate этот dispatch, если private
+child grant связывает точные `parentToolCallId`, slot `index`, `agent` и child
+`sessionFile` с captured dispatch origin. Перед settlement engine повторно
+проверяет текущие selected/active claim под уже удерживаемой workspace transaction
+lock через held-lock reader. Terminal не заменяет output receipt: mismatch,
+stale callback и replay fail closed. Существующий trusted `task_result` путь
+остаётся отдельным способом terminal settlement; он также не является receipt.
+
+При интеграции `run` с зарегистрированным host передайте действующий
+`sessionController` и `execution: sessionController.context()`. Engine вызывает
+его lifecycle preparation, сохраняя согласованность canonical claim и приватного
+bound token при resume/rework. Controller с другим workspace или execution
+context отклоняется до мутации. `createTaskCaller` должен оборачивать executor,
+который сохраняет настоящие SDK admission hooks и child lineage; обход hooks
+не предоставляет producer authority. `TaskInvocationOptions.toolCallId`
+связывает canonical authorization с той же физической task invocation.
 
 
 ## Workflows

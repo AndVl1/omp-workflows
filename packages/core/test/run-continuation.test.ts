@@ -16,6 +16,7 @@ import { beginCapability as rawBeginCapability } from "../src/engine/durable.js"
 import { resolveWorkflowContract, WorkflowContractError } from "../src/engine/workflow-contract.js";
 import { registerWorkflowProfiles } from "../src/engine/profile.js";
 import type { Profile, TaskType, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
+import { createCoreFixture, createInterpreterTaskCaller, details, submission, type Harness } from "./reliable-stage-execution-fixture.js";
 import type { TaskCaller, TaskResult } from "../src/engine/stage.js";
 
 
@@ -71,11 +72,7 @@ function trustedContext(root: string, branch = BRANCH, sessionId = "run-lifecycl
 }
 
 function taskResult(id: string, stage: string): TaskResult {
-  const artifacts: Record<string, string> = {};
-  if (stage === "reopened" || stage === "downstream") {
-    artifacts[stage] = JSON.stringify({ stage, result: "new" });
-  }
-  return { id, output: `${stage} completed`, artifacts, exitCode: 0 };
+  return { id, output: `${stage} completed`, exitCode: 0 };
 }
 
 function taskTool(
@@ -99,6 +96,43 @@ function taskTool(
       return stages.map((stage, index) => taskResult(`batch-${index}`, stage));
     },
   };
+}
+
+function createInterpreterHarness(root: string, sessionId: string): Harness {
+  return createCoreFixture({
+    route: "ordinary",
+    root,
+    branch: BRANCH,
+    sessionId,
+    workflowProfiles: [profile],
+    roles: { worker: "worker" },
+    scopeMap: [{ glob: ["**/*"], scope: "default", dev_agent: "worker" }],
+  });
+}
+
+function interpreterTaskTool(
+  harness: Harness,
+  calls: string[],
+  requests: Array<{ agent: string; task: string }> = [],
+  onCall?: (stage: string) => void,
+): TaskCaller {
+  return createInterpreterTaskCaller(harness, async (worker, request) => {
+    const stage = request.task.match(/## Stage: ([^\s]+)/)?.[1] ?? "unknown";
+    calls.push(stage);
+    requests.push({ agent: request.agent, task: request.task });
+    onCall?.(stage);
+    const submitted = await harness.tools.get("workflow_submit_result")!.execute(
+      `${worker.toolCallId}-submit`,
+      submission({ [stage]: { stage, result: "new" } }),
+      undefined,
+      undefined,
+      worker.childContext,
+    );
+    const submittedDetails = details(submitted.details);
+    assert.equal(submittedDetails.ok, true, JSON.stringify(submittedDetails));
+    assert.ok(submittedDetails.receipt && typeof submittedDetails.receipt === "object", "registered worker output must return its receipt");
+    return { id: `${worker.toolCallId}-result`, output: `${stage} completed`, exitCode: 0 };
+  });
 }
 
 function prepareNew(root: string, task = "Original task", sessionId = "run-lifecycle-session") {
@@ -259,6 +293,50 @@ test("run rejects an omitted trusted execution context before canonical mutation
   }
 });
 
+test("run rejects a controller bound to another workspace before canonical writes or task dispatch", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-run-controller-bound-root-"));
+  const foreignRoot = mkdtempSync(join(tmpdir(), "omp-run-controller-bound-foreign-"));
+  try {
+    initGit(root, BRANCH);
+    initGit(foreignRoot, BRANCH);
+    const foreignController = createWorkflowSessionController({
+      cwd: foreignRoot,
+      context: trustedContext(foreignRoot, BRANCH, "foreign-controller-session"),
+    });
+    const beforeRoot = {
+      control: readRunControl(root),
+      runs: listRuns(root, { branch: BRANCH }),
+    };
+    const beforeForeign = {
+      control: readRunControl(foreignRoot),
+      runs: listRuns(foreignRoot, { branch: BRANCH }),
+    };
+    const calls: string[] = [];
+
+    await assert.rejects(
+      run({
+        task: "mismatched controller must not mutate either workspace",
+        cwd: root,
+        branch: BRANCH,
+        autonomous: false,
+        classification: CLASSIFICATION,
+        taskTool: taskTool(calls),
+        mode: "new",
+        request_id: "mismatched-controller",
+        execution: trustedContext(root, BRANCH, "root-execution-session"),
+        sessionController: foreignController,
+      }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict",
+    );
+    assert.deepEqual(calls, [], "mismatched controller must reject before task.call or batch");
+    assert.deepEqual({ control: readRunControl(root), runs: listRuns(root, { branch: BRANCH }) }, beforeRoot);
+    assert.deepEqual({ control: readRunControl(foreignRoot), runs: listRuns(foreignRoot, { branch: BRANCH }) }, beforeForeign);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(foreignRoot, { recursive: true, force: true });
+  }
+});
+
 test("run resume rejects a selected run from the wrong branch before task calls", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-run-resume-context-"));
   try {
@@ -291,10 +369,13 @@ test("run resume rejects a selected run from the wrong branch before task calls"
 
 test("run resume preserves canonical classification, upstream inputs, and completed stage identity", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-run-resume-canonical-"));
+  initGit(root);
+  const harness = createInterpreterHarness(root, "resume-session");
   try {
-    initGit(root);
-    publishLifecycleMapping(root);
-    const seeded = prepareNew(root, "Original task", "resume-session");
+    const execution = harness.controller.context();
+    const prepared = harness.controller.prepare({ mode: "new", task: "Original task", classification: CLASSIFICATION });
+    const seeded = { context: execution, controller: harness.controller, prepared, runId: prepared.state.run_id! };
+    assert.ok(seeded.runId);
     seedResumableState(root, seeded.runId);
     const calls: string[] = [];
     const requests: Array<{ agent: string; task: string }> = [];
@@ -305,11 +386,12 @@ test("run resume preserves canonical classification, upstream inputs, and comple
       branch: BRANCH,
       autonomous: true,
       classification: { type: "BUG_FIX", complexity: "COMPLEX", confidence: "LOW", autonomous: true, workflow: "debug-cycle" },
-      taskTool: taskTool(calls, requests),
+      taskTool: interpreterTaskTool(harness, calls, requests),
       mode: "resume",
       run_id: seeded.runId,
       request_id: "resume-canonical",
-      execution: seeded.context,
+      execution,
+      sessionController: harness.controller,
     });
 
     assert.deepEqual(result.classification, CLASSIFICATION, "resume must use persisted classification over new input");
@@ -347,16 +429,20 @@ test("run resume preserves canonical classification, upstream inputs, and comple
     assert.equal(state.lifecycle_status, "complete");
     assert.doesNotMatch(readFileSync(result.statePath!, "utf8"), /"(?:dispatch_token|advance_token)"\s*:/, "handoff secrets are not persisted");
   } finally {
+    await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("run rework snapshots the previous result and reruns only the affected stage and downstream work", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-run-rework-canonical-"));
+  initGit(root);
+  const harness = createInterpreterHarness(root, "rework-session");
   try {
-    initGit(root);
-    publishLifecycleMapping(root);
-    const seeded = prepareNew(root, "Original task", "rework-session");
+    const execution = harness.controller.context();
+    const prepared = harness.controller.prepare({ mode: "new", task: "Original task", classification: CLASSIFICATION });
+    const seeded = { context: execution, controller: harness.controller, prepared, runId: prepared.state.run_id! };
+    assert.ok(seeded.runId);
     seedCompletedState(root, seeded.runId);
     const preRunState = JSON.parse(readFileSync(runTarget(root, seeded.runId).statePath!, "utf8")) as TeamState;
     assert.equal(preRunState.run_id, seeded.runId);
@@ -392,13 +478,14 @@ test("run rework snapshots the previous result and reruns only the affected stag
       branch: BRANCH,
       autonomous: true,
       classification: { type: "BUG_FIX", complexity: "COMPLEX", confidence: "LOW", autonomous: true, workflow: "debug-cycle" },
-      taskTool: taskTool(calls, requests, captureFirstTaskCall),
+      taskTool: interpreterTaskTool(harness, calls, requests, captureFirstTaskCall),
       mode: "rework",
       run_id: seeded.runId,
       request_id: "rework-canonical",
       feedback: "Fix the reopened implementation result",
       affected_stage: "reopened",
-      execution: seeded.context,
+      execution,
+      sessionController: harness.controller,
     });
 
     assert.deepEqual(result.classification, CLASSIFICATION, "rework keeps the canonical classification");
@@ -442,6 +529,7 @@ test("run rework snapshots the previous result and reruns only the affected stag
     assert.ok(manifest.artifact_sha256?.["upstream.json"], "revision manifest preserves upstream evidence");
     assert.ok(manifest.artifact_sha256?.["reopened.json"], "revision manifest preserves the old affected result");
   } finally {
+    await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

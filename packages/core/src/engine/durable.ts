@@ -2,12 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
-import { normalizePersistedState, resolveCanonicalRun, isSafeStateSegment, resolveActiveBranch, updateStateAtomically, invalidateReentryInputEvidence, type ResolvedState, type StateMutation, type StateUpdateResult, type StateSnapshot } from "./state.js";
+import { normalizePersistedState, resolveCanonicalRun, isSafeStateSegment, resolveActiveBranch, updateStateAtomically, invalidateReentryInputEvidence, withWorkspaceReadNoRecovery, type ResolvedState, type StateMutation, type StateUpdateResult, type StateSnapshot, type StatePublication } from "./state.js";
+import type { LifecycleFileContent } from "./lifecycle-journal.js";
+import { consumePreparedRecoveryAdmission, migrateStageRecoveryLedger, STAGE_RECOVERY_FIELD, type StageRecoveryLedger } from "./stage-recovery-store.js";
 import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole, type ResolvedConfig } from "./config.js";
 import { validateAgentMappingState, type AgentMappingDiagnostic, type AgentMappingState } from "./agent-mapping.js";
 import { resolveScope, type ScopeFlags } from "./scope.js";
 import { readRequiredStageInputs, resolveStageDispatchSlots, selectRoster, type RosterSelectionContext } from "./stage.js";
-import { readArtifact, writeArtifact } from "./artifacts.js";
+import { isSafeArtifactId, readArtifact, readArtifactFileSafe, writeArtifact } from "./artifacts.js";
 import { isDoDComplete, isRootCauseDocumented, readDoD } from "./dod.js";
 import { validationGate } from "../gates/validation.js";
 import { buildDispatchMarker, dispatchTaskId } from "../gates/dispatch.js";
@@ -32,7 +34,6 @@ import {
 import { loopIterationForStage, loopExhaustionKind, loopIterationRecord, loopReentryDecision, loopStateFor, resolveBackToStage } from "./loops.js";
 import {
   DEFAULT_FAN_IN_POLICY,
-  isNamespacedArtifactId,
   namespacedArtifactId,
   synthesizeArtifacts,
   type FanInPolicy,
@@ -44,7 +45,7 @@ import {
   DEFAULT_ARTIFACT_CONTRACT_POLICY,
   type ArtifactContractPolicy,
 } from "./artifact-contract.js";
-import { runTarget, terminalControlPublication } from "./run-store.js";
+import { readRunControlHeldLock, runTarget, terminalControlPublication } from "./run-store.js";
 import type {
   CapabilityBinding,
   CheckpointAnswerProof,
@@ -58,6 +59,7 @@ import type {
   ChildJoin,
   CompletionArtifactRef,
   CompletionEnvelope,
+  CompletionTerminalSignal,
   DispatchCompletion,
   DispatchRecord,
   MigrationCompletionArtifactRef,
@@ -71,11 +73,15 @@ import type {
   StageDef,
   TeamState,
   TrustedCheckpointAnswer,
+  TrustedExecutionContext,
   TypedCheckpointDecision,
   WorkIdentity,
+  WorktreeExecutionClaim,
+  StageReceiptLedger,
   CapturedDispatchContext,
 } from "./types.js";
-import { PRD_SOURCE_ARTIFACT_IDS, writeProductPrdDocument } from "./product-prd.js";
+import type { StageProducerBinding } from "./reliable-stage.js";
+import { PRD_SOURCE_ARTIFACT_IDS, prepareProductPrdDocument } from "./product-prd.js";
 
 export type DispatchAuth = {
   run_id?: string;
@@ -128,10 +134,14 @@ type ActiveCapability = {
   issued_for: CapabilityBinding;
   kind: "none" | "single" | "consilium"; expected_roles: string[]; expected_count: number;
   expected_roster: Array<{ role: string; agent: string }>;
+  /** Persisted coordinator/tool/document assignment for kind `none`. */
+  producer_assignment?: WorkIdentity;
   /** Frozen selection carried by roster-policy capabilities (masked on completion). */
   roster_selection?: RosterSelection;
   work_identity?: WorkIdentity;
-  status: "ready" | "dispatched" | "joining" | "complete" | "invalidated"; dispatches: DispatchRecord[]; pending?: PendingState[];
+  status: "ready" | "dispatched" | "joining" | "complete" | "invalidated";
+  dispatches: DispatchRecord[];
+  pending?: PendingState[];
 };
 /**
  * Keep the profile binding model-safe without weakening its identity.
@@ -177,7 +187,18 @@ export type IssuedCapability = {
   state: NonNullable<TeamState["dispatch_capability"]>;
 };
 
-export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff; child_join?: ChildJoin } | { ok: false; error: string; state?: TeamState; child_join?: ChildJoin };
+export type TransitionResult = { ok: true; state: TeamState; record?: DispatchRecord; handoff?: CapabilityHandoff; child_join?: ChildJoin; stage_receipt?: StageReceiptLedger; replayed?: boolean } | { ok: false; error: string; state?: TeamState; child_join?: ChildJoin; stage_receipt?: StageReceiptLedger };
+export type TrustedStageResultInput = {
+  run_id: string;
+  dispatch_id: string;
+  work_identity: WorkIdentity;
+  /** Canonical producer assignment checked again inside the durable transition. */
+  binding: StageProducerBinding;
+  receipt: StageReceiptLedger;
+  artifacts: Array<{ artifact_id: string; value: unknown; immutable_id: string }>;
+  /** Optional renderer sidecars committed with the receipt/state publication. */
+  publication?: StatePublication;
+};
 const MIGRATION_DISPATCH_REJECTION = "migration completion evidence is not a live dispatch";
 
 
@@ -245,7 +266,56 @@ function handoffFromState(
 
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
+const hashBytes = (value: Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const now = (): string => new Date().toISOString();
+
+function canonicalStageValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalStageValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalStageValue(entry)]),
+    );
+  }
+  return value;
+}
+
+function canonicalStageJson(value: unknown): string {
+  const encoded = JSON.stringify(canonicalStageValue(value));
+  if (encoded === undefined) throw new Error("stage submission contains a non-serializable value");
+  return encoded;
+}
+function advanceRequestHash(input: DispatchAuth): string {
+  return hash(canonicalStageJson({
+    capability_id: input.capability_id,
+    run_key: input.run_key,
+    branch: input.branch,
+    workflow: input.workflow,
+    profile_hash: input.profile_hash,
+    stage_cursor: input.stage_cursor,
+    cursor_epoch: input.cursor_epoch,
+    loop_iteration: input.loop_iteration ?? null,
+    token: input.token,
+  }));
+}
+
+function withAdvanceReceipt(state: TeamState, input: DispatchAuth, next: TeamState): TeamState {
+  return {
+    ...next,
+    advance_receipts: {
+      ...(state.advance_receipts ?? {}),
+      [input.capability_id]: {
+        request_hash: advanceRequestHash(input),
+        from_stage_cursor: input.stage_cursor,
+        from_cursor_epoch: input.cursor_epoch,
+        to_stage_cursor: next.stage_cursor,
+        to_cursor_epoch: next.cursor_epoch ?? input.cursor_epoch,
+        committed_at: now(),
+      },
+    },
+  };
+}
 /**
  * THE single durable control-plane transition seam. EVERY mutation that
  * participates in the durable workflow (begin/reissue, authorize, pending,
@@ -259,7 +329,7 @@ const now = (): string => new Date().toISOString();
  * construction.
  */
 type RecordCore =
-  | { write: true; state: TeamState; result: TransitionResult }
+  | { write: true; state: TeamState; result: TransitionResult; publication?: StatePublication }
   | { write: false; result: TransitionResult };
 
 type TransitionMutation = StateMutation<TransitionResult>;
@@ -278,15 +348,39 @@ function replayTransition(result: TransitionResult): RecordCore {
   return { write: false, result };
 }
 
-function commitTransition(next: TeamState, result: TransitionResult): RecordCore {
-  return { write: true, state: next, result };
+function commitTransition(next: TeamState, result: TransitionResult, publication?: StatePublication): RecordCore {
+  return { write: true, state: next, result, ...(publication ? { publication } : {}) };
 }
 
 function toMutation(core: RecordCore): TransitionMutation {
   return core.write
-    ? { op: "commit", state: core.state, value: core.result }
+    ? { op: "commit", state: core.state, value: core.result, ...(core.publication ? { publication: core.publication } : {}) }
     : { op: "discard", value: core.result };
 }
+function mergeStatePublications(primary: StatePublication, secondary: StatePublication): StatePublication {
+  return {
+    operation: primary.operation,
+    before: { ...primary.before, ...secondary.before },
+    after: { ...primary.after, ...secondary.after },
+  };
+}
+function publicationFileBefore(path: string): LifecycleFileContent {
+  const raw = readArtifactFileSafe(dirname(path), basename(path));
+  if (raw.status === "absent") return null;
+  if (raw.status === "invalid") throw new Error(`publication target is not a readable regular file: ${path} (${raw.error})`);
+  const bytes = raw.bytes;
+  const text = bytes.toString("utf8");
+  return Buffer.from(text, "utf8").equals(bytes)
+    ? text
+    : { encoding: "base64", data: bytes.toString("base64") };
+}
+
+function publicationContentBytes(content: LifecycleFileContent): Buffer | null {
+  if (content === null) return null;
+  return typeof content === "string" ? Buffer.from(content, "utf8") : Buffer.from(content.data, "base64");
+}
+
+
 
 function runTransition(cwd: string, mutate: (state: TeamState, target: ResolvedState) => RecordCore, opts: { terminalPublication?: boolean; runId?: string } = {}): TransitionResult {
   if (!opts.runId) return { ok: false, error: "canonical run_id is required for durable mutation" };
@@ -297,7 +391,12 @@ function runTransition(cwd: string, mutate: (state: TeamState, target: ResolvedS
       // for tool summaries (the pre-transaction behavior).
       return { op: "discard", value: { ok: false, error: "workflow state is stale for the active branch", state: snapshot.state } };
     }
-    return toMutation(mutate(snapshot.state, snapshot.target));
+    const mutation = toMutation(mutate(snapshot.state, snapshot.target));
+    if (opts.terminalPublication && mutation.op === "commit" && mutation.publication) {
+      const terminal = terminalControlPublication(cwd, snapshot.state, mutation.state);
+      return terminal ? { ...mutation, publication: mergeStatePublications(terminal, mutation.publication) } : mutation;
+    }
+    return mutation;
   }, {
     target: runTarget(cwd, opts.runId),
     ...(opts.terminalPublication ? { publication: (snapshot: StateSnapshot, nextState: TeamState) => terminalControlPublication(cwd, snapshot.state, nextState) } : {}),
@@ -1171,6 +1270,41 @@ function attachRequiredInputReceipt(state: TeamState, target: ResolvedState, sta
   };
   return { ok: true, state: { ...state, required_inputs: { ...(state.required_inputs ?? {}), [stage.id]: receipt.inputs }, required_input_receipts: { ...(state.required_input_receipts ?? {}), [stage.id]: receipt } } };
 }
+function nonWorkerAssignmentIdentity(
+  state: TeamState,
+  capability: NonNullable<TeamState["dispatch_capability"]>,
+  stage: StageDef,
+): WorkIdentity | undefined {
+  const runId = state.run_id ?? state.run_key;
+  const workflow = state.classification?.workflow;
+  const issuedFor = capability.issued_for;
+  const capabilityId = capability.capability_id;
+  const stageProduces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
+  if (!runId || !workflow || !issuedFor?.stage_cursor || !issuedFor.cursor_epoch || !capabilityId || stageProduces.length === 0) return undefined;
+  const producerId = stage.producer?.kind === "tool"
+    ? `tool:${stage.producer.tool_name}`
+    : stage.type === "document" && stage.document?.renderer
+      ? `renderer:${stage.document.renderer}`
+      : "orchestrator";
+  const assignmentId = `producer-${hash(`${producerId}|${stage.id}|${capabilityId}`).slice(0, 32)}`;
+  return {
+    run_id: runId,
+    wave_id: `wave:${capabilityId}`,
+    slice_id: `slice:${stage.id}`,
+    session_id: `producer:${capabilityId}`,
+    workflow,
+    stage_id: stage.id,
+    stage_cursor: issuedFor.stage_cursor,
+    capability_id: capabilityId,
+    capability_epoch: issuedFor.cursor_epoch,
+    loop_iteration: issuedFor.loop_iteration,
+    slot_id: stage.id,
+    task_id: assignmentId,
+    dispatch_id: assignmentId,
+    attempt: 1,
+    worker_id: producerId,
+  };
+}
 
 export function beginCapability(cwd: string, requested?: RosterBeginSelection, options?: TrustedMappingOptions & { runId?: string }): TransitionResult {
   return runTransition(cwd, (state, target) => {
@@ -1341,6 +1475,10 @@ export function beginCapability(cwd: string, requested?: RosterBeginSelection, o
       if (!rosterChanged) {
         const reissued = reissueActiveCapability(existing, stageDeclaration.declaration?.policy_hash ?? null);
         const pendingActive = (reissued.state.dispatches ?? []).some((record) => record.status === "pending" || record.status === "running");
+        const reissuedProducerIdentity = kind === "none"
+          ? reissued.state.producer_assignment ?? nonWorkerAssignmentIdentity(state, reissued.state, stage)
+          : undefined;
+        if (reissuedProducerIdentity) reissued.state.producer_assignment = reissuedProducerIdentity;
         const next: TeamState = {
           ...state,
           ...policyProjectionFor(stageDeclaration.declaration, stage.id, persistedHash),
@@ -1377,6 +1515,10 @@ export function beginCapability(cwd: string, requested?: RosterBeginSelection, o
       loop_iteration: stageIteration.iteration,
       checkpoint_policy_hash: stageDeclaration.declaration?.policy_hash ?? null,
     });
+    if (kind === "none") {
+      const producerIdentity = nonWorkerAssignmentIdentity(resetState, issued.state, stage);
+      if (producerIdentity) issued.state.producer_assignment = producerIdentity;
+    }
     // Imported successes become terminal history under the fresh capability.
     const materialized = materializeMigratedDispatches(resetState, issued.state, workflow, stage.id, target);
     if (!materialized.ok) return rejectTransition(materialized.error, state);
@@ -1438,24 +1580,56 @@ function auth(cap: ActiveCapability, a: DispatchAuth, secretHash: string): strin
 function expectedTaskId(cap: ActiveCapability, role: string): string {
   return dispatchTaskId(cap.capability_id, cap.issued_for.run_key, cap.issued_for.branch, cap.issued_for.workflow, cap.issued_for.stage_cursor, role);
 }
+function currentWorkflowOwnershipEpoch(cwd: string, state: TeamState): string | undefined {
+  let control: ReturnType<typeof readRunControlHeldLock>;
+  try {
+    control = readRunControlHeldLock(cwd);
+  } catch {
+    return undefined;
+  }
+  const claim = control.execution_claim;
+  if (
+    !claim
+    || claim.owner_kind !== "workflow"
+    || claim.run_id !== (state.run_id ?? state.run_key)
+    || control.runs[claim.run_id]?.branch !== state.branch
+    || claim.released_at !== null
+  ) return undefined;
+  return typeof claim.ownership_epoch === "string" && claim.ownership_epoch
+    ? claim.ownership_epoch
+    : undefined;
+}
+
 
 function authorizeRecord(
+  cwd: string,
   state: TeamState,
   target: ResolvedState,
   cap: ActiveCapability,
   input: DispatchAuth,
+  options: { preflightRejection?: "missing_prompt" | "invalid_arguments" } = {},
 ): RecordCore {
   if (cap.status === "invalidated" || cap.status === "complete") return rejectTransition("capability invalidated", state);
   const role = input.slot_id ?? input.role ?? "";
   const rosterEntry = cap.expected_roster.find((entry) => entry.role === role);
   if (!rosterEntry) return rejectTransition("role/slot not expected", state);
   if (input.role !== undefined && input.role !== role) return rejectTransition("slot identity mismatch", state);
+  if (input.agent !== undefined && input.agent !== rosterEntry.agent) return rejectTransition("agent identity mismatch", state);
   if (input.expected_count !== undefined && input.expected_count !== cap.expected_count) return rejectTransition("cardinality mismatch", state);
   const taskId = expectedTaskId(cap, role);
   if (input.task_id !== undefined && input.task_id !== taskId) return rejectTransition("task identity mismatch", state);
   const recordsForRole = cap.dispatches.filter((record) => record.role === role);
   const latest = recordsForRole[recordsForRole.length - 1];
   if (latest && isMigrationDispatchRecordValue(latest)) return rejectTransition(MIGRATION_DISPATCH_REJECTION, state);
+  if (
+    options.preflightRejection
+    && latest
+    && latest.tool_call_id === input.tool_call_id
+    && latest.status === "failed"
+    && latest.completion_envelope?.terminal_signal === `preflight:${options.preflightRejection}`
+  ) {
+    return replayTransition({ ok: true, state, record: latest });
+  }
 
   if (latest && latest.status !== "failed" && latest.status !== "cancelled") {
     const sameTool = Boolean(input.tool_call_id && latest.tool_call_id === input.tool_call_id);
@@ -1488,20 +1662,69 @@ function authorizeRecord(
       return replayTransition({ ok: true, state, record: latest });
     }
   }
-  if (latest && (!input.retry_of || input.retry_of !== latest.id || (latest.status !== "failed" && latest.status !== "cancelled"))) {
+  if (input.retry_of !== undefined && (!latest || input.retry_of !== latest.id)) {
     return rejectTransition("retry requires an explicit terminal failure linkage", state);
   }
-  const dispatchId = randomUUID();
-  const attempt = latest ? latest.attempt + 1 : 1;
+  let recoveryAdmission: { retry_of: string; replacement_identity: WorkIdentity; ledger: StageRecoveryLedger } | undefined;
+  if (latest?.work_identity && input.tool_call_id) {
+    const rawLedger = (state as unknown as Record<string, unknown>)[STAGE_RECOVERY_FIELD];
+    if (rawLedger !== undefined) {
+      let ledger: StageRecoveryLedger | undefined;
+      try {
+        ledger = migrateStageRecoveryLedger(rawLedger);
+      } catch {
+        return rejectTransition("recovery admission ledger is malformed", state);
+      }
+      if (ledger) {
+        const consumed = consumePreparedRecoveryAdmission(ledger, {
+          run_id: state.run_id ?? cap.issued_for.run_key,
+          authority: "ordinary",
+          generation: state.rework_generation ?? 0,
+          identity: latest.work_identity,
+          retry_of: latest.id,
+        }, input.tool_call_id);
+        if (consumed.ok) {
+          recoveryAdmission = {
+            retry_of: consumed.retry_of,
+            replacement_identity: consumed.replacement_identity,
+            ledger: consumed.ledger,
+          };
+        } else if (input.retry_of !== undefined || consumed.code !== "admission_not_found") {
+          return rejectTransition(`recovery admission cannot be consumed: ${consumed.code}`, state);
+        }
+      }
+    } else if (input.retry_of !== undefined) {
+      return rejectTransition("recovery admission is required for a replacement dispatch", state);
+    }
+  }
+  if (latest && input.retry_of !== undefined && !recoveryAdmission) {
+    return rejectTransition("recovery admission is required for a replacement dispatch", state);
+  }
+  if (!latest && input.retry_of !== undefined) {
+    return rejectTransition("retry requires an existing terminal dispatch", state);
+  }
+  if (recoveryAdmission && recoveryAdmission.retry_of !== latest?.id) {
+    return rejectTransition("recovery admission retry linkage is stale", state);
+  }
+  if (latest && !recoveryAdmission && (!input.retry_of || input.retry_of !== latest.id || (latest.status !== "failed" && latest.status !== "cancelled"))) {
+    return rejectTransition("retry requires an explicit terminal failure linkage", state);
+  }
+  const dispatchId = recoveryAdmission?.replacement_identity.dispatch_id ?? randomUUID();
+  const attempt = recoveryAdmission?.replacement_identity.attempt ?? (latest ? latest.attempt + 1 : 1);
   const identity = workIdentityFor(state, cap, role, rosterEntry.agent, dispatchId, attempt, taskId);
-  const pending = pendingFor(identity, "authorized", undefined, undefined, latest?.id ?? null);
+  if (recoveryAdmission && !sameTrustedWorkIdentity(identity, recoveryAdmission.replacement_identity)) {
+    return rejectTransition("recovery replacement identity does not match the current assignment", state);
+  }
+  const pending = pendingFor(identity, "authorized", undefined, undefined, recoveryAdmission?.retry_of ?? latest?.id ?? null);
   const envelope = completionEnvelopeFor(identity, "pending", null, [], "authorized", "engine_task_caller");
+  const ownershipEpoch = currentWorkflowOwnershipEpoch(cwd, state);
   const record: DispatchRecord = {
     id: dispatchId,
     role,
     agent: rosterEntry.agent,
     tool_call_id: input.tool_call_id,
     ...(input.origin_session_id ? { origin_session_id: input.origin_session_id } : {}),
+    ...(ownershipEpoch ? { origin_ownership_epoch: ownershipEpoch } : {}),
     status: "authorized",
     attempt,
     created_at: now(),
@@ -1518,9 +1741,22 @@ function authorizeRecord(
   projectCapabilityIdentity(nextCapability, identity);
   const next: TeamState = {
     ...state,
+    ...(recoveryAdmission ? { [STAGE_RECOVERY_FIELD]: recoveryAdmission.ledger } : {}),
     dispatch_capability: nextCapability,
   };
   projectRootLifecycle(next, cap, { identity, envelope });
+  if (options.preflightRejection) {
+    const signal: CompletionTerminalSignal = options.preflightRejection === "missing_prompt"
+      ? "preflight:missing_prompt"
+      : "preflight:invalid_arguments";
+    return completeRecord(next, target, nextCapability, record, {
+      outcome: "failed",
+      evidence: signal,
+      artifact_ids: [],
+      completed_by: "synchronous_tool_result",
+      terminal_signal: signal,
+    });
+  }
   return commitTransition(next, { ok: true, state: next, record });
 }
 
@@ -1536,7 +1772,7 @@ export function authorizeDispatch(cwd: string, authInput: DispatchAuth): Transit
     if (error) return rejectTransition(error, state);
     const coherence = authorizeCoherenceError(state, cap);
     if (coherence) return rejectTransition(coherence, state);
-    return authorizeRecord(state, target, cap, authInput);
+    return authorizeRecord(cwd, state, target, cap, authInput);
   }, authInput.run_id ? { runId: authInput.run_id } : undefined);
 }
 
@@ -1560,6 +1796,9 @@ export interface TrustedDispatchInput {
   retry_of?: string;
   origin_session_id?: string;
 }
+export interface TrustedPreflightRejectionInput extends TrustedDispatchInput {
+  rejection_code: "missing_prompt" | "invalid_arguments";
+}
 
 /** Authorize a task after the trusted runtime gate validated its marker: one cross-process transaction. */
 export function authorizeDispatchTrusted(cwd: string, input: TrustedDispatchInput): TransitionResult {
@@ -1575,11 +1814,12 @@ export function authorizeDispatchTrusted(cwd: string, input: TrustedDispatchInpu
       || input.profile_hash !== binding.profile_hash
       || input.stage_cursor !== binding.stage_cursor
       || input.cursor_epoch !== binding.cursor_epoch
+      || input.loop_iteration !== binding.loop_iteration
     ) return rejectTransition("capability binding mismatch", state);
     if (!input.tool_call_id) return rejectTransition("tool call identity required", state);
     const coherence = authorizeCoherenceError(state, cap);
     if (coherence) return rejectTransition(coherence, state);
-    return authorizeRecord(state, target, cap, {
+    return authorizeRecord(cwd, state, target, cap, {
       token: "__trusted_gate__",
       capability_id: input.capability_id,
       run_key: input.run_key,
@@ -1601,6 +1841,52 @@ export function authorizeDispatchTrusted(cwd: string, input: TrustedDispatchInpu
     });
   }, input.run_id ? { runId: input.run_id } : undefined);
 }
+/**
+ * Persist a trusted host preflight refusal as the terminal record for the
+ * exact assignment that was rejected before provider execution. The record is
+ * minted and terminalized inside one runTransition; no live worker exists.
+ */
+export function rejectDispatchPreflightTrusted(cwd: string, input: TrustedPreflightRejectionInput): TransitionResult {
+  return runTransition(cwd, (state, target) => {
+    const cap = activeCapability(state.dispatch_capability);
+    if (!cap) return rejectTransition("dispatch capability unavailable", state);
+    const binding = cap.issued_for;
+    if (
+      input.capability_id !== cap.capability_id
+      || input.run_key !== binding.run_key
+      || input.branch !== binding.branch
+      || input.workflow !== binding.workflow
+      || input.profile_hash !== binding.profile_hash
+      || input.stage_cursor !== binding.stage_cursor
+      || input.cursor_epoch !== binding.cursor_epoch
+      || input.loop_iteration !== binding.loop_iteration
+    ) return rejectTransition("capability binding mismatch", state);
+    if (!input.tool_call_id) return rejectTransition("tool call identity required", state);
+    const coherence = authorizeCoherenceError(state, cap);
+    if (coherence) return rejectTransition(coherence, state);
+    return authorizeRecord(cwd, state, target, cap, {
+      token: "__trusted_gate__",
+      capability_id: input.capability_id,
+      run_key: input.run_key,
+      branch: input.branch,
+      workflow: input.workflow,
+      profile_hash: input.profile_hash,
+      stage_cursor: input.stage_cursor,
+      cursor_epoch: input.cursor_epoch,
+      role: input.role,
+      slot_id: input.slot_id,
+      task_id: input.task_id,
+      agent: input.agent,
+      tool_call_id: input.tool_call_id,
+      expected_count: input.expected_count,
+      retry_of: input.retry_of,
+      origin_session_id: input.origin_session_id,
+      run_id: input.run_id,
+      ...(input.loop_iteration !== undefined ? { loop_iteration: input.loop_iteration } : {}),
+    }, { preflightRejection: input.rejection_code });
+  }, input.run_id ? { runId: input.run_id } : undefined);
+}
+
 
 type CompletionInput = {
   outcome: DispatchCompletion["outcome"];
@@ -1720,33 +2006,6 @@ function hasMigrationProvenance(
 }
 
 
-function registerProducedArtifactBindings(
-  state: TeamState,
-  target: ResolvedState,
-  cap: ActiveCapability,
-  artifactIds: string[],
-): TeamState {
-  if (artifactIds.length === 0 || !target.artifactsDir) return state;
-  const profile = loadProfile(cap.issued_for.workflow);
-  const stage = profile?.stages.find((candidate) => candidate.id === cap.issued_for.stage_cursor);
-  const declared = stage ? new Set(stageProduces(stage)) : new Set<string>();
-  if (declared.size === 0) return state;
-  const artifacts = { ...(state.artifacts ?? {}) };
-  let changed = false;
-  for (const id of artifactIds) {
-    if (!declared.has(id) || !isSafeStateSegment(id)) continue;
-    const value = readArtifact(target.artifactsDir, id);
-    if (value === null) continue;
-    const contract = validateProducedArtifact(id, value, artifactContractPolicy);
-    if (!contract.ok) continue;
-    const path = `artifacts/${id}.json`;
-    if (artifacts[id] !== path) {
-      artifacts[id] = path;
-      changed = true;
-    }
-  }
-  return changed ? { ...state, artifacts } : state;
-}
 
 function completeRecord(
   state: TeamState,
@@ -1761,54 +2020,25 @@ function completeRecord(
   if (!input.evidence.trim()) return rejectTransition("completion evidence required", state);
   const artifact_ids = input.artifact_ids ?? [];
   const artifactDir = target.artifactsDir ?? "";
-  // Publish only files that the active stage declares, are present under the
-  // canonical artifacts directory, and pass their shipped contract. This is
-  // an additive same-transaction binding: it does not restore invalidated
-  // outputs or replace the state snapshot, so concurrent dispatch updates are
-  // preserved by the enclosing CAS transaction.
-  state = registerProducedArtifactBindings(state, target, cap, artifact_ids);
+  // Lifecycle artifact ids must already be bound by an accepted receipt or
+  // an existing canonical publication map; terminal completion never writes them.
+  const acceptedArtifactIds = new Set((state.stage_receipts?.[record.id]?.outputs ?? []).map((output) => output.artifact_id));
   const declaredArtifacts = state.artifacts ?? {};
+  const publishedArtifactIds = new Set([...acceptedArtifactIds, ...Object.keys(declaredArtifacts)]);
   const unsafeArtifacts = new Set(artifact_ids).size !== artifact_ids.length || artifact_ids.some((id) => !isSafeStateSegment(id));
   const previousCompletion = record.completion;
   const sameOutcome = previousCompletion?.outcome === input.outcome;
   const sameArtifacts = previousCompletion !== undefined && JSON.stringify(previousCompletion.artifact_ids) === JSON.stringify(artifact_ids);
   const deferredNativeArtifacts = previousCompletion?.completed_by === "synchronous_tool_result"
     && sameOutcome
-    && previousCompletion.artifact_ids.length === 0
-    && artifact_ids.length > 0;
-  const missingArtifacts = artifact_ids.some((id) => !Object.prototype.hasOwnProperty.call(declaredArtifacts, id) && !Object.values(state.slot_artifacts ?? {}).some((stage) => Object.values(stage.slots ?? {}).some((slot) => Object.prototype.hasOwnProperty.call(slot, id))));
-  if (unsafeArtifacts || (missingArtifacts && !deferredNativeArtifacts)) return rejectTransition("declared artifact missing or unsafe", state);
+    && artifact_ids.length > 0
+    && artifact_ids.every((id) => publishedArtifactIds.has(id));
+  const missingArtifacts = artifact_ids.some((id) => !publishedArtifactIds.has(id));
+  if (unsafeArtifacts || (missingArtifacts && !deferredNativeArtifacts)) return rejectTransition("declared artifact missing or unbound", state);
   if (previousCompletion && !(sameOutcome && sameArtifacts) && !deferredNativeArtifacts) return rejectTransition("conflicting replay", state);
   const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
   const completedBy = input.completed_by ?? "workflow_complete";
   const terminalSignal = input.terminal_signal ?? (completedBy === "synchronous_tool_result" ? "native_tool_result" : "workflow_complete");
-  const snapshotted = snapshotSlotArtifacts(state, cap, record, artifact_ids, artifactDir);
-  if (snapshotted.ok === false) {
-    if (snapshotted.retryable && previousCompletion) {
-      const identity = record.work_identity ?? workIdentityFor(state, cap, record.role, record.agent, record.id, record.attempt);
-      const deferredCompletion: DispatchCompletion = {
-        ...previousCompletion,
-        artifact_ids,
-        evidence: input.evidence,
-        work_identity: identity,
-      };
-      const deferredEnvelope = completionEnvelopeFor(identity, input.outcome, "native_tool_result", completionArtifactRefs(artifactDir, artifact_ids), input.evidence, "synchronous_tool_result");
-      const deferredRecord: DispatchRecord = { ...record, work_identity: identity, completion: deferredCompletion, completion_envelope: deferredEnvelope };
-      const deferredCapability: ActiveCapability = {
-        ...cap,
-        dispatches: cap.dispatches.map((candidate) => candidate.id === record.id ? deferredRecord : candidate),
-      };
-      projectCapabilityIdentity(deferredCapability, identity);
-      const deferredState: TeamState = {
-        ...state,
-        dispatch_capability: deferredCapability,
-        updated_at: now(),
-      };
-      projectRootLifecycle(deferredState, cap, { identity, envelope: deferredEnvelope });
-      return commitTransition(deferredState, { ok: true, state: deferredState, record: deferredRecord });
-    }
-    return rejectTransition(snapshotted.error, state);
-  }
   if (previousCompletion && sameOutcome && sameArtifacts) {
     const replayEnvelope = record.completion_envelope;
     if (!replayEnvelope) return rejectTransition("terminal dispatch completion envelope is missing", state);
@@ -1819,7 +2049,7 @@ function completeRecord(
     };
     projectCapabilityIdentity(replayedCapability, identity);
     const replayedState: TeamState = {
-      ...snapshotted.state,
+      ...state,
       dispatch_capability: replayedCapability,
       updated_at: now(),
     };
@@ -1874,7 +2104,7 @@ function completeRecord(
       }
     : null;
   const next: TeamState = {
-    ...snapshotted.state,
+    ...state,
     dispatch_capability: nextCapability,
     pause: activeRecord ? { kind: "background_wait", reason: "provider work remains pending" } : { kind: "none", reason: "" },
     updated_at: now(),
@@ -1883,61 +2113,7 @@ function completeRecord(
   return commitTransition(next, { ok: true, state: next, record: updated });
 }
 
-/**
- * For multi-slot consilium stages, capture each slot's artifact content into
- * a namespaced snapshot (`<id>-<slot>.json`) at completion time, before a
- * later slot can overwrite the shared file. Recording the same artifact for
- * the same slot twice with different content is a collision and fails
- * closed. The namespaced snapshots are the provenance source for the
- * deterministic synthesis performed at advance.
- */
-function snapshotSlotArtifacts(
-  state: TeamState,
-  cap: ActiveCapability,
-  record: DispatchRecord,
-  artifactIds: string[],
-  artifactsDir: string,
-): { ok: true; state: TeamState } | { ok: false; error: string; retryable?: boolean } {
-  if (cap.kind !== "consilium" || cap.expected_count <= 1 || artifactIds.length === 0) {
-    return { ok: true, state };
-  }
-  const stageId = cap.issued_for.stage_cursor;
-  const existing = state.slot_artifacts?.[stageId] ?? { slots: {} };
-  const slots = { ...existing.slots };
-  const slotMap = { ...(slots[record.role] ?? {}) };
-  const values: Array<{ id: string; value: unknown }> = [];
-  for (const id of artifactIds) {
-    const value = readArtifact(artifactsDir, id);
-    if (value === null) {
-      return {
-        ok: false,
-        retryable: true,
-        error: `slot '${record.role}' artifact '${id}' is not readable yet; retry completion or workflow_advance`,
-      };
-    }
-    values.push({ id, value });
-  }
-  for (const { id, value } of values) {
-    const hash = hashValue(value);
-    const previous = slotMap[id];
-    if (previous && previous.hash !== hash) {
-      return { ok: false, error: `slot artifact conflict: slot '${record.role}' wrote '${id}' with different content` };
-    }
-    // Already slot-scoped ids are the slot's own provenance; only copy the
-    // shared-id writes into the namespace before a later slot can clobber.
-    const namespaced = isNamespacedArtifactId(id, record.role) ? id : namespacedArtifactId(id, record.role);
-    if (namespaced !== id) {
-      writeArtifact(artifactsDir, namespaced, value);
-    }
-    slotMap[id] = { path: join(artifactsDir, `${namespaced}.json`), hash };
-  }
-  slots[record.role] = slotMap;
-  return { ok: true, state: { ...state, slot_artifacts: { ...(state.slot_artifacts ?? {}), [stageId]: { ...existing, slots } } } };
-}
 
-function hashValue(value: unknown): string {
-  return hash(JSON.stringify(value));
-}
 export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_id: string } & Partial<CompletionInput>, options?: { runId?: string }): TransitionResult {
   return runTransition(cwd, (state, target) => {
     const cap = activeCapability(state.dispatch_capability);
@@ -1959,6 +2135,521 @@ export function completeDispatch(cwd: string, input: DispatchAuth & { dispatch_i
     if (!input.outcome || !input.evidence) return rejectTransition("terminal completion outcome and evidence are required", state);
     return completeRecord(state, target, cap, record, input as CompletionInput);
   }, options?.runId ? { runId: options.runId } : undefined);
+}
+function sameTrustedWorkIdentity(left: WorkIdentity | undefined, right: WorkIdentity | undefined): boolean {
+  if (!left || !right) return false;
+  return left.run_id === right.run_id
+    && left.wave_id === right.wave_id
+    && left.slice_id === right.slice_id
+    && left.session_id === right.session_id
+    && left.workflow === right.workflow
+    && left.stage_id === right.stage_id
+    && left.stage_cursor === right.stage_cursor
+    && left.capability_id === right.capability_id
+    && left.capability_epoch === right.capability_epoch
+    && left.loop_iteration === right.loop_iteration
+    && left.slot_id === right.slot_id
+    && left.task_id === right.task_id
+    && left.dispatch_id === right.dispatch_id
+    && left.attempt === right.attempt
+    && left.worker_id === right.worker_id;
+}
+function ordinaryPublicationClaimError(
+  cwd: string,
+  state: TeamState,
+  binding: StageProducerBinding,
+  record: DispatchRecord | undefined,
+): string | null {
+  let claim: WorktreeExecutionClaim | null;
+  try {
+    claim = readRunControlHeldLock(cwd).execution_claim;
+  } catch {
+    return "submission coordinator claim is unavailable";
+  }
+  if (!claim || claim.owner_kind !== "workflow" || claim.run_id !== state.run_id || claim.released_at !== null) {
+    return "submission coordinator claim is no longer current";
+  }
+  const expectedSession = record?.origin_session_id ?? (binding.producer.kind === "worker" ? undefined : binding.host.session_id);
+  if (binding.producer.kind === "worker" && !expectedSession) return "submission worker origin claim is unavailable";
+  if (expectedSession !== undefined && claim.coordinator_session_id !== expectedSession) {
+    return "submission coordinator ownership changed";
+  }
+  return null;
+}
+
+
+
+function verifyReceiptImmutableFiles(root: string | undefined, receipt: StageReceiptLedger): boolean {
+  if (!root) return false;
+  const references = [
+    ...receipt.outputs.map((output) => ({ ref: output.immutable_ref, digest: output.sha256 })),
+    ...receipt.evidence.map((evidence) => ({ ref: evidence.immutable_ref, digest: evidence.sha256 })),
+  ];
+  return references.every(({ ref, digest }) => {
+    if (!ref || isAbsolute(ref)) return false;
+    const raw = readArtifactFileSafe(root, ref);
+    return raw.status === "present" && hashBytes(raw.bytes) === digest;
+  });
+}
+export interface OrdinaryAcceptedStageReceiptLineage {
+  readonly session_id: string;
+  readonly session_file: string;
+  readonly parent_session_file: string;
+}
+
+export interface OrdinaryAcceptedStageReceiptRoot {
+  readonly context: TrustedExecutionContext;
+  readonly outputs: Record<string, unknown>;
+}
+export interface OrdinaryAcceptedStageReceiptCandidate {
+  readonly identity: WorkIdentity;
+  readonly receipt: StageReceiptLedger;
+}
+
+
+function isOrdinaryReplayRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Read an already accepted ordinary worker receipt for a cold-revived child.
+ *
+ * This is intentionally a proof-only path. It does not admit a dispatch,
+ * create a binding, grant a capability, publish state, or record lifecycle
+ * completion. The current root coordinator claim and canonical run are
+ * checked while the workspace read lock is held; the worker binding and
+ * immutable artifact bytes must prove the SDK lineage supplied by the child.
+ */
+export function findAcceptedOrdinaryStageReceipt(
+  input: {
+    readonly cwd: string;
+    readonly runId: string;
+    readonly lineage: OrdinaryAcceptedStageReceiptLineage;
+    readonly root: OrdinaryAcceptedStageReceiptRoot;
+  },
+): OrdinaryAcceptedStageReceiptCandidate | undefined {
+  if (
+    !input.cwd
+    || !input.runId
+    || !input.lineage.session_id
+    || !isAbsolute(input.lineage.session_file)
+    || !isAbsolute(input.lineage.parent_session_file)
+    || !input.root
+    || !input.root.context
+    || !isOrdinaryReplayRecord(input.root.outputs)
+  ) return undefined;
+  try {
+    return withWorkspaceReadNoRecovery(input.cwd, () => {
+      const context = input.root.context;
+      if (
+        context.caller !== "host"
+        || context.authority !== "coordinator"
+        || !context.session_id
+        || !context.worktree
+        || !context.branch
+        || resolve(context.worktree) !== resolve(input.cwd)
+      ) return undefined;
+
+      const claim = readRunControlHeldLock(input.cwd).execution_claim;
+      if (
+        !claim
+        || claim.owner_kind !== "workflow"
+        || claim.run_id !== input.runId
+        || claim.released_at !== null
+        || claim.coordinator_session_id !== context.session_id
+        || (claim.coordinator_process_id ?? undefined) !== (context.process_id ?? undefined)
+      ) return undefined;
+
+      const resolved = resolveCanonicalRun(input.cwd, { kind: "team", runId: input.runId }, context.branch);
+      const state = resolved?.state;
+      if (
+        !resolved
+        || !state
+        || resolved.runId !== input.runId
+        || resolved.runKey !== input.runId
+        || resolved.branch !== context.branch
+        || state.run_id !== input.runId
+        || state.run_key !== input.runId
+        || state.branch !== context.branch
+        || !resolved.artifactsDir
+      ) return undefined;
+
+      const cap = activeCapability(state.dispatch_capability);
+      if (
+        !cap
+        || cap.issued_for.run_key !== input.runId
+        || cap.issued_for.branch !== context.branch
+        || cap.issued_for.stage_cursor !== state.stage_cursor
+        || cap.issued_for.workflow !== state.classification.workflow
+      ) return undefined;
+      const profile = loadProfile(cap.issued_for.workflow);
+      const stage = profile?.stages.find((candidate) => candidate.id === state.stage_cursor);
+      if (!stage) return undefined;
+      const declared = new Set(stageProduces(stage));
+      const outputIds = Object.keys(input.root.outputs);
+      if (outputIds.length === 0 || outputIds.some((artifactId) => !declared.has(artifactId) || !isSafeArtifactId(artifactId))) return undefined;
+
+      const receipts = Object.entries(state.stage_receipts ?? {});
+      const candidates: StageReceiptLedger[] = [];
+      for (const [dispatchKey, receipt] of receipts) {
+        if (
+          !receipt
+          || !Array.isArray(receipt.outputs)
+          || !Array.isArray(receipt.evidence)
+          || receipt.outputs.length === 0
+          || typeof receipt.receipt_id !== "string"
+          || typeof receipt.submission_id !== "string"
+          || typeof receipt.digest !== "string"
+          || typeof receipt.accepted_at !== "string"
+          || dispatchKey !== receipt.dispatch_id
+        ) continue;
+        const identity = receipt.work_identity;
+        const record = cap.dispatches.find((candidate) => candidate.id === receipt.dispatch_id);
+        if (
+          !identity
+          || !record
+          || !record.work_identity
+          || record.attempt !== receipt.attempt
+          || record.status === "failed"
+          || record.status === "cancelled"
+          || !sameTrustedWorkIdentity(record.work_identity, identity)
+          || identity.run_id !== input.runId
+          || identity.workflow !== cap.issued_for.workflow
+          || identity.stage_id !== stage.id
+          || identity.stage_cursor !== state.stage_cursor
+          || identity.capability_id !== cap.capability_id
+          || identity.capability_epoch !== cap.issued_for.cursor_epoch
+          || identity.dispatch_id !== record.id
+          || identity.attempt !== record.attempt
+          || record.agent !== identity.worker_id
+          || identity.loop_iteration !== cap.issued_for.loop_iteration
+        ) continue;
+
+        const binding = receipt.binding;
+        if (!isOrdinaryReplayRecord(binding) || binding.authority !== "ordinary") continue;
+        const bindingIdentity = binding.identity;
+        const host = binding.host;
+        const producer = binding.producer;
+        if (
+          !isOrdinaryReplayRecord(bindingIdentity)
+          || !sameTrustedWorkIdentity(bindingIdentity as unknown as WorkIdentity, identity)
+          || !isOrdinaryReplayRecord(host)
+          || !isOrdinaryReplayRecord(producer)
+          || producer.kind !== "worker"
+          || host.session_id !== input.lineage.session_id
+          || typeof host.worktree !== "string"
+          || resolve(host.worktree) !== resolve(input.cwd)
+          || host.branch !== state.branch
+          || producer.profile !== identity.workflow
+          || producer.stage_id !== identity.stage_id
+          || producer.iteration !== (identity.loop_iteration ?? 1)
+          || producer.generation !== (state.rework_generation ?? 0)
+          || producer.wave_id !== identity.wave_id
+          || producer.slice_id !== identity.slice_id
+          || producer.role !== record.role
+          || producer.slot_id !== identity.slot_id
+          || producer.agent !== record.agent
+        ) continue;
+
+        const producerLineage = producer.lineage;
+        if (
+          !isOrdinaryReplayRecord(producerLineage)
+          || producerLineage.session_id !== input.lineage.session_id
+          || typeof producerLineage.session_file !== "string"
+          || typeof producerLineage.parent_session_file !== "string"
+          || !isAbsolute(producerLineage.session_file)
+          || !isAbsolute(producerLineage.parent_session_file)
+          || resolve(producerLineage.session_file) !== resolve(input.lineage.session_file)
+          || resolve(producerLineage.parent_session_file) !== resolve(input.lineage.parent_session_file)
+          || typeof producerLineage.parent_tool_call_id !== "string"
+          || producerLineage.parent_tool_call_id.length === 0
+          || typeof producerLineage.lifecycle_id !== "string"
+          || producerLineage.lifecycle_id.length === 0
+        ) continue;
+
+        const receiptOutputIds = new Set<string>();
+        let outputHashesMatch = true;
+        for (const output of receipt.outputs) {
+          if (
+            !output
+            || !isSafeArtifactId(output.artifact_id)
+            || receiptOutputIds.has(output.artifact_id)
+            || !declared.has(output.artifact_id)
+            || typeof output.immutable_ref !== "string"
+            || typeof output.sha256 !== "string"
+          ) {
+            outputHashesMatch = false;
+            break;
+          }
+          receiptOutputIds.add(output.artifact_id);
+          let serialized: string;
+          try {
+            serialized = canonicalStageJson(input.root.outputs[output.artifact_id]);
+          } catch {
+            outputHashesMatch = false;
+            break;
+          }
+          if (hash(serialized) !== output.sha256) {
+            outputHashesMatch = false;
+            break;
+          }
+        }
+        if (!outputHashesMatch || receiptOutputIds.size !== outputIds.length || outputIds.some((artifactId) => !receiptOutputIds.has(artifactId))) continue;
+        let expectedDigest: string;
+        try {
+          expectedDigest = hash(`${canonicalStageJson(identity)}\n${canonicalStageJson(input.root.outputs)}`);
+        } catch {
+          continue;
+        }
+        if (receipt.digest !== expectedDigest || !verifyReceiptImmutableFiles(resolved.artifactsDir, receipt)) continue;
+        candidates.push(receipt);
+      }
+      if (candidates.length !== 1) return undefined;
+      const receipt = candidates[0]!;
+      return {
+        identity: structuredClone(receipt.work_identity),
+        receipt: structuredClone(receipt),
+      };
+    }, () => undefined);
+  } catch {
+    return undefined;
+  }
+}
+/**
+ * Accept a worker submission inside the same durable state/artifact
+ * transaction as the canonical receipt ledger. The dispatch remains
+ * non-terminal until the authoritative host lifecycle result arrives.
+ */
+export function acceptTrustedStageResult(cwd: string, input: TrustedStageResultInput): TransitionResult {
+  return runTransition(cwd, (state, target) => {
+    const cap = activeCapability(state.dispatch_capability);
+    if (!cap) return rejectTransition("dispatch capability unavailable", state);
+    if (state.run_id !== input.run_id && state.run_key !== input.run_id) return rejectTransition("submission run identity mismatch", state);
+    if (input.binding.authority !== "ordinary" || !sameTrustedWorkIdentity(input.binding.identity, input.work_identity)) {
+      return rejectTransition("submission producer binding identity is invalid", state);
+    }
+    if (
+      resolve(input.binding.host.worktree) !== resolve(cwd)
+      || input.binding.host.branch !== state.branch
+      || !input.binding.host.session_id
+    ) return rejectTransition("submission producer host binding is stale or foreign", state);
+    const profile = loadProfile(cap.issued_for.workflow);
+    const stage = profile?.stages.find((candidate) => candidate.id === cap.issued_for.stage_cursor);
+    if (!stage) return rejectTransition("submission stage contract is unavailable", state);
+    const artifactsDir = target.artifactsDir;
+    if (!artifactsDir) return rejectTransition("submission artifact root is unavailable", state);
+    const producer = input.binding.producer;
+    const record = cap.dispatches.find((candidate) => candidate.id === input.dispatch_id);
+    const workerProducer = producer.kind === "worker";
+    if (workerProducer) {
+      if (!record) return rejectTransition("submission dispatch assignment is unavailable", state);
+      if (
+        producer.profile !== cap.issued_for.workflow
+        || producer.stage_id !== stage.id
+        || producer.generation !== (state.rework_generation ?? 0)
+        || producer.iteration !== (record.work_identity?.loop_iteration ?? cap.issued_for.loop_iteration ?? 1)
+        || producer.wave_id !== input.work_identity.wave_id
+        || producer.slice_id !== input.work_identity.slice_id
+        || producer.agent !== record.agent
+        || producer.role !== record.role
+        || producer.slot_id !== (record.work_identity?.slot_id ?? producer.slot_id)
+        || !sameTrustedWorkIdentity(record.work_identity, input.work_identity)
+      ) return rejectTransition("submission worker assignment is stale or foreign", state);
+      if (
+        (record.status === "failed" || record.status === "cancelled")
+        || (record.status === "succeeded" && record.completion?.outcome !== "succeeded")
+      ) return rejectTransition("submission arrived after terminal worker lifecycle", state);
+    } else {
+      if (record || cap.kind !== "none" || !cap.producer_assignment || !sameTrustedWorkIdentity(cap.producer_assignment, input.work_identity)) {
+        return rejectTransition("submission producer assignment is stale or foreign", state);
+      }
+      if (
+        producer.profile !== cap.issued_for.workflow
+        || producer.stage_id !== stage.id
+        || (producer.kind === "orchestrator" && (stage.type !== "orchestrator" || stage.producer !== undefined))
+        || (producer.kind === "tool" && !(
+          (stage.type === "orchestrator" && stage.producer?.kind === "tool" && stage.producer.tool_name === producer.tool_name)
+          || (stage.type === "document" && stage.document?.renderer === producer.tool_name)
+        ))
+      ) return rejectTransition("submission producer kind is not declared by the current stage", state);
+    }
+    const claimError = ordinaryPublicationClaimError(cwd, state, input.binding, record);
+    if (claimError) return rejectTransition(claimError, state);
+    const assignedAttempt = record?.attempt ?? input.work_identity.attempt;
+    const previous = state.stage_receipts?.[input.dispatch_id];
+    if (previous) {
+      if (
+        previous.digest !== input.receipt.digest
+        || previous.dispatch_id !== input.receipt.dispatch_id
+        || previous.attempt !== input.receipt.attempt
+        || !sameTrustedWorkIdentity(previous.work_identity, input.receipt.work_identity)
+        || !sameTrustedWorkIdentity(previous.work_identity, input.work_identity)
+        || (previous.binding !== undefined && canonicalStageJson(previous.binding) !== canonicalStageJson(input.binding))
+        || !verifyReceiptImmutableFiles(artifactsDir, previous)
+      ) {
+        return rejectTransition("conflicting replay for accepted stage assignment", state);
+      }
+      return replayTransition({ ok: true, state, stage_receipt: previous });
+    }
+    const declared = new Set(stageProduces(stage));
+    const artifacts = Array.isArray(input.artifacts) ? input.artifacts : [];
+    const receiptOutputs = Array.isArray(input.receipt.outputs) ? input.receipt.outputs : [];
+    const receiptEvidence = Array.isArray(input.receipt.evidence) ? input.receipt.evidence : [];
+    if (
+      typeof input.receipt.receipt_id !== "string"
+      || !/^[A-Za-z0-9._-]+$/.test(input.receipt.receipt_id)
+      || typeof input.receipt.submission_id !== "string"
+      || !/^[A-Za-z0-9._-]+$/.test(input.receipt.submission_id)
+    ) return rejectTransition("submission receipt identity is invalid", state);
+    if (artifacts.length === 0) return rejectTransition("submission must include at least one declared stage artifact", state);
+    if (receiptOutputs.length !== artifacts.length) return rejectTransition("submission receipt outputs do not match the submitted artifacts", state);
+    const seen = new Set<string>();
+    const values: Record<string, unknown> = {};
+    const outputHashes = new Map<string, string>();
+    const outputSerialized = new Map<string, string>();
+    for (const artifact of artifacts) {
+      if (!artifact || typeof artifact !== "object" || !isSafeArtifactId(artifact.artifact_id) || seen.has(artifact.artifact_id)) return rejectTransition("submission artifact id is unsafe or duplicated", state);
+      seen.add(artifact.artifact_id);
+      if (!declared.has(artifact.artifact_id)) return rejectTransition(`submission artifact '${artifact.artifact_id}' is not declared by stage '${stage.id}'`, state);
+      if (!isSafeArtifactId(artifact.immutable_id)) return rejectTransition("submission immutable artifact reference is unsafe", state);
+      const validation = validateProducedArtifact(artifact.artifact_id, artifact.value, artifactContractPolicy);
+      if (!validation.ok) return rejectTransition(`submission artifact '${artifact.artifact_id}' failed its declared contract`, state);
+      let serialized: string;
+      try {
+        serialized = canonicalStageJson(artifact.value);
+      } catch {
+        return rejectTransition(`submission artifact '${artifact.artifact_id}' is not serializable`, state);
+      }
+      const valueHash = hash(serialized);
+      outputSerialized.set(artifact.artifact_id, serialized);
+      values[artifact.artifact_id] = artifact.value;
+      outputHashes.set(artifact.artifact_id, valueHash);
+    }
+    const receiptOutputIds = new Set<string>();
+    for (const output of receiptOutputs) {
+      if (
+        !output
+        || !isSafeArtifactId(output.artifact_id)
+        || receiptOutputIds.has(output.artifact_id)
+        || !seen.has(output.artifact_id)
+        || typeof output.sha256 !== "string"
+        || output.sha256 !== outputHashes.get(output.artifact_id)
+        || (output.immutable_ref !== "" && (typeof output.immutable_ref !== "string" || isAbsolute(output.immutable_ref) || output.immutable_ref.split(/[\\/]/).includes("..")))
+      ) return rejectTransition("submission receipt output provenance is invalid", state);
+      receiptOutputIds.add(output.artifact_id);
+    }
+    if (receiptOutputIds.size !== seen.size) return rejectTransition("submission receipt outputs do not cover every submitted artifact", state);
+    const evidenceIds = new Set<string>();
+    const evidenceHashes = new Map<string, string>();
+    const evidenceBytes = new Map<string, Buffer>();
+    for (const evidence of receiptEvidence) {
+      if (
+        !evidence
+        || !isSafeArtifactId(evidence.artifact_id)
+        || evidenceIds.has(evidence.artifact_id)
+        || !seen.has(evidence.artifact_id)
+        || typeof evidence.relative_path !== "string"
+        || !evidence.relative_path
+        || isAbsolute(evidence.relative_path)
+        || evidence.relative_path.split(/[\\/]/).includes("..")
+        || typeof evidence.sha256 !== "string"
+      ) return rejectTransition("submission receipt evidence provenance is invalid", state);
+      const raw = readArtifactFileSafe(artifactsDir, evidence.relative_path);
+      if (raw.status !== "present") {
+        const reason = raw.status === "invalid" ? raw.error : raw.status;
+        return rejectTransition(`submission receipt evidence path is unreadable: ${reason}`, state);
+      }
+      const bytes = raw.bytes;
+      const actualHash = hashBytes(bytes);
+      if (actualHash !== evidence.sha256) return rejectTransition("submission receipt evidence hash does not match the referenced bytes", state);
+      evidenceHashes.set(evidence.artifact_id, actualHash);
+      evidenceBytes.set(evidence.artifact_id, bytes);
+      evidenceIds.add(evidence.artifact_id);
+    }
+    let expectedDigest: string;
+    try {
+      expectedDigest = hash(`${canonicalStageJson(input.work_identity)}\n${canonicalStageJson(values)}`);
+    } catch {
+      return rejectTransition("submission contains a non-serializable value", state);
+    }
+    if (input.receipt.digest !== expectedDigest) return rejectTransition("submission receipt digest does not match the assigned payload", state);
+    if (
+      input.receipt.dispatch_id !== input.dispatch_id
+      || input.receipt.attempt !== assignedAttempt
+      || !sameTrustedWorkIdentity(input.receipt.work_identity, input.work_identity)
+    ) return rejectTransition("submission receipt identity does not match the assigned dispatch", state);
+    const artifactPublicationBefore: Record<string, LifecycleFileContent> = {};
+    const artifactPublicationAfter: Record<string, LifecycleFileContent> = {};
+    for (const artifact of artifacts) {
+      const canonicalBody = outputSerialized.get(artifact.artifact_id);
+      if (canonicalBody === undefined) return rejectTransition(`submission artifact '${artifact.artifact_id}' serialization is unavailable`, state);
+      const logicalBody = `${JSON.stringify(artifact.value, null, 2)}\n`;
+      const immutablePath = join(artifactsDir, `${artifact.immutable_id}.json`);
+      const logicalPath = join(artifactsDir, `${artifact.artifact_id}.json`);
+      artifactPublicationBefore[immutablePath] = publicationFileBefore(immutablePath);
+      artifactPublicationAfter[immutablePath] = canonicalBody;
+      if (logicalPath !== immutablePath) {
+        artifactPublicationBefore[logicalPath] = publicationFileBefore(logicalPath);
+        artifactPublicationAfter[logicalPath] = logicalBody;
+      }
+    }
+    const artifactPublication: StatePublication = {
+      operation: input.publication?.operation ?? "resume",
+      before: artifactPublicationBefore,
+      after: artifactPublicationAfter,
+    };
+    const outputRows = artifacts.map((artifact) => {
+      const immutablePath = join(artifactsDir, `${artifact.immutable_id}.json`);
+      const logicalPath = join(artifactsDir, `${artifact.artifact_id}.json`);
+      const immutable_ref = relative(artifactsDir, immutablePath).replaceAll("\\", "/");
+      const logical_ref = relative(artifactsDir, logicalPath).replaceAll("\\", "/");
+      return { artifact, immutable_ref, logical_ref };
+    });
+    const immutableByArtifact = new Map(outputRows.map(({ artifact, immutable_ref }) => [artifact.artifact_id, immutable_ref]));
+    const immutableEvidenceByArtifact = new Map<string, string>();
+    for (const [artifactId, bytes] of evidenceBytes.entries()) {
+      const evidenceId = `evidence-${evidenceHashes.get(artifactId) ?? hashBytes(bytes)}`;
+      const evidencePath = join(artifactsDir, evidenceId);
+      try {
+        const before = publicationFileBefore(evidencePath);
+        const existing = publicationContentBytes(before);
+        if (existing !== null && !existing.equals(bytes)) {
+          return rejectTransition("submission immutable evidence reference conflicts with existing bytes", state);
+        }
+        const text = bytes.toString("utf8");
+        const after: LifecycleFileContent = Buffer.from(text, "utf8").equals(bytes)
+          ? text
+          : { encoding: "base64", data: bytes.toString("base64") };
+        artifactPublicationBefore[evidencePath] = before;
+        artifactPublicationAfter[evidencePath] = after;
+      } catch {
+        return rejectTransition("submission immutable evidence publication failed", state);
+      }
+      immutableEvidenceByArtifact.set(artifactId, relative(artifactsDir, evidencePath).replaceAll("\\", "/"));
+    }
+    const receipt: StageReceiptLedger = {
+      ...input.receipt,
+      dispatch_id: input.dispatch_id,
+      attempt: assignedAttempt,
+      accepted_at: now(),
+      binding: input.binding,
+      outputs: outputRows.map(({ artifact, immutable_ref }) => ({ artifact_id: artifact.artifact_id, immutable_ref, sha256: outputHashes.get(artifact.artifact_id)! })),
+      evidence: receiptEvidence.map((entry) => ({ ...entry, immutable_ref: immutableEvidenceByArtifact.get(entry.artifact_id) ?? immutableByArtifact.get(entry.artifact_id)! })),
+      work_identity: input.work_identity,
+    };
+    const nextArtifacts = { ...(state.artifacts ?? {}) };
+    for (const row of outputRows) nextArtifacts[row.artifact.artifact_id] = row.logical_ref;
+    const next: TeamState = {
+      ...state,
+      artifacts: nextArtifacts,
+      stage_receipts: { ...(state.stage_receipts ?? {}), [input.dispatch_id]: receipt },
+      updated_at: now(),
+    };
+    const publication = input.publication
+      ? mergeStatePublications(artifactPublication, input.publication)
+      : artifactPublication;
+    return commitTransition(next, { ok: true, state: next, stage_receipt: receipt }, publication);
+  }, { runId: input.run_id });
 }
 
 /** Reconcile a native task result without exposing capability secrets to hooks. */
@@ -1994,6 +2685,7 @@ export function reconcileTrustedTaskResult(cwd: string, input: {
     if (input.cursor_epoch && input.cursor_epoch !== cap.issued_for.cursor_epoch) return rejectTransition("cursor epoch mismatch", state);
     const coherence = authorizeCoherenceError(state, cap);
     if (coherence) return rejectTransition(coherence, state);
+    const capturedOwner = input.captured;
     if (input.captured) {
       const expectedRun = state.run_id ?? state.run_key;
       if (!expectedRun || input.captured.run_id !== expectedRun) return rejectTransition("captured dispatch run mismatch", state);
@@ -2001,6 +2693,23 @@ export function reconcileTrustedTaskResult(cwd: string, input: {
       if (input.captured.rework_generation !== (state.rework_generation ?? 0)) return rejectTransition("captured rework generation is stale", state);
       if (input.dispatch_id && input.dispatch_id !== input.captured.dispatch_id) return rejectTransition("captured dispatch mismatch", state);
       input = { ...input, dispatch_id: input.captured.dispatch_id, capability_id: input.captured.capability_id };
+    }
+    if (capturedOwner?.ownership_epoch !== undefined) {
+      if (!capturedOwner.origin_session_id) return rejectTransition("captured dispatch origin session is missing", state);
+      let claim: WorktreeExecutionClaim | null;
+      try {
+        claim = readRunControlHeldLock(cwd).execution_claim;
+      } catch {
+        return rejectTransition("captured dispatch owner claim is unavailable", state);
+      }
+      if (
+        !claim
+        || claim.owner_kind !== "workflow"
+        || claim.run_id !== capturedOwner.run_id
+        || claim.released_at !== null
+        || claim.ownership_epoch !== capturedOwner.ownership_epoch
+        || claim.coordinator_session_id !== capturedOwner.origin_session_id
+      ) return rejectTransition("captured dispatch owner claim mismatch", state);
     }
     const candidates = cap.dispatches.filter((record) => {
       if (input.dispatch_id && record.id !== input.dispatch_id) return false;
@@ -2014,6 +2723,11 @@ export function reconcileTrustedTaskResult(cwd: string, input: {
     const record = candidates[0];
     if (!record) return rejectTransition("dispatch result identity disappeared", state);
     if (input.role && input.role !== record.role) return rejectTransition("dispatch role mismatch", state);
+    if (capturedOwner?.ownership_epoch !== undefined && (
+      !capturedOwner.origin_session_id
+      || record.origin_ownership_epoch !== capturedOwner.ownership_epoch
+      || record.origin_session_id !== capturedOwner.origin_session_id
+    )) return rejectTransition("captured dispatch origin claim mismatch", state);
     if (input.pending) return pendingRecord(state, cap, record, input.pending_reason, input.provider_ref);
     return completeRecord(state, target, cap, record, {
       outcome: input.outcome,
@@ -2029,60 +2743,7 @@ function stageProduces(stage: StageDef): string[] {
   return stage.produces ? [stage.produces] : [];
 }
 
-/**
- * Native task results are reconciled before the orchestrator can inspect the
- * executor's output, so they intentionally carry no artifact ids. The
- * orchestrator may also bind those ids before a concurrent artifact write is
- * readable. Recover both forms deterministically at the advance boundary.
- * Shared ids are never inferred for a multi-slot consilium: a clobbered shared
- * file cannot prove which slot produced it.
- */
-function recoverSynchronousArtifactIds(
-  cwd: string,
-  state: TeamState,
-  target: ResolvedState,
-  cap: ActiveCapability,
-  stage: StageDef,
-): { ok: true; state: TeamState } | { ok: false; error: string } {
-  const artifactsDir = target.artifactsDir ?? "";
-  const produces = stageProduces(stage);
-  const multiSlot = cap.kind === "consilium" && cap.expected_count > 1;
-  let recovered = state;
-  for (const candidate of cap.dispatches) {
-    const completion = candidate.completion;
-    if (!completion || completion.completed_by !== "synchronous_tool_result" || completion.outcome !== "succeeded") continue;
-
-    let artifactIds = completion.artifact_ids;
-    if (artifactIds.length > 0) {
-      // Explicit ids are already bound. Only re-enter completion to create
-      // missing consilium snapshots; single-stage artifacts are validated
-      // directly by the stage contract below.
-      if (!multiSlot) continue;
-      const slotMap = recovered.slot_artifacts?.[stage.id]?.slots?.[candidate.role] ?? {};
-      const needsSnapshot = artifactIds.some((id) => !slotMap[id]);
-      if (!needsSnapshot || !artifactIds.every((id) => readArtifact(artifactsDir, id) !== null)) continue;
-    } else {
-      artifactIds = multiSlot
-        ? produces.map((id) => namespacedArtifactId(id, candidate.role)).filter((id) => readArtifact(artifactsDir, id) !== null)
-        : produces.every((id) => readArtifact(artifactsDir, id) !== null) ? produces : [];
-      if (artifactIds.length === 0) continue;
-    }
-
-    const currentCap = activeCapability(recovered.dispatch_capability);
-    if (!currentCap) return { ok: false, error: "dispatch capability disappeared during artifact recovery" };
-    const record = currentCap.dispatches.find((entry) => entry.id === candidate.id);
-    if (!record) return { ok: false, error: "dispatch disappeared during artifact recovery" };
-    const mutation = completeRecord(recovered, target, currentCap, record, {
-      outcome: completion.outcome,
-      evidence: `${completion.evidence}\nRecovered declared artifact ids at workflow advance.`,
-      artifact_ids: artifactIds,
-      completed_by: "synchronous_tool_result",
-    });
-    if (!mutation.result.ok) return { ok: false, error: mutation.result.error };
-    if (mutation.write) recovered = mutation.state;
-  }
-  return { ok: true, state: recovered };
-}
+/** Resolve a stage's declared output ids for receipt and fan-in validation. */
 
 function objectArtifact(artifactsDir: string, id: string): Record<string, unknown> | null {
   const value = readArtifact(artifactsDir, id);
@@ -2276,7 +2937,7 @@ function validateStageCompletion(
  * Fail-closed: a missing source, an unsupported contract or an unsafe
  * path blocks the transition before anything is marked done.
  */
-function renderStageDocument(stage: StageDef, target: ResolvedState): { ok: true } | { ok: false; error: string } {
+function renderStageDocument(stage: StageDef, target: ResolvedState): { ok: true; publication: StatePublication } | { ok: false; error: string } {
   const contract = stage.document;
   if (!contract) return { ok: false, error: `document stage '${stage.id}' is missing its document declaration` };
   if (contract.format !== "markdown" || contract.renderer !== "product-prd") {
@@ -2290,14 +2951,42 @@ function renderStageDocument(stage: StageDef, target: ResolvedState): { ok: true
     if (artifact === null) return { ok: false, error: `document stage '${stage.id}': source artifact '${id}.json' not found` };
     sourceArtifacts[id] = artifact;
   }
-  const written = writeProductPrdDocument({
+  const preparedResult = prepareProductPrdDocument({
     stateDir: dirname(artifactsDir),
     artifactsDir,
     path: contract.path,
     sourceArtifacts,
   });
-  if (!written.ok) return { ok: false, error: `document stage '${stage.id}' render failed: ${written.error}` };
-  return { ok: true };
+  if (!preparedResult.ok) return { ok: false, error: `document stage '${stage.id}' render failed: ${preparedResult.error}` };
+  const prepared = preparedResult.prepared;
+  const accepted = readArtifact(artifactsDir, "product_prd");
+  if (accepted === null || canonicalStageJson(accepted) !== canonicalStageJson(prepared.manifest)) {
+    return { ok: false, error: `document stage '${stage.id}' has no matching trusted product_prd publication` };
+  }
+  const readSidecar = (path: string): string | null => {
+    if (!existsSync(path)) return null;
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("document sidecar target is not a regular file");
+    return readFileSync(path, "utf8");
+  };
+  try {
+    return {
+      ok: true,
+      publication: {
+        operation: "resume",
+        before: {
+          [prepared.documentPath]: readSidecar(prepared.documentPath),
+          [prepared.htmlDocumentPath]: readSidecar(prepared.htmlDocumentPath),
+        },
+        after: {
+          [prepared.documentPath]: prepared.markdown,
+          [prepared.htmlDocumentPath]: prepared.html,
+        },
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: `document stage '${stage.id}' sidecar preparation failed: ${String(error)}` };
+  }
 }
 
 export function advanceCursor(cwd: string, input: DispatchAuth, options?: TrustedMappingOptions & { runId?: string }): TransitionResult {
@@ -2306,6 +2995,18 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
   // state under the lock; handoff secrets are derived from the committed
   // state and the commit is CAS-guarded.
   const result = runTransition(cwd, (rawState, target) => {
+  const replayReceipt = rawState.advance_receipts?.[input.capability_id];
+  if (typeof input.evidence !== "string" || !input.evidence.trim()) {
+    return rejectTransition("stage advancement evidence required", rawState);
+  }
+  if (replayReceipt) {
+    const exactReplay = replayReceipt.request_hash === advanceRequestHash(input)
+      && replayReceipt.from_stage_cursor === input.stage_cursor
+      && replayReceipt.from_cursor_epoch === input.cursor_epoch;
+    return exactReplay
+      ? replayTransition({ ok: true, state: rawState, replayed: true })
+      : rejectTransition("advance replay request conflicts with canonical receipt", rawState);
+  }
   const cap = activeCapability(rawState.dispatch_capability);
   if (!cap) return rejectTransition("dispatch capability unavailable", rawState);
   const error = auth(cap, input, cap.advance_token_hash);
@@ -2325,9 +3026,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
   if (!trusted.ok) return rejectTransition(trusted.error, rawState);
   const effectiveConfig = trusted.config;
   const flags = rawState.scope ?? resolveScope([], config);
-  const recovered = recoverSynchronousArtifactIds(cwd, rawState, target, cap, currentStage);
-  if (!recovered.ok) return rejectTransition(recovered.error, rawState);
-  let state = recovered.state;
+  let state = rawState;
 
   // Join by the persisted slot identity, never by array position or provider
   // result order. A retry replaces only the same slot's terminal record.
@@ -2355,6 +3054,37 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
     }
     return rejectTransition("dispatch join incomplete", state);
   }
+  const requiredOutputs = stageProduces(currentStage);
+  if (requiredOutputs.length > 0) {
+    if (records.length === 0) {
+      const producerIdentity = joinCap.producer_assignment;
+      const receipt = producerIdentity ? state.stage_receipts?.[producerIdentity.dispatch_id] : undefined;
+      if (!producerIdentity || !receipt) return rejectTransition("stage result receipt missing for the current producer assignment", state);
+      if (
+        receipt.dispatch_id !== producerIdentity.dispatch_id
+        || receipt.attempt !== producerIdentity.attempt
+        || !sameTrustedWorkIdentity(receipt.work_identity, producerIdentity)
+        || !verifyReceiptImmutableFiles(target.artifactsDir ?? undefined, receipt)
+      ) return rejectTransition("stage result receipt identity or immutable files are stale for the current producer assignment", state);
+      const acceptedIds = new Set(receipt.outputs.map((output) => output.artifact_id));
+      const missing = requiredOutputs.filter((artifactId) => !acceptedIds.has(artifactId));
+      if (missing.length > 0) return rejectTransition(`stage result receipt is missing required outputs: ${missing.join(", ")}`, state);
+    } else {
+      for (const record of records) {
+        const receipt = state.stage_receipts?.[record.id];
+        if (!receipt) return rejectTransition(`stage result receipt missing for dispatch '${record.id}'`, state);
+        if (
+          receipt.dispatch_id !== record.id
+          || receipt.attempt !== record.attempt
+          || !sameTrustedWorkIdentity(receipt.work_identity, record.work_identity)
+          || !verifyReceiptImmutableFiles(target.artifactsDir ?? undefined, receipt)
+        ) return rejectTransition(`stage result receipt identity is stale for dispatch '${record.id}'`, state);
+        const acceptedIds = new Set(receipt.outputs.map((output) => output.artifact_id));
+        const missing = requiredOutputs.filter((artifactId) => !acceptedIds.has(artifactId));
+        if (missing.length > 0) return rejectTransition(`stage result receipt for dispatch '${record.id}' is missing required outputs: ${missing.join(", ")}`, state);
+      }
+    }
+  }
   const joinSummary = {
     stage_id: rawState.stage_cursor,
     cursor_epoch: cap.issued_for.cursor_epoch,
@@ -2374,10 +3104,14 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
   if (isMultiSlotConsilium) {
     const currentRecords = activeCapability(state.dispatch_capability)?.dispatches ?? records;
     const withoutArtifacts = currentRecords
-      .filter((record) => record.status === "succeeded" && (record.completion?.artifact_ids.length ?? 0) === 0)
+      .filter((record) => {
+        if (record.status !== "succeeded") return false;
+        const receipt = state.stage_receipts?.[record.id];
+        return !receipt || receipt.outputs.length === 0;
+      })
       .map((record) => `${record.role} (${namespacedArtifactId(stageProduces(currentStage)[0] ?? "artifact", record.role)})`);
     if (withoutArtifacts.length > 0) {
-      return rejectTransition(`consilium fan-in incomplete: dispatches without recorded artifact_ids: ${withoutArtifacts.join(", ")}; call workflow_complete with each slot's artifact ids before workflow_advance`, state);
+      return rejectTransition(`consilium fan-in incomplete: dispatches without canonical stage receipts: ${withoutArtifacts.join(", ")}; submit each slot's declared outputs through workflow_submit_result and complete its worker lifecycle before workflow_advance`, state);
     }
   }
   if (isMultiSlotConsilium) {
@@ -2397,13 +3131,11 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
     state = synthesized.state;
   }
 
-  // Executable document stage: the engine renders the declared document
-  // from the stage's declared sources BEFORE the completion validation
-  // commits the transition — the native /do-work path never depends on an
-  // agent having rendered it, and a failed render fails the advance closed.
+  let documentPublication: StatePublication | undefined;
   if (currentStage.type === "document") {
     const rendered = renderStageDocument(currentStage, target);
     if (!rendered.ok) return rejectTransition(rendered.error, state);
+    documentPublication = rendered.publication;
   }
 
   // Stage completion validation: consumes, produces, schema contracts, the
@@ -2416,7 +3148,7 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
   // concurrent transition, too.
   const checkpointError = unresolvedCheckpointError(currentStage, state);
   if (checkpointError) {
-    return commitTransition(state, { ok: false, error: checkpointError, state });
+    return commitTransition(state, { ok: false, error: checkpointError, state }, documentPublication);
   }
   const approvalBinding = bindCompletedProductApprovalGeneration(currentStage, state, target, profile);
   if (!approvalBinding.ok) return rejectTransition(approvalBinding.error, state);
@@ -2457,9 +3189,10 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
           dispatch_capability: { ...cap, status: "complete" as const, dispatches: [] },
           updated_at: now(),
         };
-        return commitTransition(next, { ok: true, state: next });
+        const committed = withAdvanceReceipt(state, input, next);
+        return commitTransition(committed, { ok: true, state: committed }, documentPublication);
       }
-      return reenterLoop(cwd, state, target, profile, cap, currentStage, records, joinSummary, decision.reentries, flags, effectiveConfig, trusted.trusted);
+      return reenterLoop(cwd, state, target, profile, cap, currentStage, records, joinSummary, decision.reentries, flags, effectiveConfig, trusted.trusted, input, documentPublication);
     }
     const existingLoop = loopStateFor(state, currentStage.id);
     if (existingLoop) {
@@ -2641,10 +3374,11 @@ export function advanceCursor(cwd: string, input: DispatchAuth, options?: Truste
   }
   delete next.pending;
   delete next.completion_envelope;
-  const handoff = handoffSecrets && armedStage ? handoffFromState(next, handoffSecrets, armedStage) : undefined;
+  const committed = withAdvanceReceipt(state, input, next);
+  const handoff = handoffSecrets && armedStage ? handoffFromState(committed, handoffSecrets, armedStage) : undefined;
   return handoff
-    ? commitTransition(next, { ok: true, state: next, handoff })
-    : commitTransition(next, { ok: true, state: next });
+    ? commitTransition(committed, { ok: true, state: committed, handoff })
+    : commitTransition(committed, { ok: true, state: committed });
   }, { terminalPublication: true, ...(options?.runId ? { runId: options.runId } : {}) });
   return result;
 }
@@ -2671,10 +3405,18 @@ function reenterLoop(
   flags: ScopeFlags,
   config: ResolvedConfig,
   trusted: boolean,
+  advanceInput: DispatchAuth,
+  documentPublication?: StatePublication,
 ): RecordCore {
   const loop = currentStage.loop!;
   const backToStage = resolveBackToStage(profile, loop.back_to);
   if (!backToStage) return rejectTransition(`loop back_to '${loop.back_to}' is not a stage in the profile`, state);
+  const backToIndex = profile.stages.findIndex((stage) => stage.id === backToStage.id);
+  const currentIndex = profile.stages.findIndex((stage) => stage.id === currentStage.id);
+  if (backToIndex < 0 || currentIndex < backToIndex) {
+    return rejectTransition(`loop window '${backToStage.id}' → '${currentStage.id}' is not an ordered profile suffix`, state);
+  }
+  const loopWindowIds = new Set(profile.stages.slice(backToIndex, currentIndex + 1).map((stage) => stage.id));
   const kind: "none" | "single" | "consilium" =
     backToStage.type === "single" || backToStage.type === "consilium" ? backToStage.type : "none";
   const epoch = randomUUID();
@@ -2759,15 +3501,16 @@ function reenterLoop(
     stage_cursor: backToStage.id,
     cursor_epoch: epoch,
     loop_state: loopState,
-    stages: state.stages.map((s) =>
-      s.id === currentStage.id
-        ? { ...s, status: "done" as const }
-        : s.id === backToStage.id
-          ? deferredRoster
-            ? { ...s, status: "pending" as const }
-            : { ...s, status: "in_progress" as const }
-          : s,
-    ),
+    stages: state.stages.map((s) => {
+      if (!loopWindowIds.has(s.id)) return s;
+      if (s.id === currentStage.id) return { ...s, status: "done" as const };
+      if (s.id === backToStage.id) {
+        return deferredRoster
+          ? { ...s, status: "pending" as const }
+          : { ...s, status: "in_progress" as const };
+      }
+      return { ...s, status: "in_progress" as const };
+    }),
     join_summary: joinSummary,
     ...(priorLoopSelection ? { roster_selection: priorLoopSelection } : {}),
     dispatch_capability: issued
@@ -2793,17 +3536,18 @@ function reenterLoop(
   }
   delete next.pending;
   delete next.completion_envelope;
+  const committed = withAdvanceReceipt(state, advanceInput, next);
   return issued
-    ? commitTransition(next, {
+    ? commitTransition(committed, {
         ok: true,
-        state: next,
-        handoff: handoffFromState(next, {
+        state: committed,
+        handoff: handoffFromState(committed, {
           capability_id: issued.capability_id,
           dispatch_token: issued.dispatch_token,
           advance_token: issued.advance_token,
         }, backToStage),
-      })
-    : commitTransition(next, { ok: true, state: next });
+      }, documentPublication)
+    : commitTransition(committed, { ok: true, state: committed }, documentPublication);
 }
 
 export interface ChildJoinInput {

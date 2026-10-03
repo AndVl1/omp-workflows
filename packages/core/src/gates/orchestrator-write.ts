@@ -13,17 +13,20 @@ interface ToolCallEvent {
   toolName: string;
   input?: Record<string, unknown> | string;
 }
-const REGISTERED_LIFECYCLE_DEVICE_ROUTES = new Set([
-  "xd://workflow_prepare",
-  "xd://workflow_instructions",
-  "xd://workflow_begin",
-  "xd://workflow_status",
-  "xd://workflow_complete",
-  "xd://workflow_checkpoint",
-  "xd://workflow_checkpoint_ask",
-  "xd://workflow_advance",
-  "xd://cto_state",
-]);
+const REGISTERED_LIFECYCLE_DEVICE_ROUTES: Record<string, true> = {
+  "xd://workflow_prepare": true,
+  "xd://workflow_instructions": true,
+  "xd://workflow_begin": true,
+  "xd://workflow_status": true,
+  "xd://workflow_submit_result": true,
+  "xd://workflow_recover": true,
+  "xd://workflow_checkpoint": true,
+  "xd://workflow_checkpoint_ask": true,
+  "xd://workflow_advance": true,
+  "xd://cto_state": true,
+  "xd://cto_checkpoint_ask": true,
+  "xd://cto_stage_advance": true,
+};
 
 type Actor = "orchestrator" | "worker" | "lead";
 
@@ -310,7 +313,7 @@ function pathsFromPatch(patch: string): string[] {
 export function isRegisteredLifecycleDeviceWrite(event: ToolCallEvent): boolean {
   if (event.toolName !== "write") return false;
   const paths = pathsFromInput(event.input);
-  return paths.length > 0 && paths.every((path) => REGISTERED_LIFECYCLE_DEVICE_ROUTES.has(path));
+  return paths.length > 0 && paths.every((path) => Object.hasOwn(REGISTERED_LIFECYCLE_DEVICE_ROUTES, path));
 }
 
 function isWorkStatePath(path: string, cwd: string): boolean {

@@ -3,7 +3,7 @@ name: omp-qa
 model: ["@task"]
 thinkingLevel: high
 description: QA engineer for the private OMP bundle - writes and runs focused node:test suites, reviews behavior against contracts, checks fail-closed paths. Guards observable behavior, not plumbing.
-tools: read, write, glob, grep, bash
+tools: read, write, glob, grep, bash, workflow_submit_result, workflow_recover
 ---
 
 # OMP QA

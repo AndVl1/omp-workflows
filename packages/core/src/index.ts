@@ -17,9 +17,10 @@
  *   }
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   orchestratorWriteGate,
   workerWriteScopeGate,
@@ -39,21 +40,67 @@ import { ctoNestingGuard } from "./gates/cto-nesting.js";
 import { outboxEnforcementGate } from "./gates/outbox.js";
 import { ctoSliceTaskGate, parseCtoSliceMarker } from "./cto/slice-gate.js";
 import { isCtoRunTerminal, readCtoState } from "./cto/state.js";
-import { resolveActiveBranch } from "./engine/state.js";
+import { resolveActiveBranch, withWorkspaceTransaction } from "./engine/state.js";
+import { publishDeclaredDocumentStage } from "./engine/stage.js";
 import { registerObservabilityHooks, recordToolCallAttempt, setObservabilityRun } from "./observability/index.js";
-import { authorizeDispatchTrusted, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, recordCheckpointDecision, validateCheckpointAsk, commitCheckpointAnswer, hashDispatchSecret } from "./engine/durable.js";
+import { authorizeDispatchTrusted, reconcileTrustedTaskResult, beginCapability, completeDispatch, advanceCursor, recordCheckpointDecision, validateCheckpointAsk, commitCheckpointAnswer, hashDispatchSecret, rejectDispatchPreflightTrusted, findAcceptedOrdinaryStageReceipt, type CheckpointAnswerCommitResult } from "./engine/durable.js";
 import { loadProfile, registerWorkflowProfiles } from "./engine/profile.js";
 import { prepareWorkflowState, type ModelClassification, type WorkflowPrepareOptions } from "./engine/run.js";
 import { LifecycleError } from "./engine/run-lifecycle.js";
 import { resolveWorkflowContract, WorkflowContractError } from "./engine/workflow-contract.js";
-import { findCurrentCheckpointDecision } from "./engine/checkpoints.js";
+import { findCurrentCheckpointDecision, recordTrustedCheckpointAnswer } from "./engine/checkpoints.js";
 import { createWorkflowSessionController, ctoClaimCredentials, type WorkflowSessionController } from "./engine/host-controller.js";
 import { suspendCtoSession, finalizeCtoSession, readCtoStateForModel, commitCtoStateForModel } from "./cto/run.js";
 import { readDispatchOriginLocator, rememberDispatchOriginLocator } from "./dispatch-origin-locator.js";
 import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
-import { knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, retainSelectionSnapshot, readRunControl, readRunControlNoRecovery, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, reserveExecutionClaimWorkers, settleExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
-import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector, CtoClaimScope, RunControl } from "./engine/types.js";
-import { createNativeWorkerAuthority, NativeWorkerRouteError, type NativeWorkerResolution } from "./native-worker-authority.js";
+import { readRunControlNoRecovery, knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, retainSelectionSnapshot, readRunControl, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, reserveExecutionClaimWorkers, settleExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
+import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector, CtoClaimScope, RunControl, WorkIdentity, StageReceiptLedger, CapturedDispatchContext } from "./engine/types.js";
+import { createNativeWorkerAuthority, NativeWorkerRouteError, type NativeWorkerAuthority, type NativeRootAuthorityRegistration, type NativeWorkerResolution } from "./native-worker-authority.js";
+import { commitNativeCtoStageResult } from "./cto/native-stage-execution.js";
+import { advanceNativeStageForCoordinator, findNativeAcceptedStageReceipt, preflightNativeStageCheckpoint, commitNativeStageCheckpoint, type NativeStageMutationResult } from "./cto/native-stage.js";
+import {
+  OMP_STAGE_HOST_CAPABILITIES,
+  deriveWorkerStageHostBinding,
+  deriveMainStageHostBinding,
+  createTrustedToolCallback,
+  submitStageResult,
+  receiptFromLedger,
+  type StageAuthority,
+  type StageHostBindingResolver,
+  type StageHostBinding,
+  type TrustedToolCallback,
+  type StageProducerBinding,
+  type StageResultCommitter,
+  type StageResultValidationFailure,
+  type StageResultSubmissionOutcome,
+} from "./engine/reliable-stage.js";
+import {
+  recoverStageExecution,
+  type RecoveryErrorClass,
+  type RecoveryIntent,
+  type RecoveryEvidenceProof,
+  type RecoveryHostInput,
+  type RecoveryPreflightNotStartedProof,
+  type RecoveryReplacementEvidence,
+  type RecoveryTerminalEvidence,
+  type StageRecoveryCapabilities,
+  type StageRecoveryExecutionOptions,
+  type StageRecoveryHost,
+  type StageRecoveryRequest,
+  type StageRecoveryResult,
+  type StageRecoverySnapshot,
+  type StageRecoveryTransitionResult,
+  type TrustedRecoverySelection,
+} from "./engine/stage-recovery.js";
+import {
+  createOrdinaryStageRecoveryStore,
+  type OrdinaryStageRecoveryStore,
+  type StageRecoveryFormatValidationInput,
+} from "./engine/stage-recovery-store.js";
+import {
+  createNativeStageRecoveryStore,
+  type NativeStageRecoveryStore,
+} from "./cto/stage-recovery-store.js";
 import type { ScopeRuntimeClassTable } from "./engine/scope.js";
 import type { DispatchAuth, RosterBeginSelection } from "./engine/durable.js";
 import type { AgentMappingState } from "./engine/agent-mapping.js";
@@ -92,10 +139,616 @@ export interface WorkflowOwnerClaim {
   fingerprint: string;
   owner: WorkflowOwnerIdentity;
 }
+const stageBindingResolvers = new WeakMap<object, StageHostBindingResolver>();
+const stageResultCommitters = new WeakMap<object, StageResultCommitter>();
+const stageToolBindingResolvers = new WeakMap<object, (
+  ctx: unknown,
+  cwd: string,
+  runId: string,
+  toolName: string,
+  callback: TrustedToolCallback,
+) => StageHostBinding | undefined>();
+type StageToolPublisherStart =
+  | { ok: true; publish: StageResultPublisher; close(): void }
+  | { ok: false; code: string; error: string };
+const stageToolPublisherFactories = new WeakMap<object, (
+  ctx: unknown,
+  toolName: string,
+  registrationId: string,
+  invocationId: string,
+) => StageToolPublisherStart>();
+type AuthenticatedStageRecoveryStore = OrdinaryStageRecoveryStore | NativeStageRecoveryStore;
+type StaleAdmissionObservation = {
+  readonly cwd: string;
+  readonly run_id: string;
+  readonly authority: StageAuthority;
+  readonly tool_call_id: string;
+  readonly reason: string;
+  readonly observed_at: string;
+};
+type StageRecoveryRuntime = {
+  readonly storeFor: (ctx: unknown, cwd: string) => AuthenticatedStageRecoveryStore | undefined;
+  ownerStoreFor?: (
+    cwd: string,
+    runId: string,
+    authority: StageAuthority,
+  ) => AuthenticatedStageRecoveryStore | undefined;
+  readonly host: StageRecoveryHost;
+  readonly staleAdmissions: WeakMap<object, StaleAdmissionObservation>;
+  readonly automaticPending: Set<Promise<void>>;
+  automaticOpen: boolean;
+};
+const stageRecoveryRuntimes = new WeakMap<object, StageRecoveryRuntime>();
+const nativeWorkerAuthorities = new WeakMap<object, NativeWorkerAuthority>();
+function recoveryStoreForController(controller: WorkflowSessionController, cwd: string): AuthenticatedStageRecoveryStore | undefined {
+  const context = controller.context();
+  let ctoClaim: CtoClaimScope | undefined;
+  try {
+    ctoClaim = controller.activeCtoClaim();
+  } catch (error) {
+    if (!(error instanceof LifecycleError) || error.code !== "recovery_required") throw error;
+    // A torn lifecycle journal can make the durable claim unreadable. The
+    // controller's private credential binding is still the authenticated
+    // session boundary; the owner-scoped store will revalidate it after
+    // journal repair. Never manufacture this fallback without that binding.
+    const credentials = ctoClaimCredentials(controller);
+    if (!credentials) throw error;
+    ctoClaim = { run_id: credentials.run_id, ownership_epoch: credentials.ownership_epoch };
+  }
+  if (ctoClaim) return createNativeStageRecoveryStore(cwd, { context, runId: ctoClaim.run_id, claim_scope: ctoClaim });
+  const runId = controller.selectedRunId();
+  if (!runId || controller.activeClaimRunId() !== runId) return undefined;
+  return createOrdinaryStageRecoveryStore(cwd, { context, runId });
+}
+function controllerHasActiveRecoveryOwner(controller: WorkflowSessionController | null): boolean {
+  if (!controller) return false;
+  try {
+    return controller.activeCtoClaim() !== undefined || controller.activeClaimRunId() !== undefined;
+  } catch {
+    return false;
+  }
+}
 
+type WorkflowRecoveryToolInput = {
+  readonly operation: "diagnose" | "reconcile";
+  readonly intent?: RecoveryIntent;
+};
+
+function recoveryProof(input: RecoveryHostInput, eventId: string, source: string): RecoveryEvidenceProof {
+  const bindingId = input.snapshot.binding_id ?? input.snapshot.ownership?.binding_id;
+  if (!bindingId) throw new Error("recovery host binding is unavailable");
+  return {
+    authenticated: true,
+    source,
+    event_id: eventId,
+    binding_id: bindingId,
+    observed_at: new Date().toISOString(),
+    state_revision: input.snapshot.revision,
+  };
+}
+
+function recoveryMessageSender(pi: ExtensionAPI): (
+  message: unknown,
+  options: { deliverAs: "followUp"; triggerTurn: true },
+) => void | PromiseLike<void> {
+  const sendMessage = (pi as unknown as {
+    sendMessage?: (
+      message: unknown,
+      options?: { deliverAs?: "steer" | "followUp" | "nextTurn"; triggerTurn?: boolean },
+    ) => void | PromiseLike<void>;
+  }).sendMessage;
+  if (typeof sendMessage !== "function") throw new Error("the OMP host does not expose sendMessage for recovery continuation");
+  return (message, options) => sendMessage.call(pi, message, options);
+}
+
+function createStageRecoveryHost(pi: ExtensionAPI): StageRecoveryHost {
+  const queued = new Map<string, RecoveryReplacementEvidence>();
+  const queue = async (input: RecoveryHostInput & { readonly retry_of?: string; readonly producer_correction?: boolean }): Promise<void> => {
+    const send = recoveryMessageSender(pi);
+    await send({
+      customType: "omp-workflow-stage-recovery",
+      content: "Продолжите назначение через обычный workflow task admission, сохранив canonical handoff и retry_of; не создавайте второй writer и не подделывайте результаты.",
+      details: {
+        version: 1 as const,
+        kind: "stage_recovery_continuation" as const,
+        run_id: input.request.run_id,
+        authority: input.request.authority,
+        operation_id: input.operation_id,
+        retry_of: input.retry_of ?? input.identity.dispatch_id,
+        identity: input.replacement_identity ?? input.identity,
+        ...(input.snapshot.handoff ? { handoff: input.snapshot.handoff } : {}),
+        ...(input.producer_correction ? { producer_correction: true } : {}),
+      },
+    }, { deliverAs: "followUp", triggerTurn: true });
+  };
+
+  const dispatchReplacement = async (
+    input: RecoveryHostInput & { readonly retry_of: string; readonly error_class: RecoveryErrorClass; readonly producer_correction: boolean },
+  ): Promise<RecoveryReplacementEvidence> => {
+    if (input.producer_correction) throw new Error("default OMP host cannot prove same-producer format repair or producer-only correction");
+    const planned = input.replacement_identity ?? input.prepared_operation?.replacement_identity;
+    if (!planned) throw new Error("recovery replacement identity was not owner-minted");
+    const existing = queued.get(input.operation_id);
+    if (existing && existing.kind === "replacement_dispatched") {
+      if (!isDeepStrictEqual(existing.new_identity, planned)) throw new Error("recovery replacement replay identity conflicts");
+      return existing;
+    }
+    await queue(input);
+    const proof = recoveryProof(input, `recovery:${input.operation_id}:queued`, "omp-send-message");
+    const evidence: RecoveryReplacementEvidence = {
+      authoritative: true,
+      run_id: input.request.run_id,
+      dispatch_id: input.identity.dispatch_id,
+      identity: input.identity,
+      operation: "replacement_dispatch",
+      proof,
+      kind: "replacement_dispatched",
+      original_dispatch_id: input.retry_of,
+      new_identity: planned,
+      observed_at: proof.observed_at,
+      new_state: "pending",
+    };
+    queued.set(input.operation_id, evidence);
+    return evidence;
+  };
+  const capabilities: StageRecoveryCapabilities = Object.freeze({
+    trusted_lineage: "supported",
+    terminal_lifecycle: "supported",
+    preflight_not_started: "unsupported",
+    inspect: "unsupported",
+    observe: "unsupported",
+    reconnect: "unsupported",
+    resume: "unsupported",
+    clarify: "unsupported",
+    cancel_ack: "unsupported",
+    format_repair: "unsupported",
+    replacement_dispatch: "supported",
+    producer_correction: "unsupported",
+    operation_replay: "unsupported",
+  });
+  return { capabilities, dispatchReplacement };
+}
+function recoveryIdentityFromOrigin(origin: DispatchOrigin): WorkIdentity | undefined {
+  try {
+    const state = readRunState(origin.cwd, origin.run_id);
+    const dispatches = state?.dispatch_capability?.dispatches ?? [];
+    const record = dispatches.find((candidate) => candidate.id === origin.dispatch_id);
+    return record?.work_identity;
+  } catch {
+    return undefined;
+  }
+}
+
+async function persistRecoveryTerminalObservation(
+  runtime: StageRecoveryRuntime | undefined,
+  ctx: unknown,
+  cwd: string,
+  authority: StageAuthority,
+  runId: string,
+  identity: WorkIdentity | undefined,
+  toolCallId: string,
+  outcome: "succeeded" | "failed" | "cancelled",
+  terminalEvent?: { source: string; event_id: string },
+): Promise<void> {
+  if (!runtime) return;
+  const store = runtime.storeFor(ctx, cwd) ?? runtime.ownerStoreFor?.(cwd, runId, authority);
+  if (!store) return;
+  let snapshot: StageRecoverySnapshot;
+  try {
+    snapshot = await store.read({
+      run_id: runId,
+      authority,
+      ...(identity ? { identity } : {}),
+    });
+  } catch {
+    return;
+  }
+  if (!snapshot.identity || (identity && !isDeepStrictEqual(snapshot.identity, identity)) || !snapshot.binding_id) return;
+  const selection = store.selection();
+  const operationId = `omp-recovery-terminal:${toolCallId}:${snapshot.identity.dispatch_id}`;
+  let prepared: StageRecoveryTransitionResult;
+  try {
+    prepared = await store.transition({
+      phase: "prepare",
+      operation_id: operationId,
+      run_id: runId,
+      authority,
+      expected_revision: snapshot.revision,
+      selection,
+      mutation: {
+        kind: "host_action",
+        action: "observe",
+        dispatch_id: snapshot.identity.dispatch_id,
+        state_proof: snapshot.state_proof,
+      },
+    });
+  } catch {
+    return;
+  }
+  if (!prepared.ok) return;
+  if (prepared.operation.status === "acked") {
+    if (outcome !== "succeeded" || snapshot.error_context?.class === "format_validation") {
+      scheduleAutomaticRecovery(runtime, {
+        kind: "terminal",
+        run_id: runId,
+        authority,
+        cwd,
+        ctx,
+        dispatch_id: snapshot.identity.dispatch_id,
+        outcome,
+      });
+    }
+    return;
+  }
+  const observedAt = new Date().toISOString();
+  const proof: RecoveryEvidenceProof = {
+    authenticated: true,
+    source: terminalEvent?.source ?? "omp-task-result",
+    event_id: terminalEvent?.event_id ?? `task_result:${toolCallId}:${snapshot.identity.dispatch_id}`,
+    binding_id: snapshot.binding_id,
+    observed_at: observedAt,
+    state_revision: prepared.revision,
+  };
+  const evidence: RecoveryTerminalEvidence = {
+    authoritative: true,
+    run_id: runId,
+    dispatch_id: snapshot.identity.dispatch_id,
+    identity: snapshot.identity,
+    operation: "observe",
+    proof,
+    kind: "terminal",
+    outcome,
+    terminal_event_id: proof.event_id,
+    observed_at: observedAt,
+  };
+  const response: StageRecoveryResult = {
+    operation_id: operationId,
+    code: outcome === "succeeded" ? "worker_succeeded" : "worker_terminal",
+    worker: "terminal",
+    action: "none",
+    attempts_remaining: 0,
+    retry_of: snapshot.identity.dispatch_id,
+    evidence,
+    state_revision: prepared.revision,
+    state_proof: prepared.state_proof ?? { ...snapshot.state_proof, revision: prepared.revision },
+  };
+  let acked: StageRecoveryTransitionResult;
+  try {
+    acked = await store.transition({
+      phase: "ack",
+      operation_id: operationId,
+      run_id: runId,
+      authority,
+      expected_revision: prepared.revision,
+      selection,
+      evidence,
+      response,
+    });
+  } catch {
+    // The durable operation remains prepared and is replay-safe; do not infer
+    // terminality again from an unacknowledged observation.
+    return;
+  }
+  if (!acked.ok) return;
+  if (outcome !== "succeeded" || snapshot.error_context?.class === "format_validation") {
+    scheduleAutomaticRecovery(runtime, {
+      kind: "terminal",
+      run_id: runId,
+      authority,
+      cwd,
+      ctx,
+      dispatch_id: snapshot.identity.dispatch_id,
+      outcome,
+    });
+  }
+}
+
+type RecoveryDispatchSlot = {
+  readonly run_id: string;
+  readonly capability_id: string;
+  readonly stage_cursor: string;
+  readonly cursor_epoch: string;
+  readonly slot_id: string;
+  readonly task_id: string;
+  readonly agent: string;
+};
+
+function recoveryIdentityForSlot(cwd: string, slot: RecoveryDispatchSlot): WorkIdentity | undefined {
+  try {
+    const state = readRunState(cwd, slot.run_id);
+    const matches = (state?.dispatch_capability?.dispatches ?? []).filter((record) => {
+      const identity = record.work_identity;
+      return identity
+        && identity.capability_id === slot.capability_id
+        && identity.stage_id === slot.stage_cursor
+        && identity.capability_epoch === slot.cursor_epoch
+        && identity.slot_id === slot.slot_id
+        && identity.task_id === slot.task_id
+        && record.agent === slot.agent;
+    });
+    return matches.length === 1 ? matches[0]!.work_identity : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function persistRecoveryPreflightObservation(
+  runtime: StageRecoveryRuntime | undefined,
+  ctx: unknown,
+  cwd: string,
+  authority: StageAuthority,
+  runId: string,
+  identity: WorkIdentity | undefined,
+  toolCallId: string,
+  reason: string,
+): boolean {
+  if (!runtime || !identity) return false;
+  const store = runtime.storeFor(ctx, cwd) ?? runtime.ownerStoreFor?.(cwd, runId, authority);
+  if (!store) return false;
+  try {
+    const read = store.read({ run_id: runId, authority, identity });
+    if (read instanceof Promise) return false;
+    const snapshot = read;
+    if (!snapshot.identity || !snapshot.binding_id || !isDeepStrictEqual(snapshot.identity, identity)) return false;
+    const selection = store.selection();
+    const operationId = `omp-recovery-preflight:${toolCallId}:${identity.dispatch_id}`;
+    const prepared = store.transition({
+      phase: "prepare",
+      operation_id: operationId,
+      run_id: runId,
+      authority,
+      expected_revision: snapshot.revision,
+      selection,
+      mutation: {
+        kind: "host_action",
+        action: "observe",
+        dispatch_id: identity.dispatch_id,
+        state_proof: snapshot.state_proof,
+      },
+    });
+    if (prepared instanceof Promise || !prepared.ok) return false;
+    if (prepared.operation.status === "acked") return true;
+    const observedAt = new Date().toISOString();
+    const proof: RecoveryEvidenceProof = {
+      authenticated: true,
+      source: "omp-task-admission",
+      event_id: `task_call:${toolCallId}:${identity.dispatch_id}`,
+      binding_id: snapshot.binding_id,
+      observed_at: observedAt,
+      state_revision: prepared.revision,
+    };
+    const evidence: RecoveryPreflightNotStartedProof = {
+      authoritative: true,
+      kind: "preflight_not_started",
+      never_started: true,
+      run_id: runId,
+      dispatch_id: identity.dispatch_id,
+      identity,
+      reason,
+      observed_at: observedAt,
+      proof,
+    };
+    const response: StageRecoveryResult = {
+      operation_id: operationId,
+      code: "preflight_not_started",
+      worker: "not_started",
+      action: "preflight",
+      attempts_remaining: 0,
+      retry_of: identity.dispatch_id,
+      state_revision: prepared.revision,
+      state_proof: prepared.state_proof ?? { ...snapshot.state_proof, revision: prepared.revision },
+      evidence,
+    };
+    const acked = store.transition({
+      phase: "ack",
+      operation_id: operationId,
+      run_id: runId,
+      authority,
+      expected_revision: prepared.revision,
+      selection,
+      evidence,
+      response,
+    });
+    if (acked instanceof Promise || !acked.ok) return false;
+    return true;
+  } catch {
+    // A malformed attempt never gains authority from a failed observation.
+    return false;
+  }
+}
+type AutomaticRecoveryTrigger =
+  | {
+      readonly kind: "preflight";
+      readonly run_id: string;
+      readonly authority: StageAuthority;
+      readonly cwd: string;
+      readonly ctx: unknown;
+      readonly dispatch_id: string;
+    }
+  | {
+      readonly kind: "terminal";
+      readonly run_id: string;
+      readonly authority: StageAuthority;
+      readonly cwd: string;
+      readonly ctx: unknown;
+      readonly dispatch_id: string;
+      readonly outcome: "failed" | "cancelled" | "succeeded";
+    };
+
+function automaticRecoveryOperationId(trigger: AutomaticRecoveryTrigger): string {
+  return trigger.kind === "preflight"
+    ? `omp-recovery-auto:preflight:${trigger.authority}:${trigger.run_id}:${trigger.dispatch_id}`
+    : `omp-recovery-auto:terminal:${trigger.authority}:${trigger.run_id}:${trigger.dispatch_id}:${trigger.outcome}`;
+}
+
+async function executeAutomaticRecovery(
+  runtime: StageRecoveryRuntime,
+  trigger: AutomaticRecoveryTrigger,
+): Promise<void> {
+  if (!runtime.automaticOpen) return;
+  const store = runtime.storeFor(trigger.ctx, trigger.cwd)
+    ?? runtime.ownerStoreFor?.(trigger.cwd, trigger.run_id, trigger.authority);
+  if (!store) return;
+  let selection: TrustedRecoverySelection;
+  let snapshot: StageRecoverySnapshot;
+  try {
+    selection = store.selection();
+    snapshot = await store.read({
+      run_id: trigger.run_id,
+      authority: trigger.authority,
+      selection,
+    });
+  } catch {
+    return;
+  }
+  if (!snapshot.identity || snapshot.identity.dispatch_id !== trigger.dispatch_id) return;
+  if (trigger.kind === "preflight") {
+    if (!snapshot.preflight || snapshot.preflight.dispatch_id !== trigger.dispatch_id) return;
+  } else if (
+    !snapshot.terminal
+    || snapshot.terminal.dispatch_id !== trigger.dispatch_id
+    || snapshot.terminal.outcome !== trigger.outcome
+  ) {
+    return;
+  }
+  const formatRepair = trigger.kind === "terminal"
+    && trigger.outcome === "succeeded"
+    && snapshot.error_context?.class === "format_validation";
+  if (trigger.kind === "terminal" && trigger.outcome === "succeeded" && !formatRepair) return;
+  if (formatRepair
+    && runtime.host.capabilities.format_repair !== "supported"
+    && runtime.host.capabilities.producer_correction !== "supported") return;
+  const request: StageRecoveryRequest = {
+    run_id: trigger.run_id,
+    authority: trigger.authority,
+    operation: "reconcile",
+    operation_id: automaticRecoveryOperationId(trigger),
+    intent: trigger.kind === "preflight" ? "retry" : formatRepair ? "repair_format" : "replace",
+    identity: snapshot.identity,
+    expected_revision: snapshot.revision,
+    selection,
+  };
+  if (!runtime.automaticOpen) return;
+  try {
+    // Automatic recovery is deliberately grant-free. A persisted default
+    // budget may authorize one bounded replacement; exhaustion returns a
+    // typed wait result and leaves explicit workflow_recover as the only
+    // authenticated UI-grant boundary.
+    await recoverStageExecution({ request, store, host: runtime.host });
+  } catch {
+    // Canonical evidence is already durable. A failed automatic continuation
+    // remains replayable through the stable operation id and must not alter
+    // the task result or invent an outcome.
+  }
+}
+async function scanAutomaticRecoveryForOwner(
+  runtime: StageRecoveryRuntime,
+  ctx: unknown,
+  cwd: string,
+): Promise<void> {
+  if (!runtime.automaticOpen) return;
+  const store = runtime.storeFor(ctx, cwd);
+  if (!store) return;
+  let selection: TrustedRecoverySelection;
+  let snapshot: StageRecoverySnapshot;
+  try {
+    selection = store.selection();
+    snapshot = await store.read({ run_id: selection.run_id, authority: selection.authority, selection });
+  } catch {
+    return;
+  }
+  if (!snapshot.identity) return;
+  if (snapshot.preflight) {
+    scheduleAutomaticRecovery(runtime, {
+      kind: "preflight",
+      run_id: selection.run_id,
+      authority: selection.authority,
+      cwd,
+      ctx,
+      dispatch_id: snapshot.identity.dispatch_id,
+    });
+    return;
+  }
+  const terminal = snapshot.terminal;
+  if (
+    terminal
+    && (terminal.outcome !== "succeeded" || snapshot.error_context?.class === "format_validation")
+  ) {
+    scheduleAutomaticRecovery(runtime, {
+      kind: "terminal",
+      run_id: selection.run_id,
+      authority: selection.authority,
+      cwd,
+      ctx,
+      dispatch_id: terminal.dispatch_id,
+      outcome: terminal.outcome,
+    });
+  }
+}
+
+function scheduleAutomaticRecoveryScan(
+  runtime: StageRecoveryRuntime | undefined,
+  ctx: unknown,
+  cwd: string,
+): void {
+  if (!runtime || !runtime.automaticOpen) return;
+  trackAutomaticPending(runtime, scanAutomaticRecoveryForOwner(runtime, ctx, cwd).catch(() => {}));
+}
+
+
+function trackAutomaticPending(runtime: StageRecoveryRuntime, pending: Promise<void>): void {
+  runtime.automaticPending.add(pending);
+  void pending.finally(() => runtime.automaticPending.delete(pending)).catch(() => {});
+}
+
+function scheduleAutomaticRecovery(
+  runtime: StageRecoveryRuntime | undefined,
+  trigger: AutomaticRecoveryTrigger,
+): void {
+  if (!runtime || !runtime.automaticOpen) return;
+  trackAutomaticPending(runtime, executeAutomaticRecovery(runtime, trigger).catch(() => {}));
+}
+async function drainAutomaticRecovery(runtime: StageRecoveryRuntime | undefined): Promise<void> {
+  if (!runtime || runtime.automaticPending.size === 0) return;
+  await Promise.allSettled([...runtime.automaticPending]);
+}
+
+function canonicalRecoveryIdentity(
+  runtime: StageRecoveryRuntime | undefined,
+  ctx: unknown,
+  cwd: string,
+  authority: StageAuthority,
+  runId: string,
+): WorkIdentity | undefined {
+  if (!runtime) return undefined;
+  try {
+    const store = runtime.storeFor(ctx, cwd);
+    if (!store) return undefined;
+    const read = store.read({ run_id: runId, authority });
+    return read instanceof Promise ? undefined : read.identity;
+  } catch {
+    return undefined;
+  }
+}
 export type WorkflowOwnerClaimResult =
   | { ok: true; claim: WorkflowOwnerClaim; idempotent: boolean }
   | { ok: false; code: "owner_invalid" | "owner_conflict"; error: string; claim?: WorkflowOwnerClaim };
+function normalizedMixedTaskInput(input: unknown): { mixed: boolean; input: unknown } {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return { mixed: false, input };
+  const value = input as Record<string, unknown>;
+  if (!Array.isArray(value.tasks) || value.tasks.length !== 0 || typeof value.task !== "string" || typeof value.agent !== "string") {
+    return { mixed: false, input };
+  }
+  const normalized = Object.fromEntries(Object.entries(value).filter(([key]) => key !== "tasks"));
+  return { mixed: true, input: normalized };
+}
+function taskBatchMissingContext(input: unknown): boolean {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const value = input as Record<string, unknown>;
+  return Array.isArray(value.tasks)
+    && value.tasks.length > 0
+    && !Object.prototype.hasOwnProperty.call(value, "context");
+}
 
 export type WorkflowOwnerSource =
   | WorkflowOwnerIdentity
@@ -237,6 +890,7 @@ export type TrustedToolCallResolution =
   | { readonly actor: "orchestrator"; readonly artifactsDir: string }
   | { readonly actor: "worker" | "lead" }
   | { readonly kind: "authenticated-interactive-host-no-run" }
+  | { readonly kind: "authenticated-host-idle-basic-tools" }
   | { readonly kind: "authenticated-interactive-host-cto"; readonly run_id: string; readonly ownership_epoch: string }
   | { readonly kind: "denied"; readonly code: TrustedToolCallDenialCode };
 /**
@@ -328,6 +982,14 @@ export interface WorkflowToolAdapterOptions {
    */
   beforeBegin?: (cwd: string) => void | AgentMappingState | undefined | Promise<void | AgentMappingState | undefined>;
   mappingSummary?: (cwd: string) => unknown;
+  /**
+   * Engine-owned host binding resolver. Bundles normally omit this: the
+   * registration bridge installed by registerTeamWorkflow supplies the
+   * native authority resolver for assigned producer submission.
+   */
+  resolveStageHostBinding?: StageHostBindingResolver;
+  /** Optional truthful host lifecycle/recovery adapter for supported capabilities. */
+  stageRecoveryHost?: StageRecoveryHost;
   /** Reuse the exact bundle-owned controller shared with command ingress and hooks. */
   getSessionController?: (ctx: unknown, cwd: string) => WorkflowSessionController | undefined;
 }
@@ -420,6 +1082,13 @@ function isTrustedToolCallResolution(value: unknown): value is TrustedToolCallRe
   if (record.actor === "worker" || record.actor === "lead") return true;
   if (record.actor === "orchestrator") return typeof record.artifactsDir === "string" && record.artifactsDir.length > 0;
   if (record.kind === "authenticated-interactive-host-no-run") return true;
+  if (record.kind === "authenticated-host-idle-basic-tools") {
+    for (const key in record) {
+      if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+      if (key !== "kind") return false;
+    }
+    return Object.prototype.hasOwnProperty.call(record, "kind");
+  }
   if (record.kind === "authenticated-interactive-host-cto") {
     return typeof record.run_id === "string"
       && record.run_id.length > 0
@@ -471,6 +1140,36 @@ function sessionFileFromContext(ctx: unknown): string | undefined {
     }
   }
   return explicit;
+}
+type NativeAcceptedReplayLineage = {
+  readonly session_id: string;
+  readonly session_file: string;
+  readonly parent_session_file: string;
+};
+function nativeAcceptedReplayLineage(ctx: unknown, cwd: string): NativeAcceptedReplayLineage | undefined {
+  if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return undefined;
+  const manager = (ctx as { sessionManager?: unknown }).sessionManager;
+  if (!manager || typeof manager !== "object") return undefined;
+  const candidate = manager as { getCwd?: () => unknown; getHeader?: () => unknown };
+  if (typeof candidate.getCwd !== "function" || typeof candidate.getHeader !== "function") return undefined;
+  const sessionId = sessionIdFromContext(ctx);
+  const sessionFile = sessionFileFromContext(ctx);
+  if (!sessionId || !sessionFile || !isAbsolute(sessionFile)) return undefined;
+  let managerCwd: unknown;
+  let header: unknown;
+  try {
+    managerCwd = candidate.getCwd();
+    header = candidate.getHeader();
+  } catch {
+    return undefined;
+  }
+  if (typeof managerCwd !== "string" || resolve(managerCwd) !== resolve(cwd)) return undefined;
+  if (!header || typeof header !== "object" || Array.isArray(header)) return undefined;
+  const headerRecord = header as Record<string, unknown>;
+  if (headerRecord.id !== sessionId || typeof headerRecord.cwd !== "string" || resolve(headerRecord.cwd) !== resolve(cwd)) return undefined;
+  const parentSession = headerRecord.parentSession;
+  if (typeof parentSession !== "string" || !isAbsolute(parentSession)) return undefined;
+  return { session_id: sessionId, session_file: sessionFile, parent_session_file: parentSession };
 }
 function sessionSwitchActorIsAdmissible(event: unknown, ctx: unknown): boolean {
   for (const value of [event, ctx]) {
@@ -1301,6 +2000,23 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       return { failed: true };
     }
   };
+  const recoveryStoreFor = (ctx: unknown, cwd: string): AuthenticatedStageRecoveryStore | undefined => {
+    if (!opts.getSessionController) return undefined;
+    try {
+      const controller = opts.getSessionController(ctx, cwd);
+      if (!controller) return undefined;
+      return recoveryStoreForController(controller, cwd);
+    } catch {
+      return undefined;
+    }
+  };
+  stageRecoveryRuntimes.set(pi as unknown as object, {
+    storeFor: recoveryStoreFor,
+    host: createStageRecoveryHost(pi),
+    staleAdmissions: new WeakMap(),
+    automaticPending: new Set(),
+    automaticOpen: true,
+  });
   const ctoReservations = new Map<string, CtoReservation>();
   // Retain consumed host-call identities for this registration lifetime.
   // Host result events expose no immutable generation discriminator, so
@@ -1319,8 +2035,31 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     controller: WorkflowSessionController;
     key: string;
     identity: HostSessionIdentity;
+    host_context: unknown;
   };
   let lifecycleBinding: LifecycleBinding | undefined;
+  const recoveryRuntime = stageRecoveryRuntimes.get(pi as unknown as object);
+  if (recoveryRuntime) {
+    recoveryRuntime.ownerStoreFor = (cwd, runId, authority) => {
+      const binding = lifecycleBinding;
+      if (!binding?.identity.cwd) return undefined;
+      try {
+        if (resolve(binding.identity.cwd) !== resolve(cwd)) return undefined;
+        const context = binding.controller.context();
+        if (authority === "cto") {
+          const claim = binding.controller.activeCtoClaim();
+          if (!claim || claim.run_id !== runId) return undefined;
+          return createNativeStageRecoveryStore(cwd, { context, runId, claim_scope: claim });
+        }
+        return binding.controller.selectedRunId() === runId
+          && binding.controller.activeClaimRunId() === runId
+          ? createOrdinaryStageRecoveryStore(cwd, { context, runId })
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+  }
   const resolveLifecycleBinding = (ctx: unknown): LifecycleBinding | undefined => {
     const cwd = resolveCwdForContext(ctx).cwd;
     if (!cwd || !opts.getSessionController) return undefined;
@@ -1357,7 +2096,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       ...(hostIdentity.session_manager ? { session_manager: hostIdentity.session_manager } : {}),
       ...(hostIdentity.session_file ? { session_file: hostIdentity.session_file } : {}),
     };
-    return { controller, key: `${identity.session_id}\u0000${identity.cwd}`, identity };
+    return { controller, key: `${identity.session_id}\u0000${identity.cwd}`, identity, host_context: ctx };
   };
   const sameLifecycleIdentity = (left: HostSessionIdentity, right: HostSessionIdentity): boolean => {
     if (!left.session_id || !right.session_id || left.session_id !== right.session_id) return false;
@@ -1394,6 +2133,34 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       return resolveLifecycleBinding(ctx);
     } catch {
       return undefined;
+    }
+  };
+  const scanNativeOwner = (binding: LifecycleBinding | undefined, ctx: unknown): void => {
+    if (!binding?.identity.cwd || !controllerHasActiveRecoveryOwner(binding.controller)) return;
+    scheduleAutomaticRecoveryScan(stageRecoveryRuntimes.get(pi as unknown as object), ctx, binding.identity.cwd);
+  };
+  const recoveryOwnerContextFor = (
+    ctx: unknown,
+    cwd: string,
+    authority: StageAuthority,
+    runId: string,
+  ): unknown => {
+    const binding = lifecycleBinding;
+    if (!binding?.identity.cwd) return ctx;
+    try {
+      if (resolve(binding.identity.cwd) !== resolve(cwd)) return ctx;
+      if (authority === "cto") {
+        const claim = binding.controller.activeCtoClaim();
+        if (!claim || claim.run_id !== runId) return ctx;
+      } else if (
+        binding.controller.selectedRunId() !== runId
+        || binding.controller.activeClaimRunId() !== runId
+      ) {
+        return ctx;
+      }
+      return binding.controller.context();
+    } catch {
+      return ctx;
     }
   };
   const nativeWorkerAuthority = createNativeWorkerAuthority(pi.events, {
@@ -1453,7 +2220,262 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       }
       return trustedLegacyCtoOwnerForRun(cwd, runId, trustedContext, rawContext);
     },
+    onTerminalSettlement: async (settlement) => {
+      const runtime = stageRecoveryRuntimes.get(pi as unknown as object);
+      const binding = lifecycleBinding;
+      if (!runtime || !binding || !binding.identity.cwd) return;
+      try {
+        if (resolve(binding.identity.cwd) !== resolve(settlement.cwd)) return;
+      } catch {
+        return;
+      }
+      let claim: CtoClaimScope | undefined;
+      try {
+        claim = binding.controller.activeCtoClaim();
+      } catch {
+        return;
+      }
+      if (!claim || claim.run_id !== settlement.run_id || !controllerHasActiveRecoveryOwner(binding.controller)) return;
+      const persistence = persistRecoveryTerminalObservation(
+        runtime,
+        binding.controller.context(),
+        settlement.cwd,
+        "cto",
+        settlement.run_id,
+        settlement.identity,
+        settlement.tool_call_id,
+        settlement.outcome,
+      );
+      trackAutomaticPending(runtime, persistence);
+      await persistence;
+    },
+    onOrdinaryTerminalSettlement: async (settlement) => {
+      const runtime = stageRecoveryRuntimes.get(pi as unknown as object);
+      const binding = lifecycleBinding;
+      const origin = settlement.dispatch_origin;
+      if (
+        !binding?.identity.cwd
+        || !binding.identity.session_id
+        || !binding.identity.session_file
+        || !binding.identity.session_manager
+        || settlement.parent_session_id !== binding.identity.session_id
+        || settlement.parent_session_file !== binding.identity.session_file
+        || settlement.parent_manager !== binding.identity.session_manager
+        || origin.origin_session_id !== settlement.parent_session_id
+        || origin.run_id !== settlement.run_id
+        || origin.dispatch_id !== settlement.dispatch_id
+      ) return;
+      try {
+        if (resolve(binding.identity.cwd) !== resolve(settlement.cwd) || resolve(origin.cwd) !== resolve(settlement.cwd)) return;
+      } catch {
+        return;
+      }
+      let context: TrustedExecutionContext;
+      try {
+        if (binding.controller.activeCtoClaim()) return;
+        if (binding.controller.selectedRunId() !== settlement.run_id || binding.controller.activeClaimRunId() !== settlement.run_id) return;
+        context = binding.controller.context();
+      } catch {
+        return;
+      }
+      if (context.session_id !== settlement.parent_session_id || !context.worktree) return;
+      try {
+        if (resolve(context.worktree) !== resolve(settlement.cwd)) return;
+      } catch {
+        return;
+      }
+      const state = readRunState(settlement.cwd, settlement.run_id);
+      const capability = state?.dispatch_capability;
+      if (
+        !state
+        || state.run_id !== settlement.run_id
+        || state.run_key !== settlement.run_id
+        || !capability
+        || capability.status === "invalidated"
+        || capability.status === "complete"
+        || !capability.issued_for
+        || !Array.isArray(capability.dispatches)
+      ) return;
+      const matches = capability.dispatches.filter((record) => record.id === settlement.dispatch_id && record.tool_call_id === settlement.tool_call_id);
+      if (matches.length !== 1) return;
+      const record = matches[0]!;
+      const identity = record.work_identity;
+      if (
+        !identity
+        || record.status !== "authorized" && record.status !== "running" && record.status !== "pending"
+        || record.completion
+        || record.agent !== settlement.agent
+        || record.origin_session_id !== settlement.parent_session_id
+        || !record.origin_ownership_epoch
+        || capability.capability_id !== identity.capability_id
+        || capability.issued_for.run_key !== settlement.run_id
+        || capability.issued_for.stage_cursor !== identity.stage_id
+        || capability.issued_for.cursor_epoch !== identity.capability_epoch
+        || identity.run_id !== settlement.run_id
+        || origin.capability_id !== identity.capability_id
+        || origin.stage_id !== identity.stage_id
+        || origin.cursor_epoch !== identity.capability_epoch
+        || origin.slot_id !== identity.slot_id
+        || origin.task_id !== identity.task_id
+      ) return;
+      const captured: CapturedDispatchContext = {
+        run_id: settlement.run_id,
+        dispatch_id: settlement.dispatch_id,
+        capability_id: identity.capability_id,
+        ownership_epoch: record.origin_ownership_epoch,
+        origin_session_id: record.origin_session_id,
+        rework_generation: state.rework_generation ?? 0,
+      };
+      const reconciled = reconcileTrustedTaskResult(settlement.cwd, {
+        run_id: settlement.run_id,
+        dispatch_id: settlement.dispatch_id,
+        tool_call_id: settlement.tool_call_id,
+        capability_id: identity.capability_id,
+        cursor_epoch: identity.capability_epoch,
+        slot_id: identity.slot_id,
+        task_id: identity.task_id,
+        captured,
+        outcome: settlement.outcome,
+        evidence: "authoritative OMP subagent lifecycle terminal",
+        terminal_signal: "provider_terminal",
+      });
+      if (!reconciled.ok) {
+        if (!reconciled.error.includes("unknown or already reconciled")) {
+          console.warn("omp workflow SDK lifecycle reconciliation failed: " + reconciled.error);
+        }
+        return;
+      }
+      const persistence = persistRecoveryTerminalObservation(
+        runtime,
+        context,
+        settlement.cwd,
+        "ordinary",
+        settlement.run_id,
+        identity,
+        settlement.tool_call_id,
+        settlement.outcome,
+        {
+          source: "omp-subagent-lifecycle",
+          event_id: `subagent_lifecycle:${settlement.lifecycle_id}:${settlement.dispatch_id}`,
+        },
+      );
+      if (runtime) trackAutomaticPending(runtime, persistence);
+      await persistence;
+    },
   });
+  nativeWorkerAuthorities.set(pi as unknown as object, nativeWorkerAuthority);
+  type LiveRootAuthorityRegistration = Pick<NativeRootAuthorityRegistration, "cwd" | "owner">;
+  let liveRootAuthorityRegistration: LiveRootAuthorityRegistration | undefined;
+  const unregisterLiveRootAuthority = (): void => {
+    const registration = liveRootAuthorityRegistration;
+    liveRootAuthorityRegistration = undefined;
+    if (registration) nativeWorkerAuthority.unregisterRootAuthority(registration);
+  };
+  const registerLiveRootAuthority = (): void => {
+    const binding = lifecycleBinding;
+    if (!binding?.identity.cwd || !binding.host_context) {
+      unregisterLiveRootAuthority();
+      return;
+    }
+    const rootCwd = binding.identity.cwd;
+    const verified = verifiedLifecycleHost(binding.host_context);
+    if (!verified || !sameLifecycleIdentity(binding.identity, verified.identity)) {
+      unregisterLiveRootAuthority();
+      return;
+    }
+    let context: TrustedExecutionContext;
+    try {
+      context = binding.controller.context();
+    } catch {
+      unregisterLiveRootAuthority();
+      return;
+    }
+    if (
+      context.caller !== "host"
+      || context.authority !== "coordinator"
+      || !context.worktree
+      || resolve(context.worktree) !== resolve(rootCwd)
+      || !context.branch
+    ) {
+      unregisterLiveRootAuthority();
+      return;
+    }
+    if (
+      liveRootAuthorityRegistration
+      && (
+        liveRootAuthorityRegistration.owner !== binding.controller
+        || resolve(liveRootAuthorityRegistration.cwd) !== resolve(rootCwd)
+      )
+    ) {
+      unregisterLiveRootAuthority();
+    }
+    const registration: NativeRootAuthorityRegistration = {
+      cwd: rootCwd,
+      owner: binding.controller,
+      read: (runId?: string) => {
+        const current = lifecycleBinding;
+        if (
+          !current
+          || current !== binding
+          || current.host_context !== binding.host_context
+          || !sameLifecycleIdentity(current.identity, binding.identity)
+        ) return undefined;
+        const currentVerified = verifiedLifecycleHost(current.host_context);
+        if (!currentVerified || !sameLifecycleIdentity(current.identity, currentVerified.identity)) return undefined;
+        try {
+          const currentContext = binding.controller.context();
+          const currentCtoClaim = binding.controller.activeCtoClaim();
+          if (
+            currentContext.caller !== "host"
+            || currentContext.authority !== "coordinator"
+            || !currentContext.worktree
+            || resolve(currentContext.worktree) !== resolve(rootCwd)
+            || !currentContext.branch
+          ) return undefined;
+          if (currentCtoClaim) {
+            if (!runId || currentCtoClaim.run_id !== runId) return undefined;
+            return {
+              authority: "cto" as const,
+              root_ctx: current.host_context,
+              context: currentContext,
+              run_id: currentCtoClaim.run_id,
+              claim_scope: currentCtoClaim,
+            };
+          }
+          const currentRunId = binding.controller.activeClaimRunId();
+          if (!currentRunId || !runId || currentRunId !== runId || binding.controller.selectedRunId() !== currentRunId) return undefined;
+          return {
+            authority: "ordinary" as const,
+            root_ctx: current.host_context,
+            context: currentContext,
+            run_id: currentRunId,
+          };
+        } catch {
+          return undefined;
+        }
+      },
+    };
+    if (nativeWorkerAuthority.registerRootAuthority(registration)) {
+      liveRootAuthorityRegistration = {
+        cwd: registration.cwd,
+        owner: registration.owner,
+      };
+    }
+  };
+  stageBindingResolvers.set(pi as unknown as object, (ctx, cwd, runId, authority) => {
+    const resolution = nativeWorkerAuthority.resolve(ctx, cwd, runId);
+    const expectedKind = authority === "ordinary" ? "workflow" : "cto";
+    if (!resolution || resolution.kind !== expectedKind) return undefined;
+    const native = nativeWorkerAuthority.binding(ctx, cwd, runId);
+    return native ? deriveWorkerStageHostBinding({ cwd, runId, authority, native }) ?? undefined : undefined;
+  });
+  stageToolBindingResolvers.set(pi as unknown as object, (ctx, cwd, runId, toolName, callback) => {
+    const resolution = nativeWorkerAuthority.resolve(ctx, cwd, runId);
+    if (!resolution || resolution.kind !== "cto" || resolution.actor !== "lead") return undefined;
+    const native = nativeWorkerAuthority.binding(ctx, cwd, runId);
+    return native ? deriveWorkerStageHostBinding({ cwd, runId, authority: "cto", native, toolName, callback }) ?? undefined : undefined;
+  });
+  stageResultCommitters.set(pi as unknown as object, (input) => commitNativeCtoStageResult(input));
   pi.on("session_start", (event: unknown, ctx: unknown) => {
     if (!sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_start")) return;
     const verified = verifiedLifecycleHost(ctx);
@@ -1469,11 +2491,15 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     if (!lifecycleBinding) {
       lifecycleBinding = next;
       nativeWorkerAuthority.observeSessionStart(ctx);
+      registerLiveRootAuthority();
+      scanNativeOwner(lifecycleBinding, ctx);
       return;
     }
     if (!sameLifecycleIdentity(lifecycleBinding.identity, next.identity)) return;
     if (lifecycleBinding.controller !== next.controller) return;
     nativeWorkerAuthority.observeSessionStart(ctx);
+    registerLiveRootAuthority();
+    scanNativeOwner(lifecycleBinding, ctx);
   });
   pi.on("session_switch", (event: unknown, ctx: unknown) => {
     const verified = verifiedLifecycleHost(ctx);
@@ -1497,6 +2523,8 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     if (!binding) {
       lifecycleBinding = next;
       nativeWorkerAuthority.observeSessionStart(ctx);
+      registerLiveRootAuthority();
+      scanNativeOwner(lifecycleBinding, ctx);
       return;
     }
     if (
@@ -1511,6 +2539,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       || !previousSessionFile
       || binding.identity.session_file !== previousSessionFile
     ) return;
+    unregisterLiveRootAuthority();
     let oldClaim: CtoClaimScope | undefined;
     try {
       oldClaim = binding.controller.activeCtoClaim();
@@ -1528,6 +2557,8 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     }
     lifecycleBinding = next;
     nativeWorkerAuthority.observeSessionStart(ctx);
+    registerLiveRootAuthority();
+    scanNativeOwner(lifecycleBinding, ctx);
   });
   // session_shutdown is a type-only disposal event, not a session switch.
   // The host supplies no old-session id here; replacement uses session_switch.
@@ -1536,6 +2567,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     const verified = verifiedLifecycleHost(ctx);
     const binding = lifecycleBinding;
     if (!verified || !binding || !sameLifecycleIdentity(binding.identity, verified.identity)) return;
+    unregisterLiveRootAuthority();
     try {
       suspendCtoSession(binding.controller, "session-shutdown");
     } catch {
@@ -1576,6 +2608,10 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         cto_ownership_epoch?: unknown;
       }
       : {};
+    const mixedTaskInput = normalizedMixedTaskInput(event.input);
+    const normalizedTaskEvent = mixedTaskInput.mixed
+      ? { ...event, input: mixedTaskInput.input }
+      : event;
     const originSessionId = sessionIdFromContext(ctx);
     const originSessionFile = sessionFileFromContext(ctx);
     // Resolve admission exactly once. The configured bundle resolver is the
@@ -1627,6 +2663,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
           && (error.code === "recovery_required" || error.code === "run_state_invalid");
       }
     }
+    if (!admissionResolutionFailed && activeCtoScope) registerLiveRootAuthority();
     const ctoMarkerIds = event.toolName === "task" ? ctoMarkerRunIds(event.input) : [];
     const sharedContext = (() => {
       try { return sharedController?.context(); } catch { return undefined; }
@@ -1757,6 +2794,10 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         ? "orchestrator"
         : undefined;
     let authenticatedInteractiveHostNoRun = false;
+    let authenticatedHostIdleBasicTools = false;
+    let idleBasicSelectionPresent = false;
+    let idleBasicSelectedRunPresent = false;
+    let idleBasicAuthorityConflict = false;
     let noRunClaimPresent = false;
     let controlReadFailed = false;
     if (
@@ -1776,6 +2817,41 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       } catch {
         controlReadFailed = true;
         authenticatedInteractiveHostNoRun = false;
+      }
+    }
+    // This is a per-call idle predicate, not a command lease or actor credential.
+    if (
+      adaptedActor
+      && "kind" in adaptedActor
+      && adaptedActor.kind === "authenticated-host-idle-basic-tools"
+    ) {
+      idleBasicSelectedRunPresent = selectedRunId !== undefined
+        || trustedRunId !== undefined
+        || authorityRunId !== undefined;
+      idleBasicAuthorityConflict = Boolean(
+        sharedController
+        || activeCtoScope
+        || activeClaimRunId !== undefined
+        || nativeActor
+        || nativeResolutionFailed
+        || legacyCtoAdmission
+        || idleBasicSelectedRunPresent
+      );
+      if (!admissionResolutionFailed && !idleBasicAuthorityConflict && admissionCwd) {
+        try {
+          const control = readRunControlNoRecovery(admissionCwd);
+          noRunClaimPresent = control.execution_claim !== null;
+          for (const selectionId in control.selections) {
+            if (Object.prototype.hasOwnProperty.call(control.selections, selectionId)) {
+              idleBasicSelectionPresent = true;
+              break;
+            }
+          }
+          authenticatedHostIdleBasicTools = !noRunClaimPresent && !idleBasicSelectionPresent;
+        } catch {
+          controlReadFailed = true;
+          authenticatedHostIdleBasicTools = false;
+        }
       }
     }
     const selectedNoRunConflict = selectedRunId !== undefined
@@ -1872,6 +2948,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       && actorAuthorityConfigured
       && !trustedActor
       && !authenticatedInteractiveHostNoRun
+      && !authenticatedHostIdleBasicTools
       && !lifecycleDeviceWrite
       && (event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")
     ) {
@@ -1886,7 +2963,11 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
                 ? "no_run_claim_present"
                 : selectedNoRunConflict
                   ? "execution_claim_mismatch"
-                  : actorResolverDiagnosticCode);
+                  : idleBasicSelectionPresent || idleBasicSelectedRunPresent
+                    ? "selected_run_mismatch"
+                    : idleBasicAuthorityConflict
+                      ? "execution_claim_mismatch"
+                      : actorResolverDiagnosticCode);
       runAdmission(
         code,
         adaptedDenialCode || code === actorResolverDiagnosticCode ? actorResolverSignal : undefined,
@@ -1928,25 +3009,192 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], gateContext));
       run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], writeGateContext ?? gateContext!));
       run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...(writeGateContext ?? gateContext!), writeScope: opts.writeScope }));
-      run(ctoSliceTaskGate(event as unknown as Parameters<typeof ctoSliceTaskGate>[0], gateContext));
-      if (!ctoAuthorizedDispatch) run(dispatchGate(event as unknown as Parameters<typeof dispatchGate>[0], { ...gateContext, controller: sharedController }));
+      run(ctoSliceTaskGate(normalizedTaskEvent as unknown as Parameters<typeof ctoSliceTaskGate>[0], gateContext));
+      if (!ctoAuthorizedDispatch) run(dispatchGate(normalizedTaskEvent as unknown as Parameters<typeof dispatchGate>[0], { ...gateContext, controller: sharedController }));
     }
     if (!admissionResolutionBlocked) run(safetyGuard(event as unknown as Parameters<typeof safetyGuard>[0], (gateContext ?? c) as Parameters<typeof safetyGuard>[1]));
     let eventRunId = event.toolName === "task" ? ctoRunId : trustedRunId;
     let eventRunIdTrusted = typeof eventRunId === "string" && eventRunId.length > 0;
     let nativeDispatchOrigins: DispatchOrigin[] | undefined;
-    if (!result && event.toolName === "task" && !ctoAuthorizedDispatch) {
+    let ordinaryDispatchWitness = false;
+    if (!result && mixedTaskInput.mixed && event.toolName === "task") {
+      const normalizedAuthorization = gateContext
+        ? trustedDispatchRequests(
+            normalizedTaskEvent as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
+            { ...gateContext, session_id: originSessionId, controller: sharedController },
+          )
+        : { ok: true as const, requests: [] };
+      if ("reason" in normalizedAuthorization) {
+        run({ block: true, reason: normalizedAuthorization.reason });
+      } else {
+        run({ block: true, reason: "dispatch gate: mixed flat and batch task shape is unsupported; task admission was not attempted" });
+        const request = normalizedAuthorization.requests.length === 1 ? normalizedAuthorization.requests[0] : undefined;
+        const runId = request?.run_id ?? eventRunId;
+        if (runId && admissionCwd && event.toolCallId) {
+          const identity = request?.run_id
+            ? recoveryIdentityForSlot(admissionCwd, { ...request, run_id: request.run_id })
+            : canonicalRecoveryIdentity(
+                stageRecoveryRuntimes.get(pi as unknown as object),
+                ctx,
+                admissionCwd,
+                ctoAuthorizedDispatch ? "cto" : "ordinary",
+                runId,
+              );
+          const recoveryRuntime = stageRecoveryRuntimes.get(pi as unknown as object);
+          const recoveryAuthority: StageAuthority = ctoAuthorizedDispatch ? "cto" : "ordinary";
+          const persisted = persistRecoveryPreflightObservation(
+            recoveryRuntime,
+            ctx,
+            admissionCwd,
+            recoveryAuthority,
+            runId,
+            identity,
+            event.toolCallId,
+            "mixed flat and batch task shape was rejected before normal task admission",
+          );
+          if (persisted && identity) {
+            scheduleAutomaticRecovery(recoveryRuntime, {
+              kind: "preflight",
+              run_id: runId,
+              authority: recoveryAuthority,
+              cwd: admissionCwd,
+              ctx,
+              dispatch_id: identity.dispatch_id,
+            });
+          }
+        }
+      }
+    }
+    const nativeBatchContextMissing = !result
+      && event.toolName === "task"
+      && admissionCwd !== undefined
+      && taskBatchMissingContext(event.input)
+      && (
+        authenticatedInteractiveHostNoRun
+        || legacyCtoTaskAdmission
+        || nativeCtoTargeted
+        || ctoAuthorizedDispatch
+      );
+    if (nativeBatchContextMissing) {
+      const nativeCwd = admissionCwd;
+      const nativeRunId = eventRunId ?? trustedRunId ?? nativeActor?.runId;
+      const nativeActorKind = trustedActor === "lead" || nativeActor?.actor === "lead" ? "lead" as const : "orchestrator" as const;
+      run({
+        block: true,
+        reason: "dispatch gate: task batch context is required before native task admission",
+      });
+      if (event.toolCallId && nativeCwd) {
+        let rejection: ReturnType<typeof nativeWorkerAuthority.admitTaskCall> | undefined;
+        try {
+          rejection = nativeWorkerAuthority.admitTaskCall(
+            ctx,
+            event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
+            nativeActorKind,
+            nativeRunId,
+            undefined,
+            "preflight:invalid_arguments",
+          );
+        } catch {
+          rejection = undefined;
+        }
+        let ownerContext: TrustedExecutionContext | undefined;
+        const binding = lifecycleBinding;
+        if (nativeRunId && binding?.identity.cwd) {
+          try {
+            const claim = binding.controller.activeCtoClaim();
+            if (
+              claim
+              && claim.run_id === nativeRunId
+              && controllerHasActiveRecoveryOwner(binding.controller)
+              && resolve(binding.identity.cwd) === resolve(nativeCwd)
+            ) {
+              ownerContext = binding.controller.context();
+            }
+          } catch {
+            ownerContext = undefined;
+          }
+        }
+        if (rejection && typeof rejection === "object" && rejection.ok && nativeRunId && ownerContext) {
+          const runtime = stageRecoveryRuntimes.get(pi as unknown as object);
+          for (const identity of rejection.identities) {
+            const persisted = persistRecoveryPreflightObservation(
+              runtime,
+              ownerContext,
+              nativeCwd,
+              "cto",
+              nativeRunId,
+              identity,
+              event.toolCallId,
+              "task batch context was missing; native task admission was rejected before provider execution",
+            );
+            if (persisted) {
+              scheduleAutomaticRecovery(runtime, {
+                kind: "preflight",
+                run_id: nativeRunId,
+                authority: "cto",
+                cwd: nativeCwd,
+                ctx: ownerContext,
+                dispatch_id: identity.dispatch_id,
+              });
+            }
+          }
+        }
+      }
+    }
+    if (!result && event.toolName === "task" && !mixedTaskInput.mixed && !ctoAuthorizedDispatch) {
       const authorization = gateContext
         ? trustedDispatchRequests(
             event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
             { ...gateContext, session_id: originSessionId, controller: sharedController },
           )
         : { ok: true as const, requests: [] };
-      if (!authorization.ok) {
+      if ("reason" in authorization) {
         run({ block: true, reason: authorization.reason });
       } else if (!admissionCwd) {
         run({ block: true, reason: "dispatch authorization failed: workflow cwd unavailable" });
       } else {
+        const taskInput = event.input && typeof event.input === "object" && !Array.isArray(event.input)
+          ? event.input as Record<string, unknown>
+          : undefined;
+        const missingBatchContext = taskBatchMissingContext(event.input);
+        if (missingBatchContext) {
+          let rejected = authorization.requests.length > 0;
+          for (const request of authorization.requests) {
+            const refusal = rejectDispatchPreflightTrusted(admissionCwd, {
+              ...request,
+              rejection_code: "invalid_arguments",
+            });
+            if (!refusal.ok) {
+              rejected = false;
+              run({ block: true, reason: `dispatch authorization failed: ${refusal.error}` });
+              break;
+            }
+            if (request.run_id && event.toolCallId && refusal.record?.work_identity) {
+              const runtime = stageRecoveryRuntimes.get(pi as unknown as object);
+              const persisted = persistRecoveryPreflightObservation(
+                runtime,
+                ctx,
+                admissionCwd,
+                "ordinary",
+                request.run_id,
+                refusal.record.work_identity,
+                event.toolCallId,
+                "task batch context was missing; task admission was rejected before provider execution",
+              );
+              if (persisted) {
+                scheduleAutomaticRecovery(runtime, {
+                  kind: "preflight",
+                  run_id: request.run_id,
+                  authority: "ordinary",
+                  cwd: admissionCwd,
+                  ctx,
+                  dispatch_id: refusal.record.work_identity.dispatch_id,
+                });
+              }
+            }
+          }
+          if (rejected) run({ block: true, reason: "dispatch gate: task batch context is required before task admission" });
+        } else {
         const origins: DispatchOrigin[] = [];
         for (const [index, request] of authorization.requests.entries()) {
           if (request.run_id) {
@@ -1978,8 +3226,21 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
             rememberDispatchOriginLocator(toolCallId, origin);
           }
         }
-        if (origins.length > 0) nativeDispatchOrigins = origins;
+        if (
+          origins.length > 0
+          && origins.length === authorization.requests.length
+          && selectedRunId !== undefined
+          && activeClaimRunId === selectedRunId
+          && sharedContext?.caller === "host"
+          && sharedContext.authority === "coordinator"
+          && sharedContext.worktree === admissionCwd
+          && authorization.requests.every((request) => request.run_id === selectedRunId)
+        ) {
+          nativeDispatchOrigins = origins;
+          ordinaryDispatchWitness = true;
+        }
       }
+        }
     }
     let pendingCtoReservation: CtoReservation | undefined;
     const authenticatedCtoParent = Boolean(authenticatedCtoScope && trustedActor === "orchestrator");
@@ -2021,7 +3282,13 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       !result
       && event.toolName === "task"
       && admissionCwd
-      && (trustedActor === "orchestrator" || trustedActor === "lead" || authenticatedInteractiveHostNoRun || legacyCtoTaskAdmission)
+      && (
+        trustedActor === "orchestrator"
+        || trustedActor === "lead"
+        || authenticatedInteractiveHostNoRun
+        || legacyCtoTaskAdmission
+        || ordinaryDispatchWitness
+      )
     ) {
       try {
         // A no-run host may bootstrap CTO leads; the native bridge still
@@ -2030,7 +3297,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
           ctx,
           event as unknown as { toolName?: string; toolCallId?: string; input?: unknown },
           trustedActor === "lead" ? "lead" : "orchestrator",
-          eventRunId ?? trustedRunId ?? nativeActor?.runId,
+          ordinaryDispatchWitness ? selectedRunId : eventRunId ?? trustedRunId ?? nativeActor?.runId,
           nativeDispatchOrigins,
         );
         if (nativeCtoTargeted && !admitted) {
@@ -2050,13 +3317,74 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         // changes the already-allowed task decision or creates a grant.
       }
     }
+    if (
+      event.toolName === "task"
+      && event.toolCallId
+      && admissionCwd
+      && result?.block === true
+      && typeof result.reason === "string"
+      && /dispatch|admission|authority|identity|stale/i.test(result.reason)
+      && (eventRunId ?? trustedRunId)
+      && ctx !== null
+      && (typeof ctx === "object" || typeof ctx === "function")
+    ) {
+      const runtime = stageRecoveryRuntimes.get(pi as unknown as object);
+      runtime?.staleAdmissions.set(ctx as object, {
+        cwd: admissionCwd,
+        run_id: (eventRunId ?? trustedRunId)!,
+        authority: ctoAuthorizedDispatch || nativeCtoTargeted ? "cto" : "ordinary",
+        tool_call_id: event.toolCallId,
+        reason: result.reason,
+        observed_at: new Date().toISOString(),
+      });
+    }
+    const preflightReason = result?.block === true
+      && typeof result.reason === "string"
+      && (
+        result.reason === "dispatch gate: task marker disappeared during authorization"
+        || result.reason === "dispatch gate: task slot identity is missing"
+        || result.reason === "dispatch gate: task call identity is missing"
+      )
+      ? result.reason
+      : undefined;
+    if (preflightReason && event.toolName === "task" && event.toolCallId && admissionCwd) {
+      const runId = eventRunId ?? trustedRunId;
+      const authority: StageAuthority = ctoAuthorizedDispatch ? "cto" : "ordinary";
+      const identity = runId
+        ? canonicalRecoveryIdentity(stageRecoveryRuntimes.get(pi as unknown as object), ctx, admissionCwd, authority, runId)
+        : undefined;
+      if (runId) {
+        const runtime = stageRecoveryRuntimes.get(pi as unknown as object);
+        const persisted = persistRecoveryPreflightObservation(
+          runtime,
+          ctx,
+          admissionCwd,
+          authority,
+          runId,
+          identity,
+          event.toolCallId,
+          preflightReason,
+        );
+        if (persisted && identity) {
+          scheduleAutomaticRecovery(runtime, {
+            kind: "preflight",
+            run_id: runId,
+            authority,
+            cwd: admissionCwd,
+            ctx,
+            dispatch_id: identity.dispatch_id,
+          });
+        }
+      }
+    }
     if (admissionCwd && opts.observability !== false) {
       if (eventRunIdTrusted && eventRunId) setObservabilityRun(admissionCwd, eventRunId);
       recordToolCallAttempt(admissionCwd, { ...(event as unknown as { toolName?: string; toolCallId?: string; input?: unknown }), ...(eventRunId ? { runId: eventRunId } : {}) }, result ? "blocked" : "allowed", result?.reason);
     }
     return result;
   });
-  pi.on("tool_result", (event: ToolResultEvent, ctx: unknown) => {
+  pi.on("tool_result", async (event: ToolResultEvent, ctx: unknown) => {
+    const recoveryRuntime = stageRecoveryRuntimes.get(pi as unknown as object);
     if (event.toolName !== "task") return;
     if (nativeMigrationIngress(event.input) || nativeMigrationIngress(event.details) || nativeMigrationIngress(event.content)) {
       console.warn(`omp workflow task reconciliation rejected: migration-only completion provenance for tool call ${event.toolCallId}`);
@@ -2174,7 +3502,12 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     const markerFilter = taskMarkerFilter(event.input);
     const origins = taskOriginsForResult(event.toolCallId, markerFilter);
     if (origins.length === 0) {
-      if (nativeCtoResult) return;
+      if (nativeCtoResult) {
+        // Native terminal authority is settled by the lifecycle grant bridge
+        // after the canonical assignment transition. A raw task result is
+        // never terminal evidence for native recovery on its own.
+        return;
+      }
       console.warn(`omp workflow task reconciliation rejected: no exact origin for tool call ${event.toolCallId}`);
       return;
     }
@@ -2209,6 +3542,18 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       });
       if (!reconciled.ok && !reconciled.error.includes("unknown or already reconciled")) {
         console.warn("omp workflow task reconciliation failed: " + reconciled.error);
+      }
+      if (!nativeCtoResult && !asyncActive && !unknownAsync) {
+        await persistRecoveryTerminalObservation(
+          recoveryRuntime,
+          recoveryOwnerContextFor(ctx, origin.cwd, "ordinary", origin.run_id),
+          origin.cwd,
+          nativeCtoResult ? "cto" : "ordinary",
+          origin.run_id,
+          recoveryIdentityFromOrigin(origin),
+          event.toolCallId,
+          outcome,
+        );
       }
     }
     for (const origin of outcomes.unresolved) {
@@ -2274,6 +3619,78 @@ interface HostAskSurface {
     results: Array<Record<string, unknown>>;
   } | { kind: "chat" } | undefined>;
   select?(title: string, options: string[], dialogOptions?: { helpText?: string; signal?: AbortSignal }): Promise<string | undefined>;
+}
+interface HostDecisionRequest {
+  id: string;
+  question: string;
+  header: string;
+  title: string;
+  allowed: string[];
+  signal?: AbortSignal;
+}
+type HostDecisionResult =
+  | { ok: true; selected: string }
+  | { ok: false; kind: "unavailable" | "declined" | "aborted"; error: string };
+const HOST_DECISION_KEYS: Record<string, true> = {
+  id: true,
+  question: true,
+  options: true,
+  multi: true,
+  selectedOptions: true,
+  customInput: true,
+  note: true,
+  timedOut: true,
+};
+
+async function askHostDecision(surface: HostAskSurface | undefined, request: HostDecisionRequest): Promise<HostDecisionResult> {
+  const declined = (error: string): HostDecisionResult => ({ ok: false, kind: "declined", error });
+  const aborted = (): HostDecisionResult => ({ ok: false, kind: "aborted", error: "the host decision was canceled; nothing was authorized" });
+  if (request.signal?.aborted) return aborted();
+  const askDialog = typeof surface?.askDialog === "function" ? surface.askDialog.bind(surface) : undefined;
+  const select = typeof surface?.select === "function" ? surface.select.bind(surface) : undefined;
+  if (!askDialog && !select) return { ok: false, kind: "unavailable", error: "an interactive host decision surface is required" };
+  let selected: string | undefined;
+  try {
+    if (askDialog) {
+      const result = await askDialog([{
+        id: request.id,
+        question: request.question,
+        header: request.header,
+        options: request.allowed.map((label) => ({ label })),
+        multi: false,
+      }], { signal: request.signal });
+      if (request.signal?.aborted) return aborted();
+      if (!result || result.kind !== "submit") return declined("no submitted human decision was received");
+      const results = Array.isArray(result.results) ? result.results : [];
+      if (results.length !== 1) return declined("exactly one host answer is required");
+      const item = results[0];
+      if (!item || typeof item !== "object" || Array.isArray(item)) return declined("the host answer must be an object");
+      if (Object.keys(item).some((key) => !Object.hasOwn(HOST_DECISION_KEYS, key))) return declined("the host answer contains unsupported metadata");
+      if (item.id !== request.id || item.question !== request.question) return declined("the host answer does not match the current question");
+      if (!Array.isArray(item.options) || item.options.length !== request.allowed.length
+        || item.options.some((option, index) => option !== request.allowed[index])) {
+        return declined("the host answer does not match the allowed decisions");
+      }
+      if (item.multi !== false) return declined("the host answer must be single-select");
+      if (item.timedOut !== undefined && typeof item.timedOut !== "boolean") return declined("the timeout marker must be boolean");
+      if (item.timedOut === true) return declined("timeout selection is not human authorization");
+      if (item.customInput !== undefined && typeof item.customInput !== "string") return declined("custom input must be a string");
+      if (typeof item.customInput === "string" && item.customInput.trim()) return declined("custom text is not a policy-bound decision");
+      if (item.note !== undefined && typeof item.note !== "string") return declined("the host answer note must be a string");
+      const selections = item.selectedOptions;
+      if (!Array.isArray(selections) || selections.length !== 1 || typeof selections[0] !== "string") return declined("exactly one selected decision is required");
+      selected = selections[0];
+    } else if (select) {
+      selected = await select(request.title, request.allowed, { helpText: request.question, signal: request.signal });
+      if (request.signal?.aborted) return aborted();
+    }
+  } catch (error) {
+    if (request.signal?.aborted) return aborted();
+    throw error;
+  }
+  return selected && request.allowed.includes(selected)
+    ? { ok: true, selected }
+    : declined("no policy-allowed human decision was selected");
 }
 interface HostSessionProfile {
   mode: string;
@@ -2474,6 +3891,74 @@ function toolResult(value: unknown): WorkflowToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
 }
 
+/** SDK tool-call ids are opaque; persist only a namespaced canonical digest. */
+function nativeStageOperationIdFromSdkCall(sdkCallId: string): string {
+  if (sdkCallId.length === 0) return sdkCallId;
+  const digest = createHash("sha256")
+    .update("omp-workflows:cto-stage-advance:sdk-operation-id:v1\0", "utf8")
+    .update(sdkCallId, "utf8")
+    .digest("hex");
+  return `sdk-cto-stage-${digest}`;
+}
+
+export type StageResultPublisher = (outputs: Record<string, unknown>) => StageResultSubmissionOutcome;
+
+export interface StageProducerToolDefinition {
+  name: string;
+  label: string;
+  description: string;
+  parameters: unknown;
+  execute(
+    id: string,
+    params: unknown,
+    signal: AbortSignal | undefined,
+    update: unknown,
+    ctx: unknown,
+    publish: StageResultPublisher,
+  ): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }>;
+}
+
+export function registerStageProducerTool(
+  pi: Pick<ExtensionAPI, "registerTool">,
+  definition: StageProducerToolDefinition,
+): void {
+  const toolName = definition.name;
+  const execute = definition.execute;
+  const registrationId = randomUUID();
+  pi.registerTool({
+    ...definition,
+    name: toolName,
+    async execute(id: string, params: unknown, signal: AbortSignal | undefined, update: unknown, ctx: unknown) {
+      const factory = stageToolPublisherFactories.get(pi);
+      if (!factory) return toolResult({ ok: false, code: "STAGE_HOST_UNSUPPORTED", error: "trusted stage producer registration is unavailable" });
+      let started: StageToolPublisherStart;
+      try {
+        started = factory(ctx, toolName, registrationId, id);
+      } catch (error) {
+        return toolResult({ ok: false, code: "STAGE_HOST_FACTORY_FAILED", error: String(error) });
+      }
+      if (!started.ok) return toolResult(started);
+      let result: { content: Array<{ type: "text"; text: string }>; details: unknown };
+      try {
+        result = await execute(id, params, signal, update, ctx, started.publish);
+      } catch (error) {
+        try {
+          started.close();
+        } catch (closeError) {
+          return toolResult({ ok: false, code: "STAGE_PRODUCER_FAILED", error: `${String(error)}; close failed: ${String(closeError)}` });
+        }
+        return toolResult({ ok: false, code: "STAGE_PRODUCER_FAILED", error: String(error) });
+      }
+      try {
+        started.close();
+      } catch (error) {
+        return toolResult({ ok: false, code: "STAGE_PRODUCER_CLOSE_FAILED", error: String(error) });
+      }
+      return result;
+    },
+  } as never);
+}
+
 function lifecycleCandidatesForBoundary(cwd: string, mode: "resume" | "rework" | undefined, error: unknown): unknown[] | undefined {
   if (!mode || !(error instanceof LifecycleError) || !["run_not_found", "run_selection_required", "run_terminal"].includes(error.code)) return undefined;
   try {
@@ -2567,12 +4052,58 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   const { z } = pi.zod;
   const emptyParameters = z.object({}) as never;
   const resolveCwd = options.resolveCwd ?? resolveCwdFromContext;
+  const stageBindingResolver = options.resolveStageHostBinding ?? stageBindingResolvers.get(pi as unknown as object);
+  const stageResultCommitter = stageResultCommitters.get(pi as unknown as object);
+  const nativeWorkerAuthority = nativeWorkerAuthorities.get(pi as unknown as object);
+  const existingRecoveryRuntime = stageRecoveryRuntimes.get(pi as unknown as object);
+  if (existingRecoveryRuntime && options.stageRecoveryHost) {
+    stageRecoveryRuntimes.set(pi as unknown as object, { ...existingRecoveryRuntime, host: options.stageRecoveryHost });
+  } else if (!existingRecoveryRuntime && options.getSessionController) {
+    const recoveryStoreFor = (ctx: unknown, cwd: string): AuthenticatedStageRecoveryStore | undefined => {
+      try {
+        const controller = options.getSessionController!(ctx, cwd);
+        if (!controller) return undefined;
+        return recoveryStoreForController(controller, cwd);
+      } catch {
+        return undefined;
+      }
+    };
+    stageRecoveryRuntimes.set(pi as unknown as object, {
+      storeFor: recoveryStoreFor,
+      host: options.stageRecoveryHost ?? createStageRecoveryHost(pi),
+      staleAdmissions: new WeakMap(),
+      automaticPending: new Set(),
+      automaticOpen: true,
+    });
+  }
   // Authoritative host session profile, captured once per session: the host
   // fires session_start only after the runner is initialized with the
   // runtime mode and the mode's UI context, so the handler observes the
   // final values.
   let hostSession: HostSessionProfile | null = null;
   let sessionController: WorkflowSessionController | null = null;
+  const ownerRecoveryRuntime = stageRecoveryRuntimes.get(pi as unknown as object);
+  if (ownerRecoveryRuntime && !ownerRecoveryRuntime.ownerStoreFor) {
+    ownerRecoveryRuntime.ownerStoreFor = (cwd, runId, authority) => {
+      const controller = sessionController;
+      if (!controller) return undefined;
+      try {
+        const context = controller.context();
+        if (!context.worktree || resolve(context.worktree) !== resolve(cwd)) return undefined;
+        if (authority === "cto") {
+          const claim = controller.activeCtoClaim();
+          if (!claim || claim.run_id !== runId) return undefined;
+          return createNativeStageRecoveryStore(cwd, { context, runId, claim_scope: claim });
+        }
+        return controller.selectedRunId() === runId
+          && controller.activeClaimRunId() === runId
+          ? createOrdinaryStageRecoveryStore(cwd, { context, runId })
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+  }
   let lifecycleRevoked = false;
   if (typeof (pi as { on?: unknown }).on === "function") {
     const resolveIncomingController = (profile: HostSessionProfile, ctx: unknown): WorkflowSessionController | null => {
@@ -2624,12 +4155,17 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         // session_start is not a replacement proof; wait for session_switch.
         return;
       }
+      const recoveryRuntime = stageRecoveryRuntimes.get(pi as unknown as object);
+      if (recoveryRuntime) recoveryRuntime.automaticOpen = true;
       const incomingController = resolveIncomingController(incoming, ctx);
       hostSession = incoming;
       sessionController = incomingController ?? (hostSession ? sessionController : null) ?? createLocalController(incoming);
       lifecycleRevoked = false;
+      if (incomingController && incoming.cwd && controllerHasActiveRecoveryOwner(incomingController)) {
+        scheduleAutomaticRecoveryScan(recoveryRuntime, ctx, incoming.cwd);
+      }
     });
-    pi.on("session_switch", (event: unknown, ctx: unknown) => {
+    pi.on("session_switch", async (event: unknown, ctx: unknown) => {
       const prior = hostSession;
       const incoming = trustedLifecycleHostProfileFromContext(ctx, prior ?? undefined);
       if (
@@ -2675,6 +4211,11 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       if (!oldCto) {
         try { oldOrdinaryClaim = oldController?.activeClaimRunId() !== undefined; } catch { return; }
       }
+      const recoveryRuntime = stageRecoveryRuntimes.get(pi as unknown as object);
+      if (recoveryRuntime) {
+        recoveryRuntime.automaticOpen = false;
+        await drainAutomaticRecovery(recoveryRuntime);
+      }
       if (oldCto || oldOrdinaryClaim) {
         try {
           if (oldCto && oldController) suspendCtoSession(oldController, "session-replacement");
@@ -2687,12 +4228,21 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       hostSession = incoming;
       sessionController = incomingController ?? createLocalController(incoming);
       lifecycleRevoked = false;
+      if (recoveryRuntime) recoveryRuntime.automaticOpen = true;
+      if (incomingController && incoming.cwd && controllerHasActiveRecoveryOwner(incomingController)) {
+        scheduleAutomaticRecoveryScan(recoveryRuntime, ctx, incoming.cwd);
+      }
     });
     // session_shutdown is a type-only disposal event; replacement uses session_switch.
-    pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
+    pi.on("session_shutdown", async (event: unknown, ctx: unknown) => {
       if (!sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_shutdown")) return;
       const incoming = trustedLifecycleHostProfileFromContext(ctx, hostSession ?? undefined);
       if (!incoming || !hostSession || !sameHostSessionIdentity(profileIdentity(hostSession), profileIdentity(incoming))) return;
+      const recoveryRuntime = stageRecoveryRuntimes.get(pi as unknown as object);
+      if (recoveryRuntime) {
+        recoveryRuntime.automaticOpen = false;
+        await drainAutomaticRecovery(recoveryRuntime);
+      }
       try {
         const cto = sessionController?.activeCtoClaim();
         if (cto && sessionController) suspendCtoSession(sessionController, "session-shutdown");
@@ -2795,6 +4345,80 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     sessionController = createWorkflowSessionController({ cwd, context: { session_id: sessionId, caller: "host", process_id: process.pid, worktree: cwd, branch, authority: "coordinator" } });
     return sessionController;
   };
+  const stageTargetFor = (ctx: unknown, cwd: string): { runId: string; authority: StageAuthority } | null => {
+    let controller: WorkflowSessionController | undefined;
+    try {
+      controller = options.getSessionController?.(ctx, cwd);
+    } catch {
+      controller = undefined;
+    }
+    let ctoRunId: string | undefined;
+    try {
+      ctoRunId = controller?.activeCtoClaim()?.run_id;
+    } catch {
+      ctoRunId = undefined;
+    }
+    const runId = ctoRunId
+      ?? (() => {
+        try {
+          return controller?.selectedRunId() ?? readRunControlNoRecovery(cwd).execution_claim?.run_id ?? undefined;
+        } catch {
+          return undefined;
+        }
+      })();
+    if (!runId) return null;
+    const authority: StageAuthority = ctoRunId || readCtoState(runId, cwd) ? "cto" : "ordinary";
+    return { runId, authority };
+  };
+  type AcceptedReplayCandidate = { readonly identity: WorkIdentity; readonly receipt: StageReceiptLedger };
+  const acceptedReplayProjection = (candidate: AcceptedReplayCandidate): StageResultSubmissionOutcome | undefined => {
+    const receipt = candidate.receipt;
+    if (
+      receipt.dispatch_id !== candidate.identity.dispatch_id
+      || receipt.attempt !== candidate.identity.attempt
+      || !receipt.binding
+      || typeof receipt.binding !== "object"
+      || Array.isArray(receipt.binding)
+    ) return undefined;
+    return {
+      ok: true,
+      receipt: receiptFromLedger(receipt.binding as StageProducerBinding, receipt),
+    };
+  };
+  const acceptedReplay = (
+    ctx: unknown,
+    cwd: string,
+    runId: string,
+    outputs: Record<string, unknown>,
+  ): StageResultSubmissionOutcome | undefined => {
+    const lineage = nativeAcceptedReplayLineage(ctx, cwd);
+    const root = nativeWorkerAuthority?.resolveRootAuthority(cwd, runId);
+    if (!lineage || !root || root.run_id !== runId || root.context.authority !== "coordinator") return undefined;
+    const rootContext: TrustedExecutionContext = { ...root.context, authority: "coordinator" };
+    if (
+      !rootContext.worktree
+      || resolve(rootContext.worktree) !== resolve(cwd)
+      || !rootContext.branch
+    ) return undefined;
+    if (root.authority === "ordinary") {
+      const candidate = findAcceptedOrdinaryStageReceipt({
+        cwd,
+        runId,
+        lineage,
+        root: { context: rootContext, outputs },
+      });
+      return candidate ? acceptedReplayProjection(candidate) : undefined;
+    }
+    const claim = root.claim_scope;
+    if (!claim || claim.run_id !== runId) return undefined;
+    const candidate = findNativeAcceptedStageReceipt({
+      cwd,
+      runId,
+      lineage,
+      root: { context: rootContext, claim_scope: claim, outputs },
+    });
+    return candidate ? acceptedReplayProjection(candidate) : undefined;
+  };
   const requireActiveClaimForMutation = (controller: WorkflowSessionController, expectedRunId?: string): WorkflowToolResult | null => {
     try {
       const selectedRunId = controller.selectedRunId();
@@ -2812,6 +4436,71 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       error: "a workflow run is selected but this session does not hold its active execution claim; call workflow_prepare to rebind",
     });
   };
+  const resolveProducerBinding: StageHostBindingResolver = (ctx, cwd, runId, authority) => {
+    const native = stageBindingResolver?.(ctx, cwd, runId, authority);
+    if (native) return native;
+    if (authority !== "ordinary" || contextError(ctx)) return undefined;
+    const controller = controllerFor(ctx, cwd);
+    if (requireActiveClaimForMutation(controller, runId)) return undefined;
+    return deriveMainStageHostBinding({ cwd, runId, context: controller.context() }) ?? undefined;
+  };
+  stageToolPublisherFactories.set(pi as unknown as object, (ctx, toolName, registrationId, invocationId) => {
+    const denied = () => ({
+      ok: false as const,
+      code: "producer_authority_denied",
+      error: "the registered callback does not own the current declared producer assignment",
+    });
+    const cwd = currentCwd(ctx);
+    const sessionId = sessionIdFromContext(ctx);
+    if (!cwd || !sessionId || !invocationId) return denied();
+    const target = stageTargetFor(ctx, cwd);
+    if (!target) return denied();
+    const callback = createTrustedToolCallback({
+      registration_id: registrationId,
+      invocation_id: invocationId,
+      host_session_id: sessionId,
+    });
+    const resolveCallbackBinding = (): StageHostBinding | undefined => {
+      const currentTarget = stageTargetFor(ctx, cwd);
+      if (!currentTarget || currentTarget.runId !== target.runId || currentTarget.authority !== target.authority) return undefined;
+      if (target.authority === "cto") {
+        return stageToolBindingResolvers.get(pi as unknown as object)?.(ctx, cwd, target.runId, toolName, callback);
+      }
+      if (contextError(ctx)) return undefined;
+      const controller = controllerFor(ctx, cwd);
+      if (requireActiveClaimForMutation(controller, target.runId)) return undefined;
+      return deriveMainStageHostBinding({
+        cwd,
+        runId: target.runId,
+        context: controller.context(),
+        toolName,
+        callback,
+      }) ?? undefined;
+    };
+    const captured = resolveCallbackBinding();
+    if (!captured) return denied();
+    let active = true;
+    const bindingResolver: StageHostBindingResolver = () => {
+      if (!active) return undefined;
+      const current = resolveCallbackBinding();
+      return current && isDeepStrictEqual(current.binding, captured.binding) ? captured : undefined;
+    };
+    return {
+      ok: true,
+      publish: (outputs) => {
+        if (!active) return denied();
+        return submitStageResult({
+          cwd,
+          runId: target.runId,
+          authority: target.authority,
+          context: ctx,
+          bindingResolver,
+          ...(stageResultCommitter ? { ctoCommitter: stageResultCommitter } : {}),
+        }, { outputs });
+      },
+      close: () => { active = false; },
+    };
+  });
   pi.registerTool({
     name: "cto_state",
     label: "Read or commit CTO state",
@@ -2869,6 +4558,144 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         });
       } catch (error) {
         return lifecycleFailure("CTO_STATE_REJECTED", error);
+      }
+    },
+  });
+  pi.registerTool({
+    name: "cto_stage_advance",
+    label: "Advance native CTO stage",
+    description: "Advance the current native CTO stage for one exact slice after canonical readiness. The host derives the active claim, current team, cursor, outputs, and approval; model input supplies only slice_id.",
+    parameters: z.object({ slice_id: z.string().min(1) }).strict() as never,
+    async execute(id, params, _signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = currentCwd(ctx);
+      if (!cwd) return toolResult({ ok: false, code: "CTO_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      try {
+        const controller = controllerFor(ctx, cwd);
+        const claim = controller.activeCtoClaim();
+        if (!claim) return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "the session does not own an active CTO run" });
+        const context = controller.context();
+        const input = params as { slice_id: string };
+        const result: NativeStageMutationResult = advanceNativeStageForCoordinator({
+          cwd,
+          runId: claim.run_id,
+          sliceId: input.slice_id,
+          coordinator_session_id: context.session_id,
+          ownership_epoch: claim.ownership_epoch,
+          ...(context.process_id === undefined ? {} : { coordinator_process_id: context.process_id }),
+          operation_id: nativeStageOperationIdFromSdkCall(id),
+        });
+        return result.ok
+          ? toolResult({ ok: true, transition: "cto_stage_advance", run_id: claim.run_id, slice_id: input.slice_id, progress: result.progress })
+          : toolResult(result);
+      } catch (error) {
+        return toolResult({ ok: false, code: "CTO_STAGE_ADVANCE_FAILED", error: String(error) });
+      }
+    },
+  });
+  pi.registerTool({
+    name: "cto_checkpoint_ask",
+    label: "Ask for native CTO checkpoint approval",
+    description: "Ask the human for the current profile-declared checkpoint of an assigned CTO slice. The host derives the active CTO run, ownership, stage, result version, and allowed decisions; model input cannot supply an approval.",
+    parameters: z.object({ slice_id: z.string().min(1) }).strict() as never,
+    async execute(_id, params, signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      const cwd = currentCwd(ctx);
+      if (!cwd) return toolResult({ ok: false, code: "CTO_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const aborted = () => toolResult({ ok: false, code: "CTO_CHECKPOINT_ASK_ABORTED", error: "the native checkpoint question was canceled; no approval was recorded" });
+      if (signal?.aborted) return aborted();
+      try {
+        const controller = controllerFor(ctx, cwd);
+        const claim = controller.activeCtoClaim();
+        if (!claim) return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "the session does not own an active CTO run" });
+        const state = readCtoState(claim.run_id, cwd);
+        const { slice_id: sliceId } = params as { slice_id: string };
+        const teams = state?.teams.filter((team) => team.slice_id === sliceId) ?? [];
+        if (teams.length !== 1) return toolResult({ ok: false, code: "CTO_SLICE_REJECTED", error: "the requested slice does not identify one current native team" });
+        const teamId = teams[0]!.id;
+        const context = controller.context();
+        const authority = {
+          run_id: claim.run_id,
+          coordinator_session_id: context.session_id,
+          coordinator_process_id: context.process_id,
+          ownership_epoch: claim.ownership_epoch,
+          team_id: teamId,
+        };
+        const checked = preflightNativeStageCheckpoint(cwd, claim.run_id, teamId, authority);
+        if (!checked.ok) return toolResult(checked);
+        const preflight = checked.preflight;
+        if (preflight.current_approval) {
+          return toolResult({ ok: true, transition: "cto_checkpoint_answer", already_recorded: true, approval: preflight.current_approval });
+        }
+        if (preflight.default === "autonomous_allowed" && preflight.allowed_decisions.includes("proceed")) {
+          if (signal?.aborted) return aborted();
+          const contextDenied = contextError(ctx);
+          if (contextDenied) return contextDenied;
+          const currentClaim = controller.activeCtoClaim();
+          if (!currentClaim || currentClaim.run_id !== claim.run_id || currentClaim.ownership_epoch !== claim.ownership_epoch) {
+            return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "CTO ownership changed before policy-auto checkpoint authorization" });
+          }
+          const decision = "proceed" as const;
+          const committed = commitNativeStageCheckpoint({
+            cwd,
+            runId: claim.run_id,
+            teamId,
+            authority,
+            witness: preflight,
+            expected_revision: preflight.revision,
+            approval_id: randomUUID(),
+            decision,
+            source: "policy-auto",
+          });
+          return committed.ok
+            ? toolResult({ ok: true, transition: "cto_checkpoint_answer", approval: committed.approval })
+            : toolResult(committed);
+        }
+        const toolContext = ctx as unknown as { hasUI?: boolean; ui?: HostAskSurface };
+        const surface = toolContext.hasUI === true && toolContext.ui
+          ? toolContext.ui
+          : trustedInteractiveProfile()?.ui as HostAskSurface | undefined;
+        const answer = await askHostDecision(surface, {
+          id: `cto-checkpoint:${preflight.checkpoint}:${preflight.identity_scope.capability_epoch}`,
+          question: `Authorize native CTO checkpoint '${preflight.checkpoint}' for slice '${sliceId}', stage '${preflight.stage_id}', iteration ${preflight.iteration}. This decision applies only to the current result and profile scope.`,
+          header: `${claim.run_id}/${sliceId}/${preflight.stage_id}`,
+          title: `Authorize CTO checkpoint '${preflight.checkpoint}'`,
+          allowed: [...preflight.allowed_decisions],
+          signal,
+        });
+        if (!answer.ok) {
+          if (answer.kind === "aborted") return aborted();
+          return toolResult({
+            ok: false,
+            code: answer.kind === "unavailable" ? "CTO_CHECKPOINT_ASK_UNAVAILABLE" : "CTO_CHECKPOINT_DECLINED",
+            error: answer.error,
+          });
+        }
+        if (signal?.aborted) return aborted();
+        const contextDenied = contextError(ctx);
+        if (contextDenied) return contextDenied;
+        const currentClaim = controller.activeCtoClaim();
+        if (!currentClaim || currentClaim.run_id !== claim.run_id || currentClaim.ownership_epoch !== claim.ownership_epoch) {
+          return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "CTO ownership changed while awaiting the human decision" });
+        }
+        const committed = commitNativeStageCheckpoint({
+          cwd,
+          runId: claim.run_id,
+          teamId,
+          authority,
+          witness: preflight,
+          expected_revision: preflight.revision,
+          approval_id: randomUUID(),
+          decision: answer.selected,
+          source: "human",
+        });
+        return committed.ok
+          ? toolResult({ ok: true, transition: "cto_checkpoint_answer", approval: committed.approval })
+          : toolResult(committed);
+      } catch (error) {
+        return lifecycleFailure("CTO_CHECKPOINT_ASK_FAILED", error);
       }
     },
   });
@@ -2987,6 +4814,9 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
           request_id: typeof _id === "string" && _id.length > 0 ? _id : undefined,
         });
         if (commandIntent) controller.commitCommandIntent(commandIntent.intent_id);
+        if (controllerHasActiveRecoveryOwner(controller)) {
+          scheduleAutomaticRecoveryScan(stageRecoveryRuntimes.get(pi as unknown as object), ctx, cwd);
+        }
         return toolResult({
           ok: true,
           transition: prepared.transition,
@@ -3041,10 +4871,337 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         const trustedMapping = handoff === undefined ? undefined : handoff as unknown as AgentMappingState;
         const transition = beginCapability(cwd, input.selection, { ...(trustedMapping !== undefined ? { trustedMapping } : {}), runId });
         if (!transition.ok) return toolResult({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? workflowStateSummary(cwd, options.mappingSummary, runId) : undefined });
-        return toolResult({ ok: true, transition: "begin", handoff: transition.handoff, state: workflowStateSummary(cwd, options.mappingSummary, runId) });
+        const state = workflowStateSummary(cwd, options.mappingSummary, runId);
+        const workflow = transition.state.classification?.workflow;
+        const profile = workflow ? loadProfile(workflow) : undefined;
+        const declaredDocument = profile?.stages.find((stage) => stage.id === "product_prd_document");
+        if (transition.state.stage_cursor === "product_prd_document" && declaredDocument?.type === "document" && declaredDocument.document?.renderer === "product-prd") {
+          const rendered = await publishDeclaredDocumentStage({ cwd, runId, context: controller.context() });
+          if (!rendered.ok) {
+            return toolResult({
+              ok: false,
+              code: rendered.code,
+              error: rendered.error,
+              transition: "begin",
+              handoff: transition.handoff,
+              renderer: rendered,
+              state,
+            });
+          }
+          return toolResult({ ok: true, transition: "begin", handoff: transition.handoff, renderer: rendered, state });
+        }
+        return toolResult({ ok: true, transition: "begin", handoff: transition.handoff, state });
       } catch (error) {
         return toolResult({ ok: false, code: "WORKFLOW_BEGIN_FAILED", error: String(error) });
       }
+    },
+  });
+  const persistProducerFormatFailure = (
+    failure: StageResultValidationFailure,
+    ctx: unknown,
+    cwd: string,
+  ): { ok: true } | { ok: false; code: string } => {
+    const runtime = stageRecoveryRuntimes.get(pi as unknown as object);
+    let store = runtime?.storeFor(ctx, cwd);
+    let recoveryContext = ctx;
+    if (!store && sessionController) {
+      try {
+        const ownerContext = sessionController.context();
+        const ownerCto = sessionController.activeCtoClaim();
+        if (failure.authority === "cto") {
+          if (ownerCto?.run_id === failure.run_id) {
+            store = createNativeStageRecoveryStore(cwd, { context: ownerContext, runId: failure.run_id, claim_scope: ownerCto });
+            recoveryContext = ownerContext;
+          }
+        } else {
+          const ownerRun = sessionController.selectedRunId();
+          if (ownerRun === failure.run_id && sessionController.activeClaimRunId() === ownerRun) {
+            store = createOrdinaryStageRecoveryStore(cwd, { context: ownerContext, runId: failure.run_id });
+            recoveryContext = ownerContext;
+          }
+        }
+      } catch {
+        store = undefined;
+      }
+    }
+    if (!store) return { ok: false, code: "recovery_context_unavailable" };
+    try {
+      const selection = store.selection();
+      if (selection.run_id !== failure.run_id || selection.authority !== failure.authority) {
+        return { ok: false, code: "recovery_authority_denied" };
+      }
+      const read = store.read({
+        run_id: failure.run_id,
+        authority: failure.authority,
+        selection,
+        identity: failure.binding.identity,
+      });
+      if (typeof (read as { then?: unknown }).then === "function") {
+        return { ok: false, code: "recovery_context_unavailable" };
+      }
+      const snapshot = read as StageRecoverySnapshot;
+      if (!snapshot.identity || !isDeepStrictEqual(snapshot.identity, failure.binding.identity)) {
+        return { ok: false, code: "recovery_identity_unavailable" };
+      }
+      const recorded = store.recordFormatValidation({
+        run_id: failure.run_id,
+        authority: failure.authority,
+        expected_revision: snapshot.revision,
+        selection,
+        identity: failure.binding.identity,
+        state_proof: snapshot.state_proof,
+        producer: failure.binding,
+        error_context: {
+          class: "format_validation",
+          code: failure.code,
+          message: failure.error,
+          field_errors: failure.field_errors,
+          source: "canonical",
+        },
+      } satisfies StageRecoveryFormatValidationInput);
+      if (recorded.ok && snapshot.terminal) {
+        scheduleAutomaticRecovery(runtime, {
+          kind: "terminal",
+          run_id: failure.run_id,
+          authority: failure.authority,
+          cwd,
+          ctx: recoveryContext,
+          dispatch_id: snapshot.terminal.dispatch_id,
+          outcome: snapshot.terminal.outcome,
+        });
+      }
+      return recorded.ok ? { ok: true } : { ok: false, code: recorded.code };
+    } catch {
+      return { ok: false, code: "recovery_context_unavailable" };
+    }
+  };
+  pi.registerTool({
+    name: "workflow_submit_result",
+    label: "Submit assigned stage result",
+    description: "Submit logical artifact outputs for your current profile-declared worker or coordinator assignment. Producer identity, stage scope, artifact paths, and authority come from authenticated runtime context; input is exactly { outputs }. Tool-owned outputs can be published only by their registered callback.",
+    parameters: z.object({
+      outputs: z.record(z.string(), z.unknown()),
+    }).strict() as never,
+    async execute(_id, params, _signal, _update, ctx) {
+      const cwd = currentCwd(ctx);
+      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+      const target = stageTargetFor(ctx, cwd);
+      if (!target) return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "no canonical workflow or CTO run is available for this producer context" });
+      const result = submitStageResult({
+        cwd,
+        runId: target.runId,
+        authority: target.authority,
+        context: ctx,
+        bindingResolver: resolveProducerBinding,
+        acceptedReplay,
+        ...(stageResultCommitter ? { ctoCommitter: stageResultCommitter } : {}),
+        onValidationFailure: (failure) => persistProducerFormatFailure(failure, ctx, cwd),
+      }, params);
+      return result.ok
+        ? toolResult({ ok: true, receipt: result.receipt })
+        : toolResult({ ok: false, code: result.code, error: result.error, ...(result.field_errors ? { field_errors: result.field_errors } : {}) });
+    },
+  });
+  const executeRecovery = async (
+    toolCallId: string,
+    input: WorkflowRecoveryToolInput,
+    signal: AbortSignal | undefined,
+    ctx: unknown,
+  ): Promise<WorkflowToolResult> => {
+    const cwd = currentCwd(ctx);
+    if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
+    const runtime = stageRecoveryRuntimes.get(pi as unknown as object);
+    if (!runtime) return toolResult({ ok: false, code: "STAGE_HOST_UNSUPPORTED", error: "the registered host does not expose recovery ownership and continuation" });
+    // Resolve the owner-scoped store before any journal recovery. This is the
+    // existing authenticated host/session and active-claim boundary; a random
+    // context must not be able to roll a workspace journal forward.
+    const authorizedStore = runtime.storeFor(ctx, cwd);
+    if (!authorizedStore) return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "the session does not own an authenticated ordinary or native recovery target" });
+    try {
+      // Recovery reads use the no-recovery store APIs so a torn lifecycle
+      // publication cannot be mistaken for canonical owner state. Repair
+      // journals under the workspace lock, then resolve the owner-scoped
+      // store again against the repaired generation. The transaction helper
+      // preserves the active CTO claim; it only repairs durable publication
+      // files after the host/session authority check above.
+      withWorkspaceTransaction(cwd, () => undefined, { createIfMissing: false });
+    } catch {
+      return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_STATE_UNAVAILABLE", error: "the canonical lifecycle journal could not be recovered safely" });
+    }
+    const store = authorizedStore;
+    let selection: TrustedRecoverySelection;
+    let snapshot: StageRecoverySnapshot;
+    try {
+      selection = store.selection();
+      snapshot = await store.read({ run_id: selection.run_id, authority: selection.authority, selection });
+    } catch {
+      return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_STATE_UNAVAILABLE", error: "the canonical recovery owner could not be read safely" });
+    }
+    if (input.intent === "refresh_handoff") {
+      const stale = ctx !== null && (typeof ctx === "object" || typeof ctx === "function")
+        ? runtime.staleAdmissions.get(ctx as object)
+        : undefined;
+      let current;
+      try {
+        current = store.readCurrentHandoff({ run_id: selection.run_id, selection });
+      } catch {
+        return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_STATE_UNAVAILABLE", error: "the canonical recovery owner could not expose a handoff safely" });
+      }
+      if (!current.ok) {
+        return toolResult({
+          ok: true,
+          recovery: {
+            operation_id: toolCallId,
+            code: current.code,
+            worker: "unknown",
+            action: "wait",
+            attempts_remaining: 0,
+            state_revision: current.revision ?? snapshot.revision,
+            blocking_condition: current.begin_required
+              ? "the current canonical stage requires workflow_begin before a trusted handoff exists"
+              : "the current owner could not expose a trusted handoff",
+            next_action: current.begin_required ? "begin the current canonical stage before dispatch" : "reread the current owner-scoped stage handoff",
+          },
+          capabilities: runtime.host.capabilities,
+        });
+      }
+      if (ctx !== null && (typeof ctx === "object" || typeof ctx === "function")) runtime.staleAdmissions.delete(ctx as object);
+      const worker = snapshot.lifecycle === "pending" || snapshot.lifecycle === "not_started"
+        ? "not_started" as const
+        : snapshot.lifecycle === "running"
+          ? "running" as const
+          : snapshot.lifecycle === "disconnected"
+            ? "disconnected" as const
+            : snapshot.lifecycle === "terminal"
+              ? "terminal" as const
+              : "unknown" as const;
+      return toolResult({
+        ok: true,
+        recovery: {
+          operation_id: toolCallId,
+          code: "handoff_refreshed",
+          worker,
+          action: "refresh_handoff",
+          attempts_remaining: 0,
+          state_revision: current.revision,
+          state_proof: current.handoff.proof,
+          handoff: current.handoff,
+          blocking_condition: stale?.run_id === selection.run_id && stale.authority === selection.authority
+            ? "the stale caller was rejected before admission"
+            : "the current owner handoff was read without dispatching a worker",
+          next_action: "admit the returned current handoff through the normal workflow task route",
+        },
+        capabilities: runtime.host.capabilities,
+      });
+    }
+    const request: StageRecoveryRequest = {
+      run_id: selection.run_id,
+      authority: selection.authority,
+      operation: input.operation,
+      operation_id: toolCallId,
+      ...(input.intent ? { intent: input.intent } : {}),
+      ...(snapshot.identity ? { identity: snapshot.identity } : {}),
+      expected_revision: snapshot.revision,
+      selection,
+    };
+    const execute = async (currentRequest: StageRecoveryRequest): Promise<StageRecoveryResult> => {
+      const options: StageRecoveryExecutionOptions = { request: currentRequest, store, host: runtime.host };
+      return recoverStageExecution(options);
+    };
+    let recovery = await execute(request);
+    if (recovery.code !== "recovery_grant_required" || !snapshot.identity) {
+      return toolResult({ ok: true, recovery, capabilities: runtime.host.capabilities });
+    }
+    const errorClass: RecoveryErrorClass = snapshot.error_context?.class === "format_validation"
+      ? "format_validation"
+      : snapshot.preflight
+        ? "preflight_not_started"
+        : snapshot.terminal?.outcome === "cancelled"
+          ? "cancelled"
+          : "terminal_failure";
+    let profile = trustedInteractiveProfile();
+    if (!profile) profile = trustedInteractiveHostProfileFromContext(ctx);
+    const surface = profile?.hasUI && profile.ui && typeof profile.ui === "object"
+      ? profile.ui as HostAskSurface
+      : undefined;
+    let answer: HostDecisionResult;
+    try {
+      answer = await askHostDecision(surface, {
+        id: "omp-recovery-grant",
+        question: "Authorize one bounded recovery retry after the persisted budget is exhausted?",
+        header: "Recovery authorization",
+        title: "Authorize one bounded recovery retry?",
+        allowed: ["authorize_one_retry", "do_not_retry"],
+        signal,
+      });
+    } catch (error) {
+      return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_GRANT_FAILED", error: String(error) });
+    }
+    if (!answer.ok) {
+      const decision = "kind" in answer ? answer.kind : "declined";
+      const error = "error" in answer ? answer.error : "the host decision was declined";
+      return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_GRANT_REJECTED", error, decision });
+    }
+    if (answer.selected !== "authorize_one_retry") return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_GRANT_REJECTED", error: "the host declined the bounded recovery grant" });
+    let grantProof: Parameters<AuthenticatedStageRecoveryStore["commitGrant"]>[0]["proof"];
+    try {
+      grantProof = store.captureGrantAuthorization({
+        expected_revision: snapshot.revision,
+        selection,
+        identity: snapshot.identity,
+      });
+    } catch (error) {
+      return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_GRANT_REJECTED", error: String(error) });
+    }
+    const grant = store.commitGrant({
+      proof: grantProof,
+      expected_revision: snapshot.revision,
+      selection,
+      grant_id: `omp-recovery-grant:${toolCallId}`,
+      error_class: errorClass,
+      identity: snapshot.identity,
+      limit: 1,
+      reason: "One bounded recovery retry authorized after persisted exhaustion.",
+      authorizer: selection.owner_id,
+    });
+    if ("code" in grant) return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_GRANT_REJECTED", error: grant.code, revision: grant.revision });
+    let afterSelection: TrustedRecoverySelection;
+    let afterSnapshot: StageRecoverySnapshot;
+    try {
+      afterSelection = store.selection();
+      afterSnapshot = await store.read({
+        run_id: afterSelection.run_id,
+        authority: afterSelection.authority,
+        selection: afterSelection,
+        identity: snapshot.identity,
+      });
+    } catch (error) {
+      return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_GRANT_REJECTED", error: String(error) });
+    }
+    if (!afterSnapshot.identity || !isDeepStrictEqual(afterSnapshot.identity, snapshot.identity)) {
+      return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_GRANT_REJECTED", error: "recovery assignment changed while the grant was being committed" });
+    }
+    recovery = await execute({
+      ...request,
+      expected_revision: afterSnapshot.revision,
+      selection: afterSelection,
+      grant: grant.grant,
+      identity: afterSnapshot.identity,
+    });
+    return toolResult({ ok: true, recovery, capabilities: runtime.host.capabilities });
+  };
+  pi.registerTool({
+    name: "workflow_recover",
+    label: "Recover assigned stage",
+    description: "Diagnose or reconcile trusted host stage state through the owner-locked recovery ledger. The host derives the exact run, identity, retry scope, and any bounded grant; unsupported OMP operations return typed results.",
+    parameters: z.object({
+      operation: z.enum(["diagnose", "reconcile"]),
+      intent: z.enum(["observe", "reconnect", "resume", "replace", "retry", "clarify", "cancel", "cancel_ack", "refresh_handoff", "repair_format"]).optional(),
+    }).strict() as never,
+    async execute(id, params, signal, _update, ctx) {
+      const denied = contextError(ctx);
+      if (denied) return denied;
+      return executeRecovery(id, params as WorkflowRecoveryToolInput, signal, ctx);
     },
   });
   const selectorParameters = z.object({
@@ -3091,46 +5248,6 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         return toolResult(resolveWorkflowContract(cwd, { runId, branch: resolveActiveBranch(cwd) }));
       } catch (error) {
         return lifecycleFailure("WORKFLOW_RESOLUTION_FAILED", error, lifecycleCandidatesForBoundary(cwd, "rework", error));
-      }
-    },
-  });
-  pi.registerTool({
-    name: "workflow_complete",
-    label: "Complete workflow dispatch",
-    description: "Record durable completion for an authorized workflow dispatch. Use only the newest explicit `workflow_begin` handoff's `dispatch_token` as `token`; never use its `advance_token` or any pre-begin, auto-advance, or older-begin token. Copy `capability_id`, `run_key`, `branch`, `workflow`, `profile_hash`, `stage_cursor`, `cursor_epoch`, and `loop_iteration` from that handoff exactly (`profile_hash` is the compact fingerprint); do not abbreviate, reconstruct, disclose, or retry with another token.",
-    parameters: z.object({
-      dispatch_id: z.string().min(1),
-      token: z.string().min(1),
-      capability_id: z.string().min(1),
-      run_key: z.string().min(1),
-      branch: z.string().min(1),
-      workflow: z.string().min(1),
-      profile_hash: z.string().min(1),
-      stage_cursor: z.string().min(1),
-      cursor_epoch: z.string().min(1),
-      loop_iteration: z.number().int().min(1),
-      evidence: z.string().min(1),
-      artifact_ids: z.array(z.string().min(1)).default(() => []),
-      outcome: z.enum(["succeeded", "failed", "cancelled"]).default("succeeded"),
-    }) as never,
-    async execute(_id, params, _signal, _update, ctx) {
-      const denied = contextError(ctx);
-      if (denied) return denied;
-      const cwd = currentCwd(ctx);
-      if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
-      const input = params as DispatchAuth & { dispatch_id: string; evidence: string; artifact_ids?: string[]; outcome: "succeeded" | "failed" | "cancelled" };
-      try {
-        const controller = controllerFor(ctx, cwd);
-        const claimDenied = requireActiveClaimForMutation(controller);
-        if (claimDenied) return claimDenied;
-        const runId = controller.selectedRunId();
-        if (!runId) return toolResult({ ok: false, code: "no_active_run", error: "no canonical workflow run is selected for this trusted session" });
-        const transition = completeDispatch(cwd, { ...input, completed_by: "workflow_complete" }, { runId });
-        return transition.ok
-          ? toolResult({ ok: true, transition: "complete", dispatch_id: input.dispatch_id, state: transition.state, record: transition.record })
-          : toolResult({ ok: false, code: "WORKFLOW_COMPLETE_REJECTED", error: transition.error, dispatch_id: input.dispatch_id });
-      } catch (error) {
-        return toolResult({ ok: false, code: "WORKFLOW_COMPLETE_FAILED", error: String(error), dispatch_id: input.dispatch_id });
       }
     },
   });
@@ -3273,149 +5390,126 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
             state: workflowStateSummary(cwd, options.mappingSummary, selectedRunId),
           });
         }
-        // Privileged ingest boundary: the answer may come only from a real
-        // host UI surface — never from anything model-supplied. The
-        // installed host wires the prompt capability through two
-        // host-authored carriers: the per-call tool context (wired with
-        // hasUI=true by the interactive TUI and by `--mode rpc-ui`) and the
-        // session_start host profile (`--mode rpc` deliberately leaves the
-        // tool-call context UI-less while the session context carries the
-        // connected RPC client's live select bridge). Trusted interactive
-        // session ownership is re-checked here, so json/print/headless
-        // contexts and Task subagent/worker sessions fail closed before any
-        // dialog is raised.
-        const toolCtx = ctx as unknown as { hasUI?: boolean; ui?: HostAskSurface };
-        const toolSurface = toolCtx.hasUI === true && toolCtx.ui ? toolCtx.ui : undefined;
-        const profileSurface = trustedInteractiveProfile();
-        const surface: HostAskSurface | undefined = toolSurface ?? (profileSurface?.ui as HostAskSurface | undefined);
-        const askDialog = typeof surface?.askDialog === "function" ? surface.askDialog.bind(surface) : null;
-        const select = typeof surface?.select === "function" ? surface.select.bind(surface) : null;
-        if (!askDialog && !select) {
-          return toolResult({
-            ok: false,
-            code: "WORKFLOW_CHECKPOINT_ASK_UNAVAILABLE",
-            error: `checkpoint '${input.checkpoint}' requires an interactive terminal answer and no UI surface is available in this session; rerun in an interactive session (escalation channels expose no workflow-checkpoint ingest)`,
+        // A live answer may have been minted by an earlier host turn before
+        // this ask was retried. Verify every durable scope field (including the
+        // current work-identity binding) before reusing it; a stale or forged
+        // candidate must never be handed to the commit path as a decision,
+        // because that path is allowed to mint a fresh answer.
+        const currentCapability = preflight.context.state.dispatch_capability;
+        const liveCandidate = (preflight.context.state.trusted_checkpoint_answers ?? []).find((candidate) =>
+          candidate.consumed_at === undefined
+          && candidate.consumed_reason === undefined
+          && candidate.channel === "terminal"
+          && candidate.run_id === selectedRunId
+          && candidate.stage_id === stage.id
+          && candidate.checkpoint_id === input.checkpoint
+          && allowed.includes(candidate.decision)
+          && candidate.capability_id === currentCapability?.capability_id
+          && candidate.capability_epoch === currentCapability?.issued_for?.cursor_epoch
+          && candidate.loop_iteration === currentCapability?.issued_for?.loop_iteration
+        );
+        let replayAnswer: typeof liveCandidate;
+        if (liveCandidate) {
+          try {
+            const verified = recordTrustedCheckpointAnswer(preflight.context.state, {
+              answer_id: liveCandidate.answer_id,
+              channel: liveCandidate.channel,
+              reference: liveCandidate.reference,
+              stage_id: liveCandidate.stage_id,
+              checkpoint_id: liveCandidate.checkpoint_id,
+              decision: liveCandidate.decision,
+            });
+            if (verified.answer.answer_id === liveCandidate.answer_id) replayAnswer = verified.answer;
+          } catch {
+            // A malformed, stale, or forged live record is never replayed.
+          }
+        }
+        let committed: CheckpointAnswerCommitResult;
+        if (replayAnswer) {
+          if (signal?.aborted) return abortedResult();
+          const claimBeforeReplay = requireActiveClaimForMutation(controller, selectedRunId);
+          if (claimBeforeReplay) return claimBeforeReplay;
+          committed = commitCheckpointAnswer(cwd, {
+            run_id: selectedRunId,
+            token: input.token,
+            capability_id: input.capability_id,
+            run_key: input.run_key,
+            branch: input.branch,
+            workflow: input.workflow,
+            stage_cursor: input.stage_cursor,
+            cursor_epoch: input.cursor_epoch,
+            checkpoint: input.checkpoint,
+            checkpoint_id: input.checkpoint_id,
+            checkpoint_kind: input.checkpoint_kind,
+            loop_iteration: input.loop_iteration,
+            decision: replayAnswer.decision,
+          });
+        } else {
+          // Privileged ingest boundary: the answer may come only from a real
+          // host UI surface — never from anything model-supplied. The
+          // installed host wires the prompt capability through two
+          // host-authored carriers: the per-call tool context (wired with
+          // hasUI=true by the interactive TUI and by `--mode rpc-ui`) and the
+          // session_start host profile (`--mode rpc` deliberately leaves the
+          // tool-call context UI-less while the session context carries the
+          // connected RPC client's live select bridge). Trusted interactive
+          // session ownership is re-checked here, so json/print/headless
+          // contexts and Task subagent/worker sessions fail closed before any
+          // dialog is raised.
+          const toolCtx = ctx as unknown as { hasUI?: boolean; ui?: HostAskSurface };
+          const toolSurface = toolCtx.hasUI === true && toolCtx.ui ? toolCtx.ui : undefined;
+          const profileSurface = trustedInteractiveProfile();
+          const surface: HostAskSurface | undefined = toolSurface ?? (profileSurface?.ui as HostAskSurface | undefined);
+          const dialogQuestion = [
+            `Human authorization required — checkpoint '${input.checkpoint}' (${rule.kind}) at stage '${stage.id}' of workflow '${input.workflow}'.`,
+            ...(input.question ? [`Orchestrator context: ${input.question}`] : []),
+            "Select exactly one policy-allowed decision. Esc, timeout, or a custom answer records nothing.",
+          ].join("\n");
+          const answer = await askHostDecision(surface, {
+            id: `checkpoint:${input.checkpoint}`,
+            question: dialogQuestion,
+            header: `${input.workflow}/${stage.id}`,
+            title: `Authorize checkpoint '${input.checkpoint}' (${rule.kind}) — stage '${stage.id}'`,
+            allowed,
+            signal,
+          });
+          if (!answer.ok) {
+            if (answer.kind === "aborted") return abortedResult();
+            return toolResult({
+              ok: false,
+              code: answer.kind === "unavailable" ? "WORKFLOW_CHECKPOINT_ASK_UNAVAILABLE" : "WORKFLOW_CHECKPOINT_DECLINED",
+              error: answer.error,
+            });
+          }
+          const selected = answer.selected;
+          // Last cancellation gate before the durable commit: the engine commit
+          // below is fully synchronous (no await between the gate and the
+          // ledger write), so a canceled call can never reach the ledger past
+          // this point.
+          if (signal?.aborted) return abortedResult();
+          const claimBeforeCommit = requireActiveClaimForMutation(controller, selectedRunId);
+          if (claimBeforeCommit) return claimBeforeCommit;
+          // One engine-owned durable commit: commitCheckpointAnswer re-runs the
+          // full state<->capability<->profile<->policy validation against the
+          // freshly persisted state, resolves recorded/live-answer races, and
+          // either supersedes stale live proofs and mints one engine-UUID
+          // answer or reuses the exact live proof — always in one commit.
+          committed = commitCheckpointAnswer(cwd, {
+            run_id: selectedRunId,
+            token: input.token,
+            capability_id: input.capability_id,
+            run_key: input.run_key,
+            branch: input.branch,
+            workflow: input.workflow,
+            stage_cursor: input.stage_cursor,
+            cursor_epoch: input.cursor_epoch,
+            checkpoint: input.checkpoint,
+            checkpoint_id: input.checkpoint_id,
+            checkpoint_kind: input.checkpoint_kind,
+            loop_iteration: input.loop_iteration,
+            decision: selected,
           });
         }
-        const dialogQuestion = [
-          `Human authorization required — checkpoint '${input.checkpoint}' (${rule.kind}) at stage '${stage.id}' of workflow '${input.workflow}'.`,
-          ...(input.question ? [`Orchestrator context: ${input.question}`] : []),
-          "Select exactly one policy-allowed decision. Esc, timeout, or a custom answer records nothing.",
-        ].join("\n");
-        const questionId = `checkpoint:${input.checkpoint}`;
-        const declined = (error: string) => toolResult({ ok: false, code: "WORKFLOW_CHECKPOINT_DECLINED", error });
-        let selected: string | undefined;
-        try {
-          if (askDialog) {
-            const result = await askDialog(
-              [{
-                id: questionId,
-                question: dialogQuestion,
-                header: `${input.workflow}/${stage.id}`,
-                options: allowed.map((label) => ({ label })),
-                multi: false,
-              }],
-              { signal },
-            );
-            if (signal?.aborted) return abortedResult();
-            if (!result) return declined("no human answer was recorded (dialog declined); the checkpoint remains unresolved");
-            if (result.kind !== "submit") {
-              return declined("the dialog redirected to chat; a chat redirect never authorizes a policy-bound checkpoint");
-            }
-            // Strict installed-host result contract: exactly one answer item
-            // echoing the exact question asked (id, text, options), strict
-            // single-select, exactly one string selection, no timeout, no
-            // custom text, and no metadata outside the installed host's
-            // declared ExtensionAskDialogResultItem fields. Anything else is
-            // a malformed host result and records nothing.
-            const results = Array.isArray(result.results) ? result.results : [];
-            if (results.length !== 1) {
-              return declined(`malformed ask result: expected exactly one answer item, received ${results.length}`);
-            }
-            const item = results[0];
-            if (!item || typeof item !== "object" || Array.isArray(item)) {
-              return declined("malformed ask result: the answer item is not an object");
-            }
-            const knownKeys: Record<string, true> = { id: true, question: true, options: true, multi: true, selectedOptions: true, customInput: true, note: true, timedOut: true };
-            const unknownKeys = Object.keys(item).filter((key) => knownKeys[key] !== true);
-            if (unknownKeys.length > 0) {
-              return declined(`malformed ask result: unknown answer metadata (${unknownKeys.join(", ")})`);
-            }
-            if (typeof item.id !== "string" || item.id !== questionId) {
-              return declined("malformed ask result: the answer does not identify the checkpoint question");
-            }
-            if (typeof item.question !== "string" || item.question !== dialogQuestion) {
-              return declined("malformed ask result: the answer does not echo the checkpoint question");
-            }
-            if (!Array.isArray(item.options) || item.options.length !== allowed.length || item.options.some((option, index) => typeof option !== "string" || option !== allowed[index])) {
-              return declined("malformed ask result: the answer does not echo the policy-allowed options");
-            }
-            if (item.multi !== false) {
-              return declined("malformed ask result: the checkpoint question is single-select");
-            }
-            if (item.timedOut !== undefined && typeof item.timedOut !== "boolean") {
-              return declined("malformed ask result: the timedOut flag must be a boolean");
-            }
-            if (item.timedOut === true) {
-              return declined("the ask dialog timed out; timeout auto-selection is never recorded as human authorization");
-            }
-            if (item.customInput !== undefined && typeof item.customInput !== "string") {
-              return declined("malformed ask result: the custom input must be a string");
-            }
-            if (typeof item.customInput === "string" && item.customInput.trim().length > 0) {
-              return declined("custom free-text answers cannot authorize a policy-bound checkpoint; call workflow_checkpoint_ask again to select one of the allowed decisions");
-            }
-            if (item.note !== undefined && typeof item.note !== "string") {
-              return declined("malformed ask result: the answer note must be a string");
-            }
-            const selections = item.selectedOptions;
-            if (!Array.isArray(selections) || selections.length !== 1 || typeof selections[0] !== "string") {
-              return declined(`expected exactly one string selected policy-allowed decision, received ${Array.isArray(selections) ? String(selections.length) : "a non-array selection"}`);
-            }
-            selected = selections[0];
-          } else if (select) {
-            selected = await select(`Authorize checkpoint '${input.checkpoint}' (${rule.kind}) — stage '${stage.id}'`, allowed, { helpText: dialogQuestion, signal });
-            if (signal?.aborted) return abortedResult();
-          }
-        } catch (dialogError) {
-          if (signal?.aborted) return abortedResult();
-          throw dialogError;
-        }
-        if (selected !== undefined && !allowed.includes(selected)) {
-          return declined("the selected label is not a policy-allowed decision; nothing was recorded");
-        }
-        if (!selected) {
-          return declined("no human answer was recorded (dialog declined); the checkpoint remains unresolved");
-        }
-        // Last cancellation gate before the durable commit: the engine commit
-        // below is fully synchronous (no await between the gate and the
-        // ledger write), so a canceled call can never reach the ledger past
-        // this point.
-        if (signal?.aborted) return abortedResult();
-        const claimBeforeCommit = requireActiveClaimForMutation(controller, selectedRunId);
-        if (claimBeforeCommit) return claimBeforeCommit;
-        // One engine-owned durable commit: commitCheckpointAnswer re-runs the
-        // full state<->capability<->profile<->policy validation against the
-        // freshly persisted state inside a cross-process lock+CAS
-        // transaction, resolves the recorded/live-answer races
-        // (already_finalized / conflict / exact live reuse), and either
-        // supersedes every stale live proof and mints one engine-UUID answer
-        // or reuses the exact live proof — always in the same commit.
-        const committed = commitCheckpointAnswer(cwd, {
-          run_id: selectedRunId,
-          token: input.token,
-          capability_id: input.capability_id,
-          run_key: input.run_key,
-          branch: input.branch,
-          workflow: input.workflow,
-          stage_cursor: input.stage_cursor,
-          cursor_epoch: input.cursor_epoch,
-          checkpoint: input.checkpoint,
-          checkpoint_id: input.checkpoint_id,
-          checkpoint_kind: input.checkpoint_kind,
-          loop_iteration: input.loop_iteration,
-          decision: selected,
-        });
         if (!committed.ok) {
           // Honest engine mapping: a conflict already carries the
           // dialog-aware text; a policy drift keeps its dedicated message;
@@ -3589,10 +5683,62 @@ export {
   loopIterationRecord,
 } from "./engine/loops.js";
 export {
+  OMP_STAGE_HOST_CAPABILITIES,
+  stageBindingFor,
+  submitStageResult,
+  type StageAuthority,
+  type StageHostCapabilities,
+  type StageHostBindingResolver,
+  type StageRecoveryAction,
+  type StageRecoveryServiceOptions,
+  type StageRecoveryWorkerState,
+  type StageReceiptEvidence,
+  type StageReceiptOutput,
+  type StageResultReceipt,
+  type StageResultServiceOptions,
+  type StageResultCommitter,
+  type StageProducerBinding,
+  type StageHostBinding,
+  type StageResultSubmissionOutcome,
+} from "./engine/reliable-stage.js";
+export {
+  recoverStageExecution,
+  recoveryErrorDigest,
+} from "./engine/stage-recovery.js";
+export type {
+  AuthenticatedRecoveryGrant,
+  RecoveryCapability,
+  RecoveryCapabilityState,
+  RecoveryErrorClass,
+  RecoveryEvidenceProof,
+  RecoveryFormatRepairEvidence,
+  RecoveryHandoffState,
+  RecoveryHostInput,
+  RecoveryIntent,
+  RecoveryOperation,
+  RecoveryPreflightNotStartedProof,
+  RecoveryReplacementEvidence,
+  RecoveryResponsePayload,
+  RecoveryRevision,
+  RecoveryStateProof,
+  RecoveryTerminalEvidence,
+  StageRecoveryCapabilities,
+  StageRecoveryExecutionOptions,
+  StageRecoveryHost,
+  StageRecoveryRequest,
+  StageRecoveryResult,
+  StageRecoverySnapshot,
+  StageRecoveryStore,
+  StageRecoveryTransitionResult,
+  TrustedRecoverySelection,
+} from "./engine/stage-recovery.js";
+export { createOrdinaryStageRecoveryStore, type OrdinaryStageRecoveryStore } from "./engine/stage-recovery-store.js";
+export { createNativeStageRecoveryStore, type NativeStageRecoveryStore } from "./cto/stage-recovery-store.js";
+export { commitNativeCtoStageResult, type NativeStageExecutionCommitResult } from "./cto/native-stage-execution.js";
+export {
   sanitizeSlot,
   namespacedArtifactId,
   isNamespacedArtifactId,
-  slotRecordsFor,
   missingSlotResults,
   mergeSlotValues,
   synthesizeArtifacts,
@@ -3766,9 +5912,7 @@ export {
   type MigrationOutcome,
 } from "./engine/run-migration.js";
 export {
-  writeArtifact,
   readArtifact,
-  persistReturnedArtifacts,
 } from "./engine/artifacts.js";
 export {
   ACQUISITION_STATUSES,
@@ -3852,6 +5996,8 @@ export {
 	spawnLabel,
 	DevAgentUnavailableError,
 	type TaskCaller,
+	type TaskInvocationOptions,
+	type OrchestratorResult,
 	type TaskResult,
 	type TaskToolLike,
 	type StageContext,
@@ -4085,6 +6231,8 @@ export {
 	migrateCtoState,
 	canonicalizeState,
 } from "./cto/state.js";
+export { CtoMigrationError } from "./cto/state.js";
+export type { CtoMigrationErrorCode } from "./cto/state.js";
 export {
 	acquireLease,
 	heartbeatLease,

@@ -1029,6 +1029,54 @@ test("cto-core: canonicalizeState leaves a complete schema-2 state untouched", (
   }
 });
 
+test("cto-core: canonicalizeState refuses a future schema without changing source bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-canon-future-"));
+  try {
+    const runId = "future-run";
+    const future = { ...schema1Fixture(), id: runId, schema: 3 };
+    const dir = join(root, ".work-state", "cto", runId);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "state.json");
+    writeFileSync(path, JSON.stringify(future, null, 2));
+    const before = readFileSync(path, "utf8");
+    assert.throws(() => canonicalizeState(runId, root), /unsupported CTO state schema 3/);
+    assert.equal(readFileSync(path, "utf8"), before, "unsupported schema remains byte-preserved");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-core: canonicalizeState refuses active legacy workers and newer ledgers", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-canon-busy-"));
+  try {
+    const runId = "busy-run";
+    const dir = join(root, ".work-state", "cto", runId);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "state.json");
+    const active = {
+      ...schema1Fixture(),
+      id: runId,
+      teams: [{ id: "frontend", status: "in_progress", escalations: {} }],
+    };
+    writeFileSync(path, JSON.stringify(active, null, 2));
+    const before = readFileSync(path, "utf8");
+    assert.throws(() => canonicalizeState(runId, root), /quiescent workers/);
+    assert.equal(readFileSync(path, "utf8"), before, "active legacy state remains byte-preserved");
+
+    const ledgerRunId = "ledger-run";
+    const ledgerDir = join(root, ".work-state", "cto", ledgerRunId);
+    mkdirSync(ledgerDir, { recursive: true });
+    const ledgerPath = join(ledgerDir, "state.json");
+    const withLedger = { ...schema1Fixture(), id: ledgerRunId, native_stage_progress: {} };
+    writeFileSync(ledgerPath, JSON.stringify(withLedger, null, 2));
+    const ledgerBefore = readFileSync(ledgerPath, "utf8");
+    assert.throws(() => canonicalizeState(ledgerRunId, root), /newer native stage or recovery ledger/);
+    assert.equal(readFileSync(ledgerPath, "utf8"), ledgerBefore, "newer ledger remains byte-preserved");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("cto-core: writeCtoState round-trips schema 2 with stable defaults", () => {
   const root = mkdtempSync(join(tmpdir(), "cto-roundtrip-"));
   try {

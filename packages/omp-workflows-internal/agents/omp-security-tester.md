@@ -3,7 +3,7 @@ name: omp-security-tester
 model: ["@slow"]
 thinkingLevel: high
 description: Security specialist for the private OMP bundle - audits activation gates, ownership claims and dispatch authorization for fail-closed behavior and privilege boundaries. Read-only analysis plus targeted adversarial probes.
-tools: read, glob, grep, bash
+tools: read, glob, grep, bash, workflow_submit_result, workflow_recover
 ---
 
 # OMP Security Tester

@@ -99,9 +99,23 @@ export interface ProductPrdWriteOptions {
   /** The five source artifacts keyed by artifact id. */
   sourceArtifacts: Record<string, unknown>;
 }
+export interface ProductPrdPreparedDocument {
+  manifest: ProductPrdManifest;
+  markdown: string;
+  html: string;
+  documentPath: string;
+  htmlDocumentPath: string;
+  artifactPath: string;
+}
+
+export type ProductPrdPrepareResult =
+  | { ok: true; prepared: ProductPrdPreparedDocument }
+  | { ok: false; error: string };
+
 export type ProductPrdWriteResult =
   | { ok: true; documentPath: string; htmlDocumentPath: string; artifactPath: string; source_hash: string; content_hash: string }
   | { ok: false; error: string };
+
 
 export interface ProductPrdValidation {
   ok: boolean;
@@ -538,13 +552,11 @@ function restoreSnapshot(path: string, snapshot: FileSnapshot): void {
 }
 
 /**
- * Render and atomically persist the product PRD: the markdown document at
- * `join(stateDir, path)`, its derived sibling HTML viewer, and the typed
- * `product_prd` artifact with the exact manifest fields. All validation and
- * rendering happens before the first commit rename; failures restore every
- * previous target and clean temporary files.
+ * Render and validate a product PRD without mutating any final output path.
+ * Callers that own a larger transaction can publish `prepared.manifest` and
+ * include the returned document/html bytes in that transaction's after-image.
  */
-export function writeProductPrdDocument(options: ProductPrdWriteOptions): ProductPrdWriteResult {
+export function prepareProductPrdDocument(options: ProductPrdWriteOptions): ProductPrdPrepareResult {
   const sourceArtifacts: Record<string, unknown> = {};
   const provided = options.sourceArtifacts ?? {};
   for (const id of PRD_SOURCE_ARTIFACT_IDS) {
@@ -569,11 +581,6 @@ export function writeProductPrdDocument(options: ProductPrdWriteOptions): Produc
   const artifactPath = join(options.artifactsDir, `${PRODUCT_PRD_ARTIFACT_ID}.json`);
   const artifactTargetSafe = validateArtifactTarget(artifactPath);
   if (!artifactTargetSafe.ok) return { ok: false, error: artifactTargetSafe.error };
-
-  let documentTemp: string | null = null;
-  let htmlTemp: string | null = null;
-  let artifactTemp: string | null = null;
-  let snapshots: Array<[string, FileSnapshot]> | null = null;
   try {
     const markdown = renderProductPrdDocument(sourceArtifacts);
     const html = renderMarkdownDocumentHtml(markdown, {
@@ -594,37 +601,71 @@ export function writeProductPrdDocument(options: ProductPrdWriteOptions): Produc
       content_hash,
       content: markdown,
     };
+    return {
+      ok: true,
+      prepared: {
+        manifest,
+        markdown,
+        html,
+        documentPath: safe.absolute,
+        htmlDocumentPath: safeHtml.absolute,
+        artifactPath,
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: `product PRD rendering failed: ${String(error)}` };
+  }
+}
+
+/**
+ * Render and atomically persist the product PRD: the markdown document at
+ * `join(stateDir, path)`, its derived sibling HTML viewer, and the typed
+ * `product_prd` artifact with the exact manifest fields. All validation and
+ * rendering happens before the first commit rename; failures restore every
+ * previous target and clean temporary files.
+ */
+export function writeProductPrdDocument(options: ProductPrdWriteOptions): ProductPrdWriteResult {
+  const preparedResult = prepareProductPrdDocument(options);
+  if (!preparedResult.ok) return preparedResult;
+  const { prepared } = preparedResult;
+  const { manifest, markdown, html, documentPath, htmlDocumentPath, artifactPath } = prepared;
+
+  let documentTemp: string | null = null;
+  let htmlTemp: string | null = null;
+  let artifactTemp: string | null = null;
+  let snapshots: Array<[string, FileSnapshot]> | null = null;
+  try {
     snapshots = [
-      [safe.absolute, captureSnapshot(safe.absolute)],
-      [safeHtml.absolute, captureSnapshot(safeHtml.absolute)],
+      [documentPath, captureSnapshot(documentPath)],
+      [htmlDocumentPath, captureSnapshot(htmlDocumentPath)],
       [artifactPath, captureSnapshot(artifactPath)],
     ];
 
-    mkdirSync(dirname(safe.absolute), { recursive: true });
-    mkdirSync(dirname(safeHtml.absolute), { recursive: true });
+    mkdirSync(dirname(documentPath), { recursive: true });
+    mkdirSync(dirname(htmlDocumentPath), { recursive: true });
     mkdirSync(options.artifactsDir, { recursive: true });
 
     // Stage all three outputs before committing any rename.
-    documentTemp = tempPathFor(safe.absolute);
+    documentTemp = tempPathFor(documentPath);
     writeFileSync(documentTemp, markdown, "utf8");
-    htmlTemp = tempPathFor(safeHtml.absolute);
+    htmlTemp = tempPathFor(htmlDocumentPath);
     writeFileSync(htmlTemp, html, "utf8");
     artifactTemp = tempPathFor(artifactPath);
     writeFileSync(artifactTemp, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 
-    renameSync(documentTemp, safe.absolute);
+    renameSync(documentTemp, documentPath);
     documentTemp = null;
-    renameSync(htmlTemp, safeHtml.absolute);
+    renameSync(htmlTemp, htmlDocumentPath);
     htmlTemp = null;
     renameSync(artifactTemp, artifactPath);
     artifactTemp = null;
     return {
       ok: true,
-      documentPath: safe.absolute,
-      htmlDocumentPath: safeHtml.absolute,
+      documentPath,
+      htmlDocumentPath,
       artifactPath,
-      source_hash,
-      content_hash,
+      source_hash: manifest.source_hash,
+      content_hash: manifest.content_hash,
     };
   } catch (error) {
     if (documentTemp !== null) rmSync(documentTemp, { force: true });

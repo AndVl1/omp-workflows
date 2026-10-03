@@ -1,0 +1,183 @@
+{
+  "schema": "reliable-stage-host-smoke/v2",
+  "change": "reliable-stage-execution",
+  "language": "ru",
+  "runtime": {
+    "omp_package": "@oh-my-pi/pi-coding-agent",
+    "pinned_version": "18.0.6",
+    "candidate_core_env": "OMP_WORKFLOWS_CORE_TARBALL",
+    "candidate_fullstack_env": "OMP_WORKFLOWS_FULLSTACK_TARBALL",
+    "run_variant": "pinned-omp-candidate-plugins",
+    "candidate_plugins_required": true
+  },
+  "install": {
+    "isolated_prefix": "runtime",
+    "isolated_project_per_case": true,
+    "network_policy": "dependency-installation-and-authenticated-model-provider-only; fixture checks remain local",
+    "credentials_policy": "read-only source; private runtime credential store outside scratch/evidence; expiry guard before each attempt; never copy credentials into scratch or JSONL",
+    "package_store_policy": "owned-prefix-and-cache-only",
+    "omp_install": "@oh-my-pi/pi-coding-agent@18.0.6"
+  },
+  "limits": {
+    "attempt_timeout_sec": 900,
+    "idle_watchdog_sec": 960,
+    "startup_grace_sec": 120,
+    "max_attempts_per_case": 2,
+    "retry_requires_diagnosis": true,
+    "retry_requires_changed_condition": true
+  },
+  "evidence": {
+    "format": "jsonl",
+    "sources": [
+      ".work-state/ux-e2e/session.json",
+      ".work-state/ux-e2e/transcript.jsonl",
+      ".work-state/ux-e2e/ask-state.jsonl",
+      ".work-state/runs/**/observability/events.jsonl"
+    ],
+    "registration_source": "actual-host-observability-events-and-session-jsonl",
+    "canonical_oracles": "public workflow read/status APIs and persisted run state",
+    "transcript_is_not_registration_proof": true,
+    "safe_fields_only": true,
+    "required_registration_proof": "tool_call/tool_result records with matching tool_call_id and canonical accepted receipt"
+  },
+  "cleanup": {
+    "stop_owned_runtime": true,
+    "retain_evidence": true,
+    "remove_root_by_default": false,
+    "never_kill_by_name": true,
+    "never_touch_foreign_processes": true
+  },
+  "cases": [
+    {
+      "id": "H1",
+      "title": "ordinary discovery, natural classify turn-stop, submission and human checkpoint",
+      "route": "ordinary",
+      "registered_inputs": [
+        {
+          "kind": "slash_command",
+          "value": "/do-work --new \"Добавь format-label.ts с экспортом formatLabel(input: string): string: убрать внешние пробельные символы и заменить внутренние последовательности пробелов, табуляций и переводов строк одним пробелом. Добавь format-label.test.ts с исполняемой проверкой node --test. Не меняй зависимости. Не выполняй git add, commit или push. Сначала выдай только классификацию PHASE 0 и закончи ход до workflow_prepare. Не начинай workflow и не запускай workers до моего отдельного сообщения Proceed.\""
+        },
+        {
+          "kind": "human_text",
+          "value": "Proceed"
+        }
+      ],
+      "turn_stop": {
+        "mode": "natural-model-turn-boundary",
+        "boundary": "classification-visible-and-before-workflow_prepare",
+        "action": "wait-for-natural-turn-stop; do-not-kill-session",
+        "resume_input_index": 1,
+        "resume_via": "same-session-human-continuation"
+      },
+      "human_checkpoint": {
+        "required": true,
+        "answer": "Proceed",
+        "answer_only_when_real_ask_user_is_pending": true
+      },
+      "expected_events": [
+        "session_start",
+        "registered ingress for /do-work",
+        "classification boundary before workflow_prepare",
+        "same-session literal Proceed consumes pending new intent exactly once",
+        "workflow_prepare tool_call and matching successful tool_result",
+        "one native task dispatch with trusted worker identity",
+        "workflow_submit_result tool_call and matching accepted receipt",
+        "human checkpoint after accepted result",
+        "workflow_advance tool_call/result after current approval",
+        "one ordinary host tool after terminal"
+      ],
+      "required_registered_tools": ["workflow_prepare", "workflow_submit_result", "workflow_advance"],
+      "oracles": {
+        "submission": "accepted receipt.ok=true or typed accepted status plus canonical artifact/reference",
+        "advance": "canonical read/status shows one transition and one next dispatch",
+        "resume": "same run/intent, no second classification or worker before resume"
+      }
+    },
+    {
+      "id": "H2",
+      "title": "native CTO configured lead-to-roster-worker submission, approval, wave close and END",
+      "route": "cto",
+      "registered_inputs": [
+        {
+          "kind": "slash_command",
+          "value": "/cto \"Добавь format-tag.ts с экспортом formatTag(input: string): string: убрать внешние пробелы, привести строку к нижнему регистру и заключить в квадратные скобки. Добавь format-tag.test.ts с исполняемой проверкой node --test. Используй настроенный маршрут lead → roster worker; не меняй зависимости. Не выполняй git add, commit или push.\""
+        },
+        {
+          "kind": "human_text",
+          "value": "END"
+        }
+      ],
+      "human_checkpoint": {
+        "required": true,
+        "answer": "Proceed",
+        "answer_only_when_real_ask_user_is_pending": true
+      },
+      "expected_events": [
+        "session_start",
+        "registered /cto ingress",
+        "native cto_state admission with exact claim",
+        "parent-to-configured-lead task dispatch",
+        "configured-lead-to-roster-worker task dispatch with distinct trusted lineage",
+        "workflow_submit_result tool_call and matching accepted receipt",
+        "cto_checkpoint_ask tool_call/result with one real post-production human answer",
+        "cto_stage_advance tool_call/result after current approval",
+        "canonical CTO wave close: wave done, active_wave_id cleared, resident standby retained",
+        "explicit human END request",
+        "terminal CTO release and ordinary host tool"
+      ],
+      "required_registered_tools": ["cto_state", "task", "workflow_submit_result", "cto_checkpoint_ask", "cto_stage_advance"],
+      "oracles": {
+        "lineage": "canonical CTO state/dispatch records prove configured lead then allowed roster worker; event names alone are insufficient",
+        "approval": "accepted result does not close wave before current approval",
+        "wave_close": "canonical cto read API proves wave closure and resident state before END",
+        "terminal": "terminal/release receipt proves ownership release before ordinary host tool"
+      }
+    },
+    {
+      "id": "H3",
+      "title": "fresh host resume at pending checkpoint without reimplementation",
+      "route": "ordinary-resume",
+      "registered_inputs": [
+        {
+          "kind": "slash_command",
+          "value": "/do-work --new \"Добавь normalize-name.ts с экспортом normalizeName(input: string): string: убрать внешние пробелы и заменить повторяющиеся внутренние пробелы одним. Добавь normalize-name.test.ts с исполняемой проверкой node --test. Не меняй зависимости и остановись на настоящем post-production checkpoint, не подтверждая его за пользователя. Не выполняй git add, commit или push.\""
+        },
+        {
+          "kind": "slash_command",
+          "value": "/do-work --resume"
+        }
+      ],
+      "turn_stop": {
+        "mode": "fresh-host-resume",
+        "boundary": "accepted-receipt-and-worker-terminal-before-pending-human-checkpoint",
+        "action": "close-own-host-session-only-after-canonical-pending-checkpoint-and-no-active-worker",
+        "resume_input_index": 1,
+        "answer_after_resume": "Proceed",
+        "native_reconnect": "only-if-pinned-adapter-contract-says-supported; otherwise record unsupported/unknown"
+      },
+      "human_checkpoint": {
+        "required": true,
+        "answer": "Proceed",
+        "answer_only_when_real_ask_user_is_pending": true
+      },
+      "expected_events": [
+        "session_start",
+        "registered /do-work ingress",
+        "one native task dispatch and terminal worker event",
+        "workflow_submit_result accepted receipt bound to same run/dispatch",
+        "real pending human checkpoint with no active worker",
+        "owned host session close and fresh host session_start",
+        "exact registered /do-work --resume",
+        "same run/generation/stage/receipt restored without reclassification or worker replay",
+        "one current human answer",
+        "one workflow_advance transition and one terminal host action"
+      ],
+      "required_registered_tools": ["workflow_prepare", "workflow_submit_result", "workflow_advance"],
+      "oracles": {
+        "resume": "canonical read/status and JSONL correlate same run_id, dispatch_id, receipt/reference and pending checkpoint",
+        "no_replay": "task and submission counts for that identity remain one across both host sessions",
+        "approval": "only current answer advances; replayed answer/receipt is rejected or idempotent"
+      }
+    }
+  ]
+}

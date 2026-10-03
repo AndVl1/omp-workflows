@@ -184,31 +184,38 @@ ends at an explicit human approval gate.
 `lecture-research.json`):
 
 1. **URL-first intake** (orchestrator) — extract exactly one public video/playlist URL and the
-   non-empty research prompt. Record `lecture_intake` with acquisition-pending provenance. Do not
-   ask for a transcript or other source material; no network access or summarization yet.
-2. **Automatic acquisition** (orchestrator) — invoke the consumer-provided main-session
-   `lecture_acquire` tool and persist `lecture_acquisition`. The tool resolves bounded sources,
-   normalizes timestamped evidence, and preserves failures. Only `succeeded` or evidence-bearing
-   `partial` acquisition advances; failed/missing acquisition stops the workflow.
+   non-empty research prompt. Publish the declared `lecture_intake` value through
+   `workflow_submit_result({ "outputs": { ... } })`; do not ask for a transcript or other source
+   material, and do not perform network access or summarization.
+2. **Automatic acquisition** (main-session tool) — invoke the consumer-provided
+   `lecture_acquire` callback. The trusted callback publishes declared `lecture_acquisition` as
+   producer.kind `tool`; it resolves bounded sources, normalizes timestamped evidence, and
+   preserves failures. The tool has no worker terminal to wait for. Only `succeeded` or
+   evidence-bearing `partial` acquisition advances; failed/missing acquisition stops the workflow.
 3. **Lecture mapping** (consilium, bounded parallel roster) — consume only normalized
    `lecture_acquisition` evidence; **perform no network access, URL fetching, or provider calls**.
    Every URL-derived unit retains human-readable evidence and adds structured `evidence_refs`
-   (source, canonical location, quote, start/end timestamps). Produces `lecture_mapping`.
+   (source, canonical location, quote, start/end timestamps). Producers submit `lecture_mapping`
+   through the declared outputs-only contract.
 4. **Synthesis & dedupe** (single `analyst`) — merge overlapping claims across sources, record
    conflicts explicitly with the winning source and losing sources/claims, and produce deduplicated
-   candidate findings. Preserve partial-acquisition failures and gaps. Produces `lecture_candidates`.
+   candidate findings through the declared outputs-only contract. Preserve partial-acquisition
+   failures and gaps.
 5. **Repo fit & security review** (consilium, parallel, read-only) — `architect` checks candidate
    claims against the codebase with concrete repo evidence; `security-tester` reviews security and
-   IP/licensing risks. No fixes or edits. Produces `lecture_repo_fit`.
-6. **Approval** (orchestrator, explicit human checkpoint) — pause, record the verdict, and complete
-   on either explicit `approved` or `rejected`. No implementation, task creation, or code work
-   starts before approval; approval never launches implementation. Produces `lecture_decision`.
+   IP/licensing risks. No fixes or edits. Submit `lecture_repo_fit` through declared outputs.
+6. **Approval** (orchestrator, explicit human checkpoint) — pause at the profile checkpoint and
+   obtain a typed decision through the current approval surface. Ordinary workflows use
+   `workflow_checkpoint_ask`; native CTO slices use resident-root
+   `cto_checkpoint_ask({ "slice_id": "<sliceId>" })` followed by
+   `cto_stage_advance({ "slice_id": "<sliceId>" })`. No implementation, task creation, or code
+   work starts before approval; approval never launches implementation.
 
-**Artifacts.** Every stage writes typed artifacts under the selected run's `artifactsDir`
-(`.work-state/runs/<run-id>/artifacts/` for canonical runs) per `artifacts-schema.json`:
-URL intake, provider-neutral acquisition, evidence-grounded mapping, synthesis with
-conflicts, repo-fit/security findings, and the explicit decision. The profile never produces
-source code.
+**Artifacts.** Each stage's typed values are published through the outputs-only
+submission contract; the engine validates them and persists immutable output
+references under the selected run's artifact namespace (or renders deterministic
+document outputs). Producers do not write canonical workflow artifacts by path,
+copy manifests, or reconstruct receipts. The profile never produces source code.
 
 **Acquisition boundary.** Core cannot auto-acquire by itself. A consumer must register
 `lecture_acquire` (or route direct `core.run()` orchestration through `LectureAcquisitionPort`).
@@ -245,7 +252,10 @@ validates persisted state, profile hash and dispatch capability before any stage
    - **resolve roles → agents**: agent name from `.omp/team.config.json` `roles` (P6), falling back to built-in defaults and legacy `.claude/team.config.json`. Model capability is set by agent frontmatter and OMP policy — low-tier agents use `@smol` + `thinkingLevel: medium`, middle-tier use `@task` + `thinkingLevel: auto`, high-tier use `@slow` + `thinkingLevel: high`. Concrete models are configured via OMP `modelRoles` or `task.agentModelOverrides`, not in workflow config.
    - **checkpoint**: follow the declared typed checkpoint policy; interactive answers enter through `workflow_checkpoint_ask`. Routing/autonomy metadata never authorizes a checkpoint.
    - **gate**: do not mark the stage `done` until the gate condition holds.
-   - **write** the `produces` artifact to the selected run's `artifactsDir`.
+   - **submit** each producer's direct schema payload for its declared output id through
+     `workflow_submit_result({ "outputs": { "<artifact_id>": <payload> } })`. The host derives
+     producer, slot, and dispatch identity; core publishes immutable canonical references. Do
+     not write canonical artifacts by path.
    - **loop**: if the stage has a `loop`, repeat `back_to` until `until` or `max_iterations`.
    - **advance** the selected run's `stage_cursor` and mirror progress only through the configured run reader.
 
@@ -280,18 +290,28 @@ dispatches only its configured worker roster with inherited native authority.
 The lead/worker path preserves the resolved profile's stages, gates,
 checkpoints, typed artifacts, validation evidence, and DoD/approval obligations;
 it must not call ordinary `workflow_prepare`/`workflow_instructions`/
-`workflow_complete` using a CTO slug.
+`workflow_begin`/`workflow_advance` using a CTO slug. Native stage
+transition uses the registered `cto_stage_advance({ "slice_id": "<sliceId>" })`;
+the root tool derives current run/claim/profile/stage scope and rejects
+ordinary tokens or candidate-progress injection.
 
-Every declared producer artifact is a flat file: the filename supplies the
-artifact id and the file root is the direct value described by the current
-`artifact_schemas` entry (including readiness/validation fields when present).
-An id-keyed `{"implementation": {...}}` envelope, `payload`/`artifact`
-wrapper, markdown, auto-unwrapping, or schema loosening is not supported.
-Before joining a terminal result, the coordinator reads and validates the
-canonical file directly and fails closed on a wrapper or malformed payload.
+Every producer publishes only its declared direct schema values through
+`workflow_submit_result({ "outputs": { ... } })`. The engine validates
+schemas/field errors, persists immutable output references, returns the receipt,
+and owns fan-in; no producer writes workflow JSON, canonical output files,
+manifests, paths, or authority fields by hand. A worker producer additionally
+requires its matching host terminal; orchestrator/tool/document producers have
+no worker terminal to wait for and use trusted result/callback or engine
+rendering. A receipt is not a worker terminal, readiness, DoD, fan-in, or
+approval. For a profile-required actual human checkpoint, the resident root
+calls `cto_checkpoint_ask({ "slice_id": "<sliceId>" })`, then
+`cto_stage_advance({ "slice_id": "<sliceId>" })`; eligible `policy_auto`
+continues through engine-evaluated `cto_stage_advance`. Do not hand-write
+approval/state evidence or use an ordinary selector/token.
 Per-team DoD is a supplemental ordinary artifact at the exact configured
 relative `teams[].dod_path`; the default file is
-`.work-state/artifacts/<team>/dod.json`, not canonical CTO state.
+`.work-state/artifacts/<team>/dod.json`, not canonical CTO state or a typed
+workflow output.
 
 ### Защищённый artifact-proof Bash
 
@@ -341,7 +361,7 @@ slot, либо одному явно назначенному child этого s
 возвращают evidence и предложенные изменения, но не редактируют sidecar.
 Закрывать критерий можно только с фактическим criterion-specific evidence;
 неподтверждённые пункты остаются `pending`. Sidecar не добавляется в `produces`
-или `workflow_complete.artifact_ids`.
+или `workflow_submit_result.outputs`; it remains supplemental DoD evidence only.
 
 Если downstream `summary` уже связан с незавершённым DoD, он не получает права
 переписать consumed input. После явного запроса пользователя выполняется

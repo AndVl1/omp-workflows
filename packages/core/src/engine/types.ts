@@ -504,6 +504,28 @@ export interface WorkIdentity {
   attempt: number;
   worker_id: string;
 }
+export interface StageReceiptLedger {
+  receipt_id: string;
+  submission_id: string;
+  digest: string;
+  dispatch_id: string;
+  attempt: number;
+  accepted_at: string;
+  work_identity: WorkIdentity;
+  /** Canonical producer assignment retained for exact replay; never contains callback proof. */
+  binding?: unknown;
+  outputs: Array<{ artifact_id: string; immutable_ref: string; sha256: string }>;
+  evidence: Array<{ artifact_id: string; relative_path: string; immutable_ref: string; sha256: string }>;
+}
+export interface StageAdvanceReceipt {
+  /** SHA-256 of the canonical advance authorization identity and token. */
+  request_hash: string;
+  from_stage_cursor: string;
+  from_cursor_epoch: string;
+  to_stage_cursor: string;
+  to_cursor_epoch: string;
+  committed_at: string;
+}
 
 export type PendingReason = "provider_running" | "awaiting_result" | "transport_reconnect";
 export interface PendingLease {
@@ -541,7 +563,7 @@ export interface ChildJoin {
 }
 
 export type CompletionOutcome = "pending" | "succeeded" | "failed" | "cancelled";
-export type CompletionTerminalSignal = "workflow_complete" | "native_tool_result" | "provider_terminal" | "contract_failure";
+export type CompletionTerminalSignal = "workflow_complete" | "native_tool_result" | "provider_terminal" | "contract_failure" | "preflight:missing_prompt" | "preflight:invalid_arguments";
 export type CompletionSchemaStatus = "met" | "failed";
 export type CompletionDodStatus = "met" | "pending" | "failed";
 export type MigrationCompletionSchemaStatus = CompletionSchemaStatus | "not_applicable";
@@ -577,7 +599,7 @@ export interface CompletionArtifactRef {
 }
 
 /**
- * Unified terminal/pending result envelope consumed by workflow_complete,
+ * Unified terminal/pending result envelope consumed by internal completion,
  * trusted native reconciliation and child joins.
  */
 export interface CompletionEnvelope {
@@ -670,6 +692,12 @@ export interface Classification {
   autonomous_reason?: string;
 }
 
+export interface StageProducerDeclaration {
+  /** Explicit callback producer; omitted stages are coordinator-owned. */
+  kind: "tool";
+  tool_name: string;
+}
+
 export interface ProfileMatch {
   type: TaskType[];
   complexity?: Complexity[];
@@ -705,6 +733,8 @@ export interface StageDef {
   optional_consumes?: string[];
   /** Artifact ids this stage writes to `.work-state/artifacts/<id>.json`. */
   produces?: string | string[];
+  /** Explicit registered callback producer for an otherwise coordinator-owned stage. */
+  producer?: StageProducerDeclaration;
   /** Human checkpoint label. */
   checkpoint?: string;
   /**
@@ -790,6 +820,12 @@ export interface DispatchRecord {
   /** Origin host session captured before native task execution. */
   origin_session_id?: string;
   /**
+   * Engine-owned coordinator fence captured when this dispatch was
+   * authorized. Legacy records may omit it and therefore cannot prove live
+   * ownership after a coordinator handover.
+   */
+  origin_ownership_epoch?: string;
+  /**
    * `pending` is resumable background work, never an elapsed-time failure.
    * Legacy records remain readable during migration.
    */
@@ -823,6 +859,8 @@ export interface MigrationDispatchRecord {
   tool_call_id?: never;
   /** Explicitly absent on disk; migration evidence never names an origin host session. */
   origin_session_id?: never;
+  /** Explicitly absent on disk; imported evidence has no coordinator fence. */
+  origin_ownership_epoch?: never;
   status: "succeeded";
   attempt: 0;
   created_at: string;
@@ -884,16 +922,18 @@ export interface DispatchCapabilityState {
   issued_for?: CapabilityBinding;
   kind: "none" | "single" | "consilium";
   expected_roles?: string[];
-  expected_count?: number;
   expected_roster?: CapabilityRosterEntry[];
+  expected_count?: number;
+  /** Persisted assignment for coordinator/tool/document producers; never a worker dispatch. */
+  producer_assignment?: WorkIdentity;
   /** Frozen adaptive selection bound to this capability epoch. */
   roster_selection?: RosterSelection;
   work_identity?: WorkIdentity;
   pending?: PendingState[];
   status?: "ready" | "dispatched" | "joining" | "complete" | "invalidated";
   dispatches?: PersistedDispatchRecord[];
-}
 
+}
 export interface JoinSummary {
   stage_id: string;
   cursor_epoch: string;
@@ -1126,6 +1166,10 @@ export interface TeamState {
   loop_state?: LoopState;
   /** Hash-bound succeeded dispatches imported from a legacy partial stage; consumed as terminal history on begin. */
   migration_succeeded_slots?: Record<string, Array<{ dispatch_id: string; role: string; agent: string; slot_id?: string; task_id?: string; artifact_ids: string[] }>>;
+  /** Durable accepted stage submissions keyed by immutable dispatch assignment. */
+  stage_receipts?: Record<string, StageReceiptLedger>;
+  /** Exact replay receipts for successful stage advances, keyed by source capability. */
+  advance_receipts?: Record<string, StageAdvanceReceipt>;
   /** Per-slot consilium artifact provenance + synthesis evidence (additive). */
   slot_artifacts?: Record<string, StageSlotRecords>;
   observability?: ObservabilityPointer;
