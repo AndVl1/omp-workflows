@@ -3110,9 +3110,9 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
             // Strict installed-host result contract: exactly one answer item
             // echoing the exact question asked (id, text, options), strict
             // single-select, exactly one string selection, no timeout, no
-            // custom text, and no metadata outside the installed host's
-            // declared ExtensionAskDialogResultItem fields. Anything else is
-            // a malformed host result and records nothing.
+            // custom text, and no unrecognized metadata. The host's optional
+            // image lists may be undefined or empty; attachments remain
+            // unsupported. Anything else records nothing.
             const results = Array.isArray(result.results) ? result.results : [];
             if (results.length !== 1) {
               return declined(`malformed ask result: expected exactly one answer item, received ${results.length}`);
@@ -3121,10 +3121,20 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
             if (!item || typeof item !== "object" || Array.isArray(item)) {
               return declined("malformed ask result: the answer item is not an object");
             }
-            const knownKeys: Record<string, true> = { id: true, question: true, options: true, multi: true, selectedOptions: true, customInput: true, note: true, timedOut: true };
+            const knownKeys: Readonly<Record<string, true>> = { id: true, question: true, options: true, multi: true, selectedOptions: true, customInput: true, note: true, timedOut: true, customInputImages: true, noteImages: true };
             const unknownKeys = Object.keys(item).filter((key) => knownKeys[key] !== true);
             if (unknownKeys.length > 0) {
               return declined(`malformed ask result: unknown answer metadata (${unknownKeys.join(", ")})`);
+            }
+            const customInputImages = item.customInputImages;
+            if (customInputImages !== undefined
+              && (!Array.isArray(customInputImages) || customInputImages.length !== 0)) {
+              return declined("malformed ask result: customInputImages must be undefined or an empty array; checkpoint attachments are unsupported");
+            }
+            const noteImages = item.noteImages;
+            if (noteImages !== undefined
+              && (!Array.isArray(noteImages) || noteImages.length !== 0)) {
+              return declined("malformed ask result: noteImages must be undefined or an empty array; checkpoint attachments are unsupported");
             }
             if (typeof item.id !== "string" || item.id !== questionId) {
               return declined("malformed ask result: the answer does not identify the checkpoint question");

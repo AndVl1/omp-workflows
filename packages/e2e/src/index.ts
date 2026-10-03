@@ -11,7 +11,7 @@ export {
   killProcessTree,
   pidIsLive,
   assertNoLiveSession,
-  readSessionInfo,
+  readSessionRecord,
   RateLimiter,
   IdleTimer,
   securityHeaders,
@@ -70,6 +70,12 @@ export type {
   Recommendation,
   GenerateReportOptions,
   GenerateReportResult,
-  } from './report.js';
+} from './report.js';
+export { readManifest, verifyManifest, writeManifest, manifestDigest, ManifestError } from './manifest.js';
+export type { RunManifest, SessionRecord, ProcessReceipt, RunRoots, ManifestAuth, NativeHostBrokerAuth } from './manifest.js';
+export { prepareRun, doctorRun, cleanupPartialRun, validatePrepareConfig, getRunRoot } from './prepare.js';
+export type { PrepareConfig, PrepareResult, DoctorResult } from './prepare.js';
+export { inspectInstalledRuntime, snapshotRuntime, verifyRuntimeSnapshot } from './runtime.js';
+export { managedBrokerStatus, stopManagedBroker } from './broker.js';
 
 export { deferred, type Deferred } from './util.js';

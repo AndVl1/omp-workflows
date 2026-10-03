@@ -1,11 +1,38 @@
 # omp-workflows
 
-Declarative multi-stage workflow engine for [oh-my-pi](https://github.com/oh-my-pi). Native extension package — ships as a workspace of two npm packages:
+Declarative multi-stage workflow engine for [oh-my-pi](https://github.com/oh-my-pi). The monorepo ships two native extension packages and a separate isolated E2E harness:
 
 - **`@andvl1/omp-workflows-core`** — pure engine: state machine, gates, slash commands, profiles, artifact schemas. No agents, no skills, no domain opinions.
-- **`@andvl1/omp-workflows-fullstack`** — default bundle of specialized agents and domain skills for Spring/Kotlin/React/KMP/Telegram-bot stacks. Pulls core as a peer dependency.
+- **`@andvl1/omp-workflows-fullstack`** — default bundle of specialized agents and domain skills (17 specialized agents + 31 domain skills) for Spring/Kotlin/React/KMP/Telegram-bot stacks. Pulls core as a peer dependency.
+- **`@andvl1/omp-workflows-e2e`** — manifest-backed process-level acceptance against immutable snapshots of installed omp and the current checkout.
 
 Custom bundles (Rust, Go-only, minimal Python, etc.) compose core with their own role mappings.
+
+## Isolated E2E acceptance
+
+From the repository root, first prepare a disposable run, then use its manifest for every command:
+
+```bash
+npm run e2e:prepare -- --config packages/e2e/scenarios/isolated-smoke.env.json --run isolation-01 --json
+MANIFEST="${OMP_E2E_ROOT:-${TMPDIR:-/tmp}/omp-workflows-e2e}/runs/isolation-01/manifest.json"
+npm run e2e:doctor -- --manifest "$MANIFEST" --json
+npm run e2e:verify -- --manifest "$MANIFEST" --suite isolation --json
+```
+
+For a real OpenAI Codex OAuth-backed `/do-work` and new-session resume, use
+`packages/e2e/scenarios/live-smoke.env.json` and `--suite live-smoke` with a distinct
+run ID. That config explicitly starts/reuses omp's managed native host broker;
+ordinary omp clients' independent OAuth refresh remains an unverified concurrency
+risk. Run cleanup does not stop the shared broker. The harness snapshots and
+isolates child configuration/workspace but is **not** a host OS sandbox. See
+[the E2E runbook](packages/e2e/README.md) for broker prerequisites, manual
+restart, evidence and cleanup commands.
+
+For a deterministic OAuth refresh regression without a real account or model
+request, run `npm --silent run test:oauth-refresh` (Bun >=1.3.14 and development
+dependencies required). It exercises real native broker/storage/client components
+from pinned `pi-ai@18.0.6` against a synthetic local token endpoint; it does not
+replace the live workflow smoke or verify ordinary-client cross-process refresh.
 
 ## Install
 

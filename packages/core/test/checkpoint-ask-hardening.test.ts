@@ -22,9 +22,9 @@
  *   - Strict installed-host result parsing: only exactly one selected
  *     policy-allowed decision for the exact question — echoing its text and
  *     options, strict single-select (`multi === false`), one string
- *     selection, valid optional `timedOut`/`customInput` fields, and no
- *     metadata outside the installed host's `ExtensionAskDialogResultItem`
- *     contract — authorizes; anything else records nothing.
+ *     selection, valid optional `timedOut`/`customInput` fields, and only
+ *     recognized metadata. Optional image lists must be undefined or empty;
+ *     unsupported attachments or malformed results authorize nothing.
  *   - Loop-iteration binding: the handoff's `loop_iteration` is enforced
  *     when present, echoed verbatim in the answer payload, and propagates
  *     into the ledger decision scope.
@@ -200,7 +200,7 @@ function trustedToolContext(root: string): AskContext {
   return { cwd: root, session_id: SESSION_ID, hasUI: true };
 }
 
-type SubmitExtra = Partial<{ id: string; question: string; options: string[]; multi: boolean; timedOut: boolean; customInput: string; note: string }>;
+type SubmitExtra = Partial<{ id: string; question: string; options: string[]; multi: boolean; timedOut: boolean; customInput: string; note: string; customInputImages: unknown; noteImages: unknown }>;
 
 /** The canonical result item a faithful host echoes for the asked question. */
 function canonicalItem(question: DialogQuestion): Record<string, unknown> {
@@ -226,6 +226,8 @@ function submit(question: DialogQuestion, selection: string[], extra: SubmitExtr
       ...(extra.timedOut !== undefined ? { timedOut: extra.timedOut } : {}),
       ...(extra.customInput !== undefined ? { customInput: extra.customInput } : {}),
       ...(extra.note !== undefined ? { note: extra.note } : {}),
+      ...(Object.prototype.hasOwnProperty.call(extra, "customInputImages") ? { customInputImages: extra.customInputImages } : {}),
+      ...(Object.prototype.hasOwnProperty.call(extra, "noteImages") ? { noteImages: extra.noteImages } : {}),
     }],
   };
 }
@@ -616,7 +618,11 @@ withFixture("ask: malformed host results record nothing", async (root, ask) => {
     ["custom input", (question) => submit(question, [], { customInput: "make it so" })],
     ["non-string custom input", (question) => submit(question, [], { customInput: 42 })],
     ["non-string note", (question) => submit(question, ["proceed"], { note: 9 })],
-    ["unknown metadata", (question) => ({ kind: "submit", results: [{ ...canonicalItem(question), selectedOptions: ["proceed"], injected: true }] })],
+    ["non-array customInputImages", (question) => submit(question, ["proceed"], { customInputImages: null })],
+    ["non-empty customInputImages", (question) => submit(question, ["proceed"], { customInputImages: [{ type: "image" }] })],
+    ["non-array noteImages", (question) => submit(question, ["proceed"], { noteImages: "not-an-array" })],
+    ["non-empty noteImages", (question) => submit(question, ["proceed"], { noteImages: [{ type: "image" }] })],
+    ["unknown metadata alongside empty image lists", (question) => ({ kind: "submit", results: [{ ...canonicalItem(question), selectedOptions: ["proceed"], customInputImages: [], noteImages: [], injected: true }] })],
     ["unknown option", (question) => submit(question, ["ship it"])],
   ];
   for (const [label, script] of cases) {
@@ -626,6 +632,44 @@ withFixture("ask: malformed host results record nothing", async (root, ask) => {
     assert.equal(details.code, "WORKFLOW_CHECKPOINT_DECLINED", `${label}: ${details.error}`);
     assert.equal(persistedAnswers(root).length, 0, `${label} must not ingest an answer`);
   }
+});
+
+withFixture("ask: SDK no-image metadata records a policy-bound human decision", async (root, ask, tools) => {
+  const issued = writeAskFixture(root);
+  const response = await ask("t", askAuth(issued), undefined, undefined, askContext(
+    root,
+    (questions) => submit(questions[0]!, ["proceed"], { customInputImages: undefined, noteImages: undefined }),
+    [],
+  ));
+  const details = response.details as {
+    ok?: boolean;
+    decision?: string;
+    error?: string;
+    actor_provenance?: { ref: string; proof: { answer_id: string; nonce: string; channel: string; reference: string; binding: string } };
+  };
+  assert.equal(details.ok, true, details.error);
+  assert.equal(details.decision, "proceed");
+  const answers = persistedAnswers(root);
+  assert.equal(answers.length, 1, "the host result mints one canonical trusted answer");
+  assert.equal(answers[0]?.decision, "proceed");
+  assert.equal(answers[0]?.channel, "terminal");
+  assert.equal(answers[0]?.answer_id, details.actor_provenance?.proof.answer_id);
+
+  const checkpointTool = tools.get("workflow_checkpoint");
+  assert.ok(checkpointTool);
+  const checkpoint = checkpointTool.execute as unknown as AskExecute;
+  const recorded = await checkpoint("t", {
+    ...checkpointEnvelope(issued),
+    actor_provenance: details.actor_provenance,
+    decision: details.decision,
+    rationale: "human approved the implementation checkpoint",
+  }, undefined, undefined, trustedToolContext(root));
+  const recordedDetails = recorded.details as { ok?: boolean; error?: string };
+  assert.equal(recordedDetails.ok, true, recordedDetails.error);
+  const decisions = readStateFile(root).typed_checkpoint_decisions ?? [];
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0]?.decision, "proceed");
+  assert.equal(decisions[0]?.authorization, "human");
 });
 
 withFixture("ask: headless sessions keep failing closed without an interactive surface", async (root, ask) => {

@@ -20,6 +20,9 @@ coverage
 !/.omp/settings.json
 !/.omp/team.config.json
 !/.omp/teams.json
+# Committed project inputs for the disposable live-smoke fixture.
+!/packages/e2e/scenarios/live-smoke-fixture/.omp/
+!/packages/e2e/scenarios/live-smoke-fixture/.omp/**
 
 .work-state/
 

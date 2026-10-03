@@ -1,9 +1,10 @@
 # Task: run `/omp-model-roles recommendations` and report the table
 
-You are working in a fresh scratch project created by `ux-e2e bootstrap`,
-wired to the omp-workflows plugin (branch `feat/agent-model-roles`). The
-plugin ships a `/omp-model-roles` command with two subcommands:
-`validate` (already exercised in earlier runs) and `recommendations`.
+You are working in the prepared workspace recorded by the run manifest. The
+runtime and omp-workflows plugin snapshot are fixed at `prepare` time; do not
+run bootstrap, npm link, or mutate a global installation. The plugin ships a
+`/omp-model-roles` command with two subcommands: `validate` (already exercised
+in earlier runs) and `recommendations`.
 
 ## Requirement — a single, non-negotiable instruction
 

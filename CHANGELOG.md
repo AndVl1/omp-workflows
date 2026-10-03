@@ -2,6 +2,50 @@
 
 All notable changes to `omp-workflows` are documented here.
 
+## [Unreleased]
+### Added
+- Manifest-backed isolated E2E preparation, runtime/package snapshots, managed
+  native OAuth broker opt-in, provider-free isolation and live-provider workflow
+  smoke suites, restart/cleanup lifecycle, scoped redacted evidence, and root
+  `e2e:*` commands. Removed the scratch/bootstrap host-overlay launch contract.
+  See [the E2E runbook](packages/e2e/README.md) for prerequisites and limits.
+- Standalone synthetic OAuth refresh regression (`npm --silent run test:oauth-refresh`)
+  exercises real pinned native broker/storage/client components, concurrent token
+  renewal and persistence without a real account; reports its component/process
+  boundary separately from live provider and ordinary-client refresh coverage.
+
+### Fixed
+- Managed E2E broker stop accepts an owned process exiting during identity
+  observation, but refuses live foreign/reused PIDs and waits for a free listener
+  before removing its manager receipt.
+- E2E live smoke uses authoritative task-correlated native provider receipts
+  and canonical schema-2 state, rejects structured workflow refusals without
+  erasing partial evidence, and retains sanitized per-session provenance.
+  Animated startup redraws no longer hide a rendered prompt.
+  Initial and resumed sessions wait for validated native startup receipts
+  independently of transport readiness, eliminating the first-append race.
+- Standalone E2E preparation accepts installed npm symlinks while preserving
+  artifact ownership guards; retained evidence redacts escaped capability values.
+  ANSI-styled labels are matched before redaction, and PTY JSONL frames are
+  sanitized after decoding so split control sequences cannot corrupt evidence.
+- Core human checkpoint asks accept the native TUI 18.4.9 no-image result shape
+  (`customInputImages` / `noteImages` are optional and may be own `undefined`
+  values), while unknown metadata, malformed lists and unsupported attachments
+  remain fail-closed. Selection, cancellation, policy and trusted-proof gates
+  are unchanged; real PTY approvals and canonical human-decision regressions
+  exercise the repaired boundary.
+- The isolated live fixture supplies native QA/reviewer model-role bindings.
+  Unknown custom aliases no longer leave those workers without a selected model;
+  actual child provider receipts verify the repaired routing without importing
+  host credentials or changing global model settings.
+
+### Verified
+- The real isolated Grok 4.7 `/do-work` recipe completed implementation, review,
+  QA/DoD and the summary gate with two authorized native TUI approvals. Strict
+  provider provenance, zero workflow/provider errors, distinct resumed native
+  session and preserved canonical state passed. Private runtime roots were
+  cleaned and explicit owned-broker stop released its listener.
+
 ## [0.29.1] — 2026-09-29
 ### Fixed
 - **Debug-cycle first-pass artifact contract** — diagnostics now requires only discovery on its first pass and requests the latest debug artifact when revisiting a failed verification; verification produces debug later. A profile-wide regression check rejects artifacts consumed before their first producer.
@@ -17,7 +61,6 @@ All notable changes to `omp-workflows` are documented here.
 - **Foreground E2E exit** — `ux-e2e start` now wakes its foreground observer on the PTY `exit` frame even when no later output arrives, closes the session, and exits instead of waiting indefinitely.
 - **Selector-only resume admission** — `workflow_prepare` now resolves the read-only selector before new-task intent handling for explicit `--run` resume, while conflicting top-level and selector IDs are rejected without mutation; no new public required field or alias was introduced.
 - **Idle branch-context refresh** — ordinary new-command ingress refreshes an idle cached host controller from the actual Git branch before intent handling; active, selected, or unknown claims retain the fail-closed branch check, so stale context is not silently migrated.
-
 
 ## [0.28.4] — 2026-09-04
 ### Fixed

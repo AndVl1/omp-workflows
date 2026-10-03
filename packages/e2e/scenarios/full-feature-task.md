@@ -2,8 +2,10 @@
 
 Implement {{feature_description}} in the {{project_name}} project on branch {{branch}}.
 
-You are working in a fresh scratch project created by `ux-e2e bootstrap`. Run the
-workflow exactly as you would for a real change: ask clarifying questions when the
+You are working in the prepared workspace recorded by the run manifest. The
+runtime and omp-workflows plugin snapshot are fixed at `prepare` time; do not
+run bootstrap, npm link, or mutate a global installation. Run the workflow
+exactly as you would for a real change: ask clarifying questions when the
 requirements are ambiguous, and keep the change as small as reasonable.
 
 ## Requirements
