@@ -2,8 +2,8 @@
   "id": "live-smoke",
   "title": "OAuth-backed workflow state and resume",
   "description": "Submit a bounded /do-work request to the prepared isolated project and observe a real provider-backed workflow transition.",
-  "command": "/do-work",
-  "task": "[AUTONOMOUS] Create README.md with the exact text \"Isolated E2E workspace.\" in this disposable project. The acceptance criterion is that README.md contains that sentence. Do not ask for clarification.",
+  "command": "/do-work --new",
+  "task": "[AUTONOMOUS] In this disposable project, create README.md at the project root with exactly the text \"Isolated E2E workspace.\" Delegate this repository-file change with the native task tool to the implementation worker selected for README.md; do not create or edit README.md in the orchestrator context or substitute an artifacts-directory copy. Follow each returned stage contract: orchestrator/none stages perform their declared action and advance, while a single-worker stage requires a real task dispatch and its terminal result before completion. Never invent a dispatch_id or invoke a checkpoint unless the returned contract declares one. Do not ask for clarification.",
   "params": {},
   "stages": [
     {

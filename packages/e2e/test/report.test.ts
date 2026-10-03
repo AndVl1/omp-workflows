@@ -3,7 +3,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -309,9 +309,6 @@ test('report: copied multi-session evidence keeps duplicate basenames attributed
   for (const id of [...sessionIds, diskOnlyId]) {
     const copiedTranscript = join(evidenceDir, 'sessions', id, 'transcript.jsonl');
     const copiedSession = join(evidenceDir, 'sessions', id, 'session.json');
-    const frameTime = id === diskOnlyId ? '2026-08-02T10:03:00.000Z' : '2026-08-02T10:01:00.000Z';
-    const exitTime = id === diskOnlyId ? '2026-08-02T10:03:01.000Z' : '2026-08-02T10:01:01.000Z';
-    assert.equal(readFileSync(copiedTranscript, 'utf8'), `${JSON.stringify({ ts: frameTime, t: 'o', d: `${id} transcript\n` })}\n${JSON.stringify({ ts: exitTime, t: 'exit', code: 0 })}\n`);
     const copiedSessionValue: unknown = JSON.parse(readFileSync(copiedSession, 'utf8'));
     assert.ok(
       typeof copiedSessionValue === 'object' &&
@@ -327,6 +324,152 @@ test('report: copied multi-session evidence keeps duplicate basenames attributed
   assert.ok(report.evidence.includes(report.session.transcript), 'selected transcript remains reachable after cleanup');
   assert.ok(report.evidence.includes(report.session.omp_log), 'selected log remains reachable after cleanup');
 });
+
+test('report: retained native provenance is sanitized, session-scoped, and survives source cleanup', () => {
+  const fixture = makeFixture();
+  const resumeId = 'session-resume';
+  const resumeDir = join(fixture.manifest.roots.sessions, resumeId);
+  const resumePrivate = join(fixture.manifest.roots.private, 'sessions', resumeId);
+  mkdirSync(resumeDir, { recursive: true });
+  mkdirSync(resumePrivate, { recursive: true });
+  const resumeTranscript = join(resumeDir, 'transcript.jsonl');
+  const resumeLog = join(fixture.manifest.roots.logs, `${resumeId}.log`);
+  const resumeConnection = join(resumePrivate, 'connection.json');
+  writeFileSync(resumeTranscript, `${JSON.stringify({ ts: '2026-08-02T11:00:00.000Z', t: 'o', d: 'resume\n' })}\n${JSON.stringify({ ts: '2026-08-02T11:00:01.000Z', t: 'exit', code: 0 })}\n`);
+  writeFileSync(resumeLog, 'resume log\n');
+  writeFileSync(resumeConnection, JSON.stringify({ token: 'RESUME_BROKER_TOKEN' }) + '\n');
+  writeFileSync(join(resumeDir, 'session.json'), JSON.stringify({
+    id: resumeId, status: 'stopped', pid: null, started_at: '2026-08-02T11:00:00.000Z',
+    exit_code: 0, ready: true, readiness: { typed_rpc_ready: true },
+    termination: { requested: 'none', forced: false, observed: true },
+    slug: 'my-feature', omp_version: 'omp 18.3.4', profile: 'isolated-run',
+    transcript_path: resumeTranscript, log_path: resumeLog, private_connection_path: resumeConnection,
+  }) + '\n');
+  const manifest: RunManifest = {
+    ...fixture.manifest,
+    sessions: [...fixture.manifest.sessions, {
+      ...fixture.manifest.sessions[0]!, id: resumeId, status: 'stopped',
+      transcript_path: resumeTranscript, log_path: resumeLog, private_connection_path: resumeConnection,
+    }],
+  };
+  writeFileSync(fixture.manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+
+  const rawArgument = 'raw-argument-secret-unknown-to-redactor-12';
+  const coloredDispatch = '809d03b6-14c3-4341-8c1f-e7b1b478d3ae';
+  const coloredNonce = 'c5411f4a-1897-4eb8-af73-e12ceff42920';
+  const coloredText = `dis\u001b[31mpatch_token\u001b[0m: "\u001b[32m${coloredDispatch}\u001b[0m" owner_\u001b[35mnonce\u001b[0m: "\u001b[36m${coloredNonce}\u001b[0m"`;
+  writeFileSync(fixture.transcriptPath, [
+    JSON.stringify({ ts: '2026-08-02T10:00:02.000Z', t: 'o', d: coloredText }),
+    JSON.stringify({ ts: '2026-08-02T10:00:02.500Z', t: 'o', d: 'terminal fragment\u001b[' }),
+    JSON.stringify({ ts: '2026-08-02T10:00:02.750Z', t: 'o', d: 'frame after incomplete CSI' }),
+    JSON.stringify({ ts: '2026-08-02T10:00:03.000Z', t: 'exit', code: 0 }),
+  ].join('\n') + '\n');
+  const writeNative = (directory: string, id: string): string => {
+    const base = {
+      schema_version: 1, native_session_id: `native-${id}`, session_directory: realpathSync(directory),
+      model: { provider: 'xai', id: 'grok-test', metadata: 'model-private-canary' }, timestamp: 1,
+    };
+    const events = [
+      { ...base, kind: 'session_start' },
+      { ...base, kind: 'before_agent_start', task_sha256: 'a'.repeat(64) },
+      { ...base, kind: 'message_end', message: {
+        role: 'assistant', provider: 'xai', model: 'grok-test', api: 'chat',
+        usage: { input: 2, output: 9, totalTokens: 11, capTokens: rawArgument },
+        timestamp: 1, stopReason: 'stop', provider_error: false,
+        content: [
+          { type: 'text', text: `native answer ${id} {"dispatch_token":"uncollected-capability-probe"} escaped ${JSON.stringify(JSON.stringify({ advance_token: 'escaped-capability-probe' }))} colored ${coloredText}` },
+          { type: 'toolCall', id: 'private-call-id', name: 'write', resourcePath: 'xd://workflow_status', arguments: { secret: rawArgument, capTokens: rawArgument } },
+        ],
+      } },
+      { ...base, kind: 'message_end', message: { role: 'toolResult', isError: false, result: rawArgument } },
+      { ...base, kind: 'agent_end' },
+    ];
+    const body = events.map(event => JSON.stringify(event)).join('\n') + '\n';
+    writeFileSync(join(directory, 'live-native-events.jsonl'), body, { mode: 0o600 });
+    return body;
+  };
+
+  const rootDir = join(fixture.manifest.roots.sessions, 'session-1');
+  const rootNative = join(rootDir, 'live-native-events.jsonl');
+  const resumeNative = join(resumeDir, 'live-native-events.jsonl');
+  const rootBody = writeNative(rootDir, 'session-1');
+  writeNative(resumeDir, resumeId);
+
+  // A native-looking file beneath an unregistered session ID must not be scanned.
+  const foreignDir = join(fixture.manifest.roots.sessions, 'foreign-session');
+  mkdirSync(foreignDir, { recursive: true });
+  const foreignNative = join(foreignDir, 'live-native-events.jsonl');
+  writeFileSync(foreignNative, rootBody, { mode: 0o600 });
+
+  const allDir = join(fixture.manifest.roots.evidence, 'native-all');
+  const all = generateReport(fixture.manifestPath, BASE_INPUT, { mdDir: allDir, copyEvidence: true });
+  const allReport = readReport(all.jsonPath);
+  const retained = allReport.evidence.filter(path => path.endsWith('live-native-events.jsonl'));
+  assert.equal(retained.length, 2, 'only registered root and resume event logs are retained');
+  const copyFor = (id: string): string | undefined => retained.find(path => path.endsWith(join('sessions', id, 'live-native-events.jsonl')));
+  const retainedRoot = copyFor('session-1');
+  const retainedResume = copyFor(resumeId);
+  assert.ok(retainedRoot !== undefined && retainedResume !== undefined);
+  const rootExport = JSON.parse(readFileSync(retainedRoot, 'utf8').trim().split('\n')[2]!) as Record<string, unknown>;
+  const rootModel = rootExport.model as Record<string, unknown>;
+  assert.deepEqual(rootModel, { provider: 'xai', id: 'grok-test' }, 'unknown nested model fields are not retained');
+  const assistant = rootExport.message as Record<string, unknown>;
+  assert.equal(assistant.provider, 'xai');
+  assert.equal(assistant.model, 'grok-test');
+  assert.equal(assistant.api, 'chat');
+  const usage = assistant.usage as Record<string, unknown>;
+  assert.equal(usage.output, 9, 'positive provider usage remains observable');
+  assert.equal(usage.capTokens, undefined);
+  const content = assistant.content as Array<Record<string, unknown>>;
+  assert.ok(content.some(part => part.resourcePath === 'xd://workflow_status'), 'known public workflow operation is retained');
+  const retainedText = retained.map(path => readFileSync(path, 'utf8')).join('\n');
+  assert.ok(!retainedText.includes(rawArgument));
+  assert.ok(!retainedText.includes('uncollected-capability-probe'));
+  assert.ok(!retainedText.includes('escaped-capability-probe'));
+  assert.ok(!retainedText.includes('RESUME_BROKER_TOKEN'));
+  assert.ok(!retainedText.includes('arguments') && !retainedText.includes('private-call-id') && !retainedText.includes('"result"'));
+  assert.ok(!retainedText.includes('model-private-canary'));
+  const exportedTranscript = allReport.evidence.find(path => path.endsWith(join('sessions', 'session-1', 'transcript.jsonl')));
+  assert.ok(exportedTranscript !== undefined);
+  const retainedTranscript = readFileSync(exportedTranscript, 'utf8');
+  const transcriptFrames = retainedTranscript.trimEnd().split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(transcriptFrames[2]?.d, 'frame after incomplete CSI');
+  assert.equal(transcriptFrames[3]?.t, 'exit');
+  for (const capability of [coloredDispatch, coloredNonce]) {
+    assert.ok(!retainedText.includes(capability), 'colored native capability is not exported');
+    assert.ok(!retainedTranscript.includes(capability), 'serialized colored PTY capability is not exported');
+  }
+
+  const selected = generateReport(fixture.manifestPath, BASE_INPUT, {
+    mdDir: join(fixture.manifest.roots.evidence, 'native-selected'), copyEvidence: true, sessionId: resumeId,
+  });
+  const selectedReport = readReport(selected.jsonPath);
+  const selectedNative = selectedReport.evidence.filter(path => path.endsWith('live-native-events.jsonl'));
+  assert.equal(selectedNative.length, 1, 'selected resume scope excludes root and foreign session IDs');
+  assert.equal(selectedReport.session.events_jsonl, selectedNative[0]);
+
+  // The retained report remains complete after cleanup removes native sources.
+  rmSync(rootNative);
+  rmSync(resumeNative);
+  assert.ok(existsSync(retainedRoot) && existsSync(retainedResume));
+  const retainedResumeStart = JSON.parse(readFileSync(retainedResume, 'utf8').split('\n')[0]!) as Record<string, unknown>;
+  assert.equal(retainedResumeStart.native_session_id, 'native-session-resume');
+
+  // A source link to a foreign session and a hardlink are both refused.
+  symlinkSync(foreignNative, rootNative);
+  const symlinkReport = readReport(generateReport(fixture.manifestPath, BASE_INPUT, {
+    mdDir: join(fixture.manifest.roots.evidence, 'native-symlink'), copyEvidence: true, sessionId: 'session-1',
+  }).jsonPath);
+  assert.ok(!symlinkReport.evidence.some(path => path.endsWith('live-native-events.jsonl')));
+  rmSync(rootNative);
+  linkSync(foreignNative, rootNative);
+  const hardlinkReport = readReport(generateReport(fixture.manifestPath, BASE_INPUT, {
+    mdDir: join(fixture.manifest.roots.evidence, 'native-hardlink'), copyEvidence: true, sessionId: 'session-1',
+  }).jsonPath);
+  assert.ok(!hardlinkReport.evidence.some(path => path.endsWith('live-native-events.jsonl')));
+});
+
 
 test('report: binary screenshot with embedded credential is omitted from copied evidence', () => {
   const fixture = makeFixture();

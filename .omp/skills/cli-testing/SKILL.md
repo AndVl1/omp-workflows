@@ -106,6 +106,59 @@ closed. Native host broker use is explicit; run cleanup does not stop the shared
 broker, and cross-process OAuth refresh safety is not proven by this harness. Do not
 rotate credentials or silently switch providers/models to make a run pass.
 
+When an existing dedicated profile is authorized, export `OMP_PROFILE` before
+prepare, doctor, verify and broker lifecycle commands. Use a reviewed config whose
+`auth.provider` and `model` match that profile; the committed OpenAI config is not
+an xAI recipe. Keep `fixture.source: "./live-smoke-fixture"`: it supplies the
+explicit README worker mapping and read-only native event observer. Do not repair
+missing worker scope by allowing orchestrator writes or editing canonical state.
+The reviewed live scenario uses `/do-work --new`, not ambiguous task-only ingress.
+Follow the returned stage contract: orchestration stages advance after their
+declared action; single-worker stages require an actual native task/result before
+completion. Never invent a dispatch ID or invoke an undeclared checkpoint.
+`[AUTONOMOUS]` cannot authorize a checkpoint. Supervise genuine human approvals
+only after the user explicitly grants the relevant decision, and enter it through
+the actual native TUI. Do not fabricate ledger/proof or suppress an unanswered
+approval timeout. A reasoning-model recipe may select a larger finite
+`timing.stageTimeoutMs` before prepare; the config's `timeout_ms` is not the command
+deadline. Never edit a generated scenario or manifest to extend an active run.
+
+Once all clients are stopped, stop the explicitly managed broker separately:
+
+```bash
+npm --silent run e2e:auth-broker -- stop --manifest "$LIVE_MANIFEST" --json
+npm --silent run e2e:auth-broker -- status --manifest "$LIVE_MANIFEST" --json
+```
+
+Require the manager receipt removed and its listener free. A still-live mismatched
+PID must be refused; an owned target disappearing during identity observation
+must complete the same stop rather than require a second invocation. Never use
+raw process-name cleanup or infer broker shutdown from run cleanup alone.
+
+### Standalone synthetic OAuth regression
+
+For controlled token refresh without a real account or a model request:
+
+```bash
+npm --silent run test:oauth-refresh
+# Equivalent CLI command, including machine-readable evidence:
+npm --silent run e2e:oauth-refresh -- --json
+```
+
+Requires repository development dependencies and Bun >=1.3.14; no manifest or
+installed `omp` is needed. This runs real native broker/storage/client components
+from pinned `pi-ai@18.0.6` with an injected loopback synthetic token endpoint.
+The assertions require three overlapping client requests to cause one provider
+refresh, rotated access consumption, persisted reuse after SQLite reopen, no
+stale-token fallback after HTTP 503, and complete cleanup. Only the disposable
+synthetic record's expiry is moved into the native 60-second refresh window.
+
+Missing/old Bun or a failed assertion is a nonzero failure, not a skipped PASS.
+Keep this evidence separate from real-provider `live-smoke`: it does not prove
+unchanged CLI `auth-broker serve`, xAI/OpenAI OAuth protocols, scheduled background
+refresh or ordinary-client cross-process single-flight. Never change a real
+profile's token expiry to reproduce this scenario.
+
 ## 5. Diagnose without erasing evidence
 
 - Help/argument failure: preserve the nonzero result, consult `--help`, correct the
@@ -116,6 +169,21 @@ rotate credentials or silently switch providers/models to make a run pass.
   retain the initial failure, and rerun only after the prerequisite succeeds.
 - PTY hangs or an apparently successful submit: inspect session/transcript evidence,
   use CR or `e2e:input`, and do not count echoed input as command/model execution.
+- For live verification, require the fixture's native event observer, exact
+  submitted-task correlation after Enter, selected provider/model metadata, and
+  the matching native `agent_end`; an input prompt is only startup readiness.
+  Require canonical schema-2 state in the disposable
+  `.work-state/runs/<UUID>/state.json` and a distinct native session on restart.
+  Extension instructions, echoed prompts, user messages, startup turns and
+  truncated/error responses cannot prove provider success. A timeout must retain
+  independently observed checks rather than claiming every check was false;
+  cleanup must not hide the failure.
+  A normal native tool result with structured public workflow `{ok:false}` is
+  still a workflow failure even when `isError` is false; prose examples and
+  unrelated tool results are not workflow refusals. Check the retained
+  per-session `events_jsonl` links for narrowed native provenance after cleanup.
+  Capability-bearing arguments/results must not be exported, and quoted or
+  escaped token/nonce values in assistant text must remain redacted.
 - Stop/cleanup ownership ambiguity: investigate the receipt and run scope. Refuse
   unsafe process cleanup rather than killing by name or fabricating an exit.
 - A malformed fixture, generated check, or regex that fails to parse is a failed

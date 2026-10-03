@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as http from 'node:http';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 
 import { WebSocket } from 'ws';
@@ -162,6 +162,24 @@ test('server: direct launch rechecks immutable artifacts after prior integrity c
     startTestSession({ manifest: fixture.manifest, sessionId: 'tampered', noPty: true }),
     /cache_integrity_failure/u,
   );
+});
+
+test('server: refuses foreign symlinks and hardlinks as the prepared native observer', async t => {
+  for (const kind of ['symlink', 'hardlink'] as const) {
+    const fixture = createIsolatedRunFixture();
+    t.after(() => fixture.cleanup());
+    const extensionDirectory = join(fixture.manifest.roots.workspace, '.omp', 'extensions');
+    const observerPath = join(extensionDirectory, 'live-native-evidence.ts');
+    const externalPath = join(fixture.root, 'external-live-native-evidence.ts');
+    mkdirSync(extensionDirectory, { recursive: true });
+    writeFileSync(externalPath, 'export default function observer() {}\n');
+    if (kind === 'symlink') symlinkSync(externalPath, observerPath);
+    else linkSync(externalPath, observerPath);
+    await assert.rejects(
+      startTestSession({ manifest: fixture.manifest, sessionId: `${kind}-native-observer`, noPty: true }),
+      kind === 'symlink' ? /symbolic link/u : /native_observer_path_invalid/u,
+    );
+  }
 });
 
 test('server: rejects mismatched origins and ports', async t => {

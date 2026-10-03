@@ -10,13 +10,13 @@ import {
   type RunManifest,
   type SessionRecord,
 } from './manifest.js';
-import { assertSafeRunPath, buildChildEnvironment, manifestRoots, pathContained, readRunLeaseOwnership, type ManifestRoots, type RunLeaseOwnership } from './environment.js';
+import { assertSafeRunPath, buildChildEnvironment, manifestRoots, pathContained, readRunLeaseOwnership, sessionPaths, type ManifestRoots, type RunLeaseOwnership } from './environment.js';
 import { killProcessTree, pidIsLive, readSessionRecord, startTestSession, type SessionInfo, type TestSession } from './server.js';
 import { writeProviderFreeCatalog } from './runtime.js';
 import { verifyPackageArtifact } from './artifacts.js';
 import { checkBrokerConnection, resolveLaunchAuthEnvironment } from './auth.js';
 import { generateReport, type GenerateReportResult, type ReportInput, type Verdict } from './report.js';
-import { stripAnsi, TranscriptLog, WsDriver, waitFor } from './driver.js';
+import { stripAnsi, TranscriptLog, WaitTimeoutError, WsDriver, waitFor } from './driver.js';
 import { loadScenario } from './scenario.js';
 import { doctorRun } from './prepare.js';
 import { deferred } from './util.js';
@@ -922,74 +922,307 @@ function liveScenarioContract(manifest: RunManifest): LiveScenarioContract {
   return { command, input, taskPrompt, expectations };
 }
 
+const CANONICAL_RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const CANONICAL_STAGE_STATUSES: Readonly<Record<string, true>> = { pending: true, in_progress: true, done: true, skipped: true, failed: true };
+const CANONICAL_PAUSE_KINDS: Readonly<Record<string, true>> = { none: true, background_wait: true, user_checkpoint: true, needs_human: true, failed: true, done: true };
+const CANONICAL_TASK_TYPES: Readonly<Record<string, true>> = { FEATURE: true, REFACTOR: true, OPS: true, BUG_FIX: true, SPEC: true, REGRESS: true, INVESTIGATION: true, LECTURE_RESEARCH: true, REVIEW: true, HOTFIX: true, PRODUCT_DISCOVERY: true };
+const CANONICAL_COMPLEXITIES: Readonly<Record<string, true>> = { QUICK: true, MEDIUM: true, COMPLEX: true, CRITICAL: true };
+const CANONICAL_CONFIDENCES: Readonly<Record<string, true>> = { HIGH: true, MEDIUM: true, LOW: true };
+
 function workflowStateDigest(root: string, expectedBranch: string): string | null {
-  if (!existsSync(root)) return null;
-  if (!lstatSync(root).isDirectory() || lstatSync(root).isSymbolicLink()) {
-    throw new VerifyError('workflow_state_invalid', 'workflow state root is not a trusted directory');
+  function invalid(message: string): never {
+    throw new VerifyError('workflow_state_invalid', message);
   }
-  const candidates = [join(root, 'team-state.json')];
-  const features = join(root, 'features');
-  if (existsSync(features)) {
-    if (!lstatSync(features).isDirectory() || lstatSync(features).isSymbolicLink()) {
-      throw new VerifyError('workflow_state_invalid', 'workflow feature state root is not a trusted directory');
-    }
-    for (const feature of readdirSync(features).sort()) {
-      const directory = join(features, feature);
-      if (!lstatSync(directory).isDirectory() || lstatSync(directory).isSymbolicLink()) {
-        throw new VerifyError('workflow_state_invalid', 'workflow feature state directory is not trusted');
-      }
-      candidates.push(join(directory, 'state.json'));
-    }
+  const missing = (error: unknown): boolean => error instanceof Error && 'code' in error && error.code === 'ENOENT';
+  const trustedPath = (base: string, path: string, label: string): void => {
+    try { assertSafeRunPath(base, path, label); }
+    catch { invalid(`${label} is outside the trusted canonical state tree`); }
+  };
+
+  let rootStat: Stats;
+  try {
+    rootStat = lstatSync(root);
+  } catch (error) {
+    if (missing(error)) return null;
+    throw error;
   }
-  const hash = createHash('sha256');
-  let fileCount = 0;
-  for (const path of candidates) {
-    if (!existsSync(path)) continue;
-    const stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new VerifyError('workflow_state_invalid', 'canonical workflow state is not a regular file');
-    const body = readFileSync(path);
+  trustedPath(dirname(root), root, 'workflow state root');
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) invalid('canonical workflow state root is not a trusted directory');
+
+  const runsDir = join(root, 'runs');
+  let runsStat: Stats;
+  try {
+    runsStat = lstatSync(runsDir);
+  } catch (error) {
+    if (missing(error)) return null;
+    throw error;
+  }
+  trustedPath(root, runsDir, 'canonical workflow runs directory');
+  if (!runsStat.isDirectory() || runsStat.isSymbolicLink()) invalid('canonical workflow runs path is not a trusted directory');
+
+  const canonical: Array<{ path: string; body: Buffer }> = [];
+  for (const runId of readdirSync(runsDir).sort()) {
+    if (!CANONICAL_RUN_ID.test(runId)) continue;
+    const runDir = join(runsDir, runId);
+    trustedPath(runsDir, runDir, 'canonical workflow run directory');
+    const runStat = lstatSync(runDir);
+    if (!runStat.isDirectory() || runStat.isSymbolicLink()) invalid('canonical workflow run directory is not trusted');
+    const statePath = join(runDir, 'state.json');
+    trustedPath(runDir, statePath, 'canonical workflow state file');
+    let stateStat: Stats;
+    try {
+      stateStat = lstatSync(statePath);
+    } catch (error) {
+      if (missing(error)) continue;
+      throw error;
+    }
+    if (!stateStat.isFile() || stateStat.isSymbolicLink()) invalid('canonical workflow state is not a regular file');
+    const body = readFileSync(statePath);
     let raw: unknown;
     try {
       raw = JSON.parse(body.toString('utf8')) as unknown;
     } catch {
-      throw new VerifyError('workflow_state_invalid', 'canonical workflow state is not valid JSON');
+      invalid('canonical workflow state is not valid JSON');
     }
     const state = asJsonRecord(raw);
-    if (state?.schema !== 1 || state.branch !== expectedBranch || typeof state.task !== 'string' || typeof state.stage_cursor !== 'string') {
-      throw new VerifyError('workflow_state_invalid', 'canonical workflow state does not match the isolated branch');
+    if (state === null || state.schema !== 2 || state.run_id !== runId || state.run_key !== runId || !CANONICAL_RUN_ID.test(runId)) {
+      invalid('canonical workflow state does not have a matching schema-2 ordinary run identity');
     }
-    fileCount += 1;
-    hash.update(path.slice(root.length + 1));
-    hash.update('\0');
-    hash.update(body);
-    hash.update('\0');
+    const classification = asJsonRecord(state.classification);
+    if (state.branch !== expectedBranch) invalid('canonical workflow state is bound to a foreign branch');
+    if (typeof state.task !== 'string' || state.task.trim().length === 0
+      || classification === null
+      || typeof classification.workflow !== 'string' || classification.workflow.length === 0
+      || typeof classification.autonomous !== 'boolean'
+      || CANONICAL_TASK_TYPES[String(classification.type)] !== true
+      || CANONICAL_COMPLEXITIES[String(classification.complexity)] !== true
+      || CANONICAL_CONFIDENCES[String(classification.confidence)] !== true
+      || typeof state.workflow_override !== 'boolean'
+      || !Object.prototype.hasOwnProperty.call(state, 'issue')
+      || (state.issue !== null && (asJsonRecord(state.issue) === null || !Number.isSafeInteger(asJsonRecord(state.issue)?.number)))
+      || asJsonRecord(state.artifacts) === null
+      || typeof state.updated_at !== 'string' || state.updated_at.length === 0) {
+      invalid('canonical workflow state does not match the ordinary run state contract');
+    }
+    const pause = asJsonRecord(state.pause);
+    if (pause === null || CANONICAL_PAUSE_KINDS[String(pause.kind)] !== true || typeof pause.reason !== 'string') {
+      invalid('canonical workflow state has an invalid pause record');
+    }
+    if (!Array.isArray(state.stages) || typeof state.stage_cursor !== 'string' || state.stage_cursor.length === 0) {
+      invalid('canonical workflow state has no durable stage cursor');
+    }
+    const stageIds = new Set<string>();
+    let cursorCount = 0;
+    for (const rawStage of state.stages) {
+      const stage = asJsonRecord(rawStage);
+      if (stage === null || typeof stage.id !== 'string' || stage.id.length === 0 || CANONICAL_STAGE_STATUSES[String(stage.status)] !== true || stageIds.has(stage.id)) {
+        invalid('canonical workflow state contains an invalid stage record');
+      }
+      stageIds.add(stage.id);
+      if (stage.id === state.stage_cursor) cursorCount += 1;
+    }
+    if (cursorCount !== 1) invalid('canonical workflow state cursor does not identify exactly one stage');
+    canonical.push({ path: statePath, body });
   }
-  return fileCount === 0 ? null : hash.digest('hex');
+  if (canonical.length > 1) invalid('canonical workflow state is ambiguous across multiple ordinary runs');
+  const selected = canonical[0];
+  if (selected === undefined) return null;
+  const hash = createHash('sha256');
+  hash.update(selected.path.slice(root.length + 1));
+  hash.update('\0');
+  hash.update(selected.body);
+  hash.update('\0');
+  return hash.digest('hex');
+}
+const PUBLIC_WORKFLOW_OPERATIONS: Readonly<Record<string, true>> = { workflow_prepare: true, workflow_status: true, workflow_instructions: true, workflow_begin: true, workflow_complete: true, workflow_checkpoint: true, workflow_checkpoint_ask: true, workflow_advance: true };
+
+function liveInputSubmission(log: TranscriptLog, baselineFrames: number, input: string): { submitted: boolean; at: number } {
+  let typed = false;
+  for (let index = baselineFrames; index < log.frames.length; index += 1) {
+    const frame = log.frames[index];
+    if (frame?.t !== 'i') continue;
+    if (stripAnsi(frame.d).includes(input)) typed = true;
+    if (typed && frame.d.includes('\r')) {
+      const at = Date.parse(frame.ts);
+      if (!Number.isFinite(at)) throw new VerifyError('live_input_timestamp_invalid', 'submitted input timestamp is invalid');
+      return { submitted: true, at };
+    }
+  }
+  return { submitted: false, at: Number.POSITIVE_INFINITY };
 }
 
-interface LiveObservation {
-  readonly submitted: boolean;
-  readonly semantic: readonly string[];
+function forwardedTaskDigest(input: string): string {
+  // Hash the task actually submitted, not the separately declared scenario
+  // task (which may have been collapsed or replaced by an input override).
+  const submitted = input.trimStart();
+  const commandToken = submitted.match(/^\/\S+/u)?.[0];
+  if (commandToken === undefined) throw new VerifyError('live_command_input_invalid', 'live input has no slash command');
+  let forwarded = submitted.slice(commandToken.length).trimStart();
+  // The committed live recipe establishes explicit new intent. Core consumes
+  // this leading lifecycle option before forwarding the task to the model.
+  if (commandToken === '/do-work' && /^--new(?:\s|$)/u.test(forwarded)) {
+    forwarded = forwarded.slice('--new'.length).trimStart();
+  }
+  const directive = '[AUTONOMOUS]';
+  if (forwarded.startsWith(directive)) {
+    const rest = forwarded.slice(directive.length);
+    if (rest === '' || /^\s/u.test(rest)) forwarded = rest.trimStart();
+  }
+  const issue = forwarded.match(/issue=#(\d+)/u);
+  if (issue !== null) forwarded = forwarded.replace(issue[0], '');
+  return createHash('sha256').update(forwarded.trim()).digest('hex');
 }
 
-function observeLiveCommand(
-  log: TranscriptLog,
-  baselineFrames: number,
-  submittedInput: string,
-  commandToken: string,
-  expectations: readonly string[],
-): LiveObservation {
-  const before = log.frames.slice(0, baselineFrames);
-  const after = log.frames.slice(baselineFrames);
-  const submitted = after.some(frame => frame.t === 'i' && stripAnsi(frame.d).includes(commandToken));
-  const beforeOutput = before.filter(frame => frame.t === 'o').map(frame => stripAnsi(frame.d)).join('\n').toLowerCase();
-  const afterOutput = after.filter(frame => frame.t === 'o').map(frame => stripAnsi(frame.d)).join('\n').toLowerCase();
-  const commandlessOutput = afterOutput.replaceAll(submittedInput.toLowerCase(), '').replaceAll(commandToken.toLowerCase(), '').trim();
-  const semantic = expectations.filter(expectation => {
-    const expected = expectation.toLowerCase();
-    return !beforeOutput.includes(expected) && commandlessOutput.includes(expected);
-  });
-  return { submitted, semantic };
+interface NativeSessionSnapshot {
+  readonly sessionId: string;
+  readonly model: string;
+  readonly recordCount: number;
+  readonly started: boolean;
+  readonly completed: boolean;
+  readonly messages: readonly JsonRecord[];
+}
+
+/** Read only the harness fixture's native lifecycle tap, never terminal output. */
+function readNativeSessionSnapshot(manifest: RunManifest, sessionId: string, baselineRecords = 0, invocation?: { readonly taskDigest: string; readonly submittedAt: number }): NativeSessionSnapshot | null {
+  const sessionDir = sessionPaths(manifest, sessionId).root;
+  const path = join(sessionDir, 'live-native-events.jsonl');
+  let stat: Stats;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw new VerifyError('live_native_session_unreadable', 'native lifecycle evidence could not be inspected');
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new VerifyError('live_native_session_unreadable', 'native lifecycle evidence is not a regular session-owned file');
+  }
+  try {
+    assertSafeRunPath(manifestRoots(manifest).run, path, 'native lifecycle evidence');
+  } catch {
+    throw new VerifyError('live_native_session_unreadable', 'native lifecycle evidence escaped the owned session');
+  }
+  // Native evidence records the filesystem identity, not a platform's lexical
+  // temp alias (for example /tmp -> /private/tmp on macOS). Resolve only the
+  // already ownership-checked session root; never resolve a claimed record path.
+  const canonicalSessionDir = realpathSync(sessionDir);
+  const body = readFileSync(path, 'utf8');
+  // An event append can be in progress. Only complete newline-delimited records
+  // count; an incomplete trailing write cannot establish command completion.
+  const lines = body.slice(0, body.lastIndexOf('\n') + 1).split('\n');
+  const messages: JsonRecord[] = [];
+  let nativeId: string | null = null;
+  let model: string | null = null;
+  let recordCount = 0;
+  let started = false;
+  let completed = false;
+  let activeInvocation = invocation === undefined;
+  for (const line of lines) {
+    if (line.length === 0) continue;
+    let raw: unknown;
+    try { raw = JSON.parse(line) as unknown; }
+    catch { throw new VerifyError('live_native_session_unreadable', 'native lifecycle evidence contains invalid JSON'); }
+    const record = asJsonRecord(raw);
+    const recordModel = modelIdentity(record?.model);
+    if (record === null || record.schema_version !== 1
+      || typeof record.native_session_id !== 'string' || record.native_session_id.length === 0
+      || record.session_directory !== canonicalSessionDir || recordModel !== manifest.model
+      || typeof record.timestamp !== 'number' || !Number.isFinite(record.timestamp)
+      || !['session_start', 'before_agent_start', 'message_end', 'agent_end'].includes(String(record.kind))) {
+      throw new VerifyError('live_native_session_identity_mismatch', 'native lifecycle evidence does not identify the owned session and selected model');
+    }
+    if (nativeId !== null && nativeId !== record.native_session_id) {
+      throw new VerifyError('live_native_session_identity_mismatch', 'native lifecycle evidence mixed multiple native sessions');
+    }
+    nativeId = record.native_session_id;
+    model = recordModel;
+    if (record.kind === 'session_start') started = true;
+    if (recordCount++ < baselineRecords) continue;
+    if (record.kind === 'before_agent_start') {
+      activeInvocation = invocation === undefined || (record.task_sha256 === invocation.taskDigest && record.timestamp > invocation.submittedAt);
+      continue;
+    }
+    if (!activeInvocation) continue;
+    if (record.kind === 'agent_end') completed = true;
+    if (record.kind === 'message_end') {
+      const message = asJsonRecord(record.message);
+      if (message === null) throw new VerifyError('live_native_session_unreadable', 'native message event contains no message');
+      messages.push(message);
+    }
+  }
+  if (nativeId === null || model === null) return null;
+  if (recordCount < baselineRecords) {
+    throw new VerifyError('live_native_session_unreadable', 'native lifecycle evidence was truncated after command submission');
+  }
+  return { sessionId: nativeId, model, recordCount, started, completed, messages };
+}
+
+async function waitForNativeSessionStart(
+  manifest: RunManifest,
+  sessionId: string,
+  timing: { readonly startupTimeoutMs: number; readonly checkpointPollMs: number },
+): Promise<NativeSessionSnapshot> {
+  let snapshot = readNativeSessionSnapshot(manifest, sessionId);
+  await waitFor(() => {
+    if (snapshot?.started === true) return true;
+    snapshot = readNativeSessionSnapshot(manifest, sessionId);
+    return snapshot?.started === true;
+  }, { timeoutMs: timing.startupTimeoutMs, intervalMs: timing.checkpointPollMs });
+  if (snapshot?.started !== true) {
+    throw new VerifyError('live_native_session_unreadable', 'native lifecycle evidence disappeared after startup');
+  }
+  return snapshot;
+}
+
+interface NativeProviderEvidence {
+  readonly responseMatches: boolean;
+  readonly providerMessage: boolean;
+  readonly providerError: boolean;
+  readonly workflowToolErrors: number;
+}
+
+function nativeProviderEvidence(snapshot: NativeSessionSnapshot, expectedModel: string, expectations: readonly string[]): NativeProviderEvidence {
+  let responseMatches = false;
+  let providerMessage = false;
+  let providerError = false;
+  let workflowToolErrors = 0;
+  for (const message of snapshot.messages) {
+    if (message.role === 'toolResult' && (message.isError === true
+      || (message.workflow_error === true && typeof message.workflow_operation === 'string'
+        && PUBLIC_WORKFLOW_OPERATIONS[message.workflow_operation] === true))) {
+      workflowToolErrors += 1;
+      continue;
+    }
+    if (message.role !== 'assistant') continue;
+    // A native failure need not carry successful-response API/usage metadata.
+    if (message.provider_error === true || ['error', 'aborted', 'length'].includes(String(message.stopReason))) {
+      providerMessage = true;
+      providerError = true;
+      continue;
+    }
+    if (typeof message.provider !== 'string' || typeof message.model !== 'string'
+      || `${message.provider}/${message.model}` !== expectedModel || typeof message.api !== 'string' || message.api.length === 0
+      || typeof message.timestamp !== 'number' || !Number.isFinite(message.timestamp)) continue;
+    const usage = asJsonRecord(message.usage);
+    if (usage === null || typeof usage.input !== 'number' || !Number.isFinite(usage.input) || usage.input < 0
+      || typeof usage.output !== 'number' || !Number.isFinite(usage.output) || usage.output <= 0
+      || !['stop', 'toolUse'].includes(String(message.stopReason)) || !Array.isArray(message.content)) continue;
+    providerMessage = true;
+    for (const rawBlock of message.content) {
+      const block = asJsonRecord(rawBlock);
+      if (block === null) continue;
+      const operation = block.type === 'toolCall' && typeof block.name === 'string'
+        ? PUBLIC_WORKFLOW_OPERATIONS[block.name] === true ? block.name
+          : block.name === 'write' && typeof block.resourcePath === 'string' && block.resourcePath.startsWith('xd://')
+            && PUBLIC_WORKFLOW_OPERATIONS[block.resourcePath.slice('xd://'.length)] === true ? block.resourcePath : ''
+        : '';
+      const semantic = block.type === 'text' && typeof block.text === 'string' ? block.text : operation;
+      const normalized = stripAnsi(semantic).toLowerCase();
+      if (expectations.some(expectation => normalized.includes(stripAnsi(expectation).toLowerCase()))) responseMatches = true;
+    }
+  }
+  // These are independent observations. Workflow/provider failures fail the
+  // suite separately, without erasing a previously observed successful reply.
+  return { responseMatches, providerMessage, providerError, workflowToolErrors };
 }
 
 interface LiveCommandInventory {
@@ -1083,6 +1316,7 @@ async function runLiveSmoke(manifest: RunManifest, requestedSessionId: string | 
   const checks: Record<string, boolean | string> = {}, sessionIds: string[] = [];
   const errors: { code: string; message: string }[] = [];
   const contract = liveScenarioContract(manifest);
+  const timing = loadScenario(manifest.scenario.path).timing;
   if (manifest.model === null || manifest.auth.mode === 'none') {
     return {
       status: 'blocked',
@@ -1151,88 +1385,134 @@ async function runLiveSmoke(manifest: RunManifest, requestedSessionId: string | 
   }
   sessionIds.push(session.sessionId);
 
+
+  let driver: WsDriver | undefined;
+  let log: TranscriptLog | undefined;
+  let baselineFrames = 0;
+  let baselineRecords = 0;
+  let inputSubmitted = false;
+  let commandTimedOut = false;
+  let nativeSnapshot: NativeSessionSnapshot | null = null;
+  let observedState: string | null = null;
   try {
     checks.selected_model = session.readiness.model === manifest.model;
     if (checks.selected_model !== true) {
       errors.push({ code: 'live_selected_model_mismatch', message: 'live session readiness selected a different model than the manifest contract' });
     }
-    const url = readConnectionUrl(session.privateConnectionPath);
-    const driver = new WsDriver({ url, transcriptPath: session.transcriptPath });
-    const log = new TranscriptLog(session.transcriptPath);
+    driver = new WsDriver({ url: readConnectionUrl(session.privateConnectionPath), transcriptPath: session.transcriptPath });
+    log = new TranscriptLog(session.transcriptPath);
     await driver.open();
     try {
-      // PTY spawn and native inventory readiness precede the interactive
-      // editor by ~1s on omp 18.x. Sending CR before the editor mounts leaves
-      // the task typed but unsubmitted. Wait for the rendered input prompt.
-      try {
-        let consumedFrameCount = 0;
-        let recentTerminalOutput = '';
-        await waitFor(() => {
-          log.refresh();
-          while (consumedFrameCount < log.frames.length) {
-            const frame = log.frames[consumedFrameCount++];
-            if (frame?.t !== 'o' || typeof frame.d !== 'string') continue;
-            recentTerminalOutput = `${recentTerminalOutput}${frame.d}`.slice(-2_048);
-          }
-          return recentTerminalOutput.includes('╰─ ');
-        }, { timeoutMs: 30_000, intervalMs: 100 });
-      } catch {
-        throw new VerifyError('live_tui_not_ready', 'native omp did not render its interactive input prompt before command submission');
-      }
-      const baselineFrames = log.frames.length;
-      const command = contract.command!;
-      const input = contract.input!;
-      await driver.type(input);
-      await driver.pressEnter();
-      let observation: LiveObservation = { submitted: false, semantic: [] };
+      let consumedFrameCount = 0;
+      let recentTerminalOutput = '';
       await waitFor(() => {
-        log.refresh();
-        observation = observeLiveCommand(log, baselineFrames, input, command.split(/\s+/u)[0] ?? command, contract.expectations);
-        const currentState = workflowStateDigest(stateRoot, expectedBranch);
-        checks.workflow_state_saved = currentState !== null && currentState !== stateBeforeCommand;
-        return observation.submitted && observation.semantic.length > 0 && checks.workflow_state_saved === true;
-      }, { timeoutMs: 120_000, intervalMs: 250 });
-      checks.registered_command = inventory.ok && observation.submitted;
-      checks.provider_response_semantic = observation.semantic.length > 0;
-      checks.provider_output = checks.provider_response_semantic;
-      checks.startup_echo_rejected = checks.provider_response_semantic === true;
-      if (checks.registered_command !== true) errors.push({ code: 'live_command_not_submitted', message: 'the registered command was not observed as submitted terminal input' });
-      if (checks.provider_response_semantic !== true) errors.push({ code: 'live_provider_response_unproven', message: 'live output matched no scenario-specific assertion distinct from startup or terminal echo' });
+        log!.refresh();
+        while (consumedFrameCount < log!.frames.length) {
+          const frame = log!.frames[consumedFrameCount++];
+          if (frame?.t !== 'o' || typeof frame.d !== 'string') continue;
+          const output = `${recentTerminalOutput}${frame.d}`;
+          // A later animated redraw can evict a prompt from the rolling suffix.
+          // Observe each frame before clipping; ANSI styling is not prompt text.
+          if (stripAnsi(output).includes('╰─ ')) return true;
+          recentTerminalOutput = output.slice(-2_048);
+        }
+        return false;
+      }, { timeoutMs: timing.startupTimeoutMs, intervalMs: timing.checkpointPollMs });
+    } catch {
+      throw new VerifyError('live_tui_not_ready', 'native omp did not render its interactive input prompt before command submission');
+    }
+    checks.native_observer_ready = false;
+    let beforeInput: NativeSessionSnapshot;
+    try {
+      beforeInput = await waitForNativeSessionStart(manifest, session.sessionId, timing);
     } catch (error) {
-      const detail = errorOf(error, 'live_request_failed');
-      errors.push(detail);
-      checks.provider_output = false;
-      checks.provider_response_semantic = false;
-      checks.registered_command = false;
-      checks.startup_echo_rejected = false;
-    } finally {
-      await driver.close();
+      if (!(error instanceof WaitTimeoutError)) throw error;
+      throw new VerifyError('live_native_observer_missing', 'live-smoke requires the manifest-snapshotted native lifecycle observer fixture');
     }
+    checks.native_observer_ready = beforeInput.started;
+    baselineRecords = beforeInput.recordCount;
+    baselineFrames = log.frames.length;
+    stateBeforeCommand = workflowStateDigest(stateRoot, expectedBranch);
+    const input = contract.input!;
+    const taskDigest = forwardedTaskDigest(input);
+    await driver.type(input);
+    await driver.pressEnter();
+    await waitFor(() => {
+      log!.refresh();
+      const submission = liveInputSubmission(log!, baselineFrames, input);
+      inputSubmitted = submission.submitted;
+      checks.registered_command = inventory.ok && inputSubmitted;
+      const state = workflowStateDigest(stateRoot, expectedBranch);
+      if (state !== null && state !== stateBeforeCommand) observedState = state;
+      checks.workflow_state_saved = observedState !== null;
+      nativeSnapshot = readNativeSessionSnapshot(manifest, session.sessionId, baselineRecords, { taskDigest, submittedAt: submission.at });
+      // The editor remains visible while a model is busy. Only the native
+      // agent_end event from this invocation establishes completion.
+      return inputSubmitted && nativeSnapshot?.completed === true;
+    }, { timeoutMs: timing.stageTimeoutMs, intervalMs: timing.checkpointPollMs });
   } catch (error) {
-    errors.push(errorOf(error, 'live_connection_failed'));
-  } finally {
-    const sessionInfo = readSessionRecord(manifest, session.sessionId);
-    checks.session_ready = sessionInfo?.ready === true;
-    if (checks.session_ready !== true) {
-      errors.push({ code: 'live_session_not_ready', message: 'live-smoke did not observe ready:true in the owned session record' });
+    if (error instanceof WaitTimeoutError) {
+      commandTimedOut = true;
+      errors.push({ code: 'live_command_timeout', message: 'native command completion was not observed before the scenario deadline' });
+    } else {
+      errors.push(errorOf(error, 'live_request_failed'));
     }
-    await session.close();
+  } finally {
+    // Capture partial, independently observed evidence before our own close
+    // can abort an in-flight request and append a cleanup-induced error.
+    try {
+      if (log !== undefined) {
+        log.refresh();
+        inputSubmitted = liveInputSubmission(log, baselineFrames, contract.input!).submitted;
+      }
+      const submittedAt = log === undefined ? Number.POSITIVE_INFINITY : liveInputSubmission(log, baselineFrames, contract.input!).at;
+      nativeSnapshot = readNativeSessionSnapshot(manifest, session.sessionId, baselineRecords, { taskDigest: forwardedTaskDigest(contract.input!), submittedAt });
+      const state = workflowStateDigest(stateRoot, expectedBranch);
+      if (state !== null && state !== stateBeforeCommand) observedState = state;
+    } catch (error) {
+      errors.push(errorOf(error, 'live_evidence_unreadable'));
+    }
+    checks.registered_command = inventory.ok && inputSubmitted;
+    checks.live_command_timed_out = commandTimedOut;
+    checks.native_command_complete = nativeSnapshot?.completed === true;
+    checks.session_ready = readSessionRecord(manifest, session.sessionId)?.ready === true;
+    if (checks.registered_command !== true) errors.push({ code: 'live_command_not_submitted', message: 'registered command input and Enter were not observed' });
+    if (checks.session_ready !== true) errors.push({ code: 'live_session_not_ready', message: 'owned session record did not report ready:true' });
+    try { if (driver !== undefined) await driver.close(); }
+    catch (error) { errors.push(errorOf(error, 'live_driver_close_failed')); }
+    try { await session.close(); }
+    catch (error) { errors.push(errorOf(error, 'live_session_close_failed')); }
   }
 
-  // Only a canonical engine state belongs to the workflow. Session-start
-  // observability and runtime mapping files do not establish resumability.
+  checks.native_session_snapshot = nativeSnapshot !== null;
+  checks.native_session_identity = nativeSnapshot !== null && nativeSnapshot.model === manifest.model;
+  const evidence = nativeSnapshot === null
+    ? { responseMatches: false, providerMessage: false, providerError: false, workflowToolErrors: 0 }
+    : nativeProviderEvidence(nativeSnapshot, manifest.model!, contract.expectations);
+  checks.provider_message_provenance = evidence.providerMessage;
+  checks.provider_error_observed = evidence.providerError;
+  checks.workflow_tool_errors = evidence.workflowToolErrors > 0;
+  checks.provider_response_semantic = evidence.responseMatches;
+  checks.provider_output = evidence.responseMatches;
+  checks.startup_echo_rejected = evidence.responseMatches;
+  if (evidence.providerError) errors.push({ code: 'live_provider_error', message: 'native lifecycle evidence contains a failed provider request' });
+  if (evidence.workflowToolErrors > 0) errors.push({ code: 'live_workflow_tool_error', message: 'native lifecycle evidence contains failed tool results' });
+  if (!evidence.responseMatches) errors.push({ code: 'live_provider_response_unproven', message: 'no post-submission provider-authored assistant text or operation matched the scenario assertion' });
+  if (checks.native_command_complete !== true && !commandTimedOut) errors.push({ code: 'live_command_incomplete', message: 'native agent_end was not observed for this command' });
+
   let stateBeforeResume: string | null = null;
-  try {
-    stateBeforeResume = workflowStateDigest(stateRoot, expectedBranch);
-  } catch (error) {
-    errors.push(errorOf(error, 'workflow_state_invalid'));
-  }
-  checks.workflow_state_saved = stateBeforeResume !== null;
-  if (checks.workflow_state_saved !== true) errors.push({ code: 'workflow_state_missing', message: 'live-smoke did not leave a saved workflow state for resume' });
+  try { stateBeforeResume = workflowStateDigest(stateRoot, expectedBranch); }
+  catch (error) { errors.push(errorOf(error, 'workflow_state_invalid')); }
+  if (stateBeforeResume !== null && stateBeforeResume !== stateBeforeCommand) observedState = stateBeforeResume;
+  checks.workflow_state_saved = observedState !== null;
+  if (!checks.workflow_state_saved) errors.push({ code: 'workflow_state_missing', message: 'no changed canonical workflow state was observed' });
   if (stateBeforeResume === null) return { status: 'failed', checks, errors, session, sessionIds };
 
   const resumeId = `${sessionId}-resume`;
   let resumed: TestSession | undefined;
+  checks.resume_ready = false;
+  checks.resume_native_session = false;
+  checks.resume_new_session = false;
   try {
     resumed = await startTestSession({
       manifest,
@@ -1247,12 +1527,15 @@ async function runLiveSmoke(manifest: RunManifest, requestedSessionId: string | 
       return resumedInfo?.ready === true && resumedInfo.status === 'running';
     }, { timeoutMs: 15_000, intervalMs: 100 });
     checks.resume_ready = true;
-    checks.resume_new_session = resumed.sessionId !== session.sessionId && checks.resume_ready === true;
-    if (checks.resume_ready !== true) errors.push({ code: 'resume_session_not_ready', message: 'new resume session did not report ready:true' });
+    const resumedNative = await waitForNativeSessionStart(manifest, resumed.sessionId, timing);
+    checks.resume_native_session = nativeSnapshot !== null && resumedNative.sessionId !== nativeSnapshot.sessionId;
+    checks.resume_new_session = resumed.sessionId !== session.sessionId && checks.resume_ready === true && checks.resume_native_session === true;
+    if (checks.resume_native_session !== true) errors.push({ code: 'resume_native_session_unproven', message: 'restart did not identify a distinct native omp session' });
   } catch (error) {
-    checks.resume_ready = false;
     checks.resume_new_session = false;
-    errors.push(errorOf(error, 'resume_start_failed'));
+    errors.push(error instanceof WaitTimeoutError && checks.resume_ready === true
+      ? { code: 'resume_native_session_unproven', message: 'restart did not identify a distinct native omp session' }
+      : errorOf(error, 'resume_start_failed'));
   } finally {
     if (resumed !== undefined) await resumed.close();
   }
@@ -1266,7 +1549,7 @@ async function runLiveSmoke(manifest: RunManifest, requestedSessionId: string | 
     stateBeforeResume !== null
     && stateAfterResume === stateBeforeResume
     && checks.resume_new_session === true;
-  if (checks.resume_state_preserved !== true) errors.push({ code: 'resume_state_lost', message: 'a new omp session did not preserve the saved workflow state' });
+  if (checks.resume_state_preserved !== true) errors.push({ code: 'resume_state_lost', message: 'a new omp session did not preserve the saved canonical workflow state' });
   return { status: errors.length === 0 ? 'passed' : 'failed', checks, errors, session, sessionIds };
 }
 

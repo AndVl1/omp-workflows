@@ -14,6 +14,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -1073,7 +1074,7 @@ function npmInvocation(): { readonly command: string; readonly prefix: readonly 
     if (directory.length === 0) continue;
     const candidate = join(directory, process.platform === 'win32' ? 'npm.cmd' : 'npm');
     try {
-      if (lstatSync(candidate).isFile()) return { command: candidate, prefix: [] };
+      if (statSync(candidate).isFile()) return { command: candidate, prefix: [] };
     } catch {
       // Continue searching the inherited PATH only for the package manager used
       // during preparation; runtime launch never uses this fallback.

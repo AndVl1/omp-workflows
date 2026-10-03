@@ -44,6 +44,25 @@
   Bun >=1.3.14 is required; missing prerequisites fail rather than skip.
   This component/process proof does not claim unchanged CLI `serve`, real provider
   protocol, background refresh or ordinary-client cross-process coverage.
+- Managed broker stop now rechecks process liveness when ownership observation
+  loses a terminating target, completing the same stop and receipt cleanup once
+  its listener is free. Still-live mismatched PIDs are refused rather than treated
+  as stale receipts; a real-child race regression verifies both boundaries.
+- Live verification now reads branch-owned schema-2 canonical run state and
+  correlates submitted task, selected provider/model/API/usage and completion
+  through explicitly loaded read-only native evidence. Startup animations
+  cannot erase readiness; extension/user echoes, startup turns, provider errors,
+  truncation and structured workflow refusals cannot produce a false PASS.
+  Timeout reports preserve independently observed checks and restart proves
+  a distinct native session with unchanged saved state.
+- `prepare` follows installed npm executable symlinks for standalone CLI builds
+  without relaxing run, artifact or process ownership validation.
+- Native session identity compares the ownership-checked physical session root,
+  so macOS temp-directory aliases do not reject genuine lifecycle receipts.
+  A receipt claiming a different directory still fails before command input.
+- Initial command input and resumed-session identity wait for a complete native
+  startup receipt independently of transport readiness. Startup waits remain
+  bounded; unsafe, corrupt or foreign receipts are refused rather than retried.
 
 ### Security
 
@@ -51,6 +70,12 @@
   cache integrity checks, private session connection records, and verified
   process-tree stop replace best-effort scratch-path and PID matching.
   Process isolation is not a host OS sandbox.
+- Retained native evidence is scoped to registered private session files,
+  rejects symlink/hardlink targets and drops raw tool arguments/results.
+  Quoted and escaped token/nonce values in assistant/terminal text are redacted.
+  ANSI styling is removed before secret matching on decoded string fields.
+  Registered PTY JSONL is decoded and re-serialized per frame so an incomplete
+  CSI sequence cannot consume JSON delimiters or corrupt following evidence.
 
 ## 0.1.4 — 2026-08-02
 

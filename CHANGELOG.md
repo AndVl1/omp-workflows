@@ -14,6 +14,21 @@ All notable changes to `omp-workflows` are documented here.
   renewal and persistence without a real account; reports its component/process
   boundary separately from live provider and ordinary-client refresh coverage.
 
+### Fixed
+- Managed E2E broker stop accepts an owned process exiting during identity
+  observation, but refuses live foreign/reused PIDs and waits for a free listener
+  before removing its manager receipt.
+- E2E live smoke uses authoritative task-correlated native provider receipts
+  and canonical schema-2 state, rejects structured workflow refusals without
+  erasing partial evidence, and retains sanitized per-session provenance.
+  Animated startup redraws no longer hide a rendered prompt.
+  Initial and resumed sessions wait for validated native startup receipts
+  independently of transport readiness, eliminating the first-append race.
+- Standalone E2E preparation accepts installed npm symlinks while preserving
+  artifact ownership guards; retained evidence redacts escaped capability values.
+  ANSI-styled labels are matched before redaction, and PTY JSONL frames are
+  sanitized after decoding so split control sequences cannot corrupt evidence.
+
 ## [0.29.1] — 2026-09-29
 ### Fixed
 - **Debug-cycle first-pass artifact contract** — diagnostics now requires only discovery on its first pass and requests the latest debug artifact when revisiting a failed verification; verification produces debug later. A profile-wide regression check rejects artifacts consumed before their first producer.

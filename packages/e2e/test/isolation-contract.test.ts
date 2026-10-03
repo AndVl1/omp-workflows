@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
-import { delimiter, join, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { buildDetachedWorkerEnvironment } from '../src/cli.js';
 import { buildChildEnvironment, sessionPaths, writeSessionRecord } from '../src/environment.js';
@@ -158,6 +159,80 @@ test('prepare selects installed omp instead of npm-local checkout shim', async t
     if (previousPrefix === undefined) delete process.env.npm_config_local_prefix;
     else process.env.npm_config_local_prefix = previousPrefix;
   }
+});
+
+test('standalone prepare builds through a PATH npm symlink when npm_execpath is absent', async t => {
+  const npmExecPath = process.env['npm_execpath'];
+  const npmCandidates = [
+    ...(npmExecPath !== undefined && isAbsolute(npmExecPath) ? [npmExecPath] : []),
+    ...(process.env.PATH ?? '').split(delimiter).filter(Boolean).map(directory =>
+      join(directory, process.platform === 'win32' ? 'npm.cmd' : 'npm')),
+  ];
+  let npmCliPath: string | undefined;
+  for (const candidate of npmCandidates) {
+    try {
+      const resolved = realpathSync(candidate);
+      if (statSync(resolved).isFile()) {
+        npmCliPath = resolved;
+        break;
+      }
+    } catch {
+      // Try the next installed package-manager candidate.
+    }
+  }
+  assert.ok(npmCliPath !== undefined, 'the preparation regression requires the installed npm CLI');
+
+  const fixture = createPrepareRunFixture();
+  t.after(() => fixture.cleanup());
+  const coreRoot = join(fixture.root, 'packages', 'core');
+  writeFileSync(join(coreRoot, 'package.json'), JSON.stringify({
+    name: '@fixture/core',
+    version: '1.0.0',
+    type: 'module',
+    files: ['dist'],
+    main: './dist/index.js',
+    scripts: { build: 'node build.mjs' },
+  }) + '\n');
+  writeFileSync(join(coreRoot, 'build.mjs'), [
+    "import { mkdirSync, writeFileSync } from 'node:fs';",
+    "mkdirSync('dist', { recursive: true });",
+    'writeFileSync("dist/index.js", \'export const coreFixture = "built-by-npm";\\n\');',
+  ].join('\n') + '\n');
+
+  const npmBin = join(fixture.root, 'npm-bin');
+  mkdirSync(npmBin);
+  symlinkSync(npmCliPath, join(npmBin, 'npm'));
+  symlinkSync(process.execPath, join(npmBin, 'node'));
+  const cli = spawnSync(process.execPath, [
+    '--import', 'tsx',
+    fileURLToPath(new URL('../src/cli.ts', import.meta.url)),
+    'prepare', '--config', fixture.configPath, '--run', 'npm-path-symlink', '--json',
+  ], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    // Omit npm_execpath and host auth/settings. The only npm on PATH is its
+    // real CLI symlink; node is present for its shebang and the package build.
+    env: { OMP_E2E_ROOT: fixture.stateRoot, PATH: npmBin },
+  });
+  assert.equal(cli.status, 0, `${cli.error?.message ?? ''}\n${cli.stderr}\n${cli.stdout}`);
+  const payload = JSON.parse(cli.stdout) as {
+    ok: boolean;
+    status: string;
+    manifest_path?: string;
+    error?: { code?: string; message?: string };
+  };
+  assert.equal(payload.ok, true, JSON.stringify(payload.error));
+  assert.equal(payload.status, 'ready');
+  assert.ok(payload.manifest_path !== undefined);
+  const manifestPath = payload.manifest_path;
+  await withPrepareRoot(fixture.stateRoot, async () => {
+    const manifest = readManifest(manifestPath);
+    // This compiled module lives in a fresh manifest-selected cache path, so its
+    // specifier is unavailable at author time; exercise the package-loading boundary.
+    const builtPackage: unknown = await import(pathToFileURL(join(manifest.artifacts.core.root, 'dist', 'index.js')).href);
+    assert.ok(typeof builtPackage === 'object' && builtPackage !== null && 'coreFixture' in builtPackage);
+    assert.equal(builtPackage.coreFixture, 'built-by-npm');
+  });
 });
 
 test('prepare refuses a changed installed runtime for an existing run', async t => {

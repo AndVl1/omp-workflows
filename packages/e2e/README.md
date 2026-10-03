@@ -18,21 +18,21 @@ the installed host executable rather than npm's checkout-local
 specific runtime deliberately.
 
 ```bash
-# Provider-free isolation (no OAuth or LLM request).
-npm run e2e:prepare -- --config packages/e2e/scenarios/isolated-smoke.env.json --run isolation-01 --json
 export OMP_E2E_ROOT="${OMP_E2E_ROOT:-${TMPDIR:-/tmp}/omp-workflows-e2e}"
+# Provider-free isolation (no OAuth or LLM request).
+npm --silent run e2e:prepare -- --config packages/e2e/scenarios/isolated-smoke.env.json --run isolation-01 --json
 MANIFEST="$OMP_E2E_ROOT/runs/isolation-01/manifest.json"
-npm run e2e:doctor -- --manifest "$MANIFEST" --json
-npm run e2e:verify -- --manifest "$MANIFEST" --suite isolation --json
+npm --silent run e2e:doctor -- --manifest "$MANIFEST" --json
+npm --silent run e2e:verify -- --manifest "$MANIFEST" --suite isolation --json
 
 # Real provider-backed smoke: requires the installed omp's existing OpenAI Codex
 # OAuth authorization. Explicitly opts into a shared native host auth broker.
-npm run e2e:prepare -- --config packages/e2e/scenarios/live-smoke.env.json --run live-01 --json
+npm --silent run e2e:prepare -- --config packages/e2e/scenarios/live-smoke.env.json --run live-01 --json
 LIVE_MANIFEST="$OMP_E2E_ROOT/runs/live-01/manifest.json"
-npm run e2e:auth-broker -- status --manifest "$LIVE_MANIFEST" --json
-npm run e2e:auth-broker -- ensure --manifest "$LIVE_MANIFEST" --json
-npm run e2e:doctor -- --manifest "$LIVE_MANIFEST" --json
-npm run e2e:verify -- --manifest "$LIVE_MANIFEST" --suite live-smoke --json
+npm --silent run e2e:auth-broker -- status --manifest "$LIVE_MANIFEST" --json
+npm --silent run e2e:auth-broker -- ensure --manifest "$LIVE_MANIFEST" --json
+npm --silent run e2e:doctor -- --manifest "$LIVE_MANIFEST" --json
+npm --silent run e2e:verify -- --manifest "$LIVE_MANIFEST" --suite live-smoke --json
 ```
 
 `verify` generates a report and cleans run-owned secrets, process trees and workspace
@@ -40,9 +40,51 @@ by default; sanitized evidence and manifest remain. On failure, `--keep-failed`
 retains the disposable workspace and sanitized evidence but still removes run-owned
 auth caches. `verify` exits nonzero when a prerequisite or acceptance check fails;
 successful cleanup cannot turn a failed smoke into a pass. The `live-smoke` scenario
-submits a bounded `/do-work` request, waits for provider-backed semantic output and
+submits a bounded `/do-work --new` request, waits for provider-backed semantic output and
 canonical workflow state, stops that PTY, starts a second session, and checks the
 state was preserved. It does not use a real project or an existing workflow run.
+
+The committed live fixture supplies an explicit README worker/scope mapping and a
+read-only native event observer. The orchestrator must delegate the project write;
+the fixture does not bypass write guards or manufacture canonical state. Preserve
+`fixture.source: "./live-smoke-fixture"` in a reviewed provider-specific config.
+The command explicitly selects a new workflow. Its README acceptance requires a
+native implementation-worker dispatch and the project-root file; an orchestrator
+write or an artifacts-directory substitute does not satisfy the scenario.
+For a dedicated existing host profile, export `OMP_PROFILE` before prepare, doctor,
+verification and broker lifecycle commands. Its authorized provider must match the
+config's `auth.provider` and `model`; the default OpenAI config is not an xAI recipe.
+Never edit the generated manifest to change the model, profile or fixture.
+
+Live acceptance uses native assistant provider/model/API/usage metadata and a
+validated workflow operation or expected semantic response, not extension text,
+terminal echo, or a merely visible input prompt. Evidence must follow the exact
+submitted task's `before_agent_start` event after Enter, and completion requires
+the matching native `agent_end`. Provider errors, truncated output and workflow
+tool failures fail the suite even if an earlier valid response was observed.
+State is read only from a unique, branch-owned schema-2
+`.work-state/runs/<UUID>/state.json`; corrupt, ambiguous, foreign or unsafe state
+is rejected. Restart requires a distinct native session and preserved canonical
+state. Timeouts retain independently observed checks without becoming passes.
+`[AUTONOMOUS]` is a routing hint, not checkpoint authorization. A declared human
+checkpoint must receive an explicitly authorized answer through the native TUI;
+an unanswered approval remains a timeout/failure, even after a worker succeeds.
+Reasoning models may need a reviewed scenario with a larger finite
+`timing.stageTimeoutMs`; `timeout_ms` in the prepare config is not that deadline.
+
+The observer is explicitly loaded from the prepared fixture while ambient
+extension discovery remains disabled. Public workflow refusals (`{ok:false}`)
+fail acceptance even when native transport reports `isError: false`; unrelated
+tool JSON or prose examples do not count as workflow errors. Reports retain
+session-scoped, narrowed native `events_jsonl` alongside sanitized PTY evidence
+after source session cleanup. They exclude raw tool arguments/results and
+redact quoted or escaped capability values in assistant text.
+ANSI styling is normalized before secret matching on decoded text. Retained PTY
+transcripts are re-serialized per frame: incomplete terminal controls cannot
+consume JSON delimiters or make later receipt frames unreadable.
+Initial input and restart identity checks wait for a complete, validated native
+`session_start`, separately from transport readiness. Unsafe or foreign receipts
+are rejected immediately; a missing receipt is bounded by the startup deadline.
 
 ## Run-lifecycle acceptance journeys
 
@@ -256,6 +298,18 @@ otherwise the report is unassessed rather than a fabricated PASS.
   The broker itself intentionally reads the host agent database and uses the
   native protected token file. `auth-broker stop` is a separate explicit action
   and refuses foreign listeners or live clients. Run cleanup does **not** stop it.
+
+After all sessions using that broker are stopped/cleaned, explicitly address it:
+
+```bash
+npm --silent run e2e:auth-broker -- stop --manifest "$MANIFEST" --json
+npm --silent run e2e:auth-broker -- status --manifest "$MANIFEST" --json
+```
+
+A successful stop verifies process termination and a free listener before removing
+the manager receipt, including exit during identity observation. A still-live
+foreign/reused PID is refused even if the original listener is already gone;
+do not bypass that refusal with a raw kill or receipt deletion.
 
 The broker coordinates clients using **that broker**. Ordinary omp clients that
 independently read the host DB can still compete to refresh the same OAuth grant;

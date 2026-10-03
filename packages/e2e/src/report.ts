@@ -12,6 +12,7 @@ import {
   constants as fsConstants,
   existsSync,
   fchmodSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -27,6 +28,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { readManifest, validateProcessReceipt, verifyManifest, type RunManifest, type SessionRecord } from './manifest.js';
 import { readManagedBrokerToken } from './broker.js';
 import {
+  assertSafeRunPath,
   isCleanSessionTermination,
   readPersistedRunLeaseOwnership,
   readSessionRecord,
@@ -39,6 +41,13 @@ const REDACTED = '[REDACTED]';
 const EMPTY_SECRETS: ReadonlySet<string> = new Set();
 const SENSITIVE_KEY = /(?:api[_-]?key|token|secret|password|authorization|bearer|oauth|credential|refresh[_-]?token|access[_-]?token|private[_-]?connection)/iu;
 const PRIVATE_KEY = /(?:private|connection|auth[_-]?cache|refresh[_-]?token|oauth[_-]?credential|owner[_-]?nonce)/iu;
+const NATIVE_EVIDENCE_FILENAME = 'live-native-events.jsonl';
+const NATIVE_WORKFLOW_RESOURCE_PATH = /^xd:\/\/workflow_[a-z_]+$/u;
+const NATIVE_WORKFLOW_OPERATIONS: Readonly<Record<string, true>> = {
+  workflow_prepare: true, workflow_status: true, workflow_instructions: true, workflow_begin: true,
+  workflow_complete: true, workflow_checkpoint: true, workflow_checkpoint_ask: true, workflow_advance: true,
+};
+const ANSI_CSI = /(?:\u001b|\\+u001[bB])\[[0-?]*[ -/]*[@-~]/gu;
 /**
  * Evidence formats produced by the E2E runner that are safe to decode as
  * text. Keep this an allowlist so unknown files (including screenshots) are
@@ -103,7 +112,9 @@ const SESSION_RECORD_REQUIRED_FIELDS = [
  * rules cover credential forms recognizable without them.
  */
 function redactText(value: string, secretValues: ReadonlySet<string> = EMPTY_SECRETS): string {
-  let redacted = value;
+  // Decode styling boundaries before recognizing credentials, including CSI
+  // controls serialized inside copied JSONL. Colors may split labels or values.
+  let redacted = value.replace(ANSI_CSI, '');
   const exact = [...secretValues]
     .filter(secret => secret.length > 0)
     .sort((a, b) => b.length - a.length);
@@ -115,7 +126,7 @@ function redactText(value: string, secretValues: ReadonlySet<string> = EMPTY_SEC
     .replace(/(\bhttps?:\/\/)[^/\s:@]+:[^@\s]+@/giu, `$1${REDACTED}@`)
     .replace(/([?&](?:token|access_token|refresh_token|api[_-]?key|key|secret|code)=)[^&#\s]+/giu, `$1${REDACTED}`)
     .replace(
-      /(\b(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|GEMINI_API_KEY|OMP_AUTH_BROKER_TOKEN|(?:api[_-]?key|token|secret|password|authorization))\s*[:=]\s*)(["']?)[^"'\s,;&}]+/giu,
+      /(\b(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|GEMINI_API_KEY|OMP_AUTH_BROKER_TOKEN|(?:[a-z][a-z0-9_-]*)?(?:token|nonce)|api[_-]?key|secret|password|authorization)(?:\\*["'`])?\s*[:=]\s*)(\\*["'`]?)[^"'`\s,;&}]+?(?=\\*["'`]|[\s,;&}]|$)/giu,
       `$1$2${REDACTED}`,
     )
     .replace(
@@ -123,7 +134,6 @@ function redactText(value: string, secretValues: ReadonlySet<string> = EMPTY_SEC
       `$1$2${REDACTED}`,
     )
     .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9][A-Za-z0-9._~-]{7,}\b/giu, REDACTED)
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/gu, '')
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/gu, '');
   return redacted;
 }
@@ -909,7 +919,87 @@ function floorForStep(defects: readonly UxDefect[], stepId: string): number {
 /* Evidence collection                                                 */
 /* ------------------------------------------------------------------ */
 
-function collectEvidence(context: ReportContext, screenshots: readonly string[]): string[] {
+function nativeEvidencePaths(context: ReportContext): ReadonlyMap<string, string> {
+  const paths = new Map<string, string>();
+  for (const session of context.sessions) {
+    try {
+      const root = sessionPaths(context.manifest, session.id).root;
+      const path = assertSafeRunPath(context.root, join(root, NATIVE_EVIDENCE_FILENAME), 'native event evidence');
+      const scoped = registeredPath(path, context);
+      if (scoped === null) continue;
+      const stat = lstatSync(scoped);
+      if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 &&
+        (stat.mode & 0o777) === 0o600 &&
+        (typeof process.getuid !== 'function' || stat.uid === process.getuid())) {
+        paths.set(session.id, scoped);
+      }
+    } catch {
+      // Missing or unsafe native evidence is not eligible for export.
+    }
+  }
+  return paths;
+}
+
+function redactNativeEvents(text: string, context: ReportContext): string {
+  const records: string[] = [];
+  for (const line of text.split('\n')) {
+    if (line.length === 0) continue;
+    const event = asObject(JSON.parse(line) as unknown);
+    const kind = event?.kind;
+    if (event === null || event.schema_version !== 1 ||
+      (kind !== 'session_start' && kind !== 'before_agent_start' && kind !== 'message_end' && kind !== 'agent_end')) {
+      throw reportError('report_native_evidence_invalid');
+    }
+    const model = asObject(event.model);
+    let message: unknown;
+    if (kind === 'message_end') {
+      const source = asObject(event.message);
+      if (source?.role === 'toolResult') {
+        message = {
+          role: 'toolResult',
+          isError: source.isError,
+          ...(typeof source.workflow_operation === 'string' && NATIVE_WORKFLOW_OPERATIONS[source.workflow_operation] === true
+            && typeof source.workflow_error === 'boolean'
+            ? { workflow_operation: source.workflow_operation, workflow_error: source.workflow_error } : {}),
+        };
+      } else if (source?.role === 'assistant') {
+        const usage = asObject(source.usage);
+        const content: JsonObject[] = [];
+        if (Array.isArray(source.content)) {
+          for (const item of source.content) {
+            const part = asObject(item);
+            if (part?.type === 'text' && typeof part.text === 'string') {
+              content.push({ type: 'text', text: part.text });
+            } else if (part?.type === 'toolCall' && typeof part.name === 'string') {
+              const toolCall: JsonObject = { type: 'toolCall', name: part.name };
+              if (typeof part.resourcePath === 'string' && NATIVE_WORKFLOW_RESOURCE_PATH.test(part.resourcePath)) {
+                toolCall.resourcePath = part.resourcePath;
+              }
+              content.push(toolCall);
+            }
+          }
+        }
+        message = {
+          role: 'assistant', provider: source.provider, model: source.model, api: source.api,
+          usage: usage === null ? undefined : { input: usage.input, output: usage.output },
+          timestamp: source.timestamp, stopReason: source.stopReason, provider_error: source.provider_error, content,
+        };
+      } else {
+        throw reportError('report_native_evidence_invalid');
+      }
+    }
+    records.push(JSON.stringify(redactUnknown({
+      schema_version: event.schema_version, timestamp: event.timestamp,
+      native_session_id: event.native_session_id, session_directory: event.session_directory,
+      model: model === null ? undefined : { provider: model.provider, id: model.id }, kind,
+      ...(kind === 'before_agent_start' ? { task_sha256: event.task_sha256 } : {}),
+      ...(kind === 'message_end' ? { message } : {}),
+    }, context.secretValues, true)));
+  }
+  return records.join('\n') + '\n';
+}
+
+function collectEvidence(context: ReportContext, screenshots: readonly string[], nativePaths: ReadonlySet<string>): string[] {
   const candidates: string[] = [...context.sessionJsonPaths];
   for (const receipt of context.manifest.receipts ?? []) {
     sessionRecordPathValues(receipt, undefined, candidates);
@@ -923,9 +1013,11 @@ function collectEvidence(context: ReportContext, screenshots: readonly string[])
     const scoped = registeredPath(screenshot, context);
     if (scoped !== null) candidates.push(scoped);
   }
+  candidates.push(...nativePaths);
   const evidence: string[] = [];
   for (const candidate of candidates) {
     const scoped = registeredPath(candidate, context);
+    if (scoped !== null && basename(scoped) === NATIVE_EVIDENCE_FILENAME && !nativePaths.has(scoped)) continue;
     if (scoped !== null && !evidence.includes(scoped)) evidence.push(scoped);
   }
   return evidence;
@@ -942,8 +1034,14 @@ function copyEvidence(
   targetDir: string,
   context: ReportContext,
   warnings: string[],
+  nativePaths: ReadonlySet<string>,
 ): EvidenceCopyResult {
   ensureOutputDirectory(context.root, targetDir);
+  const transcriptPaths = new Set<string>();
+  for (const session of context.sessions) {
+    const path = registeredPath(session.transcript_path, context);
+    if (path !== null) transcriptPaths.add(path);
+  }
   const basenameCounts = new Map<string, number>();
   for (const src of evidence) {
     const name = basename(src);
@@ -985,6 +1083,25 @@ function copyEvidence(
           context.unsafeRawText,
         );
         writeNoFollowFile(dst, JSON.stringify(safe, null, 2) + '\n');
+      } else if (nativePaths.has(src)) {
+        const fd = openSync(src, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        try {
+          const stat = fstatSync(fd);
+          if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600 ||
+            (typeof process.getuid === 'function' && stat.uid !== process.getuid())) {
+            throw reportError('report_native_evidence_invalid');
+          }
+          writeNoFollowFile(dst, redactNativeEvents(readFileSync(fd, 'utf8'), context));
+        } finally {
+          closeSync(fd);
+        }
+      } else if (transcriptPaths.has(src)) {
+        let safeTranscript = '';
+        for (const line of readFileSync(src, 'utf8').split('\n')) {
+          if (line.trim().length === 0) continue;
+          safeTranscript += JSON.stringify(redactUnknown(JSON.parse(line), context.secretValues)) + '\n';
+        }
+        writeNoFollowFile(dst, safeTranscript);
       } else {
         writeNoFollowFile(dst, redactText(readFileSync(src, 'utf8'), context.secretValues));
       }
@@ -1411,6 +1528,8 @@ export function generateReport(
   const selectedLifecycle = asObject(selectedSession);
   const secretValues = context.secretValues;
   const warnings: string[] = [];
+  const nativeBySession = nativeEvidencePaths(context);
+  const nativePaths = new Set(nativeBySession.values());
   const isolationWithoutSession = selectedSession === undefined
     && input.verification?.suite === 'isolation'
     && context.manifest.status !== 'failed'
@@ -1540,8 +1659,11 @@ export function generateReport(
   const transcript = recordPath(selectedSession, 'transcript_path', context);
   const log = recordPath(selectedSession, 'log_path', context);
   const sessionJsonl = recordPath(selectedSession, 'session_jsonl', context);
-  const eventsJsonl = recordPath(selectedSession, 'events_jsonl', context);
-  const evidenceCandidates = collectEvidence(context, clampedSteps.flatMap(step => step.screenshots));
+  const nativeEventsSource = selectedSession === undefined ? undefined : nativeBySession.get(selectedSession.id);
+  const eventsJsonl = nativeEventsSource === undefined
+    ? recordPath(selectedSession, 'events_jsonl', context)
+    : reportText(nativeEventsSource, context);
+  const evidenceCandidates = collectEvidence(context, clampedSteps.flatMap(step => step.screenshots), nativePaths);
   const unsafeEvidence = context.unsafeRawText && evidenceCandidates.some(candidate =>
     TEXT_EVIDENCE.test(candidate) &&
     !context.sessionJsonPaths.includes(candidate),
@@ -1555,7 +1677,7 @@ export function generateReport(
   let omittedRawEvidence = unsafeEvidence;
   let copiedEvidence: ReadonlyMap<string, string> | null = null;
   if (opts.copyEvidence === true) {
-    const copied = copyEvidence(evidenceCandidates, join(mdDir, 'evidence', slug), context, warnings);
+    const copied = copyEvidence(evidenceCandidates, join(mdDir, 'evidence', slug), context, warnings, nativePaths);
     evidence = copied.paths;
     copiedEvidence = copied.bySource;
     omittedRawEvidence = unsafeEvidence || copied.omittedRaw;

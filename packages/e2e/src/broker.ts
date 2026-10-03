@@ -590,12 +590,23 @@ function processCwd(pid: number): string | null {
 function pidIsLive(pid: number): boolean {
   try {
     process.kill(pid, 0);
-    const status = psField(pid, 'stat=');
-    return status === null || !status.startsWith('Z');
   } catch (error) {
     const code = error as NodeJS.ErrnoException;
     return code.code === 'EPERM';
   }
+  let status = psField(pid, 'stat=');
+  if (status === null) {
+    // A process can exit between kill(0) and ps. A still-live but
+    // unobservable PID remains untrusted rather than being treated as dead.
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      const code = error as NodeJS.ErrnoException;
+      return code.code === 'EPERM';
+    }
+    status = psField(pid, 'stat=');
+  }
+  return status === null || !status.startsWith('Z');
 }
 
 function processObservation(pid: number): ProcessObservation | null {
@@ -624,6 +635,14 @@ function processMatchesReceipt(receipt: ManagedBrokerReceipt): ProcessObservatio
   if (!commandMatches(observed.command, receipt)) return null;
   if (resolve(receipt.cwd) !== observed.cwd) return null;
   return observed;
+}
+
+type ReceiptProcessState = 'owned' | 'stopped' | 'changed';
+
+function receiptProcessState(receipt: ManagedBrokerReceipt): ReceiptProcessState {
+  if (!pidIsLive(receipt.pid)) return 'stopped';
+  if (processMatchesReceipt(receipt) !== null) return 'owned';
+  return pidIsLive(receipt.pid) ? 'changed' : 'stopped';
 }
 
 function processMatchesExpected(observed: ProcessObservation, argv: readonly string[], executable: string, cwd: string): boolean {
@@ -835,8 +854,11 @@ function receiptMatchesManifestAtRoot(receipt: ManagedBrokerReceipt, validated: 
 }
 
 async function terminateOwnedProcess(receipt: ManagedBrokerReceipt): Promise<void> {
-  const initial = processMatchesReceipt(receipt);
-  if (initial === null) return;
+  const initialState = receiptProcessState(receipt);
+  if (initialState === 'stopped') return;
+  if (initialState === 'changed') {
+    throw new ManagedBrokerError('broker_stop_identity_changed', 'managed broker process identity changed');
+  }
   const signalTarget = receipt.pgid === receipt.pid ? -receipt.pgid : receipt.pid;
   try { process.kill(signalTarget, 'SIGTERM'); } catch (error) {
     const code = error as NodeJS.ErrnoException;
@@ -844,14 +866,16 @@ async function terminateOwnedProcess(receipt: ManagedBrokerReceipt): Promise<voi
   }
   const deadline = Date.now() + STOP_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (!pidIsLive(receipt.pid)) return;
-    const observed = processMatchesReceipt(receipt);
-    if (observed === null) throw new ManagedBrokerError('broker_stop_identity_changed', 'managed broker process identity changed');
+    const state = receiptProcessState(receipt);
+    if (state === 'stopped') return;
+    if (state === 'changed') {
+      throw new ManagedBrokerError('broker_stop_identity_changed', 'managed broker process identity changed');
+    }
     await sleep(POLL_INTERVAL_MS);
   }
-  const final = processMatchesReceipt(receipt);
-  if (final === null) {
-    if (!pidIsLive(receipt.pid)) return;
+  const finalState = receiptProcessState(receipt);
+  if (finalState === 'stopped') return;
+  if (finalState === 'changed') {
     throw new ManagedBrokerError('broker_stop_identity_changed', 'managed broker process identity changed');
   }
   try { process.kill(signalTarget, 'SIGKILL'); } catch (error) {
@@ -859,10 +883,17 @@ async function terminateOwnedProcess(receipt: ManagedBrokerReceipt): Promise<voi
     if (code.code !== 'ESRCH') throw new ManagedBrokerError('broker_stop_failed', 'managed broker could not be stopped');
   }
   const killDeadline = Date.now() + STOP_TIMEOUT_MS;
-  while (Date.now() < killDeadline && pidIsLive(receipt.pid)) {
+  while (Date.now() < killDeadline) {
+    const state = receiptProcessState(receipt);
+    if (state === 'stopped') return;
+    if (state === 'changed') {
+      throw new ManagedBrokerError('broker_stop_identity_changed', 'managed broker process identity changed');
+    }
     await sleep(POLL_INTERVAL_MS);
   }
-  if (pidIsLive(receipt.pid)) throw new ManagedBrokerError('broker_stop_failed', 'managed broker did not stop');
+  if (receiptProcessState(receipt) !== 'stopped') {
+    throw new ManagedBrokerError('broker_stop_failed', 'managed broker did not stop');
+  }
 }
 
 function sessionProcessLive(value: unknown): boolean | null {
@@ -1203,10 +1234,14 @@ export async function stopManagedBroker(manifest: RunManifest): Promise<void> {
     const clients = liveRegisteredRunClient(manifest, validated.profile.profileFingerprint);
     if (clients === null) throw new ManagedBrokerError('broker_clients_untrusted', 'registered broker clients are not trusted');
     if (clients) throw new ManagedBrokerError('broker_clients_live', 'a registered E2E run still uses the managed broker');
-    if (processMatchesReceipt(read.receipt) === null) {
+    const processState = receiptProcessState(read.receipt);
+    if (processState === 'stopped') {
       if (await portIsOccupied(validated.bind.port)) throw new ManagedBrokerError('broker_port_unowned', 'configured broker port is occupied by an unowned listener');
       removeReceipt(paths.receipt);
       return;
+    }
+    if (processState === 'changed') {
+      throw new ManagedBrokerError('broker_stop_identity_changed', 'managed broker process identity changed');
     }
     await terminateOwnedProcess(read.receipt);
     const deadline = Date.now() + STOP_TIMEOUT_MS;

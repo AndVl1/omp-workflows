@@ -20,7 +20,7 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { dirname, join, relative } from 'node:path';
@@ -469,6 +469,23 @@ export interface OmpLaunchConfig {
   readonly extensionPath: string;
   /** Session-specific state directory inside the prepared run. */
   readonly sessionDir: string;
+}
+
+/** Opt in only the prepared fixture observer, never ambient project extensions. */
+function resolveNativeObserverPath(workspaceRoot: string): string | null {
+  const candidate = join(workspaceRoot, '.omp', 'extensions', 'live-native-evidence.ts');
+  const observerPath = assertSafeRunPath(workspaceRoot, candidate, 'live native observer extension');
+  try {
+    const stat = lstatSync(observerPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 ||
+      (typeof process.getuid === 'function' && stat.uid !== process.getuid())) {
+      throw new Error('native_observer_path_invalid');
+    }
+    return observerPath;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 /**
@@ -1634,6 +1651,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
   let runtimeCheck: RuntimeSnapshot;
   try {
     env = buildChildEnvironment(manifest, { sessionId, authEnv: auth.env, runtimeBinary });
+    const nativeObserverPath = resolveNativeObserverPath(roots.workspace);
     args = buildOmpArgs({
       ompProfile: opts.ompProfile,
       model: launchModel,
@@ -1642,6 +1660,7 @@ export async function startTestSession(opts: TestSessionOptions): Promise<TestSe
       sessionDir: paths.root,
       extensionPath: join(manifest.artifacts.fullstack.root, 'dist', 'index.js'),
     });
+    if (nativeObserverPath !== null) args.push('--extension', nativeObserverPath);
     runtimeCheck = verifyLaunchIntegrity(manifest, runtimeBinary);
     writeSessionFile(paths.transcript, '', roots.run);
     writeSessionFile(paths.log, '', roots.run);

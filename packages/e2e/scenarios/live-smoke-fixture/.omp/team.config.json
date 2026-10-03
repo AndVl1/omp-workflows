@@ -1,0 +1,9 @@
+{
+  "scope_map": [
+    {
+      "glob": ["README.md"],
+      "scope": "e2e-readme",
+      "dev_agent": "e2e-readme-worker"
+    }
+  ]
+}

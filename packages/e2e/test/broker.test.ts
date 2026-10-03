@@ -5,7 +5,9 @@ import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { deferred } from '../src/util.js';
 import type { RunManifest } from '../src/manifest.js';
@@ -47,6 +49,82 @@ function processStartMarker(pid: number): string {
   const marker = result.stdout.trim();
   if (marker.length === 0) throw new Error('fixture process start marker was empty');
   return marker;
+}
+
+function spawnBrokerOwner(manifest: RunManifest): ChildProcess {
+  const helper = fileURLToPath(new URL('./fixtures/broker-owner.ts', import.meta.url));
+  return spawn(process.execPath, ['--import', 'tsx', helper, JSON.stringify(manifest)], {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+}
+
+function waitForBrokerOwnerReady(owner: ChildProcess): Promise<void> {
+  const stdout = owner.stdout;
+  if (stdout === null) return Promise.reject(new Error('broker owner has no stdout pipe'));
+  const ready = deferred<void>();
+  let settled = false;
+  let output = '';
+  const fail = (error: Error): void => {
+    if (settled) return;
+    settled = true;
+    stdout.off('data', onData);
+    ready.reject(error);
+  };
+  const onData = (chunk: Buffer | string): void => {
+    if (settled) return;
+    output += chunk.toString();
+    const newline = output.indexOf('\n');
+    if (newline < 0) return;
+    try {
+      const message: unknown = JSON.parse(output.slice(0, newline));
+      if (message === null || typeof message !== 'object' || !('ready' in message) || message.ready !== true) {
+        fail(new Error('broker owner failed before readiness'));
+        return;
+      }
+      settled = true;
+      stdout.off('data', onData);
+      ready.resolve();
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error('broker owner sent invalid readiness data'));
+    }
+  };
+  stdout.setEncoding('utf8');
+  stdout.on('data', onData);
+  owner.once('error', fail);
+  owner.once('exit', (code, signal) => fail(new Error(`broker owner exited before readiness (${String(code ?? signal)})`)));
+  return ready.promise;
+}
+
+async function stopBrokerOwner(owner: ChildProcess): Promise<void> {
+  if (owner.exitCode !== null || owner.signalCode !== null) return;
+  const exited = deferred<void>();
+  owner.once('exit', code => {
+    if (code === 0) exited.resolve();
+    else exited.reject(new Error(`broker owner cleanup exited with ${String(code)}`));
+  });
+  if (owner.stdin === null) owner.kill('SIGTERM');
+  else owner.stdin.end();
+  await exited.promise;
+}
+
+function waitForProcessAbsentByPs(pid: number): void {
+  const psBinary = process.platform === 'darwin' ? '/bin/ps' : '/usr/bin/ps';
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = spawnSync(psBinary, ['-ww', '-p', String(pid), '-o', 'stat='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C', LC_ALL: 'C' },
+      timeout: 1_000,
+    });
+    if (result.error !== undefined) throw result.error;
+    if (result.signal !== null) throw new Error('fixture ps process was interrupted');
+    if (result.status !== 0 || result.stdout.trim().length === 0) return;
+    // The separate owner must reap this real child; zombie status is not enough.
+  }
+  throw new Error('fixture process remained visible after the owner should have reaped it');
 }
 
 function spawnLiveClient(): Promise<ChildProcess> {
@@ -289,6 +367,124 @@ test('native host broker starts once, reuses, and keeps the host token private',
   await stopManagedBroker(fx.manifest);
   assert.equal(await managedBrokerStatus(fx.manifest).then(result => result.status), 'stopped');
   assert.equal(readManagedBrokerToken(fx.manifest), TOKEN);
+});
+
+test('native host broker safely cleans a gracefully exited receipt and refuses a live reused PID', async t => {
+  const fx = await fixture();
+  t.after(async () => {
+    try {
+      await stopManagedBroker(fx.manifest);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  await ensureManagedBroker(fx.manifest);
+  const managerRoot = join(fx.stateRoot, 'broker-manager');
+  const receiptName = readdirSync(managerRoot).find(file => file.endsWith('.receipt.json'));
+  assert.ok(receiptName !== undefined);
+  const receiptPath = join(managerRoot, receiptName);
+  const originalReceiptText = readFileSync(receiptPath, 'utf8');
+  const originalReceipt = JSON.parse(originalReceiptText) as Record<string, unknown>;
+  const pid = originalReceipt.pid;
+  const pgid = originalReceipt.pgid;
+  const startMarker = originalReceipt.start_marker;
+  assert.ok(typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0);
+  assert.ok(typeof pgid === 'number' && pgid === pid);
+  assert.ok(typeof startMarker === 'string');
+  assert.equal(processStartMarker(pid), startMarker);
+
+  process.kill(-pgid, 'SIGTERM');
+  const deadline = Date.now() + 5_000;
+  // This detached OS process has no child exit event in the test; poll its
+  // actual manager status rather than simulating process lifetime with timers.
+  let stopped = false;
+  while (Date.now() < deadline) {
+    if ((await managedBrokerStatus(fx.manifest)).status === 'stopped') {
+      stopped = true;
+      break;
+    }
+    await delay(25);
+  }
+  assert.equal(stopped, true, 'graceful broker exit should release its listener');
+
+  // A live PID with different identity is not a stale receipt, even after
+  // the original listener has disappeared. Never signal or discard it.
+  const reusedReceipt = { ...originalReceipt, pid: process.pid };
+  writeFileSync(receiptPath, `${JSON.stringify(reusedReceipt)}\n`, { mode: 0o600 });
+  chmodSync(receiptPath, 0o600);
+  await assert.rejects(
+    () => stopManagedBroker(fx.manifest),
+    error => error instanceof Error && 'code' in error && error.code === 'broker_stop_identity_changed',
+  );
+  const retainedReceipt: unknown = JSON.parse(readFileSync(receiptPath, 'utf8'));
+  assert.ok(retainedReceipt !== null && typeof retainedReceipt === 'object' && 'pid' in retainedReceipt);
+  assert.equal(retainedReceipt.pid, process.pid);
+
+  writeFileSync(receiptPath, originalReceiptText, { mode: 0o600 });
+  chmodSync(receiptPath, 0o600);
+  await stopManagedBroker(fx.manifest);
+  await stopManagedBroker(fx.manifest);
+  assert.equal((await managedBrokerStatus(fx.manifest)).status, 'stopped');
+  assert.equal(readdirSync(managerRoot).includes(receiptName), false);
+});
+
+test('native host broker stop succeeds when an owned target exits between liveness and ps checks', async t => {
+  const fx = await fixture();
+  let owner: ChildProcess | undefined;
+  t.after(async () => {
+    try {
+      if (owner === undefined) await stopManagedBroker(fx.manifest);
+      else await stopBrokerOwner(owner);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  owner = spawnBrokerOwner(fx.manifest);
+  await waitForBrokerOwnerReady(owner);
+  assert.equal((await managedBrokerStatus(fx.manifest)).status, 'running');
+  const managerRoot = join(fx.stateRoot, 'broker-manager');
+  const receiptName = readdirSync(managerRoot).find(file => file.endsWith('.receipt.json'));
+  assert.ok(receiptName !== undefined);
+  const receipt = JSON.parse(readFileSync(join(managerRoot, receiptName), 'utf8')) as Record<string, unknown>;
+  const pid = receipt.pid;
+  const pgid = receipt.pgid;
+  const startMarker = receipt.start_marker;
+  assert.ok(typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0);
+  assert.ok(typeof pgid === 'number' && pgid === pid);
+  assert.ok(typeof startMarker === 'string');
+  assert.equal(processStartMarker(pid), startMarker);
+
+  const realKill = process.kill.bind(process);
+  // Freeze this verified OS group until stop sends SIGTERM, then force an
+  // actual exit after kill(0) succeeds but before the next ps observation.
+  // A separate live parent reaps the broker while this test waits synchronously.
+  realKill(-pgid, 'SIGSTOP');
+  let termDelivered = false;
+  let exitForcedDuringProbe = false;
+  t.mock.method(process, 'kill', (target, signal) => {
+    const result = realKill(target, signal);
+    if (target === -pgid && signal === 'SIGTERM' && result) {
+      termDelivered = true;
+    } else if (termDelivered && !exitForcedDuringProbe && target === pid && signal === 0 && result) {
+      exitForcedDuringProbe = true;
+      realKill(-pgid, 'SIGKILL');
+      waitForProcessAbsentByPs(pid);
+    }
+    return result;
+  });
+
+  try {
+    await stopManagedBroker(fx.manifest);
+  } finally {
+    t.mock.restoreAll();
+  }
+  assert.equal(termDelivered, true, 'stop must signal the receipt-verified broker process group');
+  assert.equal(exitForcedDuringProbe, true, 'the actual target must disappear after a successful kill(0) result');
+  assert.equal((await managedBrokerStatus(fx.manifest)).status, 'stopped');
+  await stopManagedBroker(fx.manifest);
+  assert.equal(readdirSync(managerRoot).includes(receiptName), false);
 });
 
 test('native host broker resolves a relative coding-agent directory before changing cwd', async t => {
