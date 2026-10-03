@@ -444,3 +444,44 @@ Host preflight исследует `FinalHostPreflightScout` без записи.
 Диагностика process FAIL сохраняет только безопасные bounded error fields;
 canonical grants, raw assertion objects, credentials и SDK transcripts не
 публикуются. Пользовательские version/release-правки 0.29.2 остаются отдельными.
+
+### Уточнение live QA после невалидной автоматизации
+
+Native `workflow_checkpoint_ask` использует фактический selection dialog SDK;
+наличие literal `[ask_user]` в transcript не является обязательным. Оператор
+связывает текущий pending tool-call, actual UI и текущий stage/receipt, выбирает
+разрешённый policy вариант, затем проверяет matching result и canonical human
+decision. PHASE0 `Proceed` — отдельное обычное сообщение, а не замена checkpoint.
+
+Deadline один на case и устанавливается до startup. Каждый wait, browser action,
+stop/restore ограничивается оставшимся временем; новый H3 host получает remaining
+time, а не новый `15m`. До H3 stop нельзя отвечать исходному checkpoint:
+сначала settled accepted producer и pending human UI, затем stop, original-root
+`--session` restore, actual Hub `r`, exact resume и только актуальное approval.
+Непроверенный boundary записывается `NOT_VERIFIED`, не как доказанный replay.
+
+No-replay сравнивается по original implementation run/generation/stage/dispatch/
+producer и immutable receipt. Разрешённый downstream `code_review`/QA не является
+повторной implementation. Нельзя считать прежний discovery advance или прежний
+worker bash доказательством terminal: нужен canonical terminal/release, затем
+новый ordinary host action с matching result. Невалидная QA-попытка сохраняет
+расходованный budget; ошибку оператора нельзя исправить неразрешённым повтором.
+
+### Native operation identity на SDK boundary
+
+H2 actual host обнаружил production defect: SDK `execute` call ID содержит
+`|`, а canonical native operation policy допускает только безопасный alphabet.
+Registered `cto_stage_advance` больше не передаёт raw SDK ID как operation ID:
+adapter детерминированно выводит safe namespaced SHA-256 identity из **полного**
+непустого opaque ID. Все raw IDs используют один namespace; strip/replace
+не допускаются, чтобы разные вызовы не получили одинаковый durable replay key.
+Raw SDK task/tool identity и observer metadata остаются неизменными.
+
+Canonical validator, root claim, readiness и current-scope checks не ослабляются;
+пустой SDK ID остаётся отказом. Internal callers с готовыми canonical operation
+IDs не мигрируют на другой API. Exact replay того же SDK call после downstream
+admission возвращает committed transition без второго advance; новый SDK call
+не маскируется под replay. `NativeSdkOperationIdRepair` подготовил correction и
+consumer regression; handback завершён, `Main` — sole writer core integration,
+документации и итоговых проверок.
+Новый H-прогон без отдельного разрешения не запускается.

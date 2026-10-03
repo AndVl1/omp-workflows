@@ -484,16 +484,31 @@ async function prepareOrdinary(profileValue: Profile, suffix: string): Promise<R
   return { route: "ordinary", harness, runId: ingress.runId, profile: profileValue, handoff, worker };
 }
 
-async function prepareNative(profileValue: Profile, suffix: string): Promise<RouteSetup> {
+async function prepareNative(
+  profileValue: Profile,
+  suffix: string,
+  sdkAdvanceIds?: { premature: string; accepted: string },
+): Promise<RouteSetup> {
   const nativeProfile: Profile = { ...profileValue, name: "lightweight" };
   const harness = ctoHarness({ workflowProfiles: [nativeProfile], roles: ROLE_OPTIONS, scopeMap: SCOPE_MAP });
   const ingress = await ctoIngress(harness, { profile: "lightweight", classification: CTO_CLASSIFICATION });
   const lead = await admitCtoLead(harness, ingress.runId, `${suffix}-lead`);
+  if (sdkAdvanceIds) {
+    const beforePremature = nativeState(harness, ingress.runId);
+    const emptyCall = await nativeAdvance(harness, "");
+    assert.equal(emptyCall.ok, false, JSON.stringify(emptyCall));
+    assert.equal(emptyCall.code, "stage_transition_invalid", JSON.stringify(emptyCall));
+    assert.deepEqual(nativeState(harness, ingress.runId), beforePremature);
+    const premature = await nativeAdvance(harness, sdkAdvanceIds.premature);
+    assert.equal(premature.ok, false, JSON.stringify(premature));
+    assert.equal(premature.code, "native_stage_not_ready", JSON.stringify(premature));
+    assert.deepEqual(nativeState(harness, ingress.runId), beforePremature);
+  }
   const discovery = await submitAt(harness, lead.childContext, `gates-${suffix}-discovery`, initialDiscoveryOutputs(suffix));
   assert.equal(discovery.ok, true, JSON.stringify(discovery));
   const asked = await askCtoCheckpoint(harness, "slice-a", `gates-${suffix}-discovery-approval`);
   assert.equal(asked.ok, true, JSON.stringify(asked));
-  const advanced = await nativeAdvance(harness, `gates-${suffix}-discovery-advance`);
+  const advanced = await nativeAdvance(harness, sdkAdvanceIds?.accepted ?? `gates-${suffix}-discovery-advance`);
   assert.equal(advanced.ok, true, JSON.stringify(advanced));
   const firstAgent = nativeProfile.stages.find((stage) => stage.id === "implementation")?.type === "consilium" ? "developer-a" : "developer";
   const worker = await admitCtoWorker(harness, ingress.runId, lead, `${suffix}-worker`, firstAgent);
@@ -832,8 +847,32 @@ for (const route of ["ordinary", "cto"] as const) {
   });
 
   scenarioTest(`[${route === "ordinary" ? "O" : "C"}:R02] repeated advance is replay-safe and dispatches the next stage at most once`, async () => {
-    const setup = await prepare(route, GATED_PROFILE, `r02-${route}`);
+    const sdkOperationId = "call_af478fb4c7d949eaac4f27a7f451c474|fc_0995ac373927f749016ac104496ce0819197d5fb40f0ee957c";
+    const passthroughCollisionCandidate = "call_af478fb4c7d949eaac4f27a7f451c474_fc_0995ac373927f749016ac104496ce0819197d5fb40f0ee957c";
+    const setup = route === "cto"
+      ? await prepareNative(GATED_PROFILE, `r02-${route}`, { premature: sdkOperationId, accepted: sdkOperationId })
+      : await prepare(route, GATED_PROFILE, `r02-${route}`);
     try {
+      if (route === "cto") {
+        assert.ok(setup.worker);
+        const progress = nativeProgress(setup.harness, setup.runId);
+        assert.equal(progress.stage_id, "implementation", "the accepted root advance must authorize the current roster stage");
+        const advanceHistory = progress.advance_history;
+        assert.ok(Array.isArray(advanceHistory), JSON.stringify(progress));
+        assert.equal(advanceHistory.length, 1, JSON.stringify(advanceHistory));
+        const acceptedAdvance = record(advanceHistory[0]);
+        assert.equal(acceptedAdvance.from_stage_id, "discovery");
+        assert.equal(acceptedAdvance.to_stage_id, "implementation");
+
+        const afterRosterAdmission = nativeState(setup.harness, setup.runId);
+        const replay = await nativeAdvance(setup.harness, sdkOperationId);
+        assert.equal(replay.ok, true, JSON.stringify(replay));
+        assert.deepEqual(nativeState(setup.harness, setup.runId), afterRosterAdmission, "exact SDK replay after worker admission must be read-only");
+        const distinct = await nativeAdvance(setup.harness, passthroughCollisionCandidate);
+        assert.equal(distinct.ok, false, JSON.stringify(distinct));
+        assert.equal(distinct.code, "native_stage_not_ready", JSON.stringify(distinct));
+        assert.deepEqual(nativeState(setup.harness, setup.runId), afterRosterAdmission, "a distinct SDK ID must not replay the accepted transition");
+      }
       await finishWorker(setup, { implementation: implementationOutput({ summary: "advance once" }) });
       const approval = await approveCurrent(setup, "approve_implementation", `${route}-r02-approval`);
       assert.equal(approval.ok, true, JSON.stringify(approval));

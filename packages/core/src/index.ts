@@ -3891,6 +3891,16 @@ function toolResult(value: unknown): WorkflowToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
 }
 
+/** SDK tool-call ids are opaque; persist only a namespaced canonical digest. */
+function nativeStageOperationIdFromSdkCall(sdkCallId: string): string {
+  if (sdkCallId.length === 0) return sdkCallId;
+  const digest = createHash("sha256")
+    .update("omp-workflows:cto-stage-advance:sdk-operation-id:v1\0", "utf8")
+    .update(sdkCallId, "utf8")
+    .digest("hex");
+  return `sdk-cto-stage-${digest}`;
+}
+
 export type StageResultPublisher = (outputs: Record<string, unknown>) => StageResultSubmissionOutcome;
 
 export interface StageProducerToolDefinition {
@@ -4574,7 +4584,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
           coordinator_session_id: context.session_id,
           ownership_epoch: claim.ownership_epoch,
           ...(context.process_id === undefined ? {} : { coordinator_process_id: context.process_id }),
-          operation_id: id,
+          operation_id: nativeStageOperationIdFromSdkCall(id),
         });
         return result.ok
           ? toolResult({ ok: true, transition: "cto_stage_advance", run_id: claim.run_id, slice_id: input.slice_id, progress: result.progress })

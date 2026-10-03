@@ -44598,20 +44598,26 @@
     }
   },
   "remote_ci": {
-    "status": "FAIL",
-    "head_commit": "c3e241b2a47866b10bb82ab46c11b9f8f1d620f8",
-    "run_id": 36985180993,
-    "job_id": 110768478476,
-    "url": "https://github.com/AndVl1/omp-workflows/actions/runs/36985180993/job/110768478476",
+    "status": "PASS",
+    "head_commit": "7ff478c78e87b206b7e820f00a08c82a9ab4af62",
+    "run_id": 37120427613,
+    "job_id": 111195300227,
+    "url": "https://github.com/AndVl1/omp-workflows/actions/runs/37120427613/job/111195300227",
     "runtime": "Ubuntu 24.04 / Node 20.20.2",
-    "passed": ["install", "build", "typecheck", "deterministic workflow scenarios"],
-    "failed": ["workflow process scenarios"],
-    "skipped": ["full test"],
-    "diagnosed_cause": "Promise.withResolvers отсутствует в Node 20; все четыре process fixtures использовали общий несовместимый barrier helper.",
-    "corrected_candidate": "LOCAL_VERIFIED_NOT_YET_PUSHED",
-    "prior_observation": {
-      "status": "NOT_RUN",
-      "reason": "Прежний запрет commit/push; текущий пользователь разрешил автономно завершить PR."
+    "passed": ["install", "build", "typecheck", "deterministic workflow scenarios", "workflow process scenarios", "full test"],
+    "failed": [],
+    "skipped": [],
+    "job_duration_sec": 322,
+    "host_acceptance_not_substituted": true,
+    "prior_failure": {
+      "status": "FAIL",
+      "head_commit": "c3e241b2a47866b10bb82ab46c11b9f8f1d620f8",
+      "run_id": 36985180993,
+      "job_id": 110768478476,
+      "url": "https://github.com/AndVl1/omp-workflows/actions/runs/36985180993/job/110768478476",
+      "failed": ["workflow process scenarios"],
+      "skipped": ["full test"],
+      "diagnosed_cause": "Promise.withResolvers отсутствует в Node 20; исправлены parent и generated-child deferred helpers без изменения IPC/budgets."
     }
   },
   "prior_verification_summary": {
@@ -44768,7 +44774,7 @@
   },
   "autonomous_completion": {
     "authorization": "Пользователь: «если можешь, то добей самостоятельно»; merge/release/archive не выполняются.",
-    "status": "LOCAL_GREEN_AWAITING_PR_CI_AND_LIVE_H",
+    "status": "H_GATE_BLOCKED_H2_FIX_LOCALLY_VERIFIED_CI_PENDING",
     "historical_snapshots_preserved": true,
     "local_gate": {
       "runtime": "Node 20.20.2 / Darwin arm64",
@@ -44802,17 +44808,154 @@
       "evidence_labels": ["autonomous-node20-workspace-build", "autonomous-node20-workspace-typecheck", "autonomous-node20-deterministic-final-first", "autonomous-node20-deterministic-final-second", "autonomous-node20-process-duration-final", "autonomous-node20-full-serial-final", "autonomous-node20-diagnostic-smoke"]
     },
     "review": {"ci_fixture_and_reporter": "APPROVE", "model_config_harness": "APPROVE", "runtime_executed_by_reviewers": false},
+    "host_preflight": {
+      "status": "PASS",
+      "code_commit": "7ff478c78e87b206b7e820f00a08c82a9ab4af62",
+      "core_version": "0.29.1",
+      "fullstack_version": "0.29.1",
+      "sdk_version": "18.0.6",
+      "core_sha256": "fde4736fd9cc6162fb35fd8500bcf01f20f1da9c26f9d34b5fd2d46596b303c3",
+      "fullstack_sha256": "8ffc6022ea1924bcf21865d94551c4598a7fd824b06ef97a9cc390a059dd597a",
+      "runtime_manifest": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/reliable-stage-idle-qa-v2YQXn/candidate-autonomous-yGyEJs/runtime-manifest.json",
+      "model_config": {"status": "PASS_CONFIG_ONLY", "model": "openai-codex/gpt-5.5", "roles": 25, "agents": 28, "live_acceptance_not_implied": true},
+      "environment": {"node": "26.8.1", "bun": "1.3.14", "sdk": "18.0.6", "global_stores_changed": false, "auth_policy": "eligible access-only copy; source read-only; no refresh token"},
+      "startup_diagnosis": {
+        "observed": "Owned pre-case coordinator web UI: posix_spawn failed; pid null; no H ingress or model call",
+        "cause": "node-pty 1.1.0 Darwin arm64 prebuild omitted sibling spawn-helper; install returned success because prebuild directory existed",
+        "repair_scope": "Owned archived snapshot node_modules only; no candidate package/source change",
+        "initial_source_rebuild": "Node20 headers fetch failed; no H attempt",
+        "actual_repair": "Offline npm rebuild node-pty with npm_config_build_from_source=true and cached matching Node26.8.1 headers",
+        "repair_exit_code": 0,
+        "repair_duration_ms": 2972,
+        "actual_pty_wrapper_probe": {"exit_code": 0, "sdk_version": "18.0.6", "duration_ms": 1912},
+        "old_listener": {"pid": 4467, "confirmed_exited": true},
+        "model_roles_warning": "False positive for quoted JSON-as-YAML key; actual SDK config validation/model discovery passed; not spawn-failure cause"
+      },
+      "initial_proven_coordinator": {"start_exit_code": 0, "start_duration_ms": 550, "pid": 70921, "session_id": "01a101dc-a2f0-7000-8293-359ef32587e8", "model": "openai-codex/gpt-5.5", "ui": "real web terminal connected", "stopped_before_h_ingress": true, "qa_acceptance_not_implied": true},
+      "observer": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/reliable-stage-idle-qa-v2YQXn/candidate-autonomous-yGyEJs/private/qa-coordinator-observer/sdk-observations.jsonl",
+      "actual_sdk_qa_child": {
+        "status": "COMPLETED",
+        "coordinator_pid": 4612,
+        "coordinator_session_id": "01a101ee-480a-7000-89ca-01c2bf23ca2b",
+        "coordinator_lifetime_sec": 5100,
+        "reason_for_pre_case_coordinator_restart": "Guarantee parent lifetime covers all three separate case deadlines; no H input or case budget had started",
+        "native_task_id": "AutonomousHqaSdkOperator",
+        "agent": "task",
+        "index": 0,
+        "parent_tool_call_id": "call_dCmPOOxYqbJwLYaeVCOTlcgG|fc_0e7f55968c0a1520016ac101c52ce887d2b0a98c27c4fbf3bc",
+        "session_id": "01a101ef-16c6-7000-ae4c-22677b8829e8",
+        "model": "openai-codex/gpt-5.5",
+        "task_result_is_error": false,
+        "started_at": "2026-10-03T13:23:29.022Z",
+        "completed_at": "2026-10-03T13:40:25.054Z",
+        "provenance": "Actual pinned SDK task tool_call/result and task:subagent:lifecycle started followed by child host_discovery/agent_start; not Main-created receipt or functions.task substitute",
+        "qa_acceptance_not_implied": true
+      }
+    },
     "new_host_budget": {
-      "status": "PRECONDITIONS_PENDING_PR_CI",
+      "status": "EXHAUSTED_LIVE_ACCEPTANCE_NON_PASS",
       "basis": "Новое явное разрешение пользователя; исправленные model config и проверяемое Bun/PATH окружение.",
       "historical_attempts_unchanged": {"H1": 2, "H2": 2, "H3": 2},
       "new_attempt_limit_per_case": 1,
       "attempt_timeout_sec": 900,
       "automatic_retries": false,
-      "used": {"H1": 0, "H2": 0, "H3": 0},
+      "used": {"H1": 1, "H2": 1, "H3": 1},
       "sdk_child_required": true,
       "cold_restore_and_worker_revive": "NOT_VERIFIED",
-      "fresh_linked_continuation": "NOT_APPLICABLE_UNTIL_COLD_REVIVE_CAPABILITY_IS_ESTABLISHED"
+      "fresh_linked_continuation": "NOT_APPLICABLE_UNTIL_COLD_REVIVE_CAPABILITY_IS_ESTABLISHED",
+      "actual_report": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/reliable-stage-idle-qa-v2YQXn/candidate-autonomous-yGyEJs/private/autonomous-hqa-report.json",
+      "additional_h_authorization_required": true,
+      "results": {
+        "H1": {
+          "original_sdk_child_verdict": "FAIL",
+          "classification": "INVALID_QA",
+          "gate": "NOT_VERIFIED",
+          "root_session_id": "01a101f5-92ec-7000-a4e3-d78f87cfc43f",
+          "observed": ["natural PHASE0 agent_end before prepare in same SDK session", "accepted implementation receipt and exact worker terminal", "actual native human approval and implementation-to-code_review advance"],
+          "unverified": ["full workflow terminal", "ownership release", "new ordinary action after terminal"],
+          "operator_defect": "Waited for literal ask_user transcript marker while native dialog was pending; stopped before later required stages/checkpoints",
+          "second_worker": "Legitimate declared code_review, not demonstrated implementation replay",
+          "independent_review": "ActualHqaOracleReview"
+        },
+        "H2": {
+          "original_sdk_child_verdict": "FAIL",
+          "classification": "PRODUCT_DEFECT",
+          "gate": "FAIL",
+          "root_session_id": "01a101f5-9cca-7000-990e-dc2abd3a73b2",
+          "observed": ["configured team-lead selected model and started", "lead-owned discovery/dod receipt accepted", "root correctly invoked native stage advance after receipt"],
+          "unverified": ["roster worker", "current human checkpoint/advance", "successful closed wave/resident/END/ordinary action"],
+          "root_cause": "Raw SDK execute call ID contains pipe; adapter forwarded it as operation_id and canonical safe-ID validator refused before readiness",
+          "source_repair_owner": "NativeSdkOperationIdRepair",
+          "repair_status": "FIXED_SCRIPTED_RUNTIME_VERIFIED_LIVE_NOT_RERUN",
+          "independent_diagnosis": "ActualH2LeadFailureMap"
+        },
+        "H3": {
+          "original_sdk_child_verdict": "FAIL",
+          "classification": "INVALID_QA",
+          "gate": "NOT_VERIFIED",
+          "root_session_id": "01a101f5-a5c0-7000-ba2b-ec30d5dd0037",
+          "observed": ["accepted implementation receipt", "exact worker terminal", "actual pending native implementation checkpoint"],
+          "unverified": ["fresh host original-root session restore", "native Agent Hub r", "same-worker SDK identity after cold restore", "registered resume and no-replay across restore"],
+          "operator_defect": "Approved checkpoint in original host instead of stop/restore/Hub revive; required recovery boundary was never exercised",
+          "second_worker": "Legitimate declared code_review after original-host approval, not demonstrated implementation replay",
+          "independent_review": "ActualHqaOracleReview"
+        }
+      },
+      "cleanup": {
+        "sdk_child_reported": {"case_hosts_stopped": ["H1", "H2", "H3"], "case_browsers_closed": ["hqa-H1", "hqa-H2", "hqa-H3"]},
+        "main_confirmed_case_pids_exited": [12406, 12453, 12500],
+        "main_coordinator_stop_exit_code": 0,
+        "main_coordinator_browser_close_exit_code": 0,
+        "main_coordinator_pid_exited": 4612,
+        "owned_runtime_process_matches_after_cleanup": 0,
+        "owned_private_auth_db_and_sidecars_removed": true,
+        "main_throwaway_watcher_removed": true,
+        "evidence_preserved": true,
+        "global_stores_changed": false
+      }
+    },
+    "post_h2_sdk_id_repair": {
+      "status": "LOCAL_PASS_CI_PENDING",
+      "verified_source_sha256": "5cfeca755714e3b961d06eef6ac464ffe07b062b336e708cfb84b4d790db4f16",
+      "source_boundary": "Working source with protected user 0.29.2 metadata; later delta only planning/evidence/README. Exact committed candidate CI is tracked separately; no new H run.",
+      "runtime": "Node 20.20.2 / Darwin arm64",
+      "implementation": "Private registered native advance adapter derives namespaced SHA256 of complete nonempty opaque SDK id; canonical validator, root claims and readiness unchanged",
+      "review": {"status": "APPROVE", "reviewer": "NativeSdkOperationIdReview", "runtime_executed_by_reviewer": false},
+      "focused_regression": {"status": "PASS", "case": "C:R02", "pass": 1, "fail": 0, "nonselected_skipped": 29, "duration_ms": 795, "evidence": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/reliable-stage-idle-qa-v2YQXn/repair-verification-3nICVk/native-sdk-id-node20-focused-3msits/stdout.log"},
+      "runtime_smoke": {
+        "status": "PASS",
+        "surface": "Throwaway scripted host invoking production registered tools; not live H",
+        "duration_ms": 503,
+        "observed": ["empty ID rejected", "premature SDK pipe ID reaches readiness refusal without mutation", "lead own result accepted", "resident root advance committed", "current roster admitted", "exact raw SDK ID replay after roster admission is read-only", "distinct underscore ID does not alias or mutate"],
+        "evidence": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/reliable-stage-idle-qa-v2YQXn/repair-verification-3nICVk/native-sdk-id-node20-registered-smoke-PNbxaa/stdout.log",
+        "throwaway_removed": true
+      },
+      "build": {"status": "PASS", "workspaces": 4, "duration_ms": 5136},
+      "typecheck": {"status": "PASS", "workspaces": 4, "duration_ms": 4738},
+      "deterministic": {
+        "status": "PASS",
+        "runs": [{"tests": 126, "failures": 0, "trace_gaps": 0, "required_routes": 89, "duration_ms": 46995.292292, "outer_duration_ms": 47326}, {"tests": 126, "failures": 0, "trace_gaps": 0, "required_routes": 89, "duration_ms": 46924.937042000005, "outer_duration_ms": 47268}],
+        "ordered_normalized_trace_equal": true,
+        "independent_roots": true,
+        "target_ms": 60000
+      },
+      "process": {"status": "PASS", "tests": 8, "failures": 0, "trace_gaps": 0, "required_routes": 15, "duration_ms": 40306.401333, "outer_duration_ms": 40565, "target_ms": 180000},
+      "full_suite": {
+        "status": "PASS_AGGREGATED_SAME_SOURCE_WORKSPACES_WITH_EXPLAINED_BROWSER_SKIP",
+        "tests": 1684,
+        "pass": 1683,
+        "fail": 0,
+        "skip": 1,
+        "packages": {"core": {"tests": 1121, "pass": 1121}, "fullstack": {"tests": 391, "pass": 391}, "internal": {"tests": 91, "pass": 91}, "e2e": {"tests": 81, "pass": 80, "skip": 1}},
+        "initial_npm_test_exit": 1,
+        "initial_environment_failure": "D-only workflow-offline preload wrongly applied to E2E loopback listeners; 17 WORKFLOW_SCENARIO_NETWORK_FORBIDDEN failures retained",
+        "correction": "Only E2E repeated without D-only network blocker, exit0/80PASS/0FAIL/1SKIP; successful other workspace runs not repeated",
+        "corrected_e2e_duration_ms": 29367,
+        "skip_reason": "Chromium absent in isolated HOME; no browser/H PASS implied"
+      },
+      "evidence_root": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/reliable-stage-idle-qa-v2YQXn/repair-verification-3nICVk",
+      "evidence_labels": ["native-sdk-id-node20-build", "native-sdk-id-node20-typecheck", "native-sdk-id-node20-D-first", "native-sdk-id-node20-D-second", "native-sdk-id-node20-P", "native-sdk-id-node20-full-serial", "native-sdk-id-node20-e2e-loopback-corrected"],
+      "live_h_pass": false
     }
   }
 }
