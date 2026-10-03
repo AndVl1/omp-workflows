@@ -71,6 +71,20 @@ function parseResult(output: string): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function childScript(): string {
   return `
 const [{ default: assert }, { default: fsDefault, existsSync, mkdirSync, readFileSync, watch, writeFileSync }, { join }, { z }, { syncBuiltinESMExports }] = await Promise.all([
@@ -82,6 +96,15 @@ const isCto = route === "cto";
 const BRANCH = ${JSON.stringify(BRANCH)};
 const CLASSIFICATION = ${JSON.stringify(CLASSIFICATION)};
 const handoff = handoffJson ? JSON.parse(handoffJson) : undefined;
+const deferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((accept, fail) => {
+    resolve = accept;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+};
 let faultArmed = false;
 let faultRunId = "";
 let faultDispatchId = "";
@@ -508,7 +531,7 @@ const output = (value) => { process.stdout.write("@@RESULT@@" + JSON.stringify(v
 const waitBarrier = async (name) => {
   const path = join(root, name);
   const ready = join(root, "barrier", "ready-" + process.pid);
-  const { promise: released, resolve: release } = Promise.withResolvers();
+  const { promise: released, resolve: release } = deferred();
   const onRelease = (message) => {
     if (!message || typeof message !== "object" || message.type !== "barrier-release" || message.name !== name) return;
     release();
@@ -520,7 +543,7 @@ const waitBarrier = async (name) => {
     process.off("message", onRelease);
     return;
   }
-  const { promise, resolve, reject } = Promise.withResolvers();
+  const { promise, resolve, reject } = deferred();
   const watcher = watch(join(root, "barrier"), () => {
     if (!existsSync(path)) return;
     watcher.close();
@@ -846,7 +869,7 @@ async function waitForMarker(root: string, name: string, route?: "O" | "C", chil
     recordScenarioEvent({ kind: "barrier_released", ...(route ? { route } : {}), barrier, identities: { barrier }, outcome: "COMPLETED" });
     return;
   }
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const { promise, resolve, reject } = deferred<void>();
   const childExit = child
     ? (() => {
       const record = childRecords.get(child);
@@ -863,11 +886,11 @@ async function waitForMarker(root: string, name: string, route?: "O" | "C", chil
   const watcher = watch(parent, () => {
     if (!existsSync(path)) return;
     watcher.close();
-    resolve();
+    resolve(undefined);
   });
   if (existsSync(path)) {
     watcher.close();
-    resolve();
+    resolve(undefined);
   }
   const timeout = setTimeout(() => {
     watcher.close();

@@ -417,3 +417,30 @@ Quiescent migration реализует только `QuiescentMigrationOwner` ч
 5. Внешним consumers дать явный несовместимый контракт и инструкцию обновления, сохраняя fail-closed. Исправление Android bundle не заявляется частью доставки.
 6. Пройти D/P, полные existing suites и H; обновить package docs/changelog в реализации. Не архивировать `run-lifecycle`, не возобновлять старые QA sessions и не публиковать релиз этим change.
 7. До persisted migration сохранить snapshot для rollback. Downgrade допускается только при остановленном затронутом исполнении и совместимом state; иначе — forward recovery или штатный restore snapshot с проверкой ownership, не запуск старой версии против нового активного ledger.
+
+## Автономное завершение приёмки
+
+Пользователь разрешил завершить оставшиеся работы самостоятельно. Это разрешение
+включает исправление CI, включение локального model-config patch в PR и новую
+ограниченную live-приёмку; merge, release и архивирование остаются вне работы.
+
+Владельцы текущей записи: `CiProcessRepairOwner` — process fixtures в core,
+`SafeCiDiagnosticOwner` — scenario reporter в scripts; `Main` — интеграция,
+e2e launcher/config, общие manifests/lockfile, PR и planning/evidence artifacts.
+Host preflight исследует `FinalHostPreflightScout` без записи. Реальную live QA
+выполняет отдельный настоящий SDK child через agent-browser и официальный e2e,
+не суррогат orchestration `functions.task`.
+
+Новый бюджет приёмки: по одной новой попытке H1/H2/H3, максимум 900 секунд
+на case, включая startup и предусмотренный H3 restart. Автоматических повторов
+нет. Старые 2/2 попытки, причины отказов и evidence сохраняются без перезаписи;
+новый budget tranche ссылается на текущее разрешение пользователя и изменённые
+условия (полный model-role config и проверенный launch environment), а не
+сбрасывает прежний счётчик новым root. Cold restore/worker revive наблюдается
+только на настоящем worker H3; новые task/identity/grants для доказательства
+не фабрикуются.
+
+До live QA требуются зелёные D/P и проверка выбранного binary/Bun/PATH/config.
+Диагностика process FAIL сохраняет только безопасные bounded error fields;
+canonical grants, raw assertion objects, credentials и SDK transcripts не
+публикуются. Пользовательские version/release-правки 0.29.2 остаются отдельными.

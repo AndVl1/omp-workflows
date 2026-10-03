@@ -144,7 +144,8 @@ integration and attach the resulting transcript/report paths.
 ```bash
 npm run host-smoke -w @andvl1/omp-workflows-e2e -- validate
 npm run host-smoke -w @andvl1/omp-workflows-e2e -- prepare \
-  --root <owned-root> --core <core.tgz> --fullstack <fullstack.tgz>
+  --root <owned-root> --core <core.tgz> --fullstack <fullstack.tgz> \
+  --model openai-codex/gpt-5.5
 ```
 Подготовка передаёт один allowlisted environment установке, bootstrap и baseline
 commit собственных scratch repos. Родительские `INIT_CWD`, `OMP_PROJECT_DIR`,
@@ -159,9 +160,23 @@ commit собственных scratch repos. Родительские `INIT_CWD`
 `PI_CONFIG_DIR` — имя каталога относительно HOME, а не абсолютный путь:
 при запуске оставьте `.omp`, чтобы обнаруживались bootstrap project plugins.
 Не наследуйте `OMP_PROFILE`/`PI_PROFILE` или пользовательские plugins.
-Приватный host config содержит только несекретные `modelRoles`; pinned catalog
-поддерживает `openai-codex/gpt-5.5`. Закрепите main/default и используемые
-agent roles, затем проверьте фактически выбранные модели в host evidence.
+`prepare` требует конкретный `--model <provider/model>` и создаёт приватный
+host config `<owned-root>/home/.omp/agent/config.yml`: `default`, все встроенные
+роли установленного SDK и aliases из фактически обнаруженных candidate agents
+получают одну выбранную модель. Это включает `team-lead` и `cto`, которых нет
+в полной таксономии `defaultFullstackModelRoles`; список не копируется вручную.
+`<owned-root>/agent-data/config.yml` — symlink на тот же файл, чтобы root harness
+и SDK children читали один источник. Пользовательские config/auth stores не
+изменяются; обычный `ux-e2e start` сохраняет прежнее наследование профиля/config.
+
+До `PREPARED` выполняется config-only проверка каждого scratch через установленный
+SDK: `Settings.loadReadOnly` и настоящий model resolver должны разрешить каждую
+роль и обнаруженного агента в выбранную модель. Проверка не создаёт SDK sessions,
+не открывает auth DB, не вызывает модель и не расходует H-попытки.
+`runtime-manifest.json` (`reliable-stage-host-smoke/runtime/v3`) фиксирует модель,
+путь config и обнаруженные роли/agent count. Старые подготовленные roots и
+evidence не перезаписываются. Конфигурационный PASS не означает H PASS:
+при live-запуске всё ещё проверяйте фактически выбранные модели в host evidence.
 
 Исходное хранилище credentials читается только read-only. Для Codex допустим
 официальный static `api_key` в отдельном приватном SDK store, содержащий

@@ -119,6 +119,8 @@ const TRACE_SEMANTIC = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/;
 const TRACE_FILE = /^[A-Za-z0-9_.@+-]+(?:\/[A-Za-z0-9_.@+-]+)*$/;
 const TRACE_EVENT_KEYS = ['sequence', 'route', 'kind', 'workflow', 'stage', 'phase', 'tool', 'identities', 'links', 'attempt', 'revision', 'verdict', 'outcome', 'count', 'faultPoint', 'barrier', 'source'];
 const TRACE_ENVELOPE_KEYS = ['version', 'scenario_ids', 'source', 'truncated', 'events'];
+const MAX_FAILURE_DIAGNOSTIC_CHARS = 3000;
+const MAX_FAILURE_DIAGNOSTICS_PER_CASE = 4;
 
 function safeTraceInteger(value, maximum) {
   return Number.isSafeInteger(value) && value >= 0 && value <= maximum ? value : undefined;
@@ -346,6 +348,72 @@ function evidenceLocator(value) {
   return safeTraceLocator(value);
 }
 
+function safeFailureMessage(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 1024) return undefined;
+  if (!/^[A-Za-z0-9][A-Za-z0-9 .,:;!?()'-]{0,1023}$/.test(value)) return undefined;
+  if (/\b(?:actual|expected|grant|auth|authorization|bearer|credential|password|secret|token|stdout|stderr)\b/i.test(value)) return undefined;
+  if (/[A-F0-9]{32,}|\b[A-Za-z0-9_-]{32,}\b/i.test(value)) return undefined;
+  const words = value.match(/[A-Za-z][A-Za-z0-9_.:-]*/g) ?? [];
+  if (words.length === 0 || words.some(word => safeTraceSemantic(word) === undefined)) return undefined;
+  return value;
+}
+
+function safeFailureStack(value, fallback) {
+  const frames = [];
+  if (typeof value === 'string') {
+    for (const line of value.slice(0, 8192).split(/\r?\n/, 64)) {
+      if (frames.length >= 4) break;
+      const match = /^\s*at\s+(?:.+?\s+\()?((?:file:\/\/)?[^()\s]+):([0-9]+):([0-9]+)\)?\s*$/.exec(line);
+      if (!match?.[1] || match[1].startsWith('node:')) continue;
+      let file = match[1];
+      if (file.startsWith('file://')) {
+        try {
+          file = fileURLToPath(file);
+        } catch {
+          continue;
+        }
+      }
+      const locator = safeTraceLocator({ file, line: Number(match[2]), column: Number(match[3]) });
+      if (locator && !frames.some(frame => JSON.stringify(frame) === JSON.stringify(locator))) frames.push(locator);
+    }
+  }
+  if (frames.length > 0) return frames;
+  const source = safeTraceLocator(fallback);
+  return source ? [source] : undefined;
+}
+
+function unwrapNodeTestFailure(error) {
+  let current = error;
+  let wrapperCode;
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (!current || typeof current !== 'object' || Array.isArray(current) || current.code !== 'ERR_TEST_FAILURE') break;
+    const cause = current.cause;
+    if (!cause || typeof cause !== 'object' || Array.isArray(cause)) break;
+    wrapperCode ??= current.code;
+    current = cause;
+  }
+  return { error: current, wrapperCode };
+}
+
+function safeFailureDiagnostic(error, source) {
+  if (!error || typeof error !== 'object' || Array.isArray(error)) return undefined;
+  const original = error;
+  const unwrapped = unwrapNodeTestFailure(original);
+  error = unwrapped.error;
+  const name = safeTraceSemantic(error.name) ?? safeTraceSemantic(original.name);
+  const code = safeTraceSemantic(error.code) ?? safeTraceSemantic(unwrapped.wrapperCode);
+  const message = safeFailureMessage(error.message) ?? safeFailureMessage(original.message);
+  const sourceStack = safeFailureStack(error.stack, source) ?? safeFailureStack(original.stack, source);
+  const diagnostic = {
+    ...(name ? { name } : {}),
+    ...(code ? { code } : {}),
+    ...(message ? { message } : {}),
+    ...(sourceStack ? { source_stack: sourceStack } : {}),
+  };
+  if (Object.keys(diagnostic).length === 0 || JSON.stringify(diagnostic).length > MAX_FAILURE_DIAGNOSTIC_CHARS) return undefined;
+  return diagnostic;
+}
+
 function statusOutcome(previous, current) {
   if (previous === 'FAIL' || current === 'FAIL') return 'FAIL';
   if (previous === 'BLOCKED' || current === 'BLOCKED') return 'BLOCKED';
@@ -362,6 +430,7 @@ export default async function* report(events) {
   let failures = 0;
   let tests = 0;
   let observedDuration;
+  const started = performance.now();
   for await (const event of events) {
     if (event.type === 'test:diagnostic') {
       const trace = parseScenarioTrace(event.data?.message);
@@ -383,17 +452,21 @@ export default async function* report(events) {
     if (status !== 'PASS') failures++;
     const duration = typeof data.details?.duration_ms === 'number' && Number.isFinite(data.details.duration_ms) && data.details.duration_ms >= 0 ? data.details.duration_ms : 0;
     if (typeof data.name !== 'string') continue;
+    const locator = evidenceLocator({ file: data.file, line: data.line, column: data.column });
+    const diagnostic = event.type === 'test:fail' ? safeFailureDiagnostic(data.details?.error, locator) : undefined;
     for (const match of data.name.matchAll(/\[([OC]:(?:S\d{2}|R\d{2}|A\d{2}))\]/g)) {
       const id = match[1];
       if (!id) continue;
       const prior = results.get(id);
       process.stderr.write(`${JSON.stringify({ level, event: 'case_complete', id, status, duration_ms: duration })}\n`);
-      const locator = evidenceLocator({ file: data.file, line: data.line, column: data.column });
+      const failureDiagnostics = [...(prior?.failure_diagnostics ?? [])];
+      if (diagnostic && failureDiagnostics.length < MAX_FAILURE_DIAGNOSTICS_PER_CASE) failureDiagnostics.push(diagnostic);
       results.set(id, {
         id,
         test_outcome: statusOutcome(prior?.test_outcome, status),
         duration_ms: (prior?.duration_ms ?? 0) + duration,
         evidence: [...(prior?.evidence ?? []), ...(locator ? [{ ...locator, kind: 'test', status }] : [])],
+        ...(failureDiagnostics.length > 0 ? { failure_diagnostics: failureDiagnostics } : {}),
       });
     }
   }
@@ -421,6 +494,7 @@ export default async function* report(events) {
       outcome,
       ...(reason ? { reason } : {}),
       duration_ms: result.duration_ms,
+      ...(result.failure_diagnostics?.length ? { failure_diagnostics: result.failure_diagnostics } : {}),
       evidence: sourceEvidence,
       assertions,
       source_evidence: sourceEvidence,
@@ -429,7 +503,7 @@ export default async function* report(events) {
     });
   }
   const complete = failures === 0 && traceGaps === 0 && cases.every(item => item.status === 'PASS');
-  const duration = observedDuration ?? [...results.values()].reduce((sum, item) => sum + item.duration_ms, 0);
+  const duration = observedDuration ?? (performance.now() - started);
   const targetMs = level === 'D' ? 60_000 : 180_000;
   const withinBudget = duration <= targetMs;
   const sourceSha256 = /^[a-f0-9]{64}$/i.test(process.env.WORKFLOW_SOURCE_SHA256 ?? '') ? process.env.WORKFLOW_SOURCE_SHA256 : undefined;

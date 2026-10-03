@@ -44598,8 +44598,21 @@
     }
   },
   "remote_ci": {
-    "status": "NOT_RUN",
-    "reason": "User prohibits stage/commit/push/release; CI configuration is not execution evidence"
+    "status": "FAIL",
+    "head_commit": "c3e241b2a47866b10bb82ab46c11b9f8f1d620f8",
+    "run_id": 36985180993,
+    "job_id": 110768478476,
+    "url": "https://github.com/AndVl1/omp-workflows/actions/runs/36985180993/job/110768478476",
+    "runtime": "Ubuntu 24.04 / Node 20.20.2",
+    "passed": ["install", "build", "typecheck", "deterministic workflow scenarios"],
+    "failed": ["workflow process scenarios"],
+    "skipped": ["full test"],
+    "diagnosed_cause": "Promise.withResolvers отсутствует в Node 20; все четыре process fixtures использовали общий несовместимый barrier helper.",
+    "corrected_candidate": "LOCAL_VERIFIED_NOT_YET_PUSHED",
+    "prior_observation": {
+      "status": "NOT_RUN",
+      "reason": "Прежний запрет commit/push; текущий пользователь разрешил автономно завершить PR."
+    }
   },
   "prior_verification_summary": {
     "source_sha256": "3961ea38478cda9713fbbea78c54cf8aecfb89ab256a97037222e9ed492931d3",
@@ -44752,5 +44765,54 @@
     "status": "APPROVE",
     "reviewer": "FinalEvidenceBoundaryReview",
     "runtime_scope": "source-only; no additional host or CI execution"
+  },
+  "autonomous_completion": {
+    "authorization": "Пользователь: «если можешь, то добей самостоятельно»; merge/release/archive не выполняются.",
+    "status": "LOCAL_GREEN_AWAITING_PR_CI_AND_LIVE_H",
+    "historical_snapshots_preserved": true,
+    "local_gate": {
+      "runtime": "Node 20.20.2 / Darwin arm64",
+      "source_sha256": "7eab48c14b0e51aee3c7c4ac8198ab97ec64e528e355ada2db1fee7b829fcf43",
+      "source_boundary": "Рабочая копия с сохранёнными пользовательскими version/release-правками 0.29.2; exact committed PR candidate проверяется отдельно в CI и pinned host.",
+      "build": {"status": "PASS", "duration_ms": 5658},
+      "typecheck": {"status": "PASS", "duration_ms": 5036},
+      "deterministic": {
+        "status": "PASS",
+        "runs": [
+          {"tests": 126, "failures": 0, "trace_gaps": 0, "required_routes": 89, "duration_ms": 53084.289375, "outer_duration_ms": 53423},
+          {"tests": 126, "failures": 0, "trace_gaps": 0, "required_routes": 89, "duration_ms": 54647.861292, "outer_duration_ms": 54972}
+        ],
+        "ordered_normalized_trace_equal": true,
+        "target_ms": 60000,
+        "independent_temp_roots": true
+      },
+      "process": {"status": "PASS", "tests": 8, "failures": 0, "trace_gaps": 0, "required_routes": 15, "duration_ms": 46942.536334, "outer_duration_ms": 47202, "target_ms": 180000},
+      "full_suite": {
+        "status": "PASS_WITH_EXPLAINED_BROWSER_SKIP",
+        "tests": 1684,
+        "pass": 1683,
+        "fail": 0,
+        "skip": 1,
+        "duration_ms": 354821,
+        "packages": {"core": {"tests": 1121, "pass": 1121}, "e2e": {"tests": 81, "pass": 80, "skip": 1}, "fullstack": {"tests": 391, "pass": 391}, "internal": {"tests": 91, "pass": 91}},
+        "skip_reason": "Chromium отсутствует в isolated HOME; browser/H acceptance этим не подтверждается."
+      },
+      "diagnostic_smoke": {"status": "PASS", "node_test_wrapper_unwrapped": true, "raw_assertion_payload_excluded": true, "source_stack_repository_relative": true, "max_case_diagnostics": 4, "cyclic_cause_bounded": true, "acceptance_matrix_not_substituted": true},
+      "evidence_root": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/reliable-stage-idle-qa-v2YQXn/repair-verification-3nICVk",
+      "evidence_labels": ["autonomous-node20-workspace-build", "autonomous-node20-workspace-typecheck", "autonomous-node20-deterministic-final-first", "autonomous-node20-deterministic-final-second", "autonomous-node20-process-duration-final", "autonomous-node20-full-serial-final", "autonomous-node20-diagnostic-smoke"]
+    },
+    "review": {"ci_fixture_and_reporter": "APPROVE", "model_config_harness": "APPROVE", "runtime_executed_by_reviewers": false},
+    "new_host_budget": {
+      "status": "PRECONDITIONS_PENDING_PR_CI",
+      "basis": "Новое явное разрешение пользователя; исправленные model config и проверяемое Bun/PATH окружение.",
+      "historical_attempts_unchanged": {"H1": 2, "H2": 2, "H3": 2},
+      "new_attempt_limit_per_case": 1,
+      "attempt_timeout_sec": 900,
+      "automatic_retries": false,
+      "used": {"H1": 0, "H2": 0, "H3": 0},
+      "sdk_child_required": true,
+      "cold_restore_and_worker_revive": "NOT_VERIFIED",
+      "fresh_linked_continuation": "NOT_APPLICABLE_UNTIL_COLD_REVIVE_CAPABILITY_IS_ESTABLISHED"
+    }
   }
 }

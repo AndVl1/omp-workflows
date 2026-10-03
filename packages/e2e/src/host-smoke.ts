@@ -23,6 +23,12 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { runBootstrap, runStop } from './cli.js';
+import {
+  buildHostModelPlan,
+  inspectCandidateModelInventory,
+  requireConcreteModelSelector,
+  verifyPreparedModelConfig,
+} from './host-smoke-models.js';
 
 type JsonRecord = Record<string, unknown>;
 type CaseId = 'H1' | 'H2' | 'H3';
@@ -82,7 +88,7 @@ interface HostSmokePlan {
 }
 
 interface RuntimeManifest {
-  readonly schema: 'reliable-stage-host-smoke/runtime/v2';
+  readonly schema: 'reliable-stage-host-smoke/runtime/v3';
   readonly root: string;
   readonly omp_binary: string;
   readonly omp_version: string;
@@ -92,6 +98,10 @@ interface RuntimeManifest {
   readonly fullstack_package: string;
   readonly fullstack_version: string;
   readonly fullstack_tarball_sha256: string;
+  readonly selected_model: string;
+  readonly model_config_path: string;
+  readonly model_roles: readonly string[];
+  readonly model_agent_count: number;
   readonly scratch: Readonly<Record<CaseId, string>>;
 }
 
@@ -288,8 +298,9 @@ function prepareRoot(root: string): void {
   writeJson(ownerPath, { schema: 'reliable-stage-host-smoke/owner/v2', root });
 }
 
-function prepare(rootInput: string, coreTarball: string, fullstackTarball: string): void {
+function prepare(rootInput: string, coreTarball: string, fullstackTarball: string, modelInput: string): void {
   validatePlan();
+  const selectedModel = requireConcreteModelSelector(modelInput);
   const root = resolve(rootInput);
   const coreTarballPath = resolve(coreTarball);
   const fullstackTarballPath = resolve(fullstackTarball);
@@ -336,8 +347,38 @@ function prepare(rootInput: string, coreTarball: string, fullstackTarball: strin
     }
     commitScratch(scratch[id], env);
   }
+  const home = join(root, 'home');
+  const agentDir = join(root, 'agent-data');
+  const configPath = join(home, '.omp', 'agent', 'config.yml');
+  const agentConfigPath = join(agentDir, 'config.yml');
+  const inventory = inspectCandidateModelInventory({
+    candidatePrefix: prefix,
+    scratchDir: scratch.H1,
+    home,
+    agentDir,
+    extensionPath: fullstackPackage,
+  }, env);
+  const modelPlan = buildHostModelPlan(selectedModel, inventory.builtinRoleIds, inventory.agents);
+  writeJson(configPath, modelPlan.config);
+  ensureDir(dirname(agentConfigPath));
+  symlinkSync(configPath, agentConfigPath, 'file');
+  const modelChecks = CASE_IDS.map(id => verifyPreparedModelConfig({
+    candidatePrefix: prefix,
+    scratchDir: scratch[id],
+    home,
+    agentDir,
+    extensionPath: fullstackPackage,
+    configPath,
+    selectedModel: modelPlan.model,
+    roles: modelPlan.roles,
+  }, env));
+  const modelAgentCount = modelChecks[0]?.agentCount ?? 0;
+  if (modelAgentCount === 0 || modelChecks.some(check =>
+    check.agentCount !== modelAgentCount || JSON.stringify(check.roles) !== JSON.stringify(modelPlan.roles))) {
+    throw new Error('host-smoke: model config verification differed between H1/H2/H3 scratch projects');
+  }
   const manifest: RuntimeManifest = {
-    schema: 'reliable-stage-host-smoke/runtime/v2',
+    schema: 'reliable-stage-host-smoke/runtime/v3',
     root,
     omp_binary: binary,
     omp_version: version,
@@ -347,11 +388,20 @@ function prepare(rootInput: string, coreTarball: string, fullstackTarball: strin
     fullstack_package: fullstackPackage,
     fullstack_version: fullstackVersion,
     fullstack_tarball_sha256: fullstackTarballSha256,
+    selected_model: modelPlan.model,
+    model_config_path: configPath,
+    model_roles: modelPlan.roles,
+    model_agent_count: modelAgentCount,
     scratch,
   };
   writeJson(join(root, 'runtime-manifest.json'), manifest);
-  appendEvidence(evidence, { phase: 'prepare', status: 'PASS', manifest: 'runtime-manifest.json', scratch: Object.fromEntries(CASE_IDS.map(id => [id, relative(root, scratch[id])])), evidence_retained: true });
-  process.stdout.write(`${JSON.stringify({ status: 'PREPARED', root, manifest: join(root, 'runtime-manifest.json'), omp_binary: binary })}\n`);
+  appendEvidence(evidence, {
+    phase: 'prepare', status: 'PASS', manifest: 'runtime-manifest.json',
+    scratch: Object.fromEntries(CASE_IDS.map(id => [id, relative(root, scratch[id])])),
+    selected_model: modelPlan.model, model_config_path: configPath, model_roles: modelPlan.roles,
+    model_agent_count: modelAgentCount, evidence_retained: true,
+  });
+  process.stdout.write(`${JSON.stringify({ status: 'PREPARED', root, manifest: join(root, 'runtime-manifest.json'), omp_binary: binary, selected_model: modelPlan.model, model_config_path: configPath })}\n`);
 }
 
 function ownedSessionRoots(root: string): string[] {
@@ -383,7 +433,7 @@ async function cleanup(rootInput: string): Promise<void> {
 }
 
 function usage(): void {
-  process.stderr.write('Usage: host-smoke validate | prepare --root <owned-dir> --core <candidate.tgz> --fullstack <candidate.tgz> | cleanup --root <owned-dir>\n');
+  process.stderr.write('Usage: host-smoke validate | prepare --root <owned-dir> --core <candidate.tgz> --fullstack <candidate.tgz> --model <provider/model> | cleanup --root <owned-dir>\n');
 }
 
 async function main(): Promise<void> {
@@ -395,7 +445,7 @@ async function main(): Promise<void> {
       return;
     }
     if (command === 'prepare') {
-      prepare(requiredArg('--root'), requiredArg('--core'), requiredArg('--fullstack'));
+      prepare(requiredArg('--root'), requiredArg('--core'), requiredArg('--fullstack'), requiredArg('--model'));
       return;
     }
     if (command === 'cleanup') {
