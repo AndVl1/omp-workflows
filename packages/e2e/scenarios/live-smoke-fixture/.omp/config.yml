@@ -1,0 +1,3 @@
+modelRoles:
+  qa: "@task"
+  reviewer: "@task"

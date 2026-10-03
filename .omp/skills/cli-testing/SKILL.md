@@ -112,6 +112,13 @@ prepare, doctor, verify and broker lifecycle commands. Use a reviewed config who
 an xAI recipe. Keep `fixture.source: "./live-smoke-fixture"`: it supplies the
 explicit README worker mapping and read-only native event observer. Do not repair
 missing worker scope by allowing orchestrator writes or editing canonical state.
+Preserve the fixture's project `modelRoles` bindings for `qa` / `reviewer`. Native
+18.4.9 can interpret an unconfigured custom alias as a literal model selector and
+fail with `No model selected`; the fixture maps these aliases through `@task`.
+Verify actual child provider/model metadata when investigating routing: root-only
+native observer records do not prove a worker's model, and the reviewer's native
+slow/auth-aware fallback is still in effect. Never repair this by copying a host
+auth DB or changing global model settings.
 The reviewed live scenario uses `/do-work --new`, not ambiguous task-only ingress.
 Follow the returned stage contract: orchestration stages advance after their
 declared action; single-worker stages require an actual native task/result before
@@ -122,6 +129,18 @@ the actual native TUI. Do not fabricate ledger/proof or suppress an unanswered
 approval timeout. A reasoning-model recipe may select a larger finite
 `timing.stageTimeoutMs` before prepare; the config's `timeout_ms` is not the command
 deadline. Never edit a generated scenario or manifest to extend an active run.
+
+For a supervised run, choose an explicit `verify --session-id approved-live` and
+inspect the same session's actual native modal. After the user authorizes its
+selected `proceed`, `npm --silent run e2e:input -- --manifest "$LIVE_MANIFEST"
+--session-id approved-live --text '' --json` sends Enter through the ordinary PTY
+path. Before implementation approval, verify exact README bytes and the bound
+implementation artifact's worker `files_touched: ["README.md"]`; do not compare
+all orchestrator/host metadata writes with worker scope. Require native ask
+success rather than transport input success. TUI 18.4.9 submits optional no-image
+fields as own `undefined` values; Core accepts that shape while rejecting unknown
+metadata, malformed image lists and unsupported attachments. Genuine approval
+does not turn a later failed dispatch, workflow refusal or timeout into PASS.
 
 Once all clients are stopped, stop the explicitly managed broker separately:
 

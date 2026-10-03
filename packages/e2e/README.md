@@ -51,6 +51,12 @@ the fixture does not bypass write guards or manufacture canonical state. Preserv
 The command explicitly selects a new workflow. Its README acceptance requires a
 native implementation-worker dispatch and the project-root file; an orchestrator
 write or an artifacts-directory substitute does not satisfy the scenario.
+The fixture also supplies project `modelRoles` bindings for QA/reviewer aliases
+through `@task`. This avoids an unconfigured custom alias becoming a literal
+selector in native 18.4.9. It does not copy host model settings or auth storage;
+native slow/auth-aware fallback remains available for reviewers. Routing claims
+require actual child provider/model metadata, not merely the root session's
+selected model. Both real diagnostic workers produced Grok 4.7 native receipts.
 For a dedicated existing host profile, export `OMP_PROFILE` before prepare, doctor,
 verification and broker lifecycle commands. Its authorized provider must match the
 config's `auth.provider` and `model`; the default OpenAI config is not an xAI recipe.
@@ -71,6 +77,38 @@ checkpoint must receive an explicitly authorized answer through the native TUI;
 an unanswered approval remains a timeout/failure, even after a worker succeeds.
 Reasoning models may need a reviewed scenario with a larger finite
 `timing.stageTimeoutMs`; `timeout_ms` in the prepare config is not that deadline.
+
+For explicitly authorized approvals, give verification a stable session id:
+
+```bash
+npm --silent run e2e:verify -- --manifest "$LIVE_MANIFEST" \
+  --suite live-smoke --session-id approved-live --json
+```
+
+In another terminal, inspect that same session with `npm --silent run
+e2e:transcript -- --manifest "$LIVE_MANIFEST" --session-id approved-live`.
+Only when the real pending native checkpoint dialog selects the user-authorized
+`proceed`, submit its selection:
+
+```bash
+npm --silent run e2e:input -- --manifest "$LIVE_MANIFEST" \
+  --session-id approved-live --text '' --json
+```
+
+This sends Enter through the public PTY input path; it does not mint an answer or
+edit a ledger. Before implementation approval, inspect the run-owned README and
+bound implementation artifact: the exact required bytes and worker's
+`files_touched: ["README.md"]` must agree. Require the native checkpoint ask success,
+not just a successful input receipt. Known optional no-image metadata from TUI
+18.4.9 is supported; unsupported attachments and malformed answers still fail
+closed. The full authorized Grok 4.7 recipe passed the worker implementation,
+review, QA and summary gate with two genuine native approval acknowledgements.
+Its reasoning-specific scenario used a finite 1200000 ms stage deadline chosen
+before immutable prepare; the committed defaults and all error/provenance checks
+remained unchanged. Restart proved a new native session with preserved canonical
+state. Verification removed private run roots while retaining scoped evidence;
+explicit owned-broker stop released its loopback listener. Earlier failed or
+timed-out runs remain failures rather than being reclassified by that success.
 
 The observer is explicitly loaded from the prepared fixture while ambient
 extension discovery remains disabled. Public workflow refusals (`{ok:false}`)

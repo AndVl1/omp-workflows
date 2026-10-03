@@ -28,6 +28,23 @@ All notable changes to `omp-workflows` are documented here.
   artifact ownership guards; retained evidence redacts escaped capability values.
   ANSI-styled labels are matched before redaction, and PTY JSONL frames are
   sanitized after decoding so split control sequences cannot corrupt evidence.
+- Core human checkpoint asks accept the native TUI 18.4.9 no-image result shape
+  (`customInputImages` / `noteImages` are optional and may be own `undefined`
+  values), while unknown metadata, malformed lists and unsupported attachments
+  remain fail-closed. Selection, cancellation, policy and trusted-proof gates
+  are unchanged; real PTY approvals and canonical human-decision regressions
+  exercise the repaired boundary.
+- The isolated live fixture supplies native QA/reviewer model-role bindings.
+  Unknown custom aliases no longer leave those workers without a selected model;
+  actual child provider receipts verify the repaired routing without importing
+  host credentials or changing global model settings.
+
+### Verified
+- The real isolated Grok 4.7 `/do-work` recipe completed implementation, review,
+  QA/DoD and the summary gate with two authorized native TUI approvals. Strict
+  provider provenance, zero workflow/provider errors, distinct resumed native
+  session and preserved canonical state passed. Private runtime roots were
+  cleaned and explicit owned-broker stop released its listener.
 
 ## [0.29.1] — 2026-09-29
 ### Fixed

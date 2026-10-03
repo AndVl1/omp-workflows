@@ -63,6 +63,17 @@
 - Initial command input and resumed-session identity wait for a complete native
   startup receipt independently of transport readiness. Startup waits remain
   bounded; unsafe, corrupt or foreign receipts are refused rather than retried.
+- The live fixture declares project-scoped `qa` / `reviewer` model aliases via
+  `@task`, so native 18.4.9 does not treat missing class-role aliases as literal
+  model selectors and fail before a child starts. Real QA and reviewer probes
+  completed with native child receipts for the authorized Grok 4.7 model;
+  no host model settings or credential DB are copied.
+- Completed the real provider-backed Grok 4.7 `/do-work` smoke through worker
+  implementation, review, QA/DoD and summary gate, with two user-authorized native
+  terminal approvals. The immutable reasoning recipe used a finite 1200000 ms
+  deadline without weakening committed defaults or workflow-error/provenance
+  assertions. Native restart/state preservation, valid retained evidence,
+  private-root cleanup and owned-broker listener release were observed.
 
 ### Security
 
