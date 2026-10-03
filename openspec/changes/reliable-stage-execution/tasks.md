@@ -70,7 +70,9 @@
 пользователя завершены 7.3 и интеграция model-config/Node 20 fixes в PR #77:
 локально 1683 PASS/0 FAIL/1 explained SKIP, D/P GREEN и exact commit `7ff478c`
 прошёл remote CI. H2 SDK-ID correction затем прошёл локальную автоматическую
-приёмку и scripted registered-tool smoke; его новый exact commit/CI фиксируется
-в текущем report. Прогресс остаётся 29/30; 8.2 BLOCKED: новую 1/1 live-приёмку
+приёмку, scripted registered-tool smoke и remote CI exact code commit
+`6659b7e843c0ee824e54838101e99b6da71de135` (run `37134697043`: install/build/types/D/P/full Test SUCCESS).
+CI финального evidence-only head фиксируется в PR #77; production delta нет.
+Прогресс остаётся 29/30; 8.2 BLOCKED: новую 1/1 live-приёмку
 провели, но H1/H3 INVALID_QA и actual cold restore/worker revive NOT_VERIFIED.
 Merge/release/archive и пользовательские version/release-правки не выполняются.

@@ -44774,7 +44774,7 @@
   },
   "autonomous_completion": {
     "authorization": "Пользователь: «если можешь, то добей самостоятельно»; merge/release/archive не выполняются.",
-    "status": "H_GATE_BLOCKED_H2_FIX_LOCALLY_VERIFIED_CI_PENDING",
+    "status": "H_GATE_BLOCKED_H2_FIX_AUTOMATED_PASS_CI_GREEN",
     "historical_snapshots_preserved": true,
     "local_gate": {
       "runtime": "Node 20.20.2 / Darwin arm64",
@@ -44915,12 +44915,25 @@
       }
     },
     "post_h2_sdk_id_repair": {
-      "status": "LOCAL_PASS_CI_PENDING",
+      "status": "LOCAL_PASS_EXACT_CODE_COMMIT_CI_PASS",
       "verified_source_sha256": "5cfeca755714e3b961d06eef6ac464ffe07b062b336e708cfb84b4d790db4f16",
       "source_boundary": "Working source with protected user 0.29.2 metadata; later delta only planning/evidence/README. Exact committed candidate CI is tracked separately; no new H run.",
       "runtime": "Node 20.20.2 / Darwin arm64",
       "implementation": "Private registered native advance adapter derives namespaced SHA256 of complete nonempty opaque SDK id; canonical validator, root claims and readiness unchanged",
       "review": {"status": "APPROVE", "reviewer": "NativeSdkOperationIdReview", "runtime_executed_by_reviewer": false},
+      "evidence_review": {"status": "APPROVE", "reviewer": "FinalAcceptanceEvidenceReview", "resolved": "README historical versus new exhausted budget clarified", "runtime_executed_by_reviewer": false},
+      "remote_ci": {
+        "status": "SUCCESS",
+        "candidate_commit": "6659b7e843c0ee824e54838101e99b6da71de135",
+        "run_id": 37134697043,
+        "job_id": 111236736080,
+        "url": "https://github.com/AndVl1/omp-workflows/actions/runs/37134697043/job/111236736080",
+        "job_duration_seconds": 312,
+        "observed_success": ["install", "build", "typecheck", "deterministic workflow scenarios", "workflow process scenarios", "full Test"],
+        "verification_command": "gh run watch 37134697043 --repo AndVl1/omp-workflows --exit-status",
+        "exit_code": 0,
+        "final_evidence_only_head_ci": "Recorded in PR #77 checks/comment; no H rerun or production delta after this code commit"
+      },
       "focused_regression": {"status": "PASS", "case": "C:R02", "pass": 1, "fail": 0, "nonselected_skipped": 29, "duration_ms": 795, "evidence": "/var/folders/2g/rjkxjt810yz96lf62gr12vnh0000gn/T/reliable-stage-idle-qa-v2YQXn/repair-verification-3nICVk/native-sdk-id-node20-focused-3msits/stdout.log"},
       "runtime_smoke": {
         "status": "PASS",
@@ -44934,7 +44947,7 @@
       "typecheck": {"status": "PASS", "workspaces": 4, "duration_ms": 4738},
       "deterministic": {
         "status": "PASS",
-        "runs": [{"tests": 126, "failures": 0, "trace_gaps": 0, "required_routes": 89, "duration_ms": 46995.292292, "outer_duration_ms": 47326}, {"tests": 126, "failures": 0, "trace_gaps": 0, "required_routes": 89, "duration_ms": 46924.937042000005, "outer_duration_ms": 47268}],
+        "runs": [{"tests": 126, "failures": 0, "trace_gaps": 0, "required_routes": 89, "duration_ms": 46995.292292, "outer_duration_ms": 47326}, {"tests": 126, "failures": 0, "trace_gaps": 0, "required_routes": 89, "duration_ms": 46924.937042, "outer_duration_ms": 47268}],
         "ordered_normalized_trace_equal": true,
         "independent_roots": true,
         "target_ms": 60000
