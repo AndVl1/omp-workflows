@@ -313,6 +313,19 @@ relative `teams[].dod_path`; the default file is
 `.work-state/artifacts/<team>/dod.json`, not canonical CTO state or a typed
 workflow output.
 
+### Служебные сообщения и диагностика
+
+Single-path `write` в точный `xd://report_issue` или корневой
+`agent://<recipient>` — служебная операция SDK, не файловая запись.
+Host/claim admission остаётся обязательным; SDK проверяет получателя,
+доставку сообщения и доступ к диагностическому device. Эти операции не
+дают прав на lifecycle, dispatch, сдачу outputs или изменение файлов.
+Файловый `write_scope` worker не ограничивает разрешённые служебные сообщения.
+Другие `xd://` routes не получают нового исключения. URI с subpath,
+query/fragment, смешанные файловые targets и `edit` не являются этим
+служебным транспортом; registered lifecycle devices сохраняют отдельный
+контракт авторизации.
+
 ### Защищённый artifact-proof Bash
 
 Это единственное Bash-исключение в данном контракте: доверенный host artifact proof разрешает только bounded read-only Git inspection. Поддерживаются две кодировки `command`; это не два взаимоисключающих транспорта:
@@ -335,12 +348,16 @@ workflow output.
 Для non-inline encoding omitted `env` отклоняется; wrong/extra/malformed `env` отклоняется в обоих случаях.
 
 Allowlist содержит только read-only `status`, `log`, `diff`, `show` и ровно `branch --show-current`; `switch`, `checkout`, другие режимы `branch`, неподдержанные extra args, helper/wrapper, mutation и injection блокируются.
+Для `log` поддерживается не более одного положительного short count `-N`
+в диапазоне 1..100; например, `log -8 --oneline`. Нулевые, повторные,
+out-of-range counts и неподдержанные options отклоняются. Флаги
+`--no-ext-diff --no-textconv` к `log` добавлять не нужно.
 
 Примеры inline form с отсутствующим `env`:
 
 ```bash
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false status --short
-GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline
+GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -8 --oneline
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD

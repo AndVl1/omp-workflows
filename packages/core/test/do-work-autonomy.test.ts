@@ -1301,9 +1301,9 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
       orchestratorWriteGate(
         { toolName: "write", input: { path: "xd://report_issue", content: "tool routing failed" } },
         hostContext,
-      )?.block,
-      true,
-      "unregistered mounted diagnostics are not lifecycle write exemptions",
+      ),
+      undefined,
+      "diagnostic reporting is not a filesystem write",
     );
     const worker = orchestratorWriteGate({ toolName: "write", input: { actor: "orchestrator", path: "src/app.ts" } }, { ...hostContext, hasUI: false });
     assert.equal(worker, undefined);
@@ -1403,6 +1403,31 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
     assert.equal(invoke({ path: `.work-state/runs/${runId}/state.json` }, trustedRawContext)?.block, true);
     assert.equal(invoke({ path: join(artifactsDir, "..", "escape.json") }, trustedRawContext)?.block, true);
 
+    for (const path of ["xd://report_issue", "agent://LegacyReachability"]) {
+      assert.equal(invoke({ path, content: "coordination evidence" }, trustedRawContext), undefined);
+      assert.equal(
+        invoke({ path, content: "coordination evidence", paths: ["src/app.ts"] }, trustedRawContext)?.block,
+        true,
+        "mixed service/filesystem inputs cannot claim a service exemption",
+      );
+      assert.equal(
+        toolCall!({ toolName: "edit", input: { path } }, trustedRawContext)?.block,
+        true,
+        "only write is the SDK service transport",
+      );
+    }
+    for (const path of [
+      "xd://unknown-device",
+      "xd://report_issue/child",
+      "agent://LegacyReachability/report",
+      "agent://LegacyReachability?path=src",
+      "agent://LegacyReachability#field",
+      "agent://../src",
+      "agent://",
+    ]) {
+      assert.equal(invoke({ path, content: "not a root service route" }, trustedRawContext)?.block, true);
+    }
+
     const missingParents = join(artifactsDir, "new", "nested", "discovery.json");
     assert.equal(invoke({ path: missingParents }, trustedRawContext), undefined, "ordinary missing artifact parents remain valid");
     const escapeTarget = join(root, "escape-target");
@@ -1468,6 +1493,19 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts", trustedRawContext), undefined);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD", trustedRawContext), undefined);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline", trustedRawContext), undefined);
+    for (const count of [8, 25, 100]) {
+      assert.equal(invokeBash(`GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -${count} --oneline`, trustedRawContext), undefined);
+    }
+    assert.equal(
+      invokeBashInput(
+        { command: "git --no-pager -c core.fsmonitor=false log -8 --oneline", env: { GIT_OPTIONAL_LOCKS: "0" } },
+        trustedRawContext,
+      ),
+      undefined,
+    );
+    for (const args of ["-0", "-101", "-01", "-8 -2", "-8 --ext-diff", "-8 --textconv", "-8; echo changed"]) {
+      assert.equal(invokeBash(`GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log ${args} --oneline`, trustedRawContext)?.block, true);
+    }
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current", trustedRawContext), undefined);
     assert.equal(
       invokeBashInput(
@@ -1604,6 +1642,13 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
     };
     assert.equal(invoke({ path: join(artifactsDir, "discovery.json") }, foreign)?.block, true);
     assert.equal(invoke({ path: "src/app.ts" }, foreign)?.block, true);
+    for (const path of ["xd://report_issue", "agent://LegacyReachability"]) {
+      assert.equal(
+        invoke({ path, content: "forged sender", actor: "orchestrator" }, foreign)?.block,
+        true,
+        "service classification does not bypass authenticated host admission",
+      );
+    }
     const foreignExplicitOrchestrator = {
       ...foreign,
       actor: "orchestrator",

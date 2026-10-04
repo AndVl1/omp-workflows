@@ -68,6 +68,9 @@ export function orchestratorWriteGate(
   // Registered lifecycle devices use the generic write transport, but only
   // exact route writes are exempt from project-write policy.
   if (isRegisteredLifecycleDeviceWrite(event)) return;
+  // Messaging and diagnostics are host services, not filesystem writes.
+  // Unlike lifecycle devices, they retain the preceding actor/claim admission.
+  if (isTrustedHostServiceWrite(event, ctx)) return;
 
   // Canonical CTO state is engine-owned even when no ordinary strict run or
   // active CTO scope is selected (for example, immediately after a managed
@@ -106,7 +109,7 @@ export function orchestratorWriteGate(
   const artifactsDir = trustedArtifactsDirOf(ctx, actor);
   if (event.toolName === "bash" && artifactsDir) {
     if (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv)) {
-      return { block: true, reason: "orchestrator policy: trusted host artifact proof permits only sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false; diff/show also require --no-ext-diff --no-textconv" };
+      return { block: true, reason: "orchestrator policy: trusted host artifact proof permits only sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false: status, log (at most one -N, 1..100), diff, show, or branch --show-current; only diff/show require --no-ext-diff --no-textconv" };
     }
   }
 
@@ -178,11 +181,11 @@ function simpleGitWords(command: string): string[] | undefined {
   return words;
 }
 
-function splitGitArgs(args: string[], options: ReadonlySet<string>): { before: string[]; after: string[] } | undefined {
+function splitGitArgs(args: string[], options: ReadonlySet<string>, allowLogCount = false): { before: string[]; after: string[] } | undefined {
   const separator = args.indexOf("--");
   const before = separator < 0 ? args : args.slice(0, separator);
   const after = separator < 0 ? [] : args.slice(separator + 1);
-  if (before.some((arg) => arg.startsWith("-") && !options.has(arg))) return undefined;
+  if (before.some((arg) => arg.startsWith("-") && !options.has(arg) && !(allowLogCount && /^-(?:[1-9][0-9]?|100)$/.test(arg)))) return undefined;
   if (before.some((arg) => !arg.startsWith("-") && !/^[A-Za-z0-9._/@:+~^-]+$/.test(arg))) return undefined;
   if (after.some((arg) => !/^[A-Za-z0-9._/@:+~^-]+$/.test(arg))) return undefined;
   return { before, after };
@@ -225,8 +228,14 @@ function isReadOnlyProofCommand(command: string, env: unknown, hasEnv: boolean):
     return parsed.before.includes("--no-ext-diff") && parsed.before.includes("--no-textconv");
   }
   if (subcommand === "log") {
-    const parsed = splitGitArgs(args, new Set(["-1", "--no-color", "--no-decorate", "--oneline", "--reverse"]));
+    const parsed = splitGitArgs(args, new Set(["--no-color", "--no-decorate", "--oneline", "--reverse"]), true);
     if (!parsed || parsed.before.filter((arg) => !arg.startsWith("-")).length > 1) return false;
+    let countSeen = false;
+    for (const arg of parsed.before) {
+      if (!arg.startsWith("-") || arg.startsWith("--")) continue;
+      if (countSeen) return false;
+      countSeen = true;
+    }
     return true;
   }
   return false;
@@ -314,6 +323,24 @@ export function isRegisteredLifecycleDeviceWrite(event: ToolCallEvent): boolean 
   if (event.toolName !== "write") return false;
   const paths = pathsFromInput(event.input);
   return paths.length > 0 && paths.every((path) => Object.hasOwn(REGISTERED_LIFECYCLE_DEVICE_ROUTES, path));
+}
+
+function isTrustedHostServiceWrite(event: ToolCallEvent, ctx: ToolCallContext): boolean {
+  if (event.toolName !== "write" || !trustedActorOf(ctx)) return false;
+  const input = event.input;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  try {
+    if (Object.getPrototypeOf(input) !== Object.prototype) return false;
+    // Only the SDK's single-path write transport is a service request.
+    // Alias, patch, or mixed-target inputs must retain filesystem policy.
+    if ("file_path" in input || "paths" in input || "input" in input) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(input, "path");
+    if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") return false;
+    const path = descriptor.value;
+    return path === "xd://report_issue" || /^agent:\/\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path);
+  } catch {
+    return false;
+  }
 }
 
 function isWorkStatePath(path: string, cwd: string): boolean {
@@ -550,6 +577,7 @@ export function workerWriteScopeGate(
 ): { block?: boolean; reason?: string } | void {
   const scope = ctx.writeScope;
   if (isRegisteredLifecycleDeviceWrite(event)) return;
+  if (isTrustedHostServiceWrite(event, ctx)) return;
   if (!scope?.enabled) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
   if (trustedActorOf(ctx) !== "worker") return;
