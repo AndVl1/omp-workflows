@@ -52,7 +52,8 @@
 ## 8. Ограниченная host-проверка и закрытие change
 
 - [x] 8.1 Подготовить ровно H1/H2/H3 из design с изолированно pinned OMP 18.0.6 (global observed `omp --version` 18.3.4 не считается evidence), изолированной установкой, preconditions, ожидаемыми событиями, лимитом 15 минут и одним диагностированным повтором на case. Проверка: сценарии читают реальное discovered registration и JSONL/event evidence, не подменяют slash-command prose; idle/watchdog и cleanup не обрывают нормальный запуск до установленного бюджета. Evidence: реальная изолированная установка 18.0.6 и candidate 0.29.2; официальный ExtensionAPI обнаружил `do-work`, `cto` и production workflow tools, session ID/file получены из SDK sessionManager. Git-selector canary не затронут, исходный auth store не менялся, private child получил только access token без refresh. Первый H1 завершился естественно и диагностирован как FAIL; повтор H1 явно запрашивает естественный PHASE 0 turn-stop перед отдельным `Proceed`, не имитирует lifecycle.
-- [ ] 8.2 Выполнить H1/H2/H3 после зелёных D/P; проверить actual host binding, submission delivery, human UI, turn-stop и restart/resume. Проверка: отдельный PASS/FAIL/BLOCKED каждого H, отсутствие claims о неподдерживаемом native reconnect, остановка собственных processes/listeners. Нельзя закрыть gate по одним component tests или продолжать бесконечные прогоны после лимита.
+- [x] 8.2 Выполнить H1/H2/H3 после зелёных D/P; проверить actual host binding, submission delivery, human UI, turn-stop и restart/resume. Проверка: отдельный PASS/FAIL/BLOCKED каждого H, отсутствие claims о неподдерживаемом native reconnect, остановка собственных processes/listeners. Нельзя закрыть gate по одним component tests или продолжать бесконечные прогоны после лимита.
+  Текущий итог: критерии исходной спеки выполнены, 8.2 закрыт; H1/H2 independent PASS, H3 functional PASS с actual cold Hub revive и без implementation replay. Owned cleanup подтверждён. Пользователь подтвердил, что оптимизация e2e harness — отдельный эпик, и поручил закрытие/push. Более строгий browser-deadline proof не являлся исходным критерием; его NOT_VERIFIED сохранён как диагностика harness, не product blocker. Абзацы ниже — история попыток, не текущий статус.
   H1 сохраняет прежний FAIL/BLOCKED и исчерпанные 2/2 попытки; третий запуск, включая новый root, запрещён. Первые H2 BLOCKED (worker-first mandate на lead-owned discovery) и H3 FAIL (accepted receipt + exact SDK completed, но ordinary pending) диагностированы и исправлены без ослабления guard. После нового GREEN source настоящий SDK child `BoundedNativeHqaOperator` (agent `task`, session `01a0fb81-d461-7000-913d-6394860efe0b`) через agent-browser и официальный e2e выполнил только H2/H3 attempt 2/2 на OMP 18.0.6/candidate 0.29.2: H2 FAIL — configured team-lead до работы получил `No model selected`; root `--model` не заменил отсутствующий subagent model mapping. H3 FAIL — detached OMP вышел 127 до command ingress; warning missing host modelRoles подтверждён, но точная причина 127 остаётся UNKNOWN, child PATH не сохранён. Checkpoint/restore/Hub revive не достигнуты, cold revive и restored SDK identity — NOT_VERIFIED, не unsupported и не PASS. Native lifecycle подтвердил completion QA child; case stop/browser-close вызваны, Main отдельно остановил coordinator/browser. Все H бюджеты исчерпаны; дальнейшие запуски не выполнялись. Безопасные actual report/observer paths, fingerprints и original/retry история сохранены в [automatic-acceptance.json](automatic-acceptance.json).
   Новое явное разрешение пользователя позволяет отдельную автономную доприёмку: по одной новой попытке H1/H2/H3 до 900 секунд, без автоматических повторов. Старые 2/2 outcomes выше сохраняются как история, а не обнуляются новым root. Новый exact committed candidate и полный isolated model-role config проверяются до запуска; live QA выполняет настоящий SDK child, cold restore/Hub revive фиксируется только по actual identity/lifecycle evidence.
   Preconditions новой доприёмки подтверждены на exact commit `7ff478c`: candidate core/fullstack **0.29.1** из committed snapshot (пользовательские 0.29.2 metadata сохранены вне PR), SDK 18.0.6, actual выбранная модель `openai-codex/gpt-5.5`, 25 model roles/28 agents. macOS startup до H ingress оказался отдельным packaging defect `node-pty` 1.1.0: отсутствовал `spawn-helper`, несмотря на successful install. Изолированная зависимость восстановлена offline source rebuild против matching cached Node 26.8.1 headers; actual PTY wrapper `--version` вернул 18.0.6/exit 0. Это не H-попытка. Старый listener 4467 подтверждённо завершён; глобальные stores и candidate source не менялись.
@@ -76,6 +77,8 @@ CI финального evidence-only head фиксируется в PR #77; pro
 Исторический tranche exact `46da973`: H1/H2 independent PASS, H3
 coldRootRestore/noReplay PASS, но actual Hub `r` ещё NOT_VERIFIED.
 Его 1/1 per H, исходные 2/2 и предыдущие дополнительные 1/1 сохранены.
+
+#### Историческая оценка дополнительного H3-only до уточнения scope
 
 После отдельного разрешения «Один H3 — до 15 минут» выполнен ровно один
 H3-only case новым actual SDK worker `ActualSdkH3HubOnlyOperator`.
@@ -104,3 +107,26 @@ named browsers и private auth в итоге подтверждённо очищ
 бюджет 1/1 исчерпан; automatic retry нет. Fallback не нужен: actual revive
 доступен. Любой новый H требует нового явного bounded разрешения.
 Merge/release/archive и пользовательские version/release-правки не выполняются.
+
+### Текущее завершение по исходной спеке — 30/30
+
+8.2 закрыт по фактическим H1/H2 PASS и H3 functional PASS: холодное восстановление
+исходного root, actual original parked worker → Hub `r` → idle до resume/approval,
+неизменные accepted outputs, актуальное решение и один переход без повторной
+реализации. Это не объявляет H3 полным workflow complete/release.
+
+Исходная спека `deterministic-workflow-acceptance` требует заранее определить
+timeout/cleanup и остановить только собственные процессы (строки 55, 63);
+строка 67 запрещает молча расширять матрицу unrelated проблемами.
+`proposal.md:34–37` исключает ремонт harness. Требование timestamped browser
+PID/registry absence до 900s добавил private QA-протокол Main, а не исходная
+спека. Пользователь подтвердил отдельный эпик оптимизации e2e harness.
+
+Общий owned cleanup выполнен: собственные процессы/listeners/browsers остановлены,
+private auth и disposable helpers удалены. Timed browser-cleanup proof остаётся
+NOT_VERIFIED в исходных отчётах; это не переименованный PASS и не открытый
+критерий текущей задачи. Исторические failures, budgets и qualified H3 outcome
+сохранены. Новых H-прогонов и production-изменений при закрытии нет.
+Beads `br-4m8` закрыт. Предыдущий exact evidence HEAD `2c14aae` прошёл CI
+`37200406503`/job `111430746121` (SUCCESS, 224s); итог нового closure HEAD
+фиксируется в checks/комментарии PR #77. Merge/release/archive не выполняются.

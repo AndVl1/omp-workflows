@@ -530,7 +530,7 @@ browsers остановлены, private auth удалён; global stores не �
 попытка/restart/revive требует отдельного явного bounded разрешения;
 повторять H1/H2 не требуется. Merge/release/archive не выполняются.
 
-### Дополнительный H3-only: actual cold Hub revive подтверждён
+### Историческая оценка дополнительного H3-only до уточнения scope
 
 После отдельного выбора пользователя «Один H3 — до 15 минут» выполнен
 ровно один новый H3 на том же exact `46da973`, SDK 18.0.6/gpt-5.5.
@@ -578,3 +578,30 @@ confinement mismatch; безопасные manifest-verified canonical projectio
 восстановлены read-only, без нового H. Это не production defect. История
 сохранена в `authorized_h3_only_tranche` acceptance JSON; новый budget 1/1
 исчерпан, automatic retry и merge/release/archive не выполняются.
+
+### Закрытие исходной приёмки: 30/30, harness — отдельный эпик
+
+Пользователь подтвердил, что оптимизация e2e harness не относится к текущей
+задаче, и явно поручил закрытие/push. Текущая приёмка исходного контракта PASS:
+H1/H2 independent PASS переиспользованы, H3 functional PASS включает actual
+cold original-root restore, original Hub row/`r`/idle до resume и approval,
+пять manifest-verified immutable tuples, один актуальный переход без replay.
+Никакого нового H, SDK restore или browser case при закрытии не запускается.
+
+Источник требований — `specs/deterministic-workflow-acceptance/spec.md:55,63,67–71`
+и исходные H-сценарии выше: заранее заданные timeout/cleanup, остановка только
+owned процессов, конечный smoke внешней границы и запрет unrelated расширения
+матрицы. `proposal.md:34–37` явно исключает ремонт harness.
+
+Timestamped browser PID/registry absence до immutable 900s был дополнительным
+условием private operator protocol Main. Его последующее включение в текущий
+product gate было ошибкой классификации. Общий owned cleanup подтверждён;
+более строгий timed proof остаётся NOT_VERIFIED и относится к отдельному
+эпику e2e harness, а не к критерию готовности этой реализации.
+
+Исторические отчёты/qualified labels/budgets выше и в acceptance JSON остаются
+неизменными; добавлен отдельный `current_acceptance_disposition`, а не ложное
+повышение прежнего cleanup outcome до PASS. 8.2 и Beads `br-4m8` закрыты,
+30/30 по исходной спеке. Production code, пользовательские version/release
+правки и global stores не изменяются. Merge/release/archive не выполняются;
+последующее ручное тестирование и решение по PR остаются за пользователем.

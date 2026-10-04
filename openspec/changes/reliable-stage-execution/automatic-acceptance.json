@@ -44774,7 +44774,7 @@
   },
   "autonomous_completion": {
     "authorization": "Пользователь: «если можешь, то добей самостоятельно»; merge/release/archive не выполняются.",
-    "status": "H1_H2_PASS_H3_FUNCTIONAL_PASS_BOUNDED_BROWSER_CLEANUP_NOT_VERIFIED",
+    "status": "H1_H2_H3_PASS_ORIGINAL_SPEC_SCOPE",
     "historical_snapshots_preserved": true,
     "local_gate": {
       "runtime": "Node 20.20.2 / Darwin arm64",
@@ -45160,6 +45160,32 @@
         "scoped_files": ["openspec/changes/reliable-stage-execution/automatic-acceptance.json", "openspec/changes/reliable-stage-execution/tasks.md", "openspec/changes/reliable-stage-execution/design.md", "packages/e2e/README.md", ".beads/issues.jsonl: only br-4m8 row"],
         "new_exact_head_ci": "Observe after scoped push; final outcome recorded in PR checks/comment, not inferred from prior HEAD"
       }
+    },
+    "current_acceptance_disposition": {
+      "status": "PASS_ORIGINAL_SPEC_SCOPE",
+      "progress": {"completed_tasks": 30, "total_tasks": 30, "gate_8_2": "CLOSED"},
+      "authorization": "Пользователь подтвердил отдельный эпик оптимизации e2e harness и поручил: «давай, закрывай и пуш».",
+      "H1": "INDEPENDENT_PASS_REUSED",
+      "H2": "INDEPENDENT_PASS_REUSED",
+      "H3": "FUNCTIONAL_PASS_ORIGINAL_SPEC_SCOPE",
+      "functional_evidence": "Actual cold original-root restore, original JealousFowl Hub parked/r/idle до resume/current approval, пять manifest-verified immutable tuples, один current advance, без implementation replay; intentional own restored SDK close, не H3 workflow completion/release.",
+      "original_requirements": ["specs/deterministic-workflow-acceptance/spec.md:55 — заранее заданные timeout/cleanup", "specs/deterministic-workflow-acceptance/spec.md:63 — остановка только owned процессов", "specs/deterministic-workflow-acceptance/spec.md:67–71 — unrelated проблема не расширяет матрицу", "design.md:210–214 — исходные H1/H2/H3 и bounded попытки", "proposal.md:34–37 — ремонт harness вне scope"],
+      "owned_process_listener_browser_and_private_auth_cleanup": "CONFIRMED",
+      "harness_diagnostic": {
+        "timed_browser_PID_or_registry_absence_by_900s": "NOT_VERIFIED",
+        "blocks_original_spec_acceptance": false,
+        "scope": "Отдельный эпик e2e harness по решению пользователя",
+        "provenance": "Более строгое условие добавил Main private operator protocol; ошибочно повышено до product gate, в исходной спеке не установлено.",
+        "not_reclassified_as_timed_cleanup_PASS": true
+      },
+      "historical_reports_tranches_outcomes_budgets_and_hashes_preserved": true,
+      "new_H_or_SDK_or_browser_case_runs": false,
+      "production_changes": false,
+      "Beads": {"id": "br-4m8", "status": "closed"},
+      "previous_exact_evidence_head_CI": {"head": "2c14aaeecd21d61219a314864870d93d011615c9", "run": 37200406503, "job": 111430746121, "status": "SUCCESS", "duration_seconds": 224},
+      "closure_head_CI": "Итог нового scoped HEAD записывается в PR checks/комментарии после push; не выводится из предыдущего CI.",
+      "manual_user_testing": "Следующее действие пользователя, не объявляется уже выполненным",
+      "merge_release_archive": false
     }
   }
 }

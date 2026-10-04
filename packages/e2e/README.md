@@ -237,12 +237,16 @@ H3 terminal host action — intentional close собственного restored 
 Declared downstream review/QA не считается implementation replay. Full terminal/
 release и новый ordinary tool обязательны для H1/H2, по actual event window.
 
-Не подменяйте cleanup proof успешным `agent-browser close`: в CLI 0.17 manager
-close ожидается, но ошибки подавляются; daemon/socket exit отложен на 100ms
-после ответа. Immediate `session list` может ещё содержать имя — это не proof
-browser liveness. Для bounded cleanup сохраняйте actual owned browser PID/
-named-registry absence с timestamp до immutable deadline. Поздняя подтверждённая
-очистка отмечается как eventual, не ретроспективный PASS лимита.
+Диагностика timed browser cleanup относится к отдельному эпику e2e harness,
+а не к дополнительному product gate `reliable-stage-execution`. Если проверяется
+именно bounded cleanup harness, не подменяйте его proof успешным
+`agent-browser close`: в CLI 0.17 manager close ожидается, но ошибки подавляются;
+daemon/socket exit отложен на 100ms после ответа. Immediate `session list` может
+ещё содержать имя — это не proof browser liveness. Для этой диагностики сохраняйте
+actual owned browser PID/named-registry absence с timestamp до immutable deadline.
+Поздняя подтверждённая очистка — eventual, не ретроспективный PASS timed proof.
+Отсутствие такого timestamp не отменяет подтверждённые H-события и фактически
+выполненный общий owned cleanup исходной спеки; исходные NOT_VERIFIED сохраняются.
 
 Останавливайте только собственные sessions через существующий `stop`;
 `host-smoke cleanup --root <owned-root>` сохраняет evidence.
