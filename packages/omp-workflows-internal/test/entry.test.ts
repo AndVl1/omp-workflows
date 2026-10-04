@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
 	isRegisteredWorkflow,
@@ -16,6 +18,7 @@ import {
 
 import ompWorkflowsInternal, { ensureEngineActivation, resolveSessionCwd } from "../src/index.js";
 import { OMP_INTERNAL_BUNDLE_ID, OMP_INTERNAL_OWNER_KIND } from "../src/identity.js";
+import { ALLOWED_POOL_AGENTS, waitForInternalAgentMappings } from "../src/pool.js";
 
 // ── Fake host surface ────────────────────────────────────────────────────────
 
@@ -36,7 +39,7 @@ function permissiveZod(): { z: unknown } {
 	return { z };
 }
 
-function makePi(options: { tools?: boolean } = {}) {
+function makePi(options: { tools?: boolean; events?: object } = {}) {
 	const commands = new Map<string, RecordedCommand>();
 	const hooks = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const labels: string[] = [];
@@ -45,6 +48,7 @@ function makePi(options: { tools?: boolean } = {}) {
 	const sent: string[] = [];
 	const pi = {
 		...(options.tools ? { zod: permissiveZod() } : {}),
+		...(options.events ? { events: options.events } : {}),
 		registerCommand(name: string, commandOptions: { description?: string; handler: RecordedCommand["handler"] }) {
 			commands.set(name, { name, ...commandOptions });
 		},
@@ -730,6 +734,71 @@ test("raw authority requires an active claim, then returns after post-idle prepa
 	assert.equal(resumedDetails?.ok, true, JSON.stringify(resumed));
 	assert.equal(readRunControl(root).execution_claim?.run_id, runId, "post-prepare rebind restores the canonical claim");
 	assert.equal(artifactBlocked(owner), false, "post-prepare claim restores raw orchestrator authority");
+});
+
+test("tagged private aliases retain exact selected claim authority across headless UI transitions", async (t) => {
+	resetWorkflowOwners();
+	const replicaUrl = new URL("../src/index.ts", import.meta.url);
+	replicaUrl.searchParams.set("claim-registry-replica", "entry");
+	const replica = await import(replicaUrl.href) as { default: typeof ompWorkflowsInternal };
+	const discoverAgents = async () => ({
+		agents: ALLOWED_POOL_AGENTS.map((name) => ({
+			name,
+			source: "bundled" as const,
+			filePath: fileURLToPath(new URL(`../agents/${name}.md`, import.meta.url)),
+		})),
+	});
+	for (const initial of ["interactive", "headless"] as const) {
+		const root = markedRoot();
+		t.after(() => rmSync(root, { recursive: true, force: true }));
+		initGit(root);
+		mkdirSync(join(root, ".omp"), { recursive: true });
+		const events = new EventEmitter();
+		const first = makePi({ tools: true, events });
+		const alias = makePi({ tools: true, events });
+		const owner = interactiveContext(root, `tagged-${initial}`);
+		const headless = { ...owner, mode: "print", hasUI: false };
+		ompWorkflowsInternal(first.pi as never, { discoverAgents });
+		replica.default(alias.pi as never, { discoverAgents });
+		first.fireSessionStart(initial === "headless" ? headless : owner);
+		alias.fireSessionStart(headless);
+		first.fireSessionStart(owner);
+		alias.fireSessionStart(owner);
+		first.fireSessionStart(owner);
+		alias.fireSessionStart(owner);
+		const execute = (first.toolHandlers.get("workflow_prepare") ?? alias.toolHandlers.get("workflow_prepare")) as
+			(id: string, params: unknown, signal: unknown, update: unknown, ctx: unknown) => Promise<unknown>;
+		const prepared = await execute(`tagged-prepare-${initial}`, {
+			mode: "new",
+			task: "verify selected claim across private aliases",
+			classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+		}, undefined, undefined, owner);
+		const details = (prepared as { details: { ok: boolean; artifacts_dir: string; state: { run_id: string } } }).details;
+		assert.equal(details.ok, true, JSON.stringify(prepared));
+		mkdirSync(details.artifacts_dir, { recursive: true });
+		const event = { toolName: "write", input: { path: join(details.artifacts_dir, "proof.json"), content: "{}" } };
+		const blocked = (result: unknown) => Boolean(result && typeof result === "object" && "block" in result && result.block);
+		const decisions = await Promise.all([...first.fireToolCall(event, owner), ...alias.fireToolCall(event, owner)]);
+		assert.equal(decisions.some(blocked), false, JSON.stringify(decisions));
+		assert.equal(readRunControl(root).execution_claim?.run_id, details.state.run_id);
+		const copiedManager = { ...owner, sessionManager: { ...owner.sessionManager } };
+		first.fireSessionStart(copiedManager);
+		const foreign = makePi({ tools: true, events });
+		replica.default(foreign.pi as never, { discoverAgents });
+		foreign.fireSessionStart(copiedManager);
+		foreign.fireSessionStart(copiedManager);
+		const foreignDecisions = await Promise.all(foreign.fireToolCall(event, copiedManager));
+		assert.equal(foreignDecisions.some(blocked), true, "a copied manager cannot inherit the exact claim token");
+		const retained = await Promise.all([...first.fireToolCall(event, owner), ...alias.fireToolCall(event, owner)]);
+		assert.equal(retained.some(blocked), false);
+		const freshHeadless = makePi({ tools: true, events });
+		replica.default(freshHeadless.pi as never, { discoverAgents });
+		freshHeadless.fireSessionStart(headless);
+		const headlessCommand = freshHeadless.commands.get("omp-do-work");
+		await assert.rejects(() => Promise.resolve(headlessCommand!.handler("must not inherit UI authority", headless)), /trusted session identity is unavailable/);
+		await waitForInternalAgentMappings(root, discoverAgents);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
 });
 
 

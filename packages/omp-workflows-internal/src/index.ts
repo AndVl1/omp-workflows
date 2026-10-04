@@ -112,13 +112,112 @@ interface InternalSessionBinding {
 	controller?: WorkflowSessionController;
 }
 
-/**
- * The bundle owns one trusted controller per host extension instance/session.
- * The mapping is deliberately process-local: it is only an adapter seam and
- * never a source of run authority. Core's canonical controller/read APIs own
- * run selection and lifecycle mutation.
- */
-const sessionBindings = new WeakMap<object, InternalSessionBinding>();
+interface InternalRuntimeSession {
+	binding?: InternalSessionBinding;
+	runtime?: object;
+	manager?: object;
+	hostActor?: boolean;
+}
+
+interface InternalHostRegistry {
+	version: 1;
+	sessions: WeakMap<object, InternalRuntimeSession>;
+	runtimes: WeakMap<object, WeakMap<object, InternalRuntimeSession>>;
+	workerRuntimes: WeakMap<object, WeakMap<object, InternalRuntimeSession>>;
+	activatedEngines: WeakSet<object>;
+}
+
+const INTERNAL_HOST_REGISTRY = Symbol.for("omp-workflows.internal-host-registry");
+
+function getInternalHostRegistry(): InternalHostRegistry {
+	const host = globalThis as unknown as Record<symbol, unknown>;
+	const existing = host[INTERNAL_HOST_REGISTRY];
+	if (existing !== undefined) {
+		const registry = existing as Partial<InternalHostRegistry> | null;
+		if (
+			!registry
+			|| registry.version !== 1
+			|| !(registry.sessions instanceof WeakMap)
+			|| !(registry.runtimes instanceof WeakMap)
+			|| !(registry.workerRuntimes instanceof WeakMap)
+			|| !(registry.activatedEngines instanceof WeakSet)
+		) throw new Error("[internal_host_registry:unsupported] Restart OMP with compatible private bundle modules.");
+		return registry as InternalHostRegistry;
+	}
+	const registry: InternalHostRegistry = {
+		version: 1,
+		sessions: new WeakMap(),
+		runtimes: new WeakMap(),
+		workerRuntimes: new WeakMap(),
+		activatedEngines: new WeakSet(),
+	};
+	Object.defineProperty(host, INTERNAL_HOST_REGISTRY, {
+		value: registry,
+		configurable: false,
+		enumerable: false,
+		writable: false,
+	});
+	return registry;
+}
+
+const internalHostRegistry = getInternalHostRegistry();
+
+function sessionScope(pi: object): InternalRuntimeSession {
+	let scope = internalHostRegistry.sessions.get(pi);
+	if (!scope) {
+		scope = {};
+		internalHostRegistry.sessions.set(pi, scope);
+	}
+	return scope;
+}
+
+// Cache-tagged aliases share one host session across UI/print transitions.
+// Explicit worker actors remain in a separate scope and never borrow it.
+function associateCapturedRuntime(pi: object, manager: object | undefined, hostActor: boolean): boolean {
+	const runtime = (pi as { events?: unknown }).events;
+	if (!manager || !runtime || typeof runtime !== "object") return true;
+	const current = internalHostRegistry.sessions.get(pi);
+	if (
+		current
+		&& (
+			(current.runtime !== undefined && current.runtime !== runtime)
+			|| (current.manager !== undefined && current.manager !== manager)
+			|| (current.hostActor !== undefined && current.hostActor !== hostActor)
+			|| (current.binding?.sessionManager !== undefined && current.binding.sessionManager !== manager)
+		)
+	) return false;
+	const runtimes = hostActor ? internalHostRegistry.runtimes : internalHostRegistry.workerRuntimes;
+	let sessions = runtimes.get(runtime);
+	if (!sessions) {
+		sessions = new WeakMap();
+		runtimes.set(runtime, sessions);
+	}
+	const shared = sessions.get(manager);
+	if (
+		shared && current && current !== shared
+		&& (current.binding || internalHostRegistry.activatedEngines.has(current))
+	) return false;
+	const scope = shared ?? current ?? sessionScope(pi);
+	scope.runtime = runtime;
+	scope.manager = manager;
+	scope.hostActor = hostActor;
+	sessions.set(manager, scope);
+	internalHostRegistry.sessions.set(pi, scope);
+	return true;
+}
+
+function getSessionBinding(pi: object): InternalSessionBinding | undefined {
+	return internalHostRegistry.sessions.get(pi)?.binding;
+}
+
+function setSessionBinding(pi: object, binding: InternalSessionBinding): void {
+	sessionScope(pi).binding = binding;
+}
+
+function clearSessionBinding(pi: object): void {
+	const scope = internalHostRegistry.sessions.get(pi);
+	if (scope) scope.binding = undefined;
+}
 
 function sessionIdFromContext(ctx: unknown): string | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
@@ -327,7 +426,7 @@ function isVerifiedSessionSwitch(
 
 
 function switchSessionBinding(pi: object, event: unknown, ctx: unknown): void {
-	const prior = sessionBindings.get(pi);
+	const prior = getSessionBinding(pi);
 	if (!prior || !isVerifiedSessionSwitch(prior, event, ctx)) return;
 	const cwd = resolveSessionCwd(ctx);
 	if (!cwd || resolve(cwd) !== resolve(prior.cwd)) return;
@@ -501,9 +600,9 @@ function releaseSessionBinding(
 	receipt: string,
 	reason?: CtoSuspensionReason,
 ): boolean {
-	const prior = sessionBindings.get(pi);
+	const prior = getSessionBinding(pi);
 	if (!prior || !resetControllerForLifecycle(prior, receipt, reason)) return !prior;
-	sessionBindings.delete(pi);
+	clearSessionBinding(pi);
 	return true;
 }
 
@@ -515,7 +614,7 @@ function releaseSessionBinding(
  * released by an idle turn stop.
  */
 function settleSessionBinding(pi: object, event: unknown, ctx: unknown): boolean {
-	const binding = sessionBindings.get(pi);
+	const binding = getSessionBinding(pi);
 	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
 	return resetControllerForLifecycle(binding, "host-session-stop", undefined, true);
 }
@@ -531,10 +630,10 @@ function teardownSessionBinding(
 	receipt: string,
 	reason?: CtoSuspensionReason,
 ): boolean {
-	const binding = sessionBindings.get(pi);
+	const binding = getSessionBinding(pi);
 	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
 	if (!resetControllerForLifecycle(binding, receipt, reason)) return false;
-	sessionBindings.delete(pi);
+	clearSessionBinding(pi);
 	return true;
 }
 
@@ -594,11 +693,12 @@ function refreshSessionBindingBranch(binding: InternalSessionBinding): WorkflowS
  */
 function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 	const interactive = trustedInteractiveSession(ctx);
-	const current = sessionBindings.get(pi);
 	const value = ctx as { mode?: unknown; hasUI?: unknown };
 	const incomingManager = sessionManagerFromContext(ctx);
 	const incomingIdentity = sessionIdentityFromValue(ctx);
-	if (!trustedHostActor(ctx)) return;
+	const hostActor = trustedHostActor(ctx);
+	if (!associateCapturedRuntime(pi, incomingManager, hostActor) || !hostActor) return;
+	const current = getSessionBinding(pi);
 	if (!interactive) {
 		if (
 			current
@@ -612,7 +712,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 			// Headless/worker ingress can revoke interactive authority, but it
 			// is not a trusted teardown and must not release either ordinary
 			// ownership or a resident CTO claim.
-			sessionBindings.set(pi, { ...current, interactive: false });
+			setSessionBinding(pi, { ...current, interactive: false });
 		}
 		return;
 	}
@@ -627,7 +727,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 		if (sameIdentity && !current.interactive) {
 			// Re-entry of the exact manager-backed host restores UI authority
 			// without replacing the resident controller or its CTO claim.
-			sessionBindings.set(pi, { ...current, interactive: true, mode });
+			setSessionBinding(pi, { ...current, interactive: true, mode });
 			return;
 		}
 		// A different identity must arrive through the authenticated
@@ -644,7 +744,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 	}
 	const sessionId = incomingIdentity?.managerBacked === true ? incomingIdentity.sessionId : undefined;
 	const controller = sessionId ? buildTrustedController(cwd, sessionId) : undefined;
-	sessionBindings.set(pi, {
+	setSessionBinding(pi, {
 		cwd,
 		interactive,
 		mode,
@@ -663,7 +763,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
  * later ingress context that exposes the host session manager's ID.
  */
 function sharedSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
-	const binding = sessionBindings.get(pi);
+	const binding = getSessionBinding(pi);
 	if (!binding || resolve(binding.cwd) !== resolve(cwd) || !binding.interactive) return undefined;
 	if (!matchesCapturedHostContext(binding, ctx, "command")) return undefined;
 	const identity = capturedManagerIdentity(binding, ctx, cwd);
@@ -771,7 +871,7 @@ function resolveInternalTrustedToolCallActorUnsafe(
 	cwd: string,
 	runId: string | undefined,
 ): TrustedToolCallResolution | undefined {
-	const binding = sessionBindings.get(pi);
+	const binding = getSessionBinding(pi);
 	if (!binding) return deniedTrustedToolCall("host_session_not_captured");
 	const hostContextDenial = internalRawHostContextDenial(binding, ctx, cwd);
 	if (hostContextDenial) {
@@ -871,7 +971,7 @@ function resolveInternalTrustedToolCallActor(
 }
 function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
-	const binding = sessionBindings.get(pi);
+	const binding = getSessionBinding(pi);
 	if (!binding?.interactive || !binding.controller) return undefined;
 	if (!matchesCapturedHostContext(binding, ctx, "raw")) return undefined;
 	const identity = capturedManagerIdentity(binding, ctx, cwd);
@@ -889,8 +989,6 @@ function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSe
 	}
 }
 
-/** Entry points already wired for a given pi instance (idempotent per host). */
-const activatedEngines = new WeakSet<object>();
 
 /**
  * Resolve the session project root for hooks, tools and the command handler.
@@ -1016,7 +1114,8 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string, options: I
 		};
 	}
 
-	if (activatedEngines.has(pi)) return { ok: true };
+	const activationScope = sessionScope(pi);
+	if (internalHostRegistry.activatedEngines.has(activationScope)) return { ok: true };
 
 	// Registration is the last step and the WeakSet mark lands only AFTER it
 	// succeeds (SEC-BUNDLE-001): a throw mid-registration must not leave the
@@ -1034,14 +1133,14 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string, options: I
 		});
 		adapter.register(pi);
 	} catch (error) {
-		activatedEngines.delete(pi);
+		internalHostRegistry.activatedEngines.delete(activationScope);
 		return {
 			ok: false,
 			code: "registration_failed",
 			error: String(error instanceof Error ? error.message : error),
 		};
 	}
-	activatedEngines.add(pi);
+	internalHostRegistry.activatedEngines.add(activationScope);
 	return { ok: true };
 }
 

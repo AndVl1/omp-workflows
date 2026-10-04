@@ -93,7 +93,37 @@ export interface CtoClaimCredentials {
   readonly ownership_epoch: string;
 }
 
-const ctoClaimBindings = new WeakMap<WorkflowSessionController, CtoClaimCredentials>();
+interface CtoClaimBindingRegistry {
+  readonly version: 1;
+  readonly bindings: WeakMap<WorkflowSessionController, CtoClaimCredentials>;
+}
+
+const CTO_CLAIM_BINDINGS = Symbol.for("omp-workflows.cto-claim-bindings");
+
+function getCtoClaimBindings(): CtoClaimBindingRegistry["bindings"] {
+  const host = globalThis as unknown as Record<symbol, unknown>;
+  const existing = host[CTO_CLAIM_BINDINGS];
+  if (existing !== undefined) {
+    const registry = existing as Partial<CtoClaimBindingRegistry> | null;
+    if (!registry || registry.version !== 1 || !(registry.bindings instanceof WeakMap)) {
+      throw new Error("[cto_claim_registry:unsupported] Restart OMP with compatible core modules.");
+    }
+    return registry.bindings;
+  }
+  // Bundle aliases may call CTO ingress through another tagged core graph.
+  // The exact controller object remains the credential key; IDs and cwd
+  // never recover or transfer a claim.
+  const registry: CtoClaimBindingRegistry = { version: 1, bindings: new WeakMap() };
+  Object.defineProperty(host, CTO_CLAIM_BINDINGS, {
+    value: registry,
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  });
+  return registry.bindings;
+}
+
+const ctoClaimBindings = getCtoClaimBindings();
 
 function exactActiveClaim(
   claim: unknown,

@@ -79,6 +79,21 @@ inactive), `execution_claim` и конфликтующей controller/CTO/native
 или полный transcript. Подробности и действия:
 [`диагностика интеграции`](../../docs/adding-agents.md#как-разбирать-отказ-admission).
 
+Повторный SDK import с другим cache tag не создаёт новые полномочия:
+internal сохраняет один controller и одну регистрацию engine для точной пары
+host event bus / `sessionManager`. Копия manager с теми же UUID и cwd не является
+той же сессией; headless-контекст не получает interactive rights. CTO claim
+binding разделяется между копиями core только для того же объекта controller,
+без восстановления credentials по строковым идентификаторам.
+
+Проверка native workers требует сохраняемой родительской SDK-сессии:
+не запускай такой smoke с `--no-session`. Публикуй логические artifact IDs из
+`stage.produces`, а не slot-scoped имена файлов: например, каждый research worker
+передаёт `outputs.exploration`, а `exploration-<slot>.json` создаёт движок.
+`workflow_instructions` вызывает coordinator: это main-session-only control tool.
+Worker использует своё host-assignment и документацию `workflow_submit_result`;
+отказ в доступе к control tool не означает отказ уже принятой публикации.
+
 ## Жизненный цикл обычного workflow
 
 Обычные запуски имеют явный режим `new`, `resume` или `rework`. Наличие старых файлов состояния само по себе не превращает новую задачу в продолжение. Для `/team` действует тот же контракт: это alias `/do-work`.

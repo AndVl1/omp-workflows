@@ -42,6 +42,22 @@ published version**, core first, using `omp plugin install ... --force`.
 Follow the [paired update instructions](packages/fullstack/README.md), then start
 a new OMP session to load the updated extensions.
 
+### Приватный runtime этого монорепозитория
+
+В этом worktree `.omp/settings.json` загружает пакет
+`packages/omp-workflows-internal` по каноническому workspace-пути, а не через
+`node_modules` alias. Указывай каталог пакета, не отдельный `dist/index.js`:
+каталог сохраняет discovery приватных агентов и skills. Команды здесь —
+`/omp-do-work`, `/omp-team` и `/omp-cto`.
+
+Project override `.omp/plugin-overrides.json` отключает установленный
+`@andvl1/omp-workflows-fullstack` только для этого проекта, оставляя один private
+workflow owner. Это не отключает gates и не меняет глобальную установку для
+других репозиториев. После обновления build или конфигурации полностью перезапусти
+OMP; уже загруженные factories и controllers не обновляются от изменений файлов.
+Существующий run продолжай через `/omp-do-work --resume --run <run-id>` —
+удалять его state или маркеры не требуется.
+
 ### Slash command bootstrap and compatibility copies
 
 When the extension is loaded, its registered `/do-work`, `/team`, and `/cto`
