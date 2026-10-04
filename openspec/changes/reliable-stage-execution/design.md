@@ -529,3 +529,52 @@ browsers остановлены, private auth удалён; global stores не �
 Прогресс 29/30, 8.2 BLOCKED только по actual Hub revive proof. Следующая
 попытка/restart/revive требует отдельного явного bounded разрешения;
 повторять H1/H2 не требуется. Merge/release/archive не выполняются.
+
+### Дополнительный H3-only: actual cold Hub revive подтверждён
+
+После отдельного выбора пользователя «Один H3 — до 15 минут» выполнен
+ровно один новый H3 на том же exact `46da973`, SDK 18.0.6/gpt-5.5.
+H1/H2 PASS переиспользованы, production и прежние бюджеты не изменены.
+Actual native SDK task child `ActualSdkH3HubOnlyOperator` завершился
+`completed`; его parent call, index и SDK session зафиксированы.
+
+Original root PID 78908 → 80451, тот же SDK session/file; accepted
+implementation `JealousFowl` settled до исходного unanswered checkpoint.
+Наблюдались actual Hub через `Ctrl+S`, выбранная original non-advisor
+parked row и real `r`: та же строка стала idle/active just now, счётчики
+8 requests/8 tools/27K tokens неизменны. Screens 0021/0022 и typed PTY
+input подтверждают порядок: Hub `r` 11:05:50.243 → exact resume
+11:06:08.215 → current approval 11:06:59.575 → один canonical advance
+implementation → code_review 11:07:19.595. Более ранний literal `r` вне
+подтверждённого Hub context не используется как доказательство.
+
+Пять prepared snapshots с проверенными SHA manifests сохраняют exact
+run/generation/dispatch/receipt/digest/binding/output tuple. Actual immutable
+implementation bytes совпадают с canonical SHA. Original implementation:
+один start, terminal и accepted receipt; `UgliestRoundworm` — downstream
+code_review, не replay. Cold revive доступен; fallback на fresh worker
+не требуется и не фабрикуется.
+
+Для H3 «terminal host action» явно означает intentional close собственного
+**восстановленного** SDK host после актуального approval и одного перехода:
+SDK exit143 в 11:09:48.294, 622.486s от начала. Это не natural turn-end,
+canonical workflow completion/release или новый ordinary tool; последние
+требования относятся к H1/H2. Следующий review checkpoint не требует
+ещё одного approval только ради расширенного H3 gate.
+
+Функциональный H3 независимо PASS, общий outcome остаётся qualified:
+`FUNCTIONAL_H3_PASS_WITH_BOUNDED_CLEANUP_NOT_VERIFIED`. SDK/NodeCLI case
+остановлены до 900s, browser close acknowledged, но timed browser PID/
+named-registry absence не зафиксирована. CLI `agent-browser` 0.17 отвечает
+после awaited manager close и откладывает daemon/socket exit на 100ms;
+browser-close errors подавляются. Immediate listed name не доказывает
+liveness, успешный ответ не доказывает physical absence. Возможный race
+не повышается до runtime proof. Исходные NOT_VERIFIED/guard browser=false
+сохранены; все owned процессы/browsers/watchdogs и private auth в итоге
+очищены. **29/30, 8.2 BLOCKED только по bounded browser-cleanup proof**.
+
+Private projection helper имел Darwin `/var` versus `/private/var`
+confinement mismatch; безопасные manifest-verified canonical projections
+восстановлены read-only, без нового H. Это не production defect. История
+сохранена в `authorized_h3_only_tranche` acceptance JSON; новый budget 1/1
+исчерпан, automatic retry и merge/release/archive не выполняются.

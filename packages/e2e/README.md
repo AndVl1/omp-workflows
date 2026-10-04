@@ -207,9 +207,10 @@ scratch, transcripts или evidence; приватный auth store удаляе
 
 Исторический бюджет составлял исходную попытку и один диагностированный повтор
 на case; обе прежние попытки сохранены в evidence. После него отдельно проведены
-два разрешённых tranche: по одной попытке H1/H2/H3 в каждом, без автоматического
-повтора, максимум 900 секунд включая startup и H3 restore. Все эти попытки
-израсходованы `1/1`; следующий запуск или retry требует нового явного разрешения.
+два разрешённых tranche: по одной попытке H1/H2/H3 в каждом, затем отдельный
+H3-only tranche для actual Hub proof. Во всех — максимум 900 секунд включая
+startup и H3 restore, без automatic retry. Все бюджеты израсходованы `1/1`;
+следующий запуск или retry требует нового явного разрешения.
 Slash-команды вводятся через настоящий PTY по плану,
 не через `--scenario`/`--task`. H3 восстанавливает pending checkpoint без
 повторной реализации. Дополнительное наблюдение SDK cold revive использует
@@ -227,8 +228,21 @@ parked worker, нажмите `r` и сохраните видимую стро�
 оставшееся время, не новый `15m`. Native `workflow_checkpoint_ask` может показать
 selection dialog без `[ask_user]` transcript marker: проверяйте pending call,
 current UI и matching result. Перед H3 restore исходный checkpoint не отвечается.
-Declared downstream review/QA не считается implementation replay; full terminal
-и ordinary action проверяются по актуальному event window, не старым tool calls.
+Hub row/`r`/result фиксируются **до** `/do-work --resume` и current approval.
+Restore той же accepted child session может породить новый lifecycle started;
+это само по себе не replay. Проверяйте отсутствие нового implementation
+dispatch/assignment/submission и изменение accepted output hashes.
+H3 terminal host action — intentional close собственного restored SDK host
+после current approval и одного advance, не полный workflow complete/release.
+Declared downstream review/QA не считается implementation replay. Full terminal/
+release и новый ordinary tool обязательны для H1/H2, по actual event window.
+
+Не подменяйте cleanup proof успешным `agent-browser close`: в CLI 0.17 manager
+close ожидается, но ошибки подавляются; daemon/socket exit отложен на 100ms
+после ответа. Immediate `session list` может ещё содержать имя — это не proof
+browser liveness. Для bounded cleanup сохраняйте actual owned browser PID/
+named-registry absence с timestamp до immutable deadline. Поздняя подтверждённая
+очистка отмечается как eventual, не ретроспективный PASS лимита.
 
 Останавливайте только собственные sessions через существующий `stop`;
 `host-smoke cleanup --root <owned-root>` сохраняет evidence.

@@ -73,15 +73,34 @@
 приёмку, scripted registered-tool smoke и remote CI exact code commit
 `6659b7e843c0ee824e54838101e99b6da71de135` (run `37134697043`: install/build/types/D/P/full Test SUCCESS).
 CI финального evidence-only head фиксируется в PR #77; production delta нет.
-Прогресс остаётся 29/30. Последний разрешённый tranche exact `46da973`
-завершён: H1/H2 PASS с независимым oracle; H3 coldRootRestore и
-scopedImplementationNoReplay PASS, но общий H3 FAIL: actual parked-worker
-Agent Hub row selection + `r` + result NOT_VERIFIED. Исходный pending checkpoint
-не отвечен до stop; original-root session восстановлена новым PID, accepted
-run/generation/stage/receipt/digest/output-hash tuple сохранён до/после resume.
-Все три latest attempts израсходованы `1/1`, historical 2/2 и предыдущие 1/1
-сохранены. 8.2 BLOCKED только по реальному Hub revive proof; runtime refusal
-не наблюдался, `unsupported` не утверждается. Все owned процессы/listeners/
-browsers остановлены, private auth удалён. Новый H/restart/revive требует нового
-явного bounded разрешения; H1/H2 не требуют повторной приёмки.
+Исторический tranche exact `46da973`: H1/H2 independent PASS, H3
+coldRootRestore/noReplay PASS, но actual Hub `r` ещё NOT_VERIFIED.
+Его 1/1 per H, исходные 2/2 и предыдущие дополнительные 1/1 сохранены.
+
+После отдельного разрешения «Один H3 — до 15 минут» выполнен ровно один
+H3-only case новым actual SDK worker `ActualSdkH3HubOnlyOperator`.
+H1/H2 и локальные автоматические suites не повторялись; production frozen.
+Независимый oracle подтвердил **функциональный H3 PASS**: original root
+PID 78908 → 80451 / same SDK session/file, исходный checkpoint не отвечен
+до stop, actual Hub `Ctrl+S` → selected original `JealousFowl` parked →
+real `r` → idle **до** `/do-work --resume` и текущего approval.
+Пять manifest-verified canonical snapshots сохраняют run/generation/
+implementation/dispatch/receipt/digest/output-hash tuple; один original
+implementation и разрешённый downstream review, без повторной реализации.
+Current implementation → code_review commit: `11:07:19.595Z`, 473.787s
+от начала; intentional restored SDK close/exit143: `11:09:48.294Z`,
+622.486s. H3 terminal host action — именно это закрытие, не natural turn-end,
+workflow complete/release или ordinary tool после release.
+
+Общий H3: `FUNCTIONAL_H3_PASS_WITH_BOUNDED_CLEANUP_NOT_VERIFIED`.
+Close acknowledged до deadline, но helper не подтвердил исчезновение named
+browser/OS PID до immutable 900s; исходный NOT_VERIFIED report и guard
+browser=false сохранены. `agent-browser` 0.17 откладывает daemon/socket exit
+на 100ms после ответа и подавляет browser-close errors: возможный registry
+race не заменяет timed absence proof. Все owned SDK/NodeCLI/watchdog PIDs,
+named browsers и private auth в итоге подтверждённо очищены.
+**29/30, 8.2 BLOCKED только по timed browser-cleanup evidence**, не Hub,
+не доказанный production defect и не `unsupported`. Дополнительный H3-only
+бюджет 1/1 исчерпан; automatic retry нет. Fallback не нужен: actual revive
+доступен. Любой новый H требует нового явного bounded разрешения.
 Merge/release/archive и пользовательские version/release-правки не выполняются.
