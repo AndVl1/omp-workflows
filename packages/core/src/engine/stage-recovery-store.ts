@@ -221,7 +221,7 @@ export type StageRecoveryGrantCommitResult = StageRecoveryGrantCommitSuccess | S
 
 export interface StageRecoveryStoreAuthentication {
   /** Derive the current host selection; this never accepts model fields. */
-  readonly selection: () => TrustedRecoverySelection;
+  readonly selection: (identity?: WorkIdentity) => TrustedRecoverySelection;
   /** Main calls this only after its explicit trusted UI answer is authenticated. */
   readonly captureGrantAuthorization: (input: StageRecoveryGrantAuthorizationInput) => RecoveryGrantAuthorizationProof;
   readonly commitGrant: (input: StageRecoveryGrantCommitInput) => StageRecoveryGrantCommitResult;
@@ -761,6 +761,24 @@ function terminalForRead(
   const proof = historicalProof(terminal.proof, bindingId);
   return proof ? { ...clone(terminal), proof } : undefined;
 }
+/** Reuse a host-committed terminal envelope; a bare cancelled status is insufficient. */
+function canonicalTerminalForRead(dispatch: DispatchRecord | undefined, identity: WorkIdentity | undefined, bindingId: string): RecoveryTerminalProof | undefined {
+  if (!dispatch || !identity) return undefined;
+  const envelope = dispatch.completion_envelope;
+  const completion = dispatch.completion;
+  if (!envelope || !completion || !sameIdentity(dispatch.work_identity, identity) || !sameIdentity(envelope.identity, identity) || !sameIdentity(completion.work_identity, identity)
+    || envelope.outcome !== dispatch.status || completion.outcome !== dispatch.status
+    || (envelope.outcome !== "succeeded" && envelope.outcome !== "failed" && envelope.outcome !== "cancelled")
+    || envelope.completed_by !== "synchronous_tool_result" || completion.completed_by !== "synchronous_tool_result"
+    || (envelope.terminal_signal !== "provider_terminal" && envelope.terminal_signal !== "native_tool_result")
+    || !nonEmpty(envelope.evidence_ref) || !nonEmpty(envelope.emitted_at)) return undefined;
+  const eventId = `canonical-completion:${dispatch.id}`;
+  return {
+    authoritative: true, run_id: identity.run_id, dispatch_id: dispatch.id, identity: clone(identity),
+    outcome: envelope.outcome, terminal_event_id: eventId, observed_at: envelope.emitted_at,
+    proof: { authenticated: true, source: "ordinary-canonical-completion", event_id: eventId, binding_id: bindingId, observed_at: envelope.emitted_at },
+  };
+}
 function preflightReceiptMatches(
   preflight: RecoveryPreflightNotStartedProof,
   operations: readonly StageRecoveryOperationRecord[],
@@ -850,7 +868,8 @@ function snapshotFromRead(input: { cwd: string; run_id: string; state: TeamState
   const bindingId = identity ? digest({ version: 1, authority: "ordinary", run_id: input.run_id, owner_id: input.owner.owner_id, ownership_epoch: input.owner.ownership_epoch, identity }) : input.owner.binding_id;
   const ownership = ownershipFor(input.run_id, { ...input.owner, binding_id: bindingId, proof: digest({ version: 1, authority: "ordinary", run_id: input.run_id, owner_id: input.owner.owner_id, ownership_epoch: input.owner.ownership_epoch, binding_id: bindingId }) }, identity);
   const line = selectedLine;
-  const terminal = terminalForRead(line?.terminal, identity, selected.dispatch, bindingId);
+  const terminal = terminalForRead(line?.terminal, identity, selected.dispatch, bindingId)
+    ?? canonicalTerminalForRead(selected.dispatch, identity, bindingId);
   const preflight = preflightForRead(line?.preflight, line?.operations ?? [], identity, selected.dispatch, bindingId);
   const rawLifecycle = lifecycleFor(input.state, identity, selected.dispatch, line, input.owner.ownership_epoch);
   const lifecycle = (rawLifecycle === "terminal" && !terminal) || (rawLifecycle === "not_started" && !preflight) ? "unknown" : rawLifecycle;
@@ -889,9 +908,10 @@ function readCanonical(cwd: string, runId: string, context: TrustedExecutionCont
   const selected = identityForState(state, identity).identity;
   return { state, raw_hash: createHash("sha256").update(raw, "utf8").digest("hex"), revision: typeof state.state_revision === "number" ? state.state_revision : 0, owner: currentOwner(control, runId, context, selected) };
 }
-function selectionFor(runId: string, context: TrustedExecutionContext): TrustedRecoverySelection {
+function selectionFor(runId: string, context: TrustedExecutionContext, identity?: WorkIdentity): TrustedRecoverySelection {
   const current = withWorkspaceReadNoRecovery(context.worktree, () => readCanonical(context.worktree, runId, context), () => { throw new Error("ordinary canonical run is unavailable"); });
-  const selected = identityForState(current.state).identity;
+  const selected = identityForState(current.state, identity).identity;
+  if (identity && !selected) throw new Error("ordinary recovery assignment is not current");
   const bindingId = selected ? digest({ version: 1, authority: "ordinary", run_id: runId, owner_id: current.owner.owner_id, ownership_epoch: current.owner.ownership_epoch, identity: selected }) : current.owner.binding_id;
   const proof = digest({ version: 1, authority: "ordinary", run_id: runId, owner_id: current.owner.owner_id, ownership_epoch: current.owner.ownership_epoch, binding_id: bindingId });
   return { authenticated: true, run_id: runId, authority: "ordinary", owner_id: current.owner.owner_id, ownership_epoch: current.owner.ownership_epoch, binding_id: bindingId, proof };
@@ -1275,7 +1295,7 @@ export function createOrdinaryStageRecoveryStore(cwd: string, options: OrdinaryS
   };
   const runId = options.runId;
   const activeProofs = new WeakMap<object, { expected_revision: RecoveryRevision; selection: TrustedRecoverySelection; identity?: WorkIdentity }>();
-  const selection = (): TrustedRecoverySelection => selectionFor(runId, context);
+  const selection = (identity?: WorkIdentity): TrustedRecoverySelection => selectionFor(runId, context, identity);
   const captureGrantAuthorization = (input: StageRecoveryGrantAuthorizationInput): RecoveryGrantAuthorizationProof => {
     const current = withWorkspaceReadNoRecovery(cwd, () => readCanonical(cwd, runId, context, input.identity), () => { throw new Error("ordinary canonical run is unavailable"); });
     const snapshot = snapshotFromRead({ cwd, run_id: runId, state: current.state, revision: current.revision, raw_hash: current.raw_hash, owner: current.owner, identity: input.identity });

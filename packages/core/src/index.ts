@@ -30,6 +30,7 @@ import {
   type TrustedOrchestratorWriteProof,
   type WorkerWriteScope,
 } from "./gates/orchestrator-write.js";
+import { readOnlyWorkerBashGate } from "./gates/read-only-bash.js";
 import { dispatchGate, parseDispatchMarker, trustedDispatchRequests, type DispatchMarker } from "./gates/dispatch.js";
 import type { ExtensionAPI, BeforeAgentStartEvent, ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent";
 import { classificationGate, classificationToolGate } from "./gates/classification.js";
@@ -176,6 +177,7 @@ type StageRecoveryRuntime = {
   readonly host: StageRecoveryHost;
   readonly staleAdmissions: WeakMap<object, StaleAdmissionObservation>;
   readonly automaticPending: Set<Promise<void>>;
+  automaticContinuation?: Promise<void>;
   automaticOpen: boolean;
 };
 const stageRecoveryRuntimes = new WeakMap<object, StageRecoveryRuntime>();
@@ -318,6 +320,22 @@ function recoveryIdentityFromOrigin(origin: DispatchOrigin): WorkIdentity | unde
     return undefined;
   }
 }
+/** Resolve latest canonical attempts without inventing a consilium root identity. */
+function currentRecoveryAssignments(cwd: string, runId: string): WorkIdentity[] {
+  const state = readRunState(cwd, runId);
+  if (!state) throw new Error("canonical recovery state unavailable");
+  const bySlot = new Map<string, WorkIdentity>();
+  for (const dispatch of state.dispatch_capability?.dispatches ?? []) {
+    const identity = dispatch.work_identity;
+    if (!identity || identity.run_id !== runId || identity.stage_cursor !== state.stage_cursor) continue;
+    const previous = bySlot.get(identity.slot_id);
+    if (previous && previous.attempt === identity.attempt && previous.dispatch_id !== identity.dispatch_id) {
+      throw new Error("ambiguous canonical recovery slot");
+    }
+    if (!previous || identity.attempt > previous.attempt) bySlot.set(identity.slot_id, identity);
+  }
+  return [...bySlot.values()];
+}
 
 async function persistRecoveryTerminalObservation(
   runtime: StageRecoveryRuntime | undefined,
@@ -344,7 +362,7 @@ async function persistRecoveryTerminalObservation(
     return;
   }
   if (!snapshot.identity || (identity && !isDeepStrictEqual(snapshot.identity, identity)) || !snapshot.binding_id) return;
-  const selection = store.selection();
+  const selection = store.selection(snapshot.identity);
   const operationId = `omp-recovery-terminal:${toolCallId}:${snapshot.identity.dispatch_id}`;
   let prepared: StageRecoveryTransitionResult;
   try {
@@ -490,7 +508,7 @@ function persistRecoveryPreflightObservation(
     if (read instanceof Promise) return false;
     const snapshot = read;
     if (!snapshot.identity || !snapshot.binding_id || !isDeepStrictEqual(snapshot.identity, identity)) return false;
-    const selection = store.selection();
+    const selection = store.selection(identity);
     const operationId = `omp-recovery-preflight:${toolCallId}:${identity.dispatch_id}`;
     const prepared = store.transition({
       phase: "prepare",
@@ -592,11 +610,16 @@ async function executeAutomaticRecovery(
   let selection: TrustedRecoverySelection;
   let snapshot: StageRecoverySnapshot;
   try {
-    selection = store.selection();
+    const identity = trigger.authority === "ordinary"
+      ? currentRecoveryAssignments(trigger.cwd, trigger.run_id).find(candidate => candidate.dispatch_id === trigger.dispatch_id)
+      : undefined;
+    if (trigger.authority === "ordinary" && !identity) return;
+    selection = store.selection(identity);
     snapshot = await store.read({
       run_id: trigger.run_id,
       authority: trigger.authority,
       selection,
+      ...(identity ? { identity } : {}),
     });
   } catch {
     return;
@@ -645,6 +668,7 @@ async function scanAutomaticRecoveryForOwner(
   runtime: StageRecoveryRuntime,
   ctx: unknown,
   cwd: string,
+  requestedIdentity?: WorkIdentity,
 ): Promise<void> {
   if (!runtime.automaticOpen) return;
   const store = runtime.storeFor(ctx, cwd);
@@ -652,8 +676,15 @@ async function scanAutomaticRecoveryForOwner(
   let selection: TrustedRecoverySelection;
   let snapshot: StageRecoverySnapshot;
   try {
-    selection = store.selection();
-    snapshot = await store.read({ run_id: selection.run_id, authority: selection.authority, selection });
+    selection = store.selection(requestedIdentity);
+    snapshot = await store.read({ run_id: selection.run_id, authority: selection.authority, selection, ...(requestedIdentity ? { identity: requestedIdentity } : {}) });
+    if (!requestedIdentity && selection.authority === "ordinary") {
+      const identities = currentRecoveryAssignments(cwd, selection.run_id);
+      if (identities.length > 0) {
+        for (const identity of identities) await scanAutomaticRecoveryForOwner(runtime, ctx, cwd, identity);
+        return;
+      }
+    }
   } catch {
     return;
   }
@@ -706,7 +737,14 @@ function scheduleAutomaticRecovery(
   trigger: AutomaticRecoveryTrigger,
 ): void {
   if (!runtime || !runtime.automaticOpen) return;
-  trackAutomaticPending(runtime, executeAutomaticRecovery(runtime, trigger).catch(() => {}));
+  const pending = (runtime.automaticContinuation ?? Promise.resolve())
+    .then(() => executeAutomaticRecovery(runtime, trigger))
+    .catch(() => {});
+  runtime.automaticContinuation = pending;
+  trackAutomaticPending(runtime, pending);
+  void pending.finally(() => {
+    if (runtime.automaticContinuation === pending) runtime.automaticContinuation = undefined;
+  });
 }
 async function drainAutomaticRecovery(runtime: StageRecoveryRuntime | undefined): Promise<void> {
   if (!runtime || runtime.automaticPending.size === 0) return;
@@ -927,6 +965,8 @@ interface RegisterOptionsBase {
    * default — shipped workflows keep the single-writer model.
    */
   writeScope?: WorkerWriteScope;
+  /** Host-declared read-only workers receive only allowlisted AST Bash commands. */
+  readOnlyBashAgents?: readonly string[];
 }
 
 type RegisterOptionsWithoutController = RegisterOptionsBase & {
@@ -1971,6 +2011,7 @@ function ctoReservationReuseBlocked(
 
 export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {}): void {
   const label = opts.label ?? "omp-workflows";
+  const readOnlyBashAgents = opts.readOnlyBashAgents ? new Set(opts.readOnlyBashAgents) : undefined;
   const resolverConfigured = typeof opts.resolveTrustedToolCallActor === "function";
   const controllerConfigured = typeof opts.getSessionController === "function";
   const controllerProvided = opts.getSessionController !== undefined;
@@ -2995,6 +3036,11 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
                 ? "session_controller_unavailable"
                 : "selected_run_mismatch");
       runAdmission(code, adaptedDenialCode ? actorResolverSignal : undefined);
+    }
+    if (!result && nativeActor?.actor === "worker" && event.toolName === "bash" && readOnlyBashAgents && admissionCwd) {
+      const worker = nativeWorkerAuthority.binding(ctx, admissionCwd, authorityRunId);
+      if (!worker) run({ block: true, reason: "read-only worker bash requires the current authenticated native worker binding" });
+      else if (readOnlyBashAgents.has(worker.agent)) run(readOnlyWorkerBashGate(event, admissionCwd));
     }
     if (nativeActor?.actor === "worker" && event.toolName === "task") {
       run({ block: true, reason: "native worker authority does not permit nested task delegation" });
@@ -4915,7 +4961,9 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     cwd: string,
   ): { ok: true } | { ok: false; code: string } => {
     const runtime = stageRecoveryRuntimes.get(pi as unknown as object);
-    let store = runtime?.storeFor(ctx, cwd);
+    let store = failure.binding.producer.kind === "worker"
+      ? runtime?.ownerStoreFor?.(cwd, failure.run_id, failure.authority)
+      : runtime?.storeFor(ctx, cwd);
     let recoveryContext = ctx;
     if (!store && sessionController) {
       try {
@@ -4937,9 +4985,28 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         store = undefined;
       }
     }
+    if (!store && (failure.binding.producer.kind === "worker"
+      || (failure.authority === "cto" && failure.binding.producer.kind === "orchestrator" && failure.binding.producer.owner === "native-lead"))) {
+      // Native workers and leads need the live coordinator, not their local
+      // extension instance's lifecycle/controller, to record recovery context.
+      // This fallback follows successful producer binding validation only.
+      const root = nativeWorkerAuthority?.resolveRootAuthority(cwd, failure.run_id);
+      if (root
+        && root.authority === failure.authority
+        && root.run_id === failure.run_id
+        && root.context.authority === "coordinator"
+        && root.context.worktree === cwd
+        && root.context.branch === failure.binding.host.branch) {
+        const rootContext: TrustedExecutionContext = { ...root.context, authority: "coordinator" };
+        store = root.authority === "cto"
+          ? createNativeStageRecoveryStore(cwd, { context: rootContext, runId: failure.run_id, claim_scope: root.claim_scope })
+          : createOrdinaryStageRecoveryStore(cwd, { context: rootContext, runId: failure.run_id });
+        recoveryContext = root.root_ctx;
+      }
+    }
     if (!store) return { ok: false, code: "recovery_context_unavailable" };
     try {
-      const selection = store.selection();
+      const selection = store.selection(failure.binding.identity);
       if (selection.run_id !== failure.run_id || selection.authority !== failure.authority) {
         return { ok: false, code: "recovery_authority_denied" };
       }
@@ -5020,6 +5087,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     input: WorkflowRecoveryToolInput,
     signal: AbortSignal | undefined,
     ctx: unknown,
+    requestedIdentity?: WorkIdentity,
   ): Promise<WorkflowToolResult> => {
     const cwd = currentCwd(ctx);
     if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
@@ -5030,6 +5098,10 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     // context must not be able to roll a workspace journal forward.
     const authorizedStore = runtime.storeFor(ctx, cwd);
     if (!authorizedStore) return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "the session does not own an authenticated ordinary or native recovery target" });
+    // A committed automatic replacement may still be awaiting its delivery ACK.
+    // Let that existing operation finish before manual mutation captures its CAS
+    // revision; diagnosis remains available while delivery is in flight.
+    if (input.operation === "reconcile") await runtime.automaticContinuation;
     try {
       // Recovery reads use the no-recovery store APIs so a torn lifecycle
       // publication cannot be mistaken for canonical owner state. Repair
@@ -5041,12 +5113,13 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     } catch {
       return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_STATE_UNAVAILABLE", error: "the canonical lifecycle journal could not be recovered safely" });
     }
-    const store = authorizedStore;
+    const store = runtime.storeFor(ctx, cwd);
+    if (!store) return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "the session no longer owns the recovery target" });
     let selection: TrustedRecoverySelection;
     let snapshot: StageRecoverySnapshot;
     try {
-      selection = store.selection();
-      snapshot = await store.read({ run_id: selection.run_id, authority: selection.authority, selection });
+      selection = store.selection(requestedIdentity);
+      snapshot = await store.read({ run_id: selection.run_id, authority: selection.authority, selection, ...(requestedIdentity ? { identity: requestedIdentity } : {}) });
     } catch {
       return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_STATE_UNAVAILABLE", error: "the canonical recovery owner could not be read safely" });
     }
@@ -5107,6 +5180,23 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         capabilities: runtime.host.capabilities,
       });
     }
+    if (!requestedIdentity && selection.authority === "ordinary") {
+      let identities: WorkIdentity[];
+      try {
+        identities = currentRecoveryAssignments(cwd, selection.run_id);
+      } catch {
+        return toolResult({ ok: false, code: "WORKFLOW_RECOVERY_STATE_UNAVAILABLE", error: "the canonical recovery assignments could not be read safely" });
+      }
+      if (identities.length > 1) {
+        const recoveries: Array<{ slot_id: string; dispatch_id: string; result: unknown }> = [];
+        for (const identity of identities) {
+          const result = await executeRecovery(`${toolCallId}:${identity.dispatch_id}`, input, signal, ctx, identity);
+          recoveries.push({ slot_id: identity.slot_id, dispatch_id: identity.dispatch_id, result: result.details });
+        }
+        return toolResult({ ok: true, recoveries, capabilities: runtime.host.capabilities });
+      }
+      if (identities.length === 1) return executeRecovery(toolCallId, input, signal, ctx, identities[0]);
+    }
     const request: StageRecoveryRequest = {
       run_id: selection.run_id,
       authority: selection.authority,
@@ -5114,7 +5204,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       operation_id: toolCallId,
       ...(input.intent ? { intent: input.intent } : {}),
       ...(snapshot.identity ? { identity: snapshot.identity } : {}),
-      expected_revision: snapshot.revision,
+      ...(input.operation === "reconcile" ? { expected_revision: snapshot.revision } : {}),
       selection,
     };
     const execute = async (currentRequest: StageRecoveryRequest): Promise<StageRecoveryResult> => {
@@ -5181,7 +5271,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
     let afterSelection: TrustedRecoverySelection;
     let afterSnapshot: StageRecoverySnapshot;
     try {
-      afterSelection = store.selection();
+      afterSelection = store.selection(snapshot.identity);
       afterSnapshot = await store.read({
         run_id: afterSelection.run_id,
         authority: afterSelection.authority,

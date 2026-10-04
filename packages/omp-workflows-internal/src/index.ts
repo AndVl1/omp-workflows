@@ -1089,6 +1089,7 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string, options: I
 		scopeUiClasses: defaultOmpInternalScopeUiClasses,
 		flags: defaultOmpInternalFlags,
 		workflowProfiles: profiles,
+		readOnlyBashAgents: ["omp-analyst", "omp-tech-researcher"],
 		resolveCwd: resolveSessionCwd,
 		owner: privateOmpOwnerForCwd,
 		resolveTrustedToolCallActor: (ctx, sessionCwd, runId) =>

@@ -9,6 +9,7 @@
  */
 import { isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { isAllowedAstIndexBash } from "./read-only-bash.js";
 interface ToolCallEvent {
   toolName: string;
   input?: Record<string, unknown> | string;
@@ -96,9 +97,9 @@ export function orchestratorWriteGate(
   const bashCommand = event.toolName === "bash" && bashSnapshot?.valid ? bashSnapshot.command : "";
 
   // A proof-derived artifact scope is deliberately a positive allowlist:
-  // read-only status/log/diff/show plus exactly `branch --show-current`
-  // may run through bash.
-  // Accepted command encodings are not mutually exclusive transports:
+  // AST lookup/index refresh and sanitized read-only Git inspection may run
+  // through bash; source writes and arbitrary shell commands remain blocked.
+  // Accepted Git command encodings are not mutually exclusive transports:
   // inline `GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false ...`
   // accepts env absent or the exact own one-key `{ GIT_OPTIONAL_LOCKS: "0" }`;
   // non-inline `git --no-pager -c core.fsmonitor=false ...` requires that
@@ -108,8 +109,8 @@ export function orchestratorWriteGate(
   // remain blocked.
   const artifactsDir = trustedArtifactsDirOf(ctx, actor);
   if (event.toolName === "bash" && artifactsDir) {
-    if (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv)) {
-      return { block: true, reason: "orchestrator policy: trusted host artifact proof permits only sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false: status, log (at most one -N, 1..100), diff, show, or branch --show-current; only diff/show require --no-ext-diff --no-textconv" };
+    if (!isAllowedAstIndexBash(event.input, ctx.cwd) && (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv))) {
+      return { block: true, reason: "orchestrator policy: trusted host artifact proof permits allowlisted ast-index lookup/rebuild/update or sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false: status, log (at most one -N, 1..100), diff, show, or branch --show-current; only diff/show require --no-ext-diff --no-textconv" };
     }
   }
 

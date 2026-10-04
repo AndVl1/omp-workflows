@@ -488,9 +488,10 @@ function readCanonical(cwd: string, runId: string, context: TrustedExecutionCont
   const owner = currentOwner(readRunControlNoRecovery(cwd), runId, context, scope, identityForState(state, identity)?.identity);
   return { state, raw_hash: createHash("sha256").update(stateRaw(runId, cwd), "utf8").digest("hex"), revision: stateRevision(state), owner };
 }
-function selectionFor(cwd: string, runId: string, context: TrustedExecutionContext, scope?: CtoClaimScope): TrustedRecoverySelection {
-  const current = readCanonical(cwd, runId, context, scope);
-  const identity = identityForState(current.state)?.identity;
+function selectionFor(cwd: string, runId: string, context: TrustedExecutionContext, scope?: CtoClaimScope, requested?: WorkIdentity): TrustedRecoverySelection {
+  const current = readCanonical(cwd, runId, context, scope, requested);
+  const identity = identityForState(current.state, requested)?.identity;
+  if (requested && !identity) throw new Error("native recovery identity is not a canonical assignment");
   const bindingId = identity ? digest({ version: 1, authority: "cto", run_id: runId, owner_id: current.owner.owner_id, ownership_epoch: current.owner.ownership_epoch, identity }) : current.owner.binding_id;
   const proof = digest({ version: 1, authority: "cto", run_id: runId, owner_id: current.owner.owner_id, ownership_epoch: current.owner.ownership_epoch, binding_id: bindingId });
   return { authenticated: true, run_id: runId, authority: "cto", owner_id: current.owner.owner_id, ownership_epoch: current.owner.ownership_epoch, binding_id: bindingId, proof };
@@ -748,7 +749,7 @@ export function createNativeStageRecoveryStore(cwd: string, options: NativeStage
   const runId = options.runId;
   const scope = options.claim_scope;
   const activeProofs = new WeakMap<object, { expected_revision: RecoveryRevision; selection: TrustedRecoverySelection; identity: WorkIdentity }>();
-  const selection = (): TrustedRecoverySelection => selectionFor(cwd, runId, context, scope);
+  const selection = (identity?: WorkIdentity): TrustedRecoverySelection => selectionFor(cwd, runId, context, scope, identity);
   const captureGrantAuthorization = (input: StageRecoveryGrantAuthorizationInput): RecoveryGrantAuthorizationProof => {
     const current = readCanonical(cwd, runId, context, scope, input.identity);
     const snapshot = snapshotFromRead({ cwd, run_id: runId, state: current.state, raw_hash: current.raw_hash, revision: current.revision, owner: current.owner, identity: input.identity });

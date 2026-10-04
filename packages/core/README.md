@@ -94,6 +94,39 @@ binding разделяется между копиями core только дл�
 Worker использует своё host-assignment и документацию `workflow_submit_result`;
 отказ в доступе к control tool не означает отказ уже принятой публикации.
 
+`registerTeamWorkflow(pi, { readOnlyBashAgents: ["omp-analyst", "omp-tech-researcher"], ... })`
+ограничивает Bash этих агентов по **доверенному native worker binding**, а не
+по имени из tool input. Бандл отдельно добавляет `bash` в их объявленные tools.
+Разрешены одиночные `ast-index` lookup-команды (`search`, `file`, `symbol`,
+`refs`, `outline`, `imports`), help/version/stats и `rebuild`/`update`.
+Тот же AST allowlist доступен аутентифицированному artifact-scoped orchestrator
+наряду с существующим sanitized Git. Refresh изменяет индекс/cache, не исходники;
+SQL, `clear`/`watch`, shell-композиции, переопределения env и смена cwd/root запрещены.
+В установленном ast-index 3.44.2 incremental `update` может пропустить две правки
+в одну секунду; для гарантированной полной актуализации используй `rebuild`.
+
+Для consilium `stage.slot_artifacts` содержит логические ключи сдачи для каждого
+slot, а не физические имена файлов. Сдавай все явно объявленные `stage.produces`;
+если ранний этап объявляет `dod`, это тоже логический output. Не добавляй shared
+DoD sidecar в outputs этапа, который его не объявляет.
+
+`workflow_recover` выводит текущие assignments из canonical state сам: при
+нескольких slots ответ содержит `recoveries: [{ slot_id, dispatch_id, result }]`,
+где `result.recovery` относится только к данному slot; один slot сохраняет
+обычный `recovery`. Исторические attempts не становятся отдельными targets.
+Подтверждённый host terminal envelope восстанавливает terminal proof даже без
+записи старого recovery ledger; один статус `cancelled` этого права не даёт.
+Ошибки схемы живого producer сохраняются с его точной identity и field errors,
+в том числе из отдельно загруженного native child: recovery store берётся
+у проверенного живого coordinator, а не из локального controller дочерней сессии.
+Для native multi-team producer selection также привязан к точному assignment.
+Автоматические continuations разных slots последовательно готовятся и получают
+ACK, поскольку canonical revision общая для run. Ручной `reconcile` ждёт текущую
+автоматическую continuation и заново проверяет owner; `diagnose` остаётся доступен
+во время доставки и не пытается мутировать состояние со старой read revision.
+После terminal/yield сообщение в `agent://` не возвращает producer authority:
+используй штатный bounded recovery, а не публикацию от завершённого worker.
+
 ## Жизненный цикл обычного workflow
 
 Обычные запуски имеют явный режим `new`, `resume` или `rework`. Наличие старых файлов состояния само по себе не превращает новую задачу в продолжение. Для `/team` действует тот же контракт: это alias `/do-work`.

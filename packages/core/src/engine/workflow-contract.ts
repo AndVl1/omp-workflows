@@ -6,7 +6,6 @@ import { resolveConfig, resolveAgentForRole } from "./config.js";
 import { resolveScope } from "./scope.js";
 import { resolveActiveBranch, resolveCanonicalRun, withWorkspaceRead } from "./state.js";
 import { readStageInputs, resolveStageDispatchSlots } from "./stage.js";
-import { sanitizeSlot } from "./fan-in.js";
 import { artifactSchemaForStage, type JsonSchemaDef } from "./artifact-contract.js";
 import {
   checkpointPolicyHash,
@@ -579,7 +578,7 @@ export interface WorkflowStageContract {
     read_at: string;
     inputs: Array<{ artifact_id: string; path: string; sha256: string }>;
   } | null;
-  /** Artifact ids produced for each selected role/slot. */
+  /** Logical submission keys per selected slot; physical fan-in paths are engine-owned. */
   slot_artifacts: Record<string, string[]>;
   /** Persisted decisions restored from the selected run, never from chat text. */
   decisions: Array<{ id: string; summary: string; artifact_id?: string; at: string; evidence?: string }>;
@@ -623,11 +622,7 @@ export interface WorkflowStageContract {
 }
 function slotArtifactsFor(stage: StageDef, slots: Array<{ role: string; agent: string }>): Record<string, string[]> {
   const produces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
-  const multiSlot = stage.type === "consilium" && slots.length > 1;
-  return Object.fromEntries(slots.map(({ role }) => [
-    role,
-    multiSlot ? produces.map(id => `${id}-${sanitizeSlot(role)}`) : produces,
-  ]));
+  return Object.fromEntries(slots.map(({ role }) => [role, produces]));
 }
 
 function artifactSchemasFor(stage: StageDef): Record<string, JsonSchemaDef | null> {

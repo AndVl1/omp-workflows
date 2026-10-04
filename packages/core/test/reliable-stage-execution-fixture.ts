@@ -175,6 +175,7 @@ export type CoreFixtureOptions = {
   scopeMap?: Array<{ glob: string[]; scope: string; dev_agent: string }>;
   stageProducerTools?: StageProducerToolDefinition[];
   stageRecoveryHost?: StageRecoveryHost;
+  readOnlyBashAgents?: readonly string[];
   ctoTeams?: CtoTeamFixture[];
 };
 
@@ -221,6 +222,7 @@ function registerHarness(
     scopeMap: Array<{ glob: string[]; scope: string; dev_agent: string }>;
     stageProducerTools?: StageProducerToolDefinition[];
     stageRecoveryHost?: StageRecoveryHost;
+    readOnlyBashAgents?: readonly string[];
     ctoTeams?: CtoTeamFixture[];
     ctoTeamsConfigured?: boolean;
   },
@@ -358,6 +360,7 @@ function registerHarness(
     workflowProfiles: options.workflowProfiles,
     getSessionController: (ctx: unknown) => ctx === context ? controller : undefined,
     resolveTrustedToolCallActor: actorResolver,
+    readOnlyBashAgents: options.readOnlyBashAgents,
     ...(options.stageRecoveryHost ? { stageRecoveryHost: options.stageRecoveryHost } : {}),
     observability: false,
   };
@@ -507,12 +510,13 @@ export function createCoreFixture(options: CoreFixtureOptions = {}): Harness {
     scopeMap: options.scopeMap ?? [{ glob: ["**/*"], scope: cto ? "backend" : "default", dev_agent: "developer" }],
     stageProducerTools: options.stageProducerTools,
     stageRecoveryHost: options.stageRecoveryHost,
+    readOnlyBashAgents: options.readOnlyBashAgents,
     ctoTeams,
     ctoTeamsConfigured: options.ctoTeams !== undefined,
   }, cto, ownsRoot);
 }
 
-export function ordinaryHarness(options: Pick<CoreFixtureOptions, "root" | "workflowProfiles" | "stageProducerTools" | "stageRecoveryHost" | "branch" | "sessionId" | "roles" | "scopeMap" | "ctoTeams"> = {}): Harness {
+export function ordinaryHarness(options: Pick<CoreFixtureOptions, "root" | "workflowProfiles" | "stageProducerTools" | "stageRecoveryHost" | "readOnlyBashAgents" | "branch" | "sessionId" | "roles" | "scopeMap" | "ctoTeams"> = {}): Harness {
   return createCoreFixture({ route: "ordinary", workflowProfiles: options.workflowProfiles ?? [RELIABLE_PROFILE], ...options });
 }
 

@@ -500,8 +500,8 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
     const instructionResponse = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: sessionManagerFor(root, "session-direct") } as never);
     const instructionDetails = instructionResponse.details as { stage?: { slot_artifacts?: Record<string, string[]> } };
     assert.deepEqual(instructionDetails.stage?.slot_artifacts, {
-      analyst: ["spec_intake_repo_map-analyst"],
-      "tech-researcher": ["spec_intake_repo_map-tech-researcher"],
+      analyst: ["spec_intake_repo_map"],
+      "tech-researcher": ["spec_intake_repo_map"],
     });
     const gate = dispatchGate({
       toolName: "task",
