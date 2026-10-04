@@ -263,6 +263,35 @@ The prose phase descriptions in `commands/team.md` remain as a **STAGE REFERENCE
 the detailed prompt templates and review criteria live there. Profiles drive *which* stages
 run and *in what order*; the reference supplies the *how* for each stage type.
 
+### Полный hash профиля и fingerprint handoff
+
+Canonical state хранит полный SHA-256 профиля (64 hex):
+`workflow_begin.state.profile_hash`, `workflow_instructions.profile.hash`
+и `workflow_instructions.state.profileHash` показывают полное значение.
+`workflow_begin.handoff.profile_hash` намеренно содержит компактный
+fingerprint: первые 30 плюс последние 2 символа полного hash (32 hex).
+Корневой `profile_hash_note` в ответе begin явно поясняет это различие.
+
+Разная длина или прямое строковое неравенство этих двух представлений
+сами по себе не означают profile drift и не требуют recovery. В control
+calls копируется значение **актуального handoff дословно**, без вычисления
+fingerprint моделью, подстановки полного hash или изменения state.
+Пояснение не является authority: действительные несовпадения binding,
+profile, capability, cursor или loop iteration по-прежнему отклоняет движок.
+
+### Ответ штатного checkpoint-диалога
+
+OMP 18.4.9 включает `customInputImages` и `noteImages` в raw результат
+`askDialog` даже при обычном выборе без вложений. Checkpoint intake
+принимает эти два поля только отсутствующими, `undefined` или пустыми
+массивами. Непустые и malformed image metadata не дают approval;
+остальные неизвестные metadata также отклоняются.
+
+Решение выводится только из единственного policy-allowed selected option
+для точных question/id/options. Esc, timeout, custom input и stale binding
+не создают допустимый ответ. Proof, запись решения и advance остаются
+за штатными checkpoint tools; совместимость UI metadata не обходит их.
+
 ### Необязательные входы и required-input receipt
 
 `consumes` остаётся обязательным входом: его отсутствие или ошибка блокирует зависимый dispatch. `optional_consumes` означает только «прочитать, если уже существует»:

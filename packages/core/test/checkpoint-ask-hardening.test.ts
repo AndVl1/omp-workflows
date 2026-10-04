@@ -555,7 +555,7 @@ function trustedToolContext(root: string): AskContext {
 
 type SubmitExtra = Partial<{ id: string; question: string; options: string[]; multi: boolean; timedOut: boolean; customInput: string; note: string }>;
 
-/** The canonical result item a faithful host echoes for the asked question. */
+/** OMP 18.4.9 raw dialog items keep image keys even without attachments. */
 function canonicalItem(question: DialogQuestion): Record<string, unknown> {
   return {
     id: question.id,
@@ -563,6 +563,8 @@ function canonicalItem(question: DialogQuestion): Record<string, unknown> {
     options: question.options.map((option) => option.label),
     multi: false,
     selectedOptions: [] as string[],
+    customInputImages: undefined,
+    noteImages: undefined,
   };
 }
 
@@ -928,7 +930,15 @@ withFixture("ask: policy drift between the persisted state and the declaring pro
 withFixture("ask: exact replay of a live identical answer re-issues the same proof without minting", async (root, ask) => {
   const issued = writeAskFixture(root);
   seedLiveAnswer(root, "terminal/main/implementation/approve_implementation/1", "proceed");
-  const response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => submit(questions[0]!, ["proceed"]), []));
+  const response = await ask("t", askAuth(issued), undefined, undefined, askContext(root, (questions) => ({
+    kind: "submit",
+    results: [{
+      ...canonicalItem(questions[0]!),
+      selectedOptions: ["proceed"],
+      customInputImages: [],
+      noteImages: [],
+    }],
+  }), []));
   const details = response.details as { ok?: boolean; decision?: string; error?: string; actor_provenance?: { proof?: { answer_id?: string } } };
   assert.equal(details.ok, true, details.error);
   assert.equal(details.decision, "proceed");
@@ -1004,6 +1014,9 @@ withFixture("ask: malformed host results record nothing", async (root, ask) => {
     ["custom input", (question) => submit(question, [], { customInput: "make it so" })],
     ["non-string custom input", (question) => submit(question, [], { customInput: 42 })],
     ["non-string note", (question) => submit(question, ["proceed"], { note: 9 })],
+    ["custom input images", (question) => ({ kind: "submit", results: [{ ...canonicalItem(question), selectedOptions: ["proceed"], customInputImages: [{ type: "image" }] }] })],
+    ["note images", (question) => ({ kind: "submit", results: [{ ...canonicalItem(question), selectedOptions: ["proceed"], noteImages: [{ type: "image" }] }] })],
+    ["malformed image metadata", (question) => ({ kind: "submit", results: [{ ...canonicalItem(question), selectedOptions: ["proceed"], noteImages: "image" }] })],
     ["unknown metadata", (question) => ({ kind: "submit", results: [{ ...canonicalItem(question), selectedOptions: ["proceed"], injected: true }] })],
     ["unknown option", (question) => submit(question, ["ship it"])],
   ];

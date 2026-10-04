@@ -3638,9 +3638,12 @@ const HOST_DECISION_KEYS: Record<string, true> = {
   multi: true,
   selectedOptions: true,
   customInput: true,
+  customInputImages: true,
+  noteImages: true,
   note: true,
   timedOut: true,
 };
+const HOST_DECISION_IMAGE_KEYS = ["customInputImages", "noteImages"] as const;
 
 async function askHostDecision(surface: HostAskSurface | undefined, request: HostDecisionRequest): Promise<HostDecisionResult> {
   const declined = (error: string): HostDecisionResult => ({ ok: false, kind: "declined", error });
@@ -3672,6 +3675,14 @@ async function askHostDecision(surface: HostAskSurface | undefined, request: Hos
         return declined("the host answer does not match the allowed decisions");
       }
       if (item.multi !== false) return declined("the host answer must be single-select");
+      // OMP's raw dialog items include image keys even for plain selections.
+      // Empty metadata is compatible; images never authorize a checkpoint.
+      for (const key of HOST_DECISION_IMAGE_KEYS) {
+        const images = item[key];
+        if (images !== undefined && (!Array.isArray(images) || images.length !== 0)) {
+          return declined("image attachments are not supported for policy-bound decisions");
+        }
+      }
       if (item.timedOut !== undefined && typeof item.timedOut !== "boolean") return declined("the timeout marker must be boolean");
       if (item.timedOut === true) return declined("timeout selection is not human authorization");
       if (item.customInput !== undefined && typeof item.customInput !== "string") return declined("custom input must be a string");
@@ -4834,7 +4845,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
   pi.registerTool({
     name: "workflow_begin",
     label: "Begin workflow stage",
-    description: "Issue a durable opaque capability for the current workflow stage. Stages with a roster policy accept an optional semantic selection — role/facet/focus/reason occurrences only; concrete agent ids are rejected. The selection is validated against the allowed roles, multiplicity and the live registered agent mapping, then frozen: an identical re-issue is idempotent, a changed selection for an active capability is rejected.",
+    description: "Issue a durable opaque capability for the current workflow stage. Its handoff.profile_hash is intentionally a compact fingerprint (first 30 plus last 2 characters), not the full SHA-256 shown in state/workflow_instructions; different representations alone are not profile drift. Copy the current handoff binding verbatim, never reconstruct or replace its hash. Stages with a roster policy accept an optional semantic selection — role/facet/focus/reason occurrences only; concrete agent ids are rejected. The selection is validated against the allowed roles, multiplicity and the live registered agent mapping, then frozen: an identical re-issue is idempotent, a changed selection for an active capability is rejected.",
     parameters: z.object({
       selection: z.object({
         rationale: z.string().min(1).optional(),
@@ -4871,6 +4882,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         const trustedMapping = handoff === undefined ? undefined : handoff as unknown as AgentMappingState;
         const transition = beginCapability(cwd, input.selection, { ...(trustedMapping !== undefined ? { trustedMapping } : {}), runId });
         if (!transition.ok) return toolResult({ ok: false, code: "WORKFLOW_BEGIN_REJECTED", error: transition.error, state: transition.state ? workflowStateSummary(cwd, options.mappingSummary, runId) : undefined });
+        const profileHashNote = "handoff.profile_hash is intentionally a compact first-30/last-2 fingerprint; workflow_begin.state.profile_hash and workflow_instructions.profile.hash/state.profileHash are the full SHA-256. Do not compare these representations by string equality or treat their different lengths as profile drift. Copy the newest handoff.profile_hash verbatim; do not reconstruct it, replace it with the full hash, or edit state. Actual binding validation remains engine-owned.";
         const state = workflowStateSummary(cwd, options.mappingSummary, runId);
         const workflow = transition.state.classification?.workflow;
         const profile = workflow ? loadProfile(workflow) : undefined;
@@ -4884,13 +4896,14 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
               error: rendered.error,
               transition: "begin",
               handoff: transition.handoff,
+              profile_hash_note: profileHashNote,
               renderer: rendered,
               state,
             });
           }
-          return toolResult({ ok: true, transition: "begin", handoff: transition.handoff, renderer: rendered, state });
+          return toolResult({ ok: true, transition: "begin", profile_hash_note: profileHashNote, handoff: transition.handoff, renderer: rendered, state });
         }
-        return toolResult({ ok: true, transition: "begin", handoff: transition.handoff, state });
+        return toolResult({ ok: true, transition: "begin", profile_hash_note: profileHashNote, handoff: transition.handoff, state });
       } catch (error) {
         return toolResult({ ok: false, code: "WORKFLOW_BEGIN_FAILED", error: String(error) });
       }
