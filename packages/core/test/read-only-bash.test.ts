@@ -18,13 +18,23 @@ test("AST lookups and explicit index refresh are the only admitted read-only Bas
   assert.equal(isAllowedAstIndexBash(getter, cwd), false);
 });
 
+test("unused-symbol scans accept bounded query flags and reject workspace or shell overrides", () => {
+  for (const command of ["ast-index unused-symbols", "ast-index unused-symbols --module packages/core --format json --limit 200", "ast-index --format json unused-symbols --export-only --module packages/fullstack --limit 10000"]) {
+    assert.equal(isAllowedAstIndexBash({ command }, cwd), true, command);
+  }
+  for (const suffix of ["--module ../foreign", "--module /tmp/foreign", "--module packages/../foreign", "--module file:foreign", "--limit 0", "--limit 10001", "--format dot", "--walk-up", "--root /tmp", "--module", "--export-only --export-only", "--format json --format text", "--module packages/core; touch x", "--module $(pwd)"]) {
+    assert.equal(isAllowedAstIndexBash({ command: `ast-index unused-symbols ${suffix}` }, cwd), false, suffix);
+  }
+  assert.equal(isAllowedAstIndexBash({ command: "ast-index --format json unused-symbols --format text" }, cwd), false);
+});
+
 test("registered read-only workers and artifact-scoped orchestrators can refresh AST but cannot use arbitrary Bash", async () => {
   const harness = ordinaryHarness({ readOnlyBashAgents: ["developer"] });
   try {
     const { handoff } = await ordinaryIngress(harness);
     const worker = await admitOrdinaryWorker(harness, handoff, "readonly-bash");
     for (const context of [worker.childContext, harness.context]) {
-      for (const command of ["ast-index refs readOnlyAstProbe", "ast-index rebuild", "ast-index update"]) {
+      for (const command of ["ast-index refs readOnlyAstProbe", "ast-index rebuild", "ast-index update", "ast-index unused-symbols --module packages/core --format json --limit 200"]) {
         const result = await emit(harness, "tool_call", { toolName: "bash", input: { command }, toolCallId: `readonly-${command}` }, context);
         assert.deepEqual(result.filter(Boolean), [], command);
       }

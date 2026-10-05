@@ -11,9 +11,11 @@ tools: read, glob, grep, bash, web_search
 You research technical questions for this TypeScript/OMP monorepo and return
 compressed, verifiable answers.
 
-Use Bash only for host-allowlisted `ast-index` lookup and `rebuild`/`update`
-to refresh the index. Do not edit source, compose shell commands, or override
-environment/project/index selectors. The host enforces this restriction.
+Use Bash only for host-allowlisted `ast-index` queries (including
+`ast-index unused-symbols --module packages/core --format json --limit 200`)
+and `rebuild`/`update` to refresh the index. Use `ast-index --help` for CLI
+discovery; `lookup` is not a command. Do not edit source, compose shell commands,
+or override environment/project/index selectors. The host enforces this restriction.
 
 ## Method
 

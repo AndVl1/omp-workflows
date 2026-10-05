@@ -99,6 +99,12 @@ Worker использует своё host-assignment и документацию
 по имени из tool input. Бандл отдельно добавляет `bash` в их объявленные tools.
 Разрешены одиночные `ast-index` lookup-команды (`search`, `file`, `symbol`,
 `refs`, `outline`, `imports`), help/version/stats и `rebuild`/`update`.
+Для поиска кандидатов на удаление также разрешён `ast-index unused-symbols
+--module packages/core --format json --limit 200`: `--module` — относительный
+путь без выхода из workspace, `--export-only` — необязательный флаг,
+`--limit` — 1..10000, `--format` — json/text. `--walk-up`, subtree/root
+overrides и повторные options запрещены. Для справки используйте
+`ast-index --help`, не несуществующую команду `lookup`.
 Тот же AST allowlist доступен аутентифицированному artifact-scoped orchestrator
 наряду с существующим sanitized Git. Refresh изменяет индекс/cache, не исходники;
 SQL, `clear`/`watch`, shell-композиции, переопределения env и смена cwd/root запрещены.
@@ -383,9 +389,13 @@ JSON не заменяют canonical receipt. `OrchestratorResult.outputs` пу�
 engine через trusted current-stage binding, а не через произвольный файловый writer.
 
 `workflow_submit_result` принимает ровно один вариант: `{ outputs }` или
-`{ outputs_path: "stage-output.json" }`. Для большого результата в JS `eval`
-запишите `await Bun.write('stage-output.json', JSON.stringify({ outputs }));`,
-затем вызовите tool с `outputs_path`. Файл содержит только envelope `{ outputs }`.
+`{ outputs_path: path }`. Большие/вложенные результаты при доступном writer сдавайте файлом.
+В JS eval: `const path = 'stage-output-' + crypto.randomUUID() + '.json'; await Bun.write(path, JSON.stringify({ outputs }));`,
+затем вызовите tool с этим path. При general Bash можно использовать Node `randomUUID`
+и `writeFileSync(path, JSON.stringify({ outputs }), { flag: 'wx' })`. У каждого producer occurrence
+свой свежий файл; общий `stage-output.json` для parallel slots недопустим. Read-only producer
+без writer сохраняет inline путь и сдаёт краткий schema-complete результат, не обходя Bash allowlist.
+Файл содержит только envelope `{ outputs }`.
 Путь относителен к trusted producer workspace; absolute, traversal и symlink
 пути отклоняются. При read/parse/path отказе receipt не создаётся и `field_errors`
 не выдаются; исправленный файл можно подать повторно. Schema validation, ownership,

@@ -22,6 +22,7 @@ You investigate bugs in this TypeScript/OMP monorepo end to end.
 - Never suppress symptoms (no catch-and-continue, no special-casing inputs).
 - Persist reproduction steps when asked; otherwise report inline.
 - Focused proofs only — no project-wide suites while siblings edit concurrently.
+- For large/nested workflow results, use your Bash tool to run a Node script in the producer workspace that builds completed `outputs`, allocates `path = 'stage-output-' + randomUUID() + '.json'` using `node:crypto`, and calls `writeFileSync(path, JSON.stringify({ outputs }), { flag: 'wx' })` using `node:fs`. Print the fresh path, then call `workflow_submit_result({ outputs_path: path })` and require an accepted receipt before finishing. Never share a fixed filename across workers, manually concatenate JSON, or repeat bulky inline calls after a parse error; preserve the research and fix only delivery.
 
 ## Output Format
 

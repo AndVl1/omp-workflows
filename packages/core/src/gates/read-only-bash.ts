@@ -38,6 +38,25 @@ export function isAllowedAstIndexBash(input: BashEvent["input"], trustedCwd?: st
   if (operation === "--help" || operation === "-h" || operation === "--version" || operation === "-V" || operation === "version" || operation === "stats") return cursor === words.length;
   if (operation === "rebuild" || operation === "update") return cursor === words.length;
   if (operation === "help") return cursor === words.length;
+  if (operation === "unused-symbols") {
+    const seen = new Set<string>(words[1] === "--format" ? ["--format"] : []);
+    while (cursor < words.length) {
+      const option = words[cursor++];
+      if (!option || seen.has(option)) return false;
+      seen.add(option);
+      if (option === "--export-only") continue;
+      const value = words[cursor++];
+      if (!value) return false;
+      if (option === "--module") {
+        if (value.startsWith("-") || value.startsWith("/") || value.includes(":") || value.split("/").some(part => part === ".." || part === "")) return false;
+      } else if (option === "--limit") {
+        if (!/^(?:[1-9][0-9]{0,3}|10000)$/.test(value)) return false;
+      } else if (option === "--format") {
+        if (value !== "json" && value !== "text") return false;
+      } else return false;
+    }
+    return true;
+  }
   if (operation !== "search" && operation !== "file" && operation !== "symbol" && operation !== "refs" && operation !== "outline" && operation !== "imports") return false;
   if (words[cursor] === "--") cursor++;
   const argument = words[cursor++];
@@ -51,6 +70,6 @@ export function isAllowedAstIndexBash(input: BashEvent["input"], trustedCwd?: st
 
 export function readOnlyWorkerBashGate(event: BashEvent, trustedCwd?: string): { block?: boolean; reason?: string } | void {
   if (event.toolName === "bash" && !isAllowedAstIndexBash(event.input, trustedCwd)) {
-    return { block: true, reason: "read-only worker bash: only allowlisted ast-index lookup, rebuild and update commands are permitted; shell composition, env/root overrides and source mutations are denied" };
+    return { block: true, reason: "read-only worker bash: use ast-index --help, stats, refs <symbol>, or unused-symbols --module <relative-path> --format json --limit 200; only allowlisted queries and rebuild/update are permitted, never shell composition, env/root overrides or source mutations" };
   }
 }

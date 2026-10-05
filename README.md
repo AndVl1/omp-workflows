@@ -341,14 +341,20 @@ Producer сдаёт результат через `workflow_submit_result({ outp
 выводит их из подтверждённого host binding. Запись JSON вручную не заменяет
 сдачу результата.
 
-Для больших результатов используйте `workflow_submit_result({ outputs_path: "stage-output.json" })`.
-Файл имеет ровно формат `{ "outputs": { ... } }`; inline `outputs` остаётся доступен,
-но в одном вызове разрешён только один вариант. Путь разрешается относительно
-workspace подтверждённого producer, не cwd координатора; absolute/`..`/symlink
-пути запрещены. В JavaScript `eval` с готовым объектом `outputs` запишите файл
-программно: `await Bun.write('stage-output.json', JSON.stringify({ outputs }));`,
-затем вызовите tool. Не собирайте JSON вручную. Только принятый tool receipt
-подтверждает публикацию. При отказе исправьте файл/вызов без повторного исследования.
+Для больших, вложенных или многострочных результатов при наличии авторизованного программного writer
+обязателен `workflow_submit_result({ outputs_path: path })`. Файл имеет ровно формат `{ "outputs": { ... } }`.
+Inline остаётся для небольших простых результатов и read-only producers без writer;
+их результат должен быть кратким, но полным по схеме. В вызове разрешён ровно один вариант.
+Путь относителен к workspace подтверждённого producer; absolute/`..`/symlink запрещены.
+Каждый producer occurrence создаёт уникальный файл, не общий `stage-output.json`.
+В JS eval: `const path = 'stage-output-' + crypto.randomUUID() + '.json'; await Bun.write(path, JSON.stringify({ outputs }));`.
+При разрешённом general Bash используйте Node с `randomUUID` из `node:crypto` и
+`writeFileSync(path, JSON.stringify({ outputs }), { flag: 'wx' })` из `node:fs`;
+выведите path и передайте именно его в tool. Не собирайте JSON вручную.
+После inline parse error переключитесь на файл, если writer разрешён; иначе исправьте
+и упростите inline payload без потери обязательных полей. Не повторяйте исследование.
+Read-only ast-index-only allowlist не разрешает Node; не обходите ограничения tools.
+Только принятый tool receipt подтверждает публикацию. При отказе исправьте файл/вызов без повторного исследования.
 Read/path/JSON ошибки возвращают `code`/`error` без `field_errors`; schema ошибки
 после чтения идут обычным validation path. Это доставка payload, не восстановление
 уже завершённого worker и не новая authority.
