@@ -239,7 +239,7 @@ async function preflightAndRecover(harness: Harness, runId: string, currentHando
   const reconciled = details((await recover.execute("reliable-recovery-reconcile", { operation: "reconcile", intent: "retry" }, undefined, undefined, harness.context)).details);
   assert.equal(reconciled.ok, true, JSON.stringify(reconciled));
   const recovery = details(reconciled.recovery);
-  assert.equal(recovery.code, "replacement_dispatched", JSON.stringify(reconciled));
+  assert.equal(recovery.code, "replacement_queued", JSON.stringify(reconciled));
   assert.equal(recovery.retry_of, refusedDispatch, JSON.stringify(reconciled));
   const recoveryEvidence = details(recovery.evidence);
   const replacementIdentity = details(recoveryEvidence.new_identity);
@@ -554,7 +554,7 @@ scenarioTest("[C:A01][C:A02] native CTO registered chain recovers a malformed le
     const reconciled = details((await recover.execute("reliable-c-a01-reconcile", { operation: "reconcile", intent: "retry" }, undefined, undefined, harness.context)).details);
     assert.equal(reconciled.ok, true, JSON.stringify(reconciled));
     const recovery = details(reconciled.recovery);
-    assert.equal(recovery.code, "replacement_dispatched", JSON.stringify(reconciled));
+    assert.equal(recovery.code, "replacement_queued", JSON.stringify(reconciled));
     assert.equal(recovery.retry_of, refusedDispatch, JSON.stringify(reconciled));
     const replacementIdentity = details(details(recovery.evidence).new_identity);
     assert.equal(typeof replacementIdentity.dispatch_id, "string", JSON.stringify(reconciled));

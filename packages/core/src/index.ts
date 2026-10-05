@@ -251,7 +251,7 @@ function createStageRecoveryHost(pi: ExtensionAPI): StageRecoveryHost {
     const send = recoveryMessageSender(pi);
     await send({
       customType: "omp-workflow-stage-recovery",
-      content: "Продолжите сохранённое назначение через обычный workflow task admission с canonical handoff и retry_of. Сохраните имеющиеся изменения, отчёт предыдущего worker и результаты проверок; выполните только оставшуюся работу и проверки, затем workflow_submit_result. Не повторяйте весь workflow, не создавайте второй writer и не подделывайте результаты.",
+      content: "Continuation QUEUED, not started: invoke a NEW task through normal workflow admission using the existing ready permit and current canonical handoff/retry_of. Do NOT wake the old agent, wait for an unstarted worker, or request another replacement. Preserve saved task, changes, report and check results; finish only remaining work/checks, then workflow_submit_result. Native slots use the configured lead-to-roster route.",
       details: {
         version: 1 as const,
         kind: "stage_recovery_continuation" as const,
@@ -291,7 +291,7 @@ function createStageRecoveryHost(pi: ExtensionAPI): StageRecoveryHost {
       original_dispatch_id: input.retry_of,
       new_identity: planned,
       observed_at: proof.observed_at,
-      new_state: "pending",
+      new_state: "queued",
     };
     queued.set(input.operation_id, evidence);
     return evidence;

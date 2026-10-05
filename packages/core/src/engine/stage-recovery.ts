@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import type { StageAuthority, StageProducerBinding } from "./reliable-stage.js";
 import type { WorkIdentity } from "./types.js";
@@ -221,6 +222,7 @@ export interface RecoveryResponsePayload {
   readonly retry_of?: string;
   readonly blocking_condition?: string;
   readonly next_action?: string;
+  readonly continuation?: { readonly status: "queued" | "admitted"; readonly next_tool: "task" | "observe"; readonly identity: WorkIdentity };
   readonly evidence?: RecoveryHostEvidence;
   readonly handoff?: TrustedRecoveryHandoff;
   readonly error_context?: SafeRecoveryErrorContext;
@@ -362,7 +364,7 @@ export interface RecoveryReplacementEvidence extends RecoveryHostEvidenceBase {
   readonly kind: "replacement_dispatched";
   readonly original_dispatch_id: string;
   readonly new_identity: WorkIdentity;
-  readonly new_state: "authorized" | "running" | "pending";
+  readonly new_state: "authorized" | "running" | "pending" | "queued";
   readonly observed_at: string;
   readonly errors_digest?: string;
 }
@@ -788,11 +790,20 @@ function invalidRequestResult(request: StageRecoveryRequest, code: string, condi
   };
 }
 
+function isQueuedReplacement(evidence: RecoveryTransitionEvidence | undefined): boolean {
+  return evidence?.kind === "replacement_dispatched" && (evidence.new_state === "queued"
+    || (evidence.new_state === "pending" && evidence.proof.source === "omp-send-message" && evidence.proof.event_id.endsWith(":queued")));
+}
+
 function replayPayload(request: StageRecoveryRequest, operation: RecoveryOperationRecord, snapshot?: StageRecoverySnapshot): StageRecoveryResult | undefined {
   if (operation.status !== "acked" || !operation.response) return undefined;
+  if (snapshot?.identity && operation.replacement_identity && isDeepStrictEqual(snapshot.identity, operation.replacement_identity)
+    && (snapshot.lifecycle === "running" || snapshot.lifecycle === "disconnected" || snapshot.lifecycle === "terminal" || snapshot.terminal)) return undefined;
   const attempts = operation.error_class && snapshot
     ? availableAttempts(snapshot, operation.error_class, request)
     : operation.response.attempts_remaining;
+  if (operation.admission?.state === "ready" && operation.replacement_identity && isQueuedReplacement(operation.evidence ?? operation.response.evidence)) return { ...operation.response, code: "replacement_queued", worker: "unknown", action: "replace", continuation: { status: "queued", next_tool: "task", identity: operation.replacement_identity }, next_action: "Invoke a NEW task using the current canonical handoff and this existing ready continuation permit. Do not wake the old agent, wait for an unstarted worker, or request another replacement. Native worker slots use the configured lead-to-roster route.", attempts_remaining: attempts, operation_id: request.operation_id, replayed: true };
+  if (operation.admission?.state === "consumed" && operation.replacement_identity) return { ...operation.response, code: "replacement_admitted", worker: "unknown", action: "observe", continuation: { status: "admitted", next_tool: "observe", identity: operation.replacement_identity }, next_action: "The continuation permit was consumed by task admission; observe the linked new execution lifecycle, never dispatch another worker or wake the predecessor.", attempts_remaining: attempts, operation_id: request.operation_id, replayed: true };
   return { ...operation.response, attempts_remaining: attempts, operation_id: request.operation_id, replayed: true };
 }
 
@@ -917,14 +928,16 @@ function replacementPayload(
   evidence: RecoveryReplacementEvidence,
   errorClass: RecoveryErrorClass,
 ): RecoveryResponsePayload {
+  const queued = isQueuedReplacement(evidence);
   return {
-    code: "replacement_dispatched",
+    code: queued ? "replacement_queued" : "replacement_dispatched",
     worker: evidence.new_state === "running" ? "running" : "unknown",
     action: "replace",
     attempts_remaining: availableAttempts(snapshot, errorClass, request),
     retry_of: evidence.original_dispatch_id,
     evidence,
-    next_action: evidence.new_state === "running" ? "observe the linked replacement" : "wait for the linked replacement lifecycle",
+    ...(queued ? { continuation: { status: "queued" as const, next_tool: "task" as const, identity: evidence.new_identity } } : {}),
+    next_action: queued ? "Invoke a NEW task using the current canonical handoff and the existing ready continuation permit; preserve saved work and remaining checks. Do not wake the old agent, wait for an unstarted worker, or request another replacement. Native slots use the configured lead-to-roster route." : evidence.new_state === "running" ? "observe the linked replacement" : "wait for the linked replacement lifecycle",
     state_revision: snapshot.revision,
     state_proof: snapshot.state_proof,
   };

@@ -1181,7 +1181,7 @@ scenarioTest("[O:R13] [C:R13] competing process recovery has one durable winner"
       assert.equal(left.code, 0, left.output);
       assert.equal(right.code, 0, right.output);
       const responses = [left, right].map((result, index) => requireRecord(result.result, `${route} recovery race ${index}`)).map((value) => requireRecord(value.recovery, `${route} recovery race response`));
-      const winners = responses.filter((response) => response.ok === true && response.recovery && typeof response.recovery === "object" && (response.recovery as Record<string, unknown>).code === "replacement_dispatched");
+      const winners = responses.filter((response) => response.ok === true && response.recovery && typeof response.recovery === "object" && (response.recovery as Record<string, unknown>).code === "replacement_queued");
       const responseSummary = responses.map((response) => {
         const nested = response.recovery && typeof response.recovery === "object" && !Array.isArray(response.recovery)
           ? response.recovery as Record<string, unknown>
@@ -1221,7 +1221,7 @@ scenarioTest("[O:R13] [C:R13] competing process recovery has one durable winner"
       const admission = requireRecord(operation.admission, `${route} recovery race replacement permit`);
       assert.equal(admission.state, "ready", `${route} recovery race must leave one queued replacement permit`);
       const operationResponse = requireRecord(operation.response, `${route} recovery race operation response`);
-      assert.equal(operationResponse.code, "replacement_dispatched", `${route} recovery race operation must record replacement response`);
+      assert.equal(operationResponse.code, "replacement_queued", `${route} recovery race operation must record replacement response`);
       const budgets = Object.values(lineages).flatMap((lineage) => {
         const entries = lineage && typeof lineage === "object" && !Array.isArray(lineage)
           ? (lineage as Record<string, unknown>).budgets
@@ -1255,7 +1255,7 @@ scenarioTest("[O:R14] [C:R14] process restart preserves bounded recovery budget 
         if (attempt < 2) {
           assert.equal(response.ok, true, recovered.output);
           const details = requireRecord(response.recovery, recovered.output);
-          assert.equal(details.code, "replacement_dispatched", recovered.output);
+          assert.equal(details.code, "replacement_queued", recovered.output);
           const evidence = requireRecord(details.evidence, recovered.output);
           const identity = requireRecord(evidence.new_identity, recovered.output);
           assert.equal(typeof identity.dispatch_id, "string", recovered.output);
@@ -1272,7 +1272,7 @@ scenarioTest("[O:R14] [C:R14] process restart preserves bounded recovery budget 
       const continuedValue = requireRecord(continued.result, `${route} R14 bounded continuation`);
       const continuedResponse = requireRecord(continuedValue.recovery, continued.output);
       assert.equal(continuedResponse.ok, true, continued.output);
-      assert.equal(requireRecord(continuedResponse.recovery, continued.output).code, "replacement_dispatched", continued.output);
+      assert.equal(requireRecord(continuedResponse.recovery, continued.output).code, "replacement_queued", continued.output);
       const state = canonicalProcessState(root, route, fixture.runId);
       const ledger = state.stage_recovery;
       assert.ok(ledger && typeof ledger === "object" && !Array.isArray(ledger), `${route} R14 must persist the recovery ledger`);

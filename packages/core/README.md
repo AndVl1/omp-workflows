@@ -395,6 +395,11 @@ workflow. Новый worker сохраняет изменения и преды�
 работу и проверки, затем сдаёт результат. Пользователь может просто попросить
 «продолжи текущую задачу»; internal IDs и правка state не нужны. Accepted receipt
 не разрешает replacement; live/unknown worker не разрешает второго writer.
+Default host сначала возвращает `replacement_queued` с `continuation.next_tool: task`.
+Это ready permit, НЕ запущенный worker: coordinator вызывает новый `task` по текущему
+handoff, не будит старого агента и не запрашивает ещё один replacement. Повторная
+diagnosis возвращает этот же permit без расхода бюджета. Consumed значит admitted;
+running требует отдельного authoritative lifecycle.
 
 
 `workflow_submit_result` принимает ровно один вариант: `{ outputs }` или

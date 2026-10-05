@@ -106,6 +106,16 @@ Accepted receipt SHALL оставаться immutable stop condition для cont
 - **WHEN** receipt уже принят либо два coordinator запроса конкурируют за continuation
 - **THEN** receipt не заменяется; без receipt только один owner-authorized permit создаёт новое исполнение, старый producer не получает полномочий новой попытки
 
+### Requirement: Очередь continuation не означает запуск worker
+
+Default OMP followUp acknowledgement SHALL возвращать `replacement_queued`, `worker: unknown` и `continuation: { status: queued, next_tool: task, identity }`. Очередь MUST NOT объявляться dispatched/running. Coordinator SHALL использовать существующий ready permit для NEW task по текущему canonical handoff; MUST NOT будить predecessor, ждать незапущенного worker или запрашивать второй replacement. Native worker slots SHALL сохранять configured lead→roster route.
+
+Повторная read-only diagnosis и replay ready permit SHALL возвращать тот же queued status и next-tool без новой очереди или расхода бюджета, включая старые сохранённые queue acknowledgements. Consumed permit SHALL означать admitted, не доказанный running; running/terminal SHALL требовать authoritative lifecycle. Host с реальным dispatch callback SHALL сохранять truthful dispatched result.
+
+#### Scenario: R26 Queued continuation требует нового task
+- **WHEN** default host поставил continuation в очередь, а permit остаётся ready
+- **THEN** recovery указывает NEW task, не wake старого агента; diagnosis сохраняет бюджет и единственную очередь; task admission потребляет исходный permit, новый worker сдаёт receipt и этап продвигается только после остальных gates
+
 ### Requirement: Доработка выполняет реальные итерации
 
 Ошибка структуры сдачи SHALL исправляться отдельно от реализации. Содержательный FAIL verification либо changes-requested review SHALL запускать затронутую работу и зависимые проверки по профилю с сохранением допустимых upstream-результатов. Каждая итерация SHALL иметь собственный scope и evidence; downstream MUST NOT запускаться при неразрешённом FAIL. Счётчик итераций SHALL отражать реальные исполнения, а не синтетические успешные записи.

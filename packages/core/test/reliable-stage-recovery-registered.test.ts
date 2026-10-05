@@ -738,7 +738,7 @@ scenarioTest("[O:R06] registered ordinary preflight refusal records one linked r
     assert.equal(diagnosis.worker, "unknown", safeRecoveryDetails(diagnosis));
     assert.equal(diagnosis.retry_of, refusedDispatch);
     const reconciled = await recover(setupValue, "reconcile", "retry");
-    assert.equal(reconciled.code, "replacement_dispatched", safeRecoveryDetails(reconciled));
+    assert.equal(reconciled.code, "replacement_queued", safeRecoveryDetails(reconciled));
     const message = automaticMessage;
     assert.equal(message.run_id, setupValue.runId);
     assert.equal(message.authority, "ordinary");
@@ -777,7 +777,7 @@ scenarioTest("[C:R06] registered native preflight refusal records one linked ret
     assert.equal(diagnosis.worker, "unknown", safeRecoveryDetails(diagnosis));
     assert.equal(diagnosis.retry_of, refusedDispatch);
     const reconciled = await recover(setupValue, "reconcile", "retry");
-    assert.equal(reconciled.code, "replacement_dispatched", safeRecoveryDetails(reconciled));
+    assert.equal(reconciled.code, "replacement_queued", safeRecoveryDetails(reconciled));
     const message = automaticMessage;
     assert.equal(message.authority, "cto");
     assert.equal(message.retry_of, refusedDispatch);
@@ -874,7 +874,7 @@ async function runR08(route: Route): Promise<void> {
     const failedIdentity = identityFromSnapshot(await snapshotFor(setupValue));
     await terminalWorker(setupValue.harness, worker, true);
     const replacement = await recover(setupValue, "reconcile", "replace");
-    assert.equal(replacement.code, "replacement_dispatched", safeRecoveryDetails(replacement));
+    assert.equal(replacement.code, "replacement_queued", safeRecoveryDetails(replacement));
     assert.equal(replacement.retry_of, failedIdentity.dispatch_id);
     const message = recoveryMessage(await setupValue.harness.waitForRecoveryMessage());
     assert.equal(message.retry_of, failedIdentity.dispatch_id);
@@ -1194,7 +1194,7 @@ async function runR14(route: Route): Promise<void> {
     const firstFailed = identityFromSnapshot(await snapshotFor(setupValue));
     await terminalWorker(setupValue.harness, firstWorker, true);
     const first = await recover(setupValue, "reconcile", "replace");
-    assert.equal(first.code, "replacement_dispatched", safeRecoveryDetails(first));
+    assert.equal(first.code, "replacement_queued", safeRecoveryDetails(first));
     const firstMessage = recoveryMessage(await setupValue.harness.waitForRecoveryMessage());
     assert.equal(firstMessage.retry_of, firstFailed.dispatch_id);
     const firstReplacement = asRecord(firstMessage.identity, "first replacement identity");
@@ -1226,7 +1226,7 @@ async function runR14(route: Route): Promise<void> {
     }
     await terminalWorker(setupValue.harness, secondWorker, true);
     const second = await recover(setupValue, "reconcile", "replace");
-    assert.equal(second.code, "replacement_dispatched", safeRecoveryDetails(second));
+    assert.equal(second.code, "replacement_queued", safeRecoveryDetails(second));
     const messagesAfterSecond = recoveryMessages(setupValue.harness);
     assert.equal(messagesAfterSecond.length, 2);
     const secondMessage = messagesAfterSecond[1]!;
@@ -1272,7 +1272,7 @@ async function runR14(route: Route): Promise<void> {
     try {
       setHostAnswer(restarted.harness, "authorize_one_retry");
       const continued = await recover(restarted, "reconcile", "replace");
-      assert.equal(continued.code, "replacement_dispatched", safeRecoveryDetails(continued));
+      assert.equal(continued.code, "replacement_queued", safeRecoveryDetails(continued));
       assert.equal(recoveryMessages(restarted.harness).length, 1);
       const snapshot = await snapshotFor(restarted);
       const grants = Array.isArray(snapshot.grants) ? snapshot.grants : [];
@@ -1544,11 +1544,22 @@ for (const route of ["ordinary", "cto"] as const) {
       assert.equal(diagnosed.code, "incomplete_assignment", safeRecoveryDetails(diagnosed));
       assert.equal(diagnosed.worker, "terminal");
       const continued = await recover(current, "reconcile", "replace");
-      assert.equal(continued.code, "replacement_dispatched", safeRecoveryDetails(continued));
+      assert.equal(continued.code, "replacement_queued", safeRecoveryDetails(continued));
       const message = recoveryMessage(await current.harness.waitForRecoveryMessage());
+      const beforeReplay = await snapshotFor(current);
+      const queueCount = recoveryMessages(current.harness).length;
+      const replay = await recover(current, "diagnose", "observe");
+      assert.equal(replay.code, "replacement_queued", safeRecoveryDetails(replay));
+      assert.equal(replay.worker, "unknown");
+      assert.equal(asRecord(replay.continuation, "queued continuation").next_tool, "task");
+      assert.deepEqual((await snapshotFor(current)).budgets, beforeReplay.budgets);
+      assert.equal(recoveryMessages(current.harness).length, queueCount);
       const previous = identityFromSnapshot(await snapshotFor(current));
       assert.equal(message.retry_of, previous.dispatch_id);
       const replacement = await admit(current, "incomplete-next");
+      const admittedSnapshot = await snapshotFor(current);
+      const admittedOperations = admittedSnapshot.operations as RecoveryRecord[];
+      assert.ok(admittedOperations.some((op) => op.admission && op.replacement_identity && asRecord(op.admission, "admission").state === "consumed" && asRecord(op.replacement_identity, "replacement").dispatch_id === asRecord(message.identity, "queued identity").dispatch_id));
       const stale = await submitValid(current.harness, first, "incomplete-stale");
       assert.equal(stale.ok, false, JSON.stringify(stale));
       const receipt = await submitValid(current.harness, replacement, "incomplete-submit");

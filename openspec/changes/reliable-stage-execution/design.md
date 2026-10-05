@@ -108,6 +108,8 @@ Read-only diagnosis требует authenticated host/worktree, но не дей
 | Подтверждён terminal failure/cancel | Resume если host поддерживает, иначе связанный replacement с контекстом | Старый worker продолжает писать параллельно |
 | Подтверждён succeeded без обязательного receipt | `incomplete_assignment`: bounded linked continuation сохранённой задачи, изменений и оставшихся проверок | Host success означает выполненную задачу; повторить весь workflow |
 | Succeeded с accepted receipt | Оценить readiness/checkpoint и обычный advance, без replacement | Перезаписать immutable результат |
+| FollowUp queued, permit ready | `replacement_queued`, `continuation.next_tool=task`: NEW task с существующим permit | Ждать незапущенного worker, wake predecessor, второй replacement |
+| Permit consumed | Admitted; наблюдать linked execution | Admission означает running/terminal |
 | Неизвестный статус | Сохранить pending и способ повторной сверки | Удалить claim/state или придумать terminal |
 | Ошибка сдачи | Field errors producer-у; после его terminal — assignment только на восстановление сдачи | Coordinator сочиняет evidence либо запускает всю реализацию заново |
 | Устаревший handoff | Проверить ownership и выдать актуальное продолжение | Подбор token или downgrade trust |

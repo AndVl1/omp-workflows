@@ -149,7 +149,7 @@ test("public recovery diagnoses every canonical cancelled dispatch without an am
     const replaced = details((await recover.execute("replace-parallel-cancellations", { operation: "reconcile", intent: "replace" }, undefined, undefined, harness.context)).details);
     const replacements = replaced.recoveries as typeof recoveries;
     for (const row of replacements) {
-      assert.equal(details(row.result.recovery).code, "replacement_dispatched", JSON.stringify(row));
+      assert.equal(details(row.result.recovery).code, "replacement_queued", JSON.stringify(row));
       assert.equal(details(row.result.recovery).retry_of, row.dispatch_id);
     }
     const continuations = harness.messages.filter(entry => (entry.message as { customType?: string }).customType === "omp-workflow-stage-recovery");

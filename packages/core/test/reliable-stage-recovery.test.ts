@@ -387,6 +387,37 @@ test("two concurrent replacements share one CAS winner and one linked writer", a
   assert.equal(store.transitions.filter((entry) => entry.phase === "ack").length, 1);
 });
 
+for (const queued of [false, true]) {
+  test(`replacement replay preserves ${queued ? "legacy queue next task" : "custom host running proof"}`, async () => {
+    const failed = identity("dispatch-replay");
+    const store = new CanonicalRecoveryStore(baseSnapshot({ identity: failed, producer: producer(failed), lifecycle: "terminal", terminal: terminal(failed.dispatch_id, "terminal-replay"), budgets: [{ error_class: "terminal_failure", limit: 1, used: 0 }] }));
+    let calls = 0;
+    const host = { capabilities: replacementCapabilities, dispatchReplacement: async (input: { operation_id: string; retry_of: string; replacement_identity?: WorkIdentity }) => {
+      calls++;
+      assert.ok(input.replacement_identity);
+      return { authoritative: true as const, kind: "replacement_dispatched" as const, operation: "replacement_dispatch" as const, run_id: runId, dispatch_id: failed.dispatch_id, identity: failed, original_dispatch_id: input.retry_of, new_identity: input.replacement_identity, new_state: queued ? "pending" as const : "running" as const, observed_at: "2026-09-30T00:00:03.000Z", proof: { ...hostProof(failed, "replacement_dispatch", queued ? "recovery:legacy:queued" : "custom-running"), ...(queued ? { source: "omp-send-message" } : {}) } };
+    } };
+    const first = await recoverStageExecution({ request: request("replay-proof"), store, host });
+    const replay = await recoverStageExecution({ request: { ...request("replay-proof"), operation: "diagnose", intent: "observe" }, store, host });
+    assert.equal(first.code, queued ? "replacement_queued" : "replacement_dispatched");
+    assert.equal(replay.code, first.code);
+    assert.equal(replay.worker, queued ? "unknown" : "running");
+    assert.equal(replay.continuation?.next_tool, queued ? "task" : undefined);
+    assert.equal(calls, 1);
+    if (queued) {
+      const op = store.state.operations?.find((entry) => entry.replacement_identity);
+      assert.ok(op?.replacement_identity);
+      store.state = { ...store.state, identity: op.replacement_identity, state_proof: { ...store.state.state_proof, dispatch_id: op.replacement_identity.dispatch_id }, producer: producer(op.replacement_identity), lifecycle: "running", terminal: undefined };
+      const running = await recoverStageExecution({ request: { ...request("replay-proof"), operation: "diagnose", intent: "observe" }, store, host });
+      assert.equal(running.code, "worker_running");
+      store.state = { ...store.state, lifecycle: "terminal", submission: { required: true, accepted: true, task: "developer" } };
+      const complete = await recoverStageExecution({ request: { ...request("replay-proof"), operation: "diagnose", intent: "observe" }, store, host });
+      assert.equal(complete.code, "worker_succeeded");
+      assert.equal(complete.action, "none");
+    }
+  });
+}
+
 test("format repair sends exact canonical errors to the same producer and never dispatches implementation replacement", async () => {
   const worker = identity("dispatch-format");
   const fields = [
