@@ -97,7 +97,7 @@ export interface StageNativeBindingInput {
 }
 
 
-/** Exact model-facing shape. All authority fields are host-derived. */
+/** Submission-service envelope. All authority fields are host-derived. */
 export interface StageResultSubmission {
   readonly outputs: Record<string, unknown>;
 }
@@ -648,6 +648,11 @@ export function deriveRendererStageHostBinding(input: {
     },
     callback,
   };
+}
+
+/** Host-private file ingress uses the same validated producer as submission. */
+export function resolveStageSubmissionBinding(options: StageResultServiceOptions): StageHostBinding | null {
+  return producerBindingFor(options);
 }
 
 function producerBindingFor(options: StageResultServiceOptions): StageHostBinding | null {

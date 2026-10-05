@@ -341,6 +341,18 @@ Producer сдаёт результат через `workflow_submit_result({ outp
 выводит их из подтверждённого host binding. Запись JSON вручную не заменяет
 сдачу результата.
 
+Для больших результатов используйте `workflow_submit_result({ outputs_path: "stage-output.json" })`.
+Файл имеет ровно формат `{ "outputs": { ... } }`; inline `outputs` остаётся доступен,
+но в одном вызове разрешён только один вариант. Путь разрешается относительно
+workspace подтверждённого producer, не cwd координатора; absolute/`..`/symlink
+пути запрещены. В JavaScript `eval` с готовым объектом `outputs` запишите файл
+программно: `await Bun.write('stage-output.json', JSON.stringify({ outputs }));`,
+затем вызовите tool. Не собирайте JSON вручную. Только принятый tool receipt
+подтверждает публикацию. При отказе исправьте файл/вызов без повторного исследования.
+Read/path/JSON ошибки возвращают `code`/`error` без `field_errors`; schema ошибки
+после чтения идут обычным validation path. Это доставка payload, не восстановление
+уже завершённого worker и не новая authority.
+
 - **Producer ownership.** Worker публикует только собственный slot;
   orchestrator — объявленный ему этап. Tool producer использует
   `registerStageProducerTool` и publisher, действующий только внутри

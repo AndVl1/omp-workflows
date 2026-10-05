@@ -2227,6 +2227,7 @@ export function findAcceptedOrdinaryStageReceipt(
     readonly lineage: OrdinaryAcceptedStageReceiptLineage;
     readonly root: OrdinaryAcceptedStageReceiptRoot;
   },
+  eligibilityOnly = false,
 ): OrdinaryAcceptedStageReceiptCandidate | undefined {
   if (
     !input.cwd
@@ -2287,7 +2288,7 @@ export function findAcceptedOrdinaryStageReceipt(
       if (!stage) return undefined;
       const declared = new Set(stageProduces(stage));
       const outputIds = Object.keys(input.root.outputs);
-      if (outputIds.length === 0 || outputIds.some((artifactId) => !declared.has(artifactId) || !isSafeArtifactId(artifactId))) return undefined;
+      if (!eligibilityOnly && (outputIds.length === 0 || outputIds.some((artifactId) => !declared.has(artifactId) || !isSafeArtifactId(artifactId)))) return undefined;
 
       const receipts = Object.entries(state.stage_receipts ?? {});
       const candidates: StageReceiptLedger[] = [];
@@ -2366,6 +2367,10 @@ export function findAcceptedOrdinaryStageReceipt(
           || typeof producerLineage.lifecycle_id !== "string"
           || producerLineage.lifecycle_id.length === 0
         ) continue;
+        if (eligibilityOnly) {
+          if (verifyReceiptImmutableFiles(resolved.artifactsDir, receipt)) candidates.push(receipt);
+          continue;
+        }
 
         const receiptOutputIds = new Set<string>();
         let outputHashesMatch = true;

@@ -59,12 +59,14 @@ import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, Tr
 import { createNativeWorkerAuthority, NativeWorkerRouteError, type NativeWorkerAuthority, type NativeRootAuthorityRegistration, type NativeWorkerResolution } from "./native-worker-authority.js";
 import { commitNativeCtoStageResult } from "./cto/native-stage-execution.js";
 import { advanceNativeStageForCoordinator, findNativeAcceptedStageReceipt, preflightNativeStageCheckpoint, commitNativeStageCheckpoint, type NativeStageMutationResult } from "./cto/native-stage.js";
+import { readArtifactFileSafe } from "./engine/artifacts.js";
 import {
   OMP_STAGE_HOST_CAPABILITIES,
   deriveWorkerStageHostBinding,
   deriveMainStageHostBinding,
   createTrustedToolCallback,
   submitStageResult,
+  resolveStageSubmissionBinding,
   receiptFromLedger,
   type StageAuthority,
   type StageHostBindingResolver,
@@ -5055,18 +5057,53 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
       return { ok: false, code: "recovery_context_unavailable" };
     }
   };
+  const submissionEnvelope = z.object({ outputs: z.record(z.string(), z.unknown()) }).strict();
+  const submissionDelivery = z.union([
+    submissionEnvelope,
+    z.object({ outputs_path: z.string().min(1) }).strict(),
+  ]);
   pi.registerTool({
     name: "workflow_submit_result",
     label: "Submit assigned stage result",
-    description: "Submit logical artifact outputs for your current profile-declared worker or coordinator assignment. Producer identity, stage scope, artifact paths, and authority come from authenticated runtime context; input is exactly { outputs }. Tool-owned outputs can be published only by their registered callback.",
-    parameters: z.object({
-      outputs: z.record(z.string(), z.unknown()),
-    }).strict() as never,
+    description: "Submit logical artifact outputs for your current profile-declared worker or coordinator assignment. Input is exactly { outputs } or { outputs_path }; the latter reads a JSON { outputs } envelope from the authenticated producer workspace. Identity and authority remain host-derived. Tool-owned outputs can be published only by their registered callback.",
+    parameters: submissionDelivery as never,
     async execute(_id, params, _signal, _update, ctx) {
       const cwd = currentCwd(ctx);
       if (!cwd) return toolResult({ ok: false, code: "WORKFLOW_STATE_UNAVAILABLE", error: "workflow cwd unavailable" });
       const target = stageTargetFor(ctx, cwd);
       if (!target) return toolResult({ ok: false, code: "WORKFLOW_CONTEXT_REJECTED", error: "no canonical workflow or CTO run is available for this producer context" });
+      const delivery = submissionDelivery.safeParse(params);
+      if (!delivery.success) return toolResult({ ok: false, code: "invalid_submission", error: "provide exactly one of outputs or outputs_path" });
+      let submission: unknown = delivery.data;
+      if ("outputs_path" in delivery.data) {
+        const binding = resolveStageSubmissionBinding({ cwd, runId: target.runId, authority: target.authority, context: ctx, bindingResolver: resolveProducerBinding });
+        // Terminal replay uses persisted producer lineage before file access;
+        // the service still verifies exact replay and immutable artifact bytes.
+        const lineage = !binding ? nativeAcceptedReplayLineage(ctx, cwd) : undefined;
+        const root = lineage ? nativeWorkerAuthority?.resolveRootAuthority(cwd, target.runId) : undefined;
+        let replayBinding: StageProducerBinding | undefined;
+        if (lineage && root?.run_id === target.runId && root.authority === target.authority && root.context.authority === "coordinator") {
+          const context: TrustedExecutionContext = { ...root.context, authority: "coordinator" };
+          const candidate = root.authority === "ordinary"
+            ? findAcceptedOrdinaryStageReceipt({ cwd, runId: target.runId, lineage, root: { context, outputs: {} } }, true)
+            : root.claim_scope
+              ? findNativeAcceptedStageReceipt({ cwd, runId: target.runId, lineage, root: { context, claim_scope: root.claim_scope, outputs: {} } }, true)
+              : undefined;
+          replayBinding = candidate?.receipt.binding as StageProducerBinding | undefined;
+        }
+        const workspace = binding?.binding.host.worktree ?? replayBinding?.host.worktree;
+        if (!workspace || resolve(workspace) !== resolve(cwd)) return toolResult({ ok: false, code: "producer_authority_denied", error: "submission file requires an authenticated producer workspace" });
+        const file = readArtifactFileSafe(workspace, delivery.data.outputs_path);
+        if (file.status !== "present") return toolResult({ ok: false, code: file.status === "absent" ? "submission_file_unreadable" : "invalid_submission_path", error: file.status === "absent" ? "submission file does not exist in the producer workspace" : file.error });
+        try {
+          submission = JSON.parse(file.bytes.toString("utf8"));
+        } catch {
+          return toolResult({ ok: false, code: "invalid_submission_json", error: "submission file is not valid JSON; fix the file and submit again" });
+        }
+        const envelope = submissionEnvelope.safeParse(submission);
+        if (!envelope.success) return toolResult({ ok: false, code: "invalid_submission", error: "submission file must contain exactly { outputs: { ... } }" });
+        submission = envelope.data;
+      }
       const result = submitStageResult({
         cwd,
         runId: target.runId,
@@ -5076,7 +5113,7 @@ export function registerWorkflowTools(pi: ExtensionAPI, options: WorkflowToolAda
         acceptedReplay,
         ...(stageResultCommitter ? { ctoCommitter: stageResultCommitter } : {}),
         onValidationFailure: (failure) => persistProducerFormatFailure(failure, ctx, cwd),
-      }, params);
+      }, submission);
       return result.ok
         ? toolResult({ ok: true, receipt: result.receipt })
         : toolResult({ ok: false, code: result.code, error: result.error, ...(result.field_errors ? { field_errors: result.field_errors } : {}) });

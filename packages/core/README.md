@@ -382,6 +382,17 @@ Worker сдаёт логические `outputs` через зарегистри
 JSON не заменяют canonical receipt. `OrchestratorResult.outputs` публикуются
 engine через trusted current-stage binding, а не через произвольный файловый writer.
 
+`workflow_submit_result` принимает ровно один вариант: `{ outputs }` или
+`{ outputs_path: "stage-output.json" }`. Для большого результата в JS `eval`
+запишите `await Bun.write('stage-output.json', JSON.stringify({ outputs }));`,
+затем вызовите tool с `outputs_path`. Файл содержит только envelope `{ outputs }`.
+Путь относителен к trusted producer workspace; absolute, traversal и symlink
+пути отклоняются. При read/parse/path отказе receipt не создаётся и `field_errors`
+не выдаются; исправленный файл можно подать повторно. Schema validation, ownership,
+immutable publication, exact replay и readiness остаются прежними. Файл не
+считается опубликованным до принятого receipt; не повторяйте исследование для
+исправления доставки. Terminal worker recovery этим API не добавляется.
+
 В async-ack сценарии первоначальный ответ `task` оставляет ordinary dispatch в
 `pending`; сам ACK не является terminal. Поздний authoritative OMP 18.0.6
 subagent-lifecycle terminal также может reconciliate этот dispatch, если private

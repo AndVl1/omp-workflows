@@ -1323,10 +1323,10 @@ ${JSON.stringify(schema, null, 2)}
   const registeredWorker = stage.type === "single" || stage.type === "consilium";
   const submissionContract = registeredWorker
     ? [
-      "Call the registered `workflow_submit_result` tool exactly once after completing the work.",
-      "Use exactly this shape: `{ \"outputs\": { \"declared_id\": <direct JSON value> } }`.",
-      "Submit only declared output keys, submit direct values matching their schemas, and do not include run, stage, dispatch, token, identity, receipt, or completion fields.",
-      "Do not write canonical artifact files and do not use files, textual task output, exit 0, or an invented/fallback publication as a substitute for the registered submission. The accepted receipt is separate from SDK task termination.",
+      "After completing the work, publish through the registered `workflow_submit_result` tool. Supply exactly one of `{ \"outputs\": { \"declared_id\": <direct JSON value> } }` or `{ \"outputs_path\": \"stage-output.json\" }`.",
+      "For large results prefer outputs_path: programmatically serialize the exact envelope `{ outputs }` with JSON.stringify and write it inside your producer workspace, then call workflow_submit_result. For example, in the JavaScript eval tool with your completed outputs object: `await Bun.write('stage-output.json', JSON.stringify({ outputs }));` Then submit `{ \"outputs_path\": \"stage-output.json\" }`. Never assemble JSON text by hand. Paths must be workspace-relative; absolute paths, traversal and symlinks are rejected.",
+      "Submit only declared output keys and direct values matching their schemas. Do not include run, workspace, stage, dispatch, token, identity, receipt, or completion fields in either envelope.",
+      "Publication is complete only when the tool confirms acceptance with a receipt. On refusal, repair only the file/payload or publication call using the returned error, and submit again; do not repeat completed research. Do not write canonical artifact files or treat a delivery file, textual task output, exit 0, or fallback publication as a receipt. The accepted receipt is separate from SDK task termination.",
       slotScoped ? "This is one consilium slot: submit only your own values; the engine performs receipt-based fan-in." : "",
     ].filter(Boolean).join(" ")
     : "The orchestrator host must return declared values in `outputs` so the engine can publish them through the durable workflow_submit_result path; do not write canonical artifact files.";

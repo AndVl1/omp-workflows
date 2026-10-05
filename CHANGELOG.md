@@ -5,6 +5,7 @@ All notable changes to `omp-workflows` are documented here.
 ## [Unreleased]
 
 ### Changed
+- **Файловая доставка результата** — `workflow_submit_result` принимает взаимоисключающие `{ outputs }` и `{ outputs_path }`. JSON-файл строго `{ outputs }` читается один раз безопасным reader из trusted producer workspace; unsafe path, read и parse ошибки отклоняются без receipt и без schema `field_errors`. Inline, ownership, schema validation, immutable receipts/replay и advance gates сохранены; recovery/state machine не меняются. Worker guidance предпочитает программный `JSON.stringify` для больших результатов и исправление только доставки при отказе.
 - **Протокол сдачи результатов** — model-facing `workflow_complete` заменён на `workflow_submit_result({ outputs })`. Producer authority выводится из host binding, а не из полей модели; worker, объявленный orchestrator и зарегистрированный tool сохраняют разные границы полномочий. Core публикует immutable payload и receipt; ручной JSON не заменяет сдачу.
 - **Границы завершения этапа** — accepted receipt, worker terminal, DoD и human approval проверяются раздельно. Native CTO root использует `cto_checkpoint_ask({ slice_id })` и `cto_stage_advance({ slice_id })`, не ordinary selector или изменённый моделью progress.
 - **Честные recovery capabilities** — queued continuation не объявляется запущенным worker; неизвестный исход не разрешает второго writer. Недоступные native transport capabilities остаются явно unsupported/unknown.

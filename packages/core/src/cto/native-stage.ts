@@ -603,6 +603,7 @@ export function findNativeAcceptedStageReceipt(
     lineage: NativeAcceptedStageReceiptLineage;
     root: NativeAcceptedStageReceiptRoot;
   },
+  eligibilityOnly = false,
 ): NativeAcceptedStageReceiptCandidate | undefined {
   if (
     !input.cwd
@@ -693,6 +694,7 @@ export function findNativeAcceptedStageReceipt(
             && assignment.role === producer.role;
         });
         if (progressMatches.length !== 1) return false;
+        if (eligibilityOnly) return true;
         try {
           return receipt.digest === nativeAcceptedReplayDigest(identity, input.root.outputs);
         } catch {
