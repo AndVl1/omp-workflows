@@ -610,3 +610,17 @@ product gate было ошибкой классификации. Общий owne
 30/30 по исходной спеке. Production code, пользовательские version/release
 правки и global stores не изменяются. Merge/release/archive не выполняются;
 последующее ручное тестирование и решение по PR остаются за пользователем.
+
+### Хранение evidence перед merge
+
+`automatic-acceptance.json` (45 191 строка raw traces/истории) сохраняется только
+локально под точечным gitignore, не является runtime/config input и не входит в PR.
+Исторические ссылки на acceptance JSON в этом change относятся к локальному evidence,
+не к переносимому Git artifact; машинные /tmp пути не обещают доступность другим reviewers.
+Краткий итог сохранён выше: исходная приёмка 30/30, H1/H2 independent PASS,
+H3 functional PASS; более строгий timed browser cleanup proof остаётся NOT_VERIFIED
+и не переклассифицирован в PASS. Новые delivery/AST fixes не означают повтор H.
+Текущий code/spec candidate `61a2c10` прошёл
+[CI 37336789766](https://github.com/AndVl1/omp-workflows/actions/runs/37336789766):
+build/typecheck/D/P/Test SUCCESS. Это evidence автоматических checks, не нового live H.
+

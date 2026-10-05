@@ -1,5 +1,10 @@
 # Tasks
 
+Raw `automatic-acceptance.json` хранится локально и исключён из Git. Исторические
+ссылки ниже указывают на локальный evidence, не обязательный файл репозитория.
+Переносимый краткий итог/ограничения и актуальный CI — в design.md,
+раздел «Хранение evidence перед merge».
+
 ## 1. Контракты и детерминированный вход в приёмку
 
 - [x] 1.1 Назначить единственных владельцев core, fullstack, internal, recovery, registered acceptance и integration по design §9; зафиксировать общий `StageProducerBinding` с exact `producer.kind: worker|orchestrator|tool`, существующим `WorkIdentity`, `StageHostBinding`, outputs-only submission/immutable receipt/recovery типами и найти всех потребителей перед изменением API. В caller inventory перечислить фактические profile orchestrator stages из core/internal и fullstack `src/tools/lecture-acquire.ts`; `beginCapability` должен сохранять legitimate non-worker assignment, а derive helpers не должны его фабриковать; записать, что `StageWorkerBinding` alias не нужен (unreleased draft). Проверка: согласованная таблица owners/callers в design, без конкурирующей записи и внутренних импортов потребителей.
