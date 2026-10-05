@@ -45,6 +45,7 @@ export type RecoveryErrorClass =
   | "preflight_not_started"
   | "terminal_failure"
   | "cancelled"
+  | "incomplete_assignment"
   | "format_validation"
   | "transport"
   | (string & {});
@@ -246,6 +247,8 @@ export interface StageRecoverySnapshot {
   readonly producer_available?: boolean;
   readonly lifecycle: "pending" | "running" | "disconnected" | "terminal" | "not_started" | "unknown";
   readonly terminal?: RecoveryTerminalProof;
+  /** Owner-derived current assignment publication requirement, never supplied by callers. */
+  readonly submission?: { readonly required: boolean; readonly accepted: boolean; readonly task: string };
   readonly preflight?: RecoveryPreflightNotStartedProof;
   readonly error_context?: StageRecoveryErrorContext;
   readonly budgets?: readonly RecoveryBudget[];
@@ -941,7 +944,7 @@ function validateSnapshot(request: StageRecoveryRequest, snapshot: StageRecovery
 
 function terminalProof(snapshot: StageRecoverySnapshot): RecoveryTerminalProof | undefined {
   if (!snapshot.terminal || snapshot.terminal.authoritative !== true) return undefined;
-  if (snapshot.terminal.outcome === "succeeded") return undefined;
+  if (snapshot.terminal.outcome === "succeeded" && !(snapshot.submission?.required && !snapshot.submission.accepted)) return undefined;
   return snapshot.terminal;
 }
 
@@ -952,6 +955,7 @@ function canonicalPreflight(snapshot: StageRecoverySnapshot): RecoveryPreflightN
 
 function errorClassFor(snapshot: StageRecoverySnapshot, proof?: RecoveryTerminalProof | RecoveryPreflightNotStartedProof): RecoveryErrorClass {
   if (proof && "kind" in proof && proof.kind === "preflight_not_started") return "preflight_not_started";
+  if (proof && "outcome" in proof && proof.outcome === "succeeded") return "incomplete_assignment";
   if (proof && "outcome" in proof && proof.outcome === "cancelled") return "cancelled";
   if (snapshot.error_context?.class === "format_validation") return "format_validation";
   return "terminal_failure";
@@ -1425,6 +1429,7 @@ async function repairFormat(
 async function classifyAndReconcile(options: StageRecoveryExecutionOptions, snapshot: StageRecoverySnapshot): Promise<StageRecoveryResult> {
   const { request, store, host } = options;
   const identity = snapshot.identity;
+  if (snapshot.lifecycle === "terminal" && snapshot.submission?.accepted) return resultWithHost(request, snapshot, host, { code: "worker_succeeded", worker: "terminal", action: "none", next_action: "evaluate the stage; accepted publication is immutable" });
   const retryOf = snapshot.preflight?.dispatch_id ?? terminalProof(snapshot)?.dispatch_id;
   if (request.intent === "repair_format" && (snapshot.error_context?.class !== "format_validation" || !snapshot.error_context.field_errors || snapshot.error_context.field_errors.length === 0)) return repairFormat(options, snapshot);
   const persistedOperation = operationFor(snapshot, request.operation_id, retryOf);
@@ -1479,6 +1484,7 @@ async function classifyAndReconcile(options: StageRecoveryExecutionOptions, snap
   }
   const terminal = terminalProof(snapshot);
   if (terminal) {
+    if (terminal.outcome === "succeeded") return replaceAfterProof(options, snapshot, terminal, "incomplete_assignment");
     if (terminal.outcome === "failed" && supported(host?.capabilities ?? EMPTY_CAPABILITIES, "resume", host?.resume) && request.intent !== "replace" && request.intent !== "retry") {
       if (request.operation === "diagnose") return resultWithHost(request, snapshot, host, { code: "resume_available", worker: "terminal", action: "resume", retry_of: terminal.dispatch_id, error_class: "terminal_failure", next_action: "reconcile the same worker with the authoritative resume callback" });
       return executeHostAction(options, snapshot, identity, request.operation_id, "resume", { kind: "host_action", action: "resume", dispatch_id: identity.dispatch_id, state_proof: snapshot.state_proof }, "terminal_failure");
@@ -1535,10 +1541,11 @@ export async function recoverStageExecution(options: StageRecoveryExecutionOptio
     if (snapshot.lifecycle === "disconnected") return resultWithHost(request, snapshot, host, { code: "worker_disconnected", worker: "disconnected", action: "wait", blocking_condition: "transport loss is not proof that the executor stopped", next_action: "reconnect the same worker or wait for terminal proof" });
     const preflight = canonicalPreflight(snapshot);
     if (preflight) return resultWithHost(request, snapshot, host, { code: "preflight_not_started", worker: "not_started", action: "replace", retry_of: preflight.dispatch_id, error_class: "preflight_not_started", next_action: "reconcile one bounded linked replacement" });
+    if ((snapshot.lifecycle === "terminal" || snapshot.terminal?.outcome === "succeeded") && snapshot.submission?.accepted) return resultWithHost(request, snapshot, host, { code: "worker_succeeded", worker: "terminal", action: "none", next_action: "evaluate the stage; accepted publication is immutable and must not be replaced" });
     const terminal = terminalProof(snapshot);
     if (terminal) {
       const resumeAvailable = terminal.outcome === "failed" && supported(host?.capabilities ?? EMPTY_CAPABILITIES, "resume", host?.resume);
-      return resultWithHost(request, snapshot, host, { code: resumeAvailable ? "resume_available" : "worker_terminal", worker: "terminal", action: resumeAvailable ? "resume" : "replace", retry_of: terminal.dispatch_id, error_class: terminal.outcome === "cancelled" ? "cancelled" : "terminal_failure", next_action: resumeAvailable ? "reconcile the same worker with the authoritative resume callback" : "reconcile only after terminal proof and budget checks" });
+      return resultWithHost(request, snapshot, host, { code: terminal.outcome === "succeeded" ? "incomplete_assignment" : resumeAvailable ? "resume_available" : "worker_terminal", worker: "terminal", action: resumeAvailable ? "resume" : "replace", retry_of: terminal.dispatch_id, error_class: terminal.outcome === "succeeded" ? "incomplete_assignment" : terminal.outcome === "cancelled" ? "cancelled" : "terminal_failure", next_action: resumeAvailable ? "reconcile the same worker with the authoritative resume callback" : "reconcile one bounded linked continuation using saved work, then finish only the remaining assignment" });
     }
     return resultWithHost(request, snapshot, host, { code: "worker_outcome_unknown", worker: "unknown", action: "wait", blocking_condition: "no authoritative start, preflight, or terminal event is persisted", next_action: "wait or clarify; never infer not_started from provider_ref, timeout, absence, or exception" });
   }

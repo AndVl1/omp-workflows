@@ -423,8 +423,9 @@ function snapshotFromRead(input: { cwd: string; run_id: string; state: CtoState;
   const rawLifecycle = selected ? lifecycleFor(selected, selectedLine, input.owner.ownership_epoch) : "unknown";
   const terminal = terminalForRead(selectedLine?.terminal, identity, selected?.assignment, bindingId);
   const preflight = preflightForRead(selectedLine?.preflight, selectedLine?.operations ?? [], identity, selected?.assignment, bindingId, selectedLine);
-  const lifecycle = (rawLifecycle === "terminal" && !terminal) || (rawLifecycle === "not_started" && !preflight) ? "unknown" : rawLifecycle;
+  const lifecycle = rawLifecycle === "terminal" && !terminal ? (selected?.assignment?.status === "terminal" && identity && Object.values(input.state.stage_receipts ?? {}).some((entry) => sameIdentity(entry.work_identity, identity)) ? "terminal" : "unknown") : rawLifecycle === "not_started" && !preflight ? "unknown" : rawLifecycle;
   const stateProof = proofFor(input.run_id, input.revision, input.raw_hash, identity);
+  const receipt = identity ? Object.values(input.state.stage_receipts ?? {}).find((entry) => sameIdentity(entry.work_identity, identity)) : undefined;
   return {
     run_id: input.run_id,
     authority: "cto",
@@ -437,6 +438,7 @@ function snapshotFromRead(input: { cwd: string; run_id: string; state: CtoState;
     ...(selectedLine?.producer_available === undefined ? { producer_available: producer !== undefined && lifecycle !== "terminal" } : { producer_available: selectedLine.producer_available }),
     lifecycle,
     ...(terminal ? { terminal } : {}),
+    ...(selected?.assignment && selected.progress ? { submission: { required: selected.progress.declared_outputs.length > 0, accepted: receipt !== undefined, task: activeWave(input.state)?.task ?? selected.progress.stage_id } } : {}),
     ...(preflight ? { preflight } : {}),
     ...(selectedLine?.error_context ? { error_context: clone(selectedLine.error_context) } : {}),
     budgets: clone(recoveryBudgetsWithDefaults(selectedLine?.budgets ?? [])),
@@ -551,7 +553,7 @@ function consumeBudget(line: StageRecoveryLineage, input: StageRecoveryPrepareRe
     if ("kind" in mutation.proof && mutation.proof.kind === "preflight_not_started") {
       if (!snapshot.preflight || canonicalJson(snapshot.preflight) !== canonicalJson(mutation.proof)) return { ok: false, code: "preflight_proof_unpersisted" };
     } else {
-      if ("outcome" in mutation.proof && mutation.proof.outcome === "succeeded") return { ok: false, code: "executor_not_attested_stopped" };
+      if ("outcome" in mutation.proof && mutation.proof.outcome === "succeeded" && (errorClass !== "incomplete_assignment" || !snapshot.submission?.required || snapshot.submission.accepted)) return { ok: false, code: "assignment_continuation_denied" };
       if (!snapshot.terminal || canonicalJson(snapshot.terminal) !== canonicalJson(mutation.proof)) return { ok: false, code: "executor_not_attested_stopped" };
     }
   }

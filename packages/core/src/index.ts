@@ -251,7 +251,7 @@ function createStageRecoveryHost(pi: ExtensionAPI): StageRecoveryHost {
     const send = recoveryMessageSender(pi);
     await send({
       customType: "omp-workflow-stage-recovery",
-      content: "Продолжите назначение через обычный workflow task admission, сохранив canonical handoff и retry_of; не создавайте второй writer и не подделывайте результаты.",
+      content: "Продолжите сохранённое назначение через обычный workflow task admission с canonical handoff и retry_of. Сохраните имеющиеся изменения, отчёт предыдущего worker и результаты проверок; выполните только оставшуюся работу и проверки, затем workflow_submit_result. Не повторяйте весь workflow, не создавайте второй writer и не подделывайте результаты.",
       details: {
         version: 1 as const,
         kind: "stage_recovery_continuation" as const,
@@ -261,6 +261,7 @@ function createStageRecoveryHost(pi: ExtensionAPI): StageRecoveryHost {
         retry_of: input.retry_of ?? input.identity.dispatch_id,
         identity: input.replacement_identity ?? input.identity,
         ...(input.snapshot.handoff ? { handoff: input.snapshot.handoff } : {}),
+        ...(input.snapshot.submission ? { assignment: input.snapshot.submission } : {}),
         ...(input.producer_correction ? { producer_correction: true } : {}),
       },
     }, { deliverAs: "followUp", triggerTurn: true });

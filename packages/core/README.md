@@ -388,6 +388,15 @@ Worker сдаёт логические `outputs` через зарегистри
 JSON не заменяют canonical receipt. `OrchestratorResult.outputs` публикуются
 engine через trusted current-stage binding, а не через произвольный файловый writer.
 
+Если worker завершился нормально, но обязательного receipt нет, coordinator использует
+`workflow_recover` diagnose, затем reconcile с `intent: "replace"`. Engine проверяет
+canonical terminal/assignment/receipt и выдаёт bounded linked continuation, а не новый
+workflow. Новый worker сохраняет изменения и предыдущий отчёт, выполняет оставшуюся
+работу и проверки, затем сдаёт результат. Пользователь может просто попросить
+«продолжи текущую задачу»; internal IDs и правка state не нужны. Accepted receipt
+не разрешает replacement; live/unknown worker не разрешает второго writer.
+
+
 `workflow_submit_result` принимает ровно один вариант: `{ outputs }` или
 `{ outputs_path: path }`. Большие/вложенные результаты при доступном writer сдавайте файлом.
 В JS eval: `const path = 'stage-output-' + crypto.randomUUID() + '.json'; await Bun.write(path, JSON.stringify({ outputs }));`,

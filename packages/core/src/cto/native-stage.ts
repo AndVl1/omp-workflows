@@ -905,6 +905,7 @@ function planNativeStageAssignments(
       }
       let replacementForItem: WorkIdentity | undefined;
       if (candidate) {
+        if (state.stage_receipts?.[candidate.retry_of]) return { result: fail("assignment_already_published", "accepted assignment cannot be continued"), worker_ids: [], recovery_permits: [], changed: false };
         const consumed = consumePreparedRecoveryAdmission(workingRecoveryLedger!, {
           run_id: state.id,
           authority: "cto",

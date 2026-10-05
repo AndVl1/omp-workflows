@@ -135,3 +135,11 @@ NOT_VERIFIED в исходных отчётах; это не переимено�
 Beads `br-4m8` закрыт. Предыдущий exact evidence HEAD `2c14aae` прошёл CI
 `37200406503`/job `111430746121` (SUCCESS, 224s); итог нового closure HEAD
 фиксируется в checks/комментарии PR #77. Merge/release/archive не выполняются.
+
+### Terminal incomplete assignment continuation
+
+- [x] Различить host `succeeded` и accepted mandatory receipt в owner projections ordinary/native; terminal без receipt получает `incomplete_assignment`, не `unknown`.
+- [x] Переиспользовать bounded replacement/permit/root-lineage budgets и locked receipt checks; accepted receipt не разрешает новый dispatch; stale old producer не публикует новый результат.
+- [x] Передать continuation сохранённую задачу и указание закончить только оставшуюся работу/проверки; обновить recovery spec R24/R25, coordinator guidance и changelog.
+- [x] Registered O/C сценарии: terminal success без receipt → linked admission → old publication denied → accepted receipt → checkpoint → advance. Standalone registered-tool smoke также получил обычный receipt attempt 2. Workspace build/typecheck и 29 focused recovery tests PASS. Это scripted host fixture, не live Android/Mainframer восстановление.
+

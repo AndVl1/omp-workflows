@@ -106,6 +106,8 @@ Read-only diagnosis требует authenticated host/worktree, но не дей
 | Worker жив, transport доступен | Reattach/observe по поддерживаемому adapter contract | Создать замену для удобства |
 | Worker жив, transport недоступен | Ограниченная сверка, затем объяснимое ожидание | Timeout означает terminal |
 | Подтверждён terminal failure/cancel | Resume если host поддерживает, иначе связанный replacement с контекстом | Старый worker продолжает писать параллельно |
+| Подтверждён succeeded без обязательного receipt | `incomplete_assignment`: bounded linked continuation сохранённой задачи, изменений и оставшихся проверок | Host success означает выполненную задачу; повторить весь workflow |
+| Succeeded с accepted receipt | Оценить readiness/checkpoint и обычный advance, без replacement | Перезаписать immutable результат |
 | Неизвестный статус | Сохранить pending и способ повторной сверки | Удалить claim/state или придумать terminal |
 | Ошибка сдачи | Field errors producer-у; после его terminal — assignment только на восстановление сдачи | Coordinator сочиняет evidence либо запускает всю реализацию заново |
 | Устаревший handoff | Проверить ownership и выдать актуальное продолжение | Подбор token или downgrade trust |

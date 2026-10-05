@@ -65,6 +65,7 @@ export const DEFAULT_RECOVERY_BUDGET_CLASSES: readonly RecoveryErrorClass[] = [
   "preflight_not_started",
   "terminal_failure",
   "cancelled",
+  "incomplete_assignment",
   "format_validation",
   "transport",
 ];
@@ -873,6 +874,9 @@ function snapshotFromRead(input: { cwd: string; run_id: string; state: TeamState
   const preflight = preflightForRead(line?.preflight, line?.operations ?? [], identity, selected.dispatch, bindingId);
   const rawLifecycle = lifecycleFor(input.state, identity, selected.dispatch, line, input.owner.ownership_epoch);
   const lifecycle = (rawLifecycle === "terminal" && !terminal) || (rawLifecycle === "not_started" && !preflight) ? "unknown" : rawLifecycle;
+  const stage = identity ? loadProfile(identity.workflow)?.stages.find((entry) => entry.id === identity.stage_id) : undefined;
+  const outputs = stage ? (Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : []) : [];
+  const receipt = identity ? Object.values(input.state.stage_receipts ?? {}).find((entry) => sameIdentity(entry.work_identity, identity)) : undefined;
   return {
     run_id: input.run_id,
     authority: "ordinary",
@@ -885,6 +889,7 @@ function snapshotFromRead(input: { cwd: string; run_id: string; state: TeamState
     ...(line?.producer_available === undefined ? { producer_available: producer !== undefined && lifecycle !== "terminal" } : { producer_available: line.producer_available }),
     lifecycle,
     ...(terminal ? { terminal } : {}),
+    ...(identity && selected.dispatch && stage ? { submission: { required: outputs.length > 0, accepted: receipt !== undefined, task: input.state.task } } : {}),
     ...(preflight ? { preflight } : {}),
     ...(line?.error_context ? { error_context: clone(line.error_context) } : {}),
     budgets: clone(recoveryBudgetsWithDefaults(line?.budgets ?? [])),
@@ -972,7 +977,7 @@ function consumeBudget(line: StageRecoveryLineage, input: StageRecoveryPrepareRe
     if ("kind" in mutation.proof && mutation.proof.kind === "preflight_not_started") {
       if (!snapshot.preflight || canonicalJson(snapshot.preflight) !== canonicalJson(mutation.proof)) return { ok: false, code: "preflight_proof_unpersisted" };
     } else {
-      if ("outcome" in mutation.proof && mutation.proof.outcome === "succeeded") return { ok: false, code: "executor_not_attested_stopped" };
+      if ("outcome" in mutation.proof && mutation.proof.outcome === "succeeded" && (errorClass !== "incomplete_assignment" || !snapshot.submission?.required || snapshot.submission.accepted)) return { ok: false, code: "assignment_continuation_denied" };
       if (!snapshot.terminal || canonicalJson(snapshot.terminal) !== canonicalJson(mutation.proof)) return { ok: false, code: "executor_not_attested_stopped" };
     }
   }

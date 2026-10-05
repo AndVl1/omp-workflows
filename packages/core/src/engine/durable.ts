@@ -173,7 +173,7 @@ const activeCapability = (value: TeamState["dispatch_capability"]): ActiveCapabi
   const latestByRole = new Map<string, DispatchRecord>();
   for (const record of cap.dispatches) {
     const previous = latestByRole.get(record.role);
-    if (previous && previous.status !== "failed" && previous.status !== "cancelled") return null;
+    if (previous && previous.status !== "failed" && previous.status !== "cancelled" && !(previous.status === "succeeded" && record.pending?.retry_of === previous.id && record.attempt === previous.attempt + 1)) return null;
     latestByRole.set(record.role, record);
   }
   return cap;
@@ -1684,6 +1684,7 @@ function authorizeRecord(
           retry_of: latest.id,
         }, input.tool_call_id);
         if (consumed.ok) {
+          if (state.stage_receipts?.[latest.id]) return rejectTransition("accepted assignment cannot be continued", state);
           recoveryAdmission = {
             retry_of: consumed.retry_of,
             replacement_identity: consumed.replacement_identity,
@@ -2448,6 +2449,7 @@ export function acceptTrustedStageResult(cwd: string, input: TrustedStageResultI
     const workerProducer = producer.kind === "worker";
     if (workerProducer) {
       if (!record) return rejectTransition("submission dispatch assignment is unavailable", state);
+      if (cap.dispatches.some((candidate) => candidate.pending?.retry_of === record.id)) return rejectTransition("submission assignment was superseded by linked continuation", state);
       if (
         producer.profile !== cap.issued_for.workflow
         || producer.stage_id !== stage.id

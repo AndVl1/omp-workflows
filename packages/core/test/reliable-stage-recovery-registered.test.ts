@@ -1534,3 +1534,43 @@ scenarioTest("[C:R15] native invalid submission returns exact producer errors an
   await runR15("cto");
 });
 
+
+for (const route of ["ordinary", "cto"] as const) {
+  scenarioTest(`${route}: terminal success without receipt continues saved assignment`, async () => {
+    await withSetup(route, async (current) => {
+      const first = await admit(current, "incomplete-first");
+      await terminalWorker(current.harness, first);
+      const diagnosed = await recover(current, "diagnose", "observe");
+      assert.equal(diagnosed.code, "incomplete_assignment", safeRecoveryDetails(diagnosed));
+      assert.equal(diagnosed.worker, "terminal");
+      const continued = await recover(current, "reconcile", "replace");
+      assert.equal(continued.code, "replacement_dispatched", safeRecoveryDetails(continued));
+      const message = recoveryMessage(await current.harness.waitForRecoveryMessage());
+      const previous = identityFromSnapshot(await snapshotFor(current));
+      assert.equal(message.retry_of, previous.dispatch_id);
+      const replacement = await admit(current, "incomplete-next");
+      const stale = await submitValid(current.harness, first, "incomplete-stale");
+      assert.equal(stale.ok, false, JSON.stringify(stale));
+      const receipt = await submitValid(current.harness, replacement, "incomplete-submit");
+      assert.equal(receipt.ok, true, JSON.stringify(receipt));
+      assert.equal(typeof asRecord(receipt.receipt, "accepted receipt").receipt_id, "string");
+      await terminalWorker(current.harness, replacement);
+      const complete = await recover(current, "diagnose", "observe");
+      assert.equal(complete.code, "worker_succeeded", safeRecoveryDetails(complete));
+      assert.equal(complete.action, "none");
+      const messagesBefore = recoveryMessages(current.harness).length;
+      const forbidden = await recover(current, "reconcile", "replace");
+      assert.equal(forbidden.code, "worker_succeeded", safeRecoveryDetails(forbidden));
+      assert.equal(recoveryMessages(current.harness).length, messagesBefore);
+      if (route === "ordinary") {
+        assert.ok(current.handoff);
+        assert.equal((await advanceOrdinaryStage(current.harness, current.handoff, "incomplete-advance")).stage_cursor, "next");
+      } else {
+        const checkpoint = await requireTool(current.harness, "cto_checkpoint_ask").execute("incomplete-checkpoint", { slice_id: "slice-a" }, undefined, undefined, current.harness.context);
+        assert.equal(details(checkpoint.details).ok, true, JSON.stringify(checkpoint.details));
+        const advanced = await requireTool(current.harness, "cto_stage_advance").execute("incomplete-advance", { slice_id: "slice-a" }, undefined, undefined, current.harness.context);
+        assert.equal(details(advanced.details).ok, true, JSON.stringify(advanced.details));
+      }
+    });
+  });
+}

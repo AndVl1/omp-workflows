@@ -90,6 +90,22 @@ Recovery decisions SHALL extend existing `TeamState`/`CtoState` with `stage_reco
 - **WHEN** сдача любого producer не прошла проверку либо worker завершился без обязательной сдачи
 - **THEN** invalid submission returns exact schema errors to the same producer caller; default OMP 18 has no format-repair callback and `format_repair`/`producer_correction` remain unsupported. Only a truthful injected host may prove positive format-repair; fabricated ack or default implementation replacement for type errors is forbidden. A linked submission-repair executor is allowed only after worker terminal confirmation; for `orchestrator`/`tool` no worker terminal is required or created, implementation is not repeated and coordinator does not fabricate missing content
 
+### Requirement: Продолжение завершённого незавершённого assignment
+
+Host lifecycle `succeeded` SHALL означать завершение исполнения, а не успешность задания. Для текущего worker assignment с подтверждённым terminal и отсутствующим обязательным accepted receipt `workflow_recover` SHALL диагностировать `incomplete_assignment`, а не `unknown`. После bounded reconcile existing replacement admission SHALL выдать ровно одну связанную execution identity с `retry_of`. Owner SHALL проверить текущий stage/assignment, обязательность сдачи и отсутствие receipt под canonical lock; отсутствие файла или текст worker MUST NOT заменять эту проверку.
+
+Continuation SHALL сохранить исходную задачу, имеющиеся изменения, доступный отчёт и evidence; выполнить только оставшуюся работу и проверки и опубликовать результат обычным `workflow_submit_result`. Coordinator MUST NOT повторять весь workflow или фабриковать missing content. Pure delivery/schema repair SHALL оставаться отдельным publication-only действием. Пользователь SHALL иметь возможность запросить продолжение обычным текстом без внутренних dispatch/stage ID.
+
+Accepted receipt SHALL оставаться immutable stop condition для continuation; после handoff старый producer MUST NOT писать или публиковать новый результат. Live/disconnected/unknown worker MUST NOT получать второго writer. Конкурирующие запросы SHALL потреблять один permit; бюджеты класса `incomplete_assignment` SHALL сохраняться по root lineage через restart. Unsupported host и исчерпанный бюджет SHALL возвращать typed отказ без нового исполнения.
+
+#### Scenario: R24 Worker blocked после внешнего сбоя
+- **WHEN** worker сохраняет изменения, проверка падает из-за внешнего препятствия, worker нормально завершается без обязательного receipt и coordinator запрашивает продолжение
+- **THEN** engine диагностирует terminal incomplete assignment и выдаёт bounded linked continuation; новый worker использует сохранённую работу, заканчивает проверки, получает обычный receipt; advance остаётся закрыт до остальных условий этапа
+
+#### Scenario: R25 Receipt и конкурентное продолжение
+- **WHEN** receipt уже принят либо два coordinator запроса конкурируют за continuation
+- **THEN** receipt не заменяется; без receipt только один owner-authorized permit создаёт новое исполнение, старый producer не получает полномочий новой попытки
+
 ### Requirement: Доработка выполняет реальные итерации
 
 Ошибка структуры сдачи SHALL исправляться отдельно от реализации. Содержательный FAIL verification либо changes-requested review SHALL запускать затронутую работу и зависимые проверки по профилю с сохранением допустимых upstream-результатов. Каждая итерация SHALL иметь собственный scope и evidence; downstream MUST NOT запускаться при неразрешённом FAIL. Счётчик итераций SHALL отражать реальные исполнения, а не синтетические успешные записи.
