@@ -2,7 +2,7 @@
 
 ## Why
 
-Текущий Bash gate допускает лишь несколько `ast-index` verbs и ограниченные аргументы: полезные `unused-symbols`, `deps`, `module-route`, SQL и structural patterns отклоняются до запуска CLI. Вместо постоянного угадывания отдельных команд нужен допуск самого AST-инструмента с сохранением границы «не произвольный shell».
+Текущий Bash gate допускает lookup/index-refresh и узкий `unused-symbols` с ограниченными flags (baseline локальных fixes `b57045e`); `deps`, `module-route`, SQL и structural patterns остаются вне текущего allowlist. Этот proposal описывает ещё не выполненный полный допуск AST-инструмента с границей «не произвольный shell»; baseline не закрывает его acceptance/tasks.
 
 ## What Changes
 

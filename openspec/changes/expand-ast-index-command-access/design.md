@@ -8,6 +8,13 @@
 
 Existing `simpleGitWords` в orchestrator gate тоже намеренно запрещает quotes и не является готовым shell lexer. Main-spec inventory пуст; новая capability не дублирует опубликованный main spec. Это planning-only change, а не фиксация уже выполненного расширения.
 
+Baseline локальных исправлений `b57045e`: к strict parser добавлен unused-symbols
+с relative --module, --export-only, bounded --limit и json/text --format.
+Эта реализация сохраняет per-verb/option whitelist и не является описанным ниже
+полным cutover. AST-only workers не получают writer/Node права; диагностика с
+general Bash публикует JSON.stringify envelope через уникальный файл и outputs_path.
+
+
 ## Goals / Non-Goals
 
 **Goals:**

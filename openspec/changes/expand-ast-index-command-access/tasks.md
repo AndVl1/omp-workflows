@@ -1,5 +1,9 @@
 # Tasks
 
+Реализованный узкий baseline `b57045e` (unused-symbols/ограниченные flags) и writer-aware
+publication guidance отражены в specs. Они не выполняют полный argv/quoted/roots/watch
+cutover ниже; unchecked tasks остаются pending, не проставляются по baseline smoke.
+
 ## 1. Общая AST command boundary
 
 - [ ] 1.1 Назначить одного implementation/integration owner согласно design и заменить в `packages/core/src/gates/read-only-bash.ts` character/space split на однопроходное распознавание одной команды с буквальными quoted/escaped argv; сохранить trusted executable и metadata boundaries. Проверка: подготовленные в группе 2 cases различают quoted SQL/pattern/path и активные substitutions/operators; malformed quotes/NUL дают отказ; direct AST predicate metadata cases сохраняют отсутствие getter execution только на этапе распознавания AST.

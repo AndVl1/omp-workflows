@@ -4,6 +4,17 @@
 
 Определить полный доступ к AST-анализу и управлению индексом для исследователей и оркестратора, не превращая разрешение специализированного CLI в общий shell-доступ или установку глобальных интеграций.
 
+### Реализованный baseline и граница этого proposal
+
+Ниже описано **планируемое полное расширение**, не текущая реализованная поверхность.
+Локально реализован узкий baseline: single-command search/file/symbol/refs/outline/imports,
+help/version/stats, rebuild/update и unused-symbols с --module (relative, без ../absolute),
+--export-only, --limit 1..10000, --format json/text; duplicate/unknown options запрещены.
+Shell composition, env/root/cwd overrides остаются запрещены; Node/file writer не выдаётся
+этой AST capability. Broad verbs, quoted arguments, watch/root management и global
+--walk-up из требований ниже **не считаются выполненными этим baseline**.
+
+
 ## ADDED Requirements
 
 ### Requirement: Полная поверхность AST анализа и управления индексом

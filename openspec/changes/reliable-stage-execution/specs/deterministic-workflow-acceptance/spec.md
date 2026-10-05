@@ -93,3 +93,12 @@
 #### Scenario: A15 Детерминированный document renderer
 - **WHEN** registered D runner advances `product-discovery/product_prd_document` with its existing `type:"document"` contract (`format:"markdown"`, `renderer:"product-prd"`, declared safe relative path) and the five declared source artifacts
 - **THEN** the engine-owned trusted renderer callback publishes byte-identical document/typed source-content hashes through the same immutable publication/receipt path, without model submission, network access or invented worker terminal
+
+### Requirement: Файловый transport проверяется через зарегистрированный tool
+
+Acceptance SHALL покрывать корректный file envelope/receipt, inline compatibility, both/neither refusal, malformed JSON → correction, обычный schema field_errors path, absolute/traversal/symlink и foreign producer denial, immutable conflict и cold exact replay без canonical мутации. Existing `packages/core/test/stage-result-file.test.ts` покрывает ordinary/CTO handlers; эти проверки не объявляются новыми D runner IDs без фактической регистрации trace mapping. Runtime smoke SHALL отдельно выполнять программную запись уникального файла → зарегистрированный outputs_path → accepted receipt; наличие worker text не является proof.
+
+#### Scenario: File transport сохраняет receipt contract
+- **WHEN** acceptance вызывает зарегистрированный tool с валидным файлом и затем с ошибочными envelope/path/schema/identity
+- **THEN** валидный результат получает assignment-bound receipt, отказы не создают partial publication; read/parse errors не маскируются под schema field_errors
+

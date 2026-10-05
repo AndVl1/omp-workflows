@@ -40,7 +40,7 @@
 
 ### 1. Один протокол сдачи, три доверенных вида producer binding
 
-Рабочее имя нового tool — `workflow_submit_result`. Model-facing envelope остаётся ровно `StageResultSubmission { readonly outputs: Record<string, unknown> }`: модель не передаёт run ID, stage/iteration, dispatch token, capability, authority, producer kind, slot, `tool_name`, пути canonical state или иные служебные идентификаторы. Evidence-ссылки проверяются как часть объявленного output contract; они не становятся authority-полями envelope. При нескольких разрешённых outputs выбор ограничен назначениями текущего caller.
+`workflow_submit_result` принимает ровно один model-facing delivery вариант: `{ outputs: Record<string, unknown> }` либо `{ outputs_path: relativePath }`. Файл строго `{ outputs }`; adapter устанавливает trusted producer workspace, безопасно читает bytes один раз, JSON.parse и передаёт envelope существующему service. Absolute/traversal/symlink и foreign workspace отвергаются; read/path/parse refusal возвращает code/error без schema field_errors/receipt. Authority, immutable publication и replay не меняются. Model не передаёт run/stage/token/producer metadata или canonical state paths.
 
 Core формирует внутренний `StageProducerBinding` только из сохранённого назначения текущего profile/cursor и доверенного runtime-контекста. Его точный discriminant — `producer.kind: "worker" | "orchestrator" | "tool"`:
 
@@ -51,6 +51,9 @@ Core формирует внутренний `StageProducerBinding` только
 Binding дополнительно связывает authority (`ordinary` или `cto`), существующий `WorkIdentity`, profile/stage/iteration/generation и host `{ session_id, worktree, branch }`. Проверка сравнивает kind, assignment, generation, cursor, host и callback с canonical state; текстовые идентификаторы в payload не расширяют полномочия. Подмена worker из main/lead context, чужой или stale assignment, неаутентичный/replayed callback и tool вызванный вне его declared host boundary отвергаются до публикации; для `lecture_acquire` этой boundary является только main session. Старый `StageWorkerBinding` не оставляется alias: draft ещё не выпущен, поэтому callers переводятся на общий `StageProducerBinding` одновременно.
 
 Существующие artifact schemas/validators и snapshots переиспользуются. Невалидный tool JSON также считается неуспешной сдачей: host parsing failure не должен завершать этап. Модель может ошибаться в outputs; детерминизм заключается в проверке и последствиях, а не в обещании безошибочной генерации. В production нет альтернативы «если tool не получилось, доверься файлу»; workflow-owned outputs публикуются только через этот протокол/core API. Альтернатива усилить prompts и продолжать ручной JSON отклонена: она сохраняет класс текущих сбоев.
+
+Большие/nested результаты при разрешённом writer публикуются файлом с уникальным UUID именем на producer occurrence, не общим stage-output.json. JS eval использует Bun.write/JSON.stringify; diagnostics с general Bash может использовать Node randomUUID/writeFileSync с flag wx и передать напечатанный path. AST-only readonly producer без writer сохраняет concise schema-complete inline путь; инструкции не создают отсутствующих tools или source-write прав. После parse error исправляется доставка, не исследование.
+
 
 ### 2. Квитанция, crash-consistency и отдельный terminal transport
 
@@ -314,7 +317,7 @@ Core использует этот вариант исключительно д�
 
 Managed workers продолжают использовать существующий process-local `NativeWorkerAuthority`: доверенный parent Task и уникальный SDK lifecycle связывают canonical assignment с точным session file, затем собственный SDK manager ребёнка подтверждает identity. Это отдельный путь, не idle fallback и не доказательство cold restore. Internal consumer остаётся type-compatible и не выдаёт новую idle capability. Для этого ограниченного repair `Main` владеет actual source integration в core/fullstack, `IdleRegisteredConsumerTests` — кодом двух registered consumer regressions, `IdleAppliedCodeReview` — read-only review. SDK 18.0.6 source evidence не приравнивается к текущему compiled 18.3.4; путь текущего root extension не наблюдён. Изменение исходников и этот контракт не являются runtime PASS.
 
-Единый model-facing вход `workflow_submit_result` принимает только `outputs: Record<string, unknown>` по объявленным artifact IDs текущего producer; evidence-ссылки валидируются по существующему artifact contract. Никаких run ID, token, authority, producer kind, slot, `tool_name` или binding в аргументах. `workflow_recover` предоставляет diagnose/reconcile выбранного trusted контекста без stage token. Типы ниже — общий Core contract; designated owner реализует согласованную часть после approval `Main`, а consumer adapters не создают binding из payload.
+Единый model-facing вход `workflow_submit_result` принимает взаимоисключающие inline `outputs` или `outputs_path`; file adapter доставляет строго outputs envelope в тот же service. Evidence/schema/producer validation и workflow_recover остаются прежними. Delivery не добавляет terminal recovery, retry budgets или повторное исследование.
 
 ```ts
 type StageProducerKind = "worker" | "orchestrator" | "tool";
@@ -360,6 +363,8 @@ interface StageHostBinding {
   readonly callback?: TrustedToolCallback;
 }
 interface StageResultSubmission { readonly outputs: Record<string, unknown>; }
+// Tool delivery boundary, before the existing outputs-only service:
+type StageResultDelivery = StageResultSubmission | { readonly outputs_path: string };
 interface StageResultReceipt {
   readonly receipt_id: string; readonly submission_id: string;
   readonly binding: StageProducerBinding; readonly digest: string;

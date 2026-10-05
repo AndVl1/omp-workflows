@@ -8,7 +8,7 @@
 
 ### Requirement: Доверенная привязка сдачи результата
 
-Система SHALL предоставлять producer-у инструмент структурированной сдачи результата текущего задания в ordinary и CTO исполнении. Model-facing envelope SHALL remain exactly `{ outputs: Record<string, unknown> }`; run, этап, iteration, dispatch, attempt и producer scope SHALL определяться доверенным runtime-контекстом, а модель MUST NOT быть обязана передавать tokens, capability, authority, producer kind, пути canonical state или вычислять служебные идентификаторы. Caller без действующей привязки MUST NOT получить полномочия через поля payload. При нескольких заданиях выбор SHALL ограничиваться подтверждёнными назначениями caller.
+Система SHALL предоставлять producer-у существующий `workflow_submit_result` в ordinary и CTO исполнении. Model-facing input SHALL содержать ровно один вариант: `{ outputs: Record<string, unknown> }` либо `{ outputs_path: relativePath }`, без дополнительных authority-полей. Run, этап, iteration, dispatch, attempt и producer scope SHALL определяться доверенным runtime-контекстом, не моделью. `outputs_path` SHALL быть только способом доставки, не новым publisher или источником полномочий. Caller без действующей привязки MUST NOT получить полномочия через payload.
 
 Atomic evidence и receipt publication SHALL use shared `StatePublication` over existing `LifecycleFileContent` (`string | base64 image | null`); direct binary fallback MUST NOT be introduced.
 
@@ -19,6 +19,35 @@ Atomic evidence и receipt publication SHALL use shared `StatePublication` over 
 #### Scenario: S02 Чужой или устаревший producer
 - **WHEN** caller без назначения, worker другого slice либо старой попытки сдаёт результат текущего этапа
 - **THEN** сдача отвергается без публикации результата и изменения этапа, даже если payload содержит правильные текстовые идентификаторы
+
+### Requirement: Файловая доставка через trusted producer workspace
+
+Файл SHALL содержать строго `{ outputs: Record<string, unknown> }`, без дополнительных форматов, угадывания структуры или починки JSON. Boundary SHALL установить producer/workspace через существующие host bindings до чтения, разрешить относительный путь только внутри этого workspace и выполнить одно безопасное чтение с проверкой symlink/containment. Cwd координатора MUST NOT подменять workspace producer. Прочитанные bytes SHALL пройти JSON.parse и существующий submission service без копии ownership/schema/immutable/receipt логики. Cold replay eligibility SHALL использовать существующий owner-scoped no-recovery boundary до чтения; delivery MUST NOT запускать recovery или изменять state machine.
+
+#### Scenario: Файл принят и inline сохранён
+- **WHEN** действующий producer сдаёт корректный envelope через outputs_path либо inline outputs
+- **THEN** существующий service валидирует outputs и создаёт обычный receipt; exact replay возвращает прежний receipt, изменённый accepted payload отвергается
+
+#### Scenario: Взаимоисключающие delivery варианты
+- **WHEN** input содержит оба outputs/outputs_path либо ни одного
+- **THEN** tool отвергает вызов без публикации и receipt
+
+#### Scenario: Ошибка доставки исправлена без повторного исследования
+- **WHEN** файл отсутствует, нечитаем или содержит malformed JSON, затем действующий producer исправляет файл и повторяет сдачу
+- **THEN** первоначальный отказ содержит структурированные code/error без schema field_errors и receipt; исправленный payload проходит обычный service, а неверная output schema возвращает существующие field_errors
+
+#### Scenario: Небезопасный путь или чужой producer
+- **WHEN** caller использует absolute path, ../, symlink либо чужую producer/workspace identity
+- **THEN** сдача отвергается без receipt; foreign/ineligible producer не получает разрешения читать delivery file
+
+### Requirement: Writer-aware инструкции и изоляция parallel delivery
+
+Для больших, вложенных или многострочных результатов при авторизованном программном writer worker SHALL использовать outputs_path и JSON.stringify, не вручную собранный JSON. Каждый producer occurrence SHALL выделять свежий UUID filename; parallel workers MUST NOT использовать общий stage-output.json. JavaScript eval/Bun.write SHALL предлагаться только при доступном eval; general Bash producer может использовать Node randomUUID и writeFileSync с flag wx. AST-only Bash MUST NOT давать Node/source-write права. Read-only producer без writer SHALL сохранить concise schema-complete inline путь. После inline parse failure producer SHALL переключиться на файл при разрешённом writer либо исправить inline без потери required fields и повторного исследования. Только accepted receipt SHALL подтверждать публикацию; метод MUST NOT обещать восстановление уже завершённого worker.
+
+#### Scenario: Parallel producers и разные writer capabilities
+- **WHEN** parallel producers готовят результаты и только часть имеет разрешённый programmatic writer
+- **THEN** file producers используют разные свежие filenames и JSON.stringify; readonly producer без writer сохраняет concise inline сдачу без обхода AST-only gate, а все завершают публикацию только accepted receipt
+
 
 ### Requirement: Дискриминированное доверенное владение producer
 

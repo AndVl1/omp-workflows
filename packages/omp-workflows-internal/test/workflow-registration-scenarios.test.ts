@@ -16,6 +16,7 @@ import {
 } from "@andvl1/omp-workflows-core";
 
 import ompWorkflowsInternal from "../src/index.js";
+import { z } from "zod";
 
 const INTERNAL_PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TEST_PROFILE: Profile = {
@@ -88,11 +89,6 @@ interface Harness {
 	withRecoveryDispatchBarrier: <T>(callback: (barrier: RecoveryDispatchBarrier) => Promise<T>) => Promise<T>;
 }
 
-function permissiveZod(): { z: unknown } {
-	const schema = new Proxy({}, { get: () => () => schema });
-	const z = new Proxy({}, { get: () => () => schema });
-	return { z };
-}
 
 function markedRoot(): string {
 	const root = mkdtempSync(join(tmpdir(), "omp-internal-workflow-registration-"));
@@ -229,7 +225,7 @@ function makeHarness(): Harness {
 		return delivery;
 	};
 	const pi = {
-		zod: permissiveZod(),
+		zod: { z },
 		on,
 		events: { on },
 		registerCommand() {},
