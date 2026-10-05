@@ -59,9 +59,9 @@ Trusted runtime SHALL назначать ровно один producer discrimina
 - **WHEN** trusted ordinary main-session coordinator or configured CTO lead submits outputs for its current profile-declared orchestrator stage
 - **THEN** outputs are accepted under `producer.kind="orchestrator"` with immutable receipt for that scope, without inventing worker terminal and without satisfying separate approval
 
-#### Scenario: S14 Имитация worker, чужой или stale assignment
-- **WHEN** main/lead caller supplies worker-looking model fields, or worker from another slot/generation/branch or stale lineage submits outputs
-- **THEN** submission is rejected before publication, with no receipt or stage mutation, even when textual IDs in payload match the target
+#### Scenario: S14 Собственный output profile-declared tool
+- **WHEN** текущий authenticated profile-declared tool callback сдаёт свой output через callback-local publisher
+- **THEN** результат принимается под producer.kind tool с immutable receipt для точного assignment; worker terminal и approval не фабрикуются (foreign/stale/impersonation denial остаётся S02/A12)
 
 #### Scenario: S15 Аутентичность tool callback
 - **WHEN** profile-declared tool callback submits through callback-local publisher, or unregistered, wrong-host, wrong-stage, replayed or forged callback attempts same submission
