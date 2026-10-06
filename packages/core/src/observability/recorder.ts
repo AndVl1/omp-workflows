@@ -66,6 +66,8 @@ const TERMINAL_SIGNALS: Record<CompletionTerminalSignal, true> = {
   native_tool_result: true,
   provider_terminal: true,
   contract_failure: true,
+  "preflight:missing_prompt": true,
+  "preflight:invalid_arguments": true,
 };
 const PENDING_REASONS: Record<PendingReason, true> = {
   provider_running: true,

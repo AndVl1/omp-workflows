@@ -23,7 +23,6 @@ import {
   beginCapability,
   completeDispatch,
   createCapability,
-  reconcileTrustedTaskResult,
 } from "../src/engine/durable.js";
 import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 import { resolveConfig } from "../src/engine/config.js";
@@ -35,6 +34,16 @@ import { buildDispatchMarker, dispatchTaskId, parseDispatchMarker, trustedDispat
 import { dodBackstop, validateTypedDoD } from "../src/gates/dod-backstop.js";
 import { registerTeamWorkflow, registerWorkflowTools } from "../src/index.js";
 import { flushRecorder } from "../src/observability/hooks.js";
+import {
+  admitOrdinaryWorker,
+  createCoreFixture,
+  details,
+  requireTool,
+  submission,
+  terminalWorker,
+  type Handoff,
+  type Harness,
+} from "./reliable-stage-execution-fixture.js";
 import {
   TRUSTED_ORCHESTRATOR_WRITE_PROOF,
   createTrustedOrchestratorWriteProof,
@@ -80,12 +89,8 @@ function writeWorkflowState(root: string, state: Record<string, unknown>): strin
   const target = runTarget(root, runId);
   mkdirSync(target.artifactsDir!, { recursive: true });
   const normalized = {
-    schema: 2,
-    run_id: runId,
-    run_key: runId,
     lifecycle_status: "active",
     rework_generation: 0,
-    branch,
     title: "autonomy regression",
     task: "autonomy regression",
     classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
@@ -211,6 +216,27 @@ function registeredWorkflowTools(root: string): Map<string, RegisteredWorkflowTo
   return tools;
 }
 
+function registeredAutonomyHarness(root: string, branch: string, roles: Record<string, string>) {
+  return createCoreFixture({
+    route: "ordinary",
+    root,
+    branch,
+    sessionId: trustedContext(root, branch).session_id,
+    roles,
+    scopeMap: [{ glob: ["**/*"], scope: "backend-kotlin", dev_agent: "developer-kotlin" }],
+  });
+}
+
+async function bindRegisteredAutonomyHarness(
+  harness: Harness,
+  runId: string,
+): Promise<void> {
+  await harness.emit("session_start", { type: "session_start" }, harness.context);
+  const prepared = harness.controller.prepare({ mode: "resume", run_id: runId });
+  assert.equal(prepared.state.run_id, runId);
+  assert.equal(harness.controller.activeClaimRunId(), runId);
+}
+
 test("host admission resolves session-manager cwd for mounted read and workflow tools", async () => {
   const root = mkdtempSync(join(tmpdir(), "host-admission-session-cwd-"));
   try {
@@ -254,6 +280,7 @@ test("host admission resolves session-manager cwd for mounted read and workflow 
       observability: true,
       resolveCwd: resolveSessionCwd,
       getSessionController: getController,
+      resolveTrustedToolCallActor: () => undefined,
     });
     registerWorkflowTools(pi as never, {
       resolveCwd: resolveSessionCwd,
@@ -396,10 +423,13 @@ test("lifecycle write routes are exact outer exemptions while handlers retain ho
       "xd://workflow_instructions",
       "xd://workflow_begin",
       "xd://workflow_status",
-      "xd://workflow_complete",
+      "xd://workflow_submit_result",
+      "xd://workflow_recover",
       "xd://workflow_checkpoint",
       "xd://workflow_checkpoint_ask",
       "xd://workflow_advance",
+      "xd://cto_checkpoint_ask",
+      "xd://cto_stage_advance",
     ];
     assert.equal(controller.selectedRunId(), undefined, "positive route must begin without a preselected run");
     assert.equal(toolCall(routeEvent("xd://workflow_prepare"), trusted), undefined, "workflow_prepare outer write should reach its handler");
@@ -508,6 +538,7 @@ test("lifecycle write routes are exact outer exemptions while handlers retain ho
       ["traversal", routeEvent("xd://workflow_prepare/../workflow_begin")],
       ["case", routeEvent("XD://workflow_prepare")],
       ["unknown", routeEvent("xd://report_issue")],
+      ["removed_completion", routeEvent("xd://workflow_complete")],
       ["ast_edit", routeEvent("xd://ast_edit")],
       ["source", routeEvent("src/app.ts")],
       [".work-state", routeEvent(".work-state/runs/current/state.json")],
@@ -548,6 +579,7 @@ test("host admission blocks cwd-required tools when the resolver has no workspac
     getSessionController: () => {
       throw new Error("missing cwd must not resolve a session controller");
     },
+    resolveTrustedToolCallActor: () => undefined,
   });
   const toolCall = handlers.tool_call?.[0];
   assert.ok(toolCall, "registered tool_call hook is required");
@@ -558,10 +590,162 @@ test("host admission blocks cwd-required tools when the resolver has no workspac
   };
   for (const toolName of ["ask", "task", "write", "edit", "bash"]) {
     const result = toolCall!({ toolName, toolCallId: "missing-cwd-" + toolName, input: {} }, context);
-    assert.deepEqual(result, { block: true, reason: "workflow cwd unavailable" }, toolName);
+    assert.equal(result?.block, true, toolName);
+    assert.match(result?.reason ?? "", /\[workflow_admission:cwd_unavailable\]/, toolName);
   }
   const readResult = toolCall!({ toolName: "read", toolCallId: "missing-cwd-read", input: { path: "xd://workflow_instructions" } }, context);
   assert.equal(readResult, undefined, "read remains harmless without an authoritative workspace");
+});
+
+test("controller-only registration is rejected before host hooks are installed", () => {
+  let labels = 0;
+  let hooks = 0;
+  const pi = {
+    setLabel() {
+      labels += 1;
+    },
+    on() {
+      hooks += 1;
+    },
+  };
+  assert.throws(
+    () => registerTeamWorkflow(pi as never, {
+      label: "bundle label with unsafe\ntext",
+      getSessionController: () => undefined,
+    } as never),
+    /\[workflow_registration:missing_actor_resolver\]/,
+  );
+  assert.equal(labels, 0, "invalid registration must not publish a label");
+  assert.equal(hooks, 0, "invalid registration must not install partial hooks");
+});
+
+test("host admission diagnostics classify resolver failures and invalid adapter output safely", () => {
+  const root = mkdtempSync(join(tmpdir(), "host-admission-diagnostics-"));
+  try {
+    const throwingHandlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (throwingHandlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      resolveCwd: () => {
+        throw new Error("secret cwd resolver exception");
+      },
+      resolveTrustedToolCallActor: () => undefined,
+      label: "diagnostic-bundle",
+    });
+    const throwingResult = throwingHandlers.tool_call?.[0]?.(
+      { toolName: "write", toolCallId: "cwd-throw", input: { path: "src/app.ts", content: "x" } },
+      { cwd: root },
+    ) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(throwingResult?.block, true);
+    assert.match(throwingResult?.reason ?? "", /\[workflow_admission:cwd_resolution_failed\]/);
+    assert.doesNotMatch(throwingResult?.reason ?? "", /secret cwd resolver exception/);
+
+    const nullContextHandlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (nullContextHandlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      cwd: root,
+      resolveTrustedToolCallActor: () => undefined,
+      label: "diagnostic-bundle",
+    });
+    for (const context of [undefined, null]) {
+      let nullContextResult: { block?: boolean; reason?: string } | undefined;
+      assert.doesNotThrow(() => {
+        nullContextResult = nullContextHandlers.tool_call?.[0]?.(
+          { toolName: "write", toolCallId: "null-context", input: { path: "src/app.ts", content: "x" } },
+          context,
+        ) as { block?: boolean; reason?: string } | undefined;
+      });
+      assert.equal(nullContextResult?.block, true);
+      assert.match(nullContextResult?.reason ?? "", /\[workflow_admission:actor_unresolved\]/);
+    }
+
+    let invalidResolution: unknown = { actor: "orchestrator", artifactsDir: 42 };
+    const invalidHandlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (invalidHandlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      cwd: root,
+      resolveTrustedToolCallActor: () => invalidResolution as never,
+      label: "diagnostic-bundle",
+    });
+    for (const resolution of [
+      { actor: "orchestrator", artifactsDir: 42 },
+      { kind: "denied", code: "untrusted_actor_context", actor: "worker" },
+      { kind: "authenticated-interactive-host-no-run", actor: "worker" },
+    ]) {
+      invalidResolution = resolution;
+      const invalidResult = invalidHandlers.tool_call?.[0]?.(
+        { toolName: "write", toolCallId: "invalid-adapter", input: { path: "src/app.ts", content: "x" } },
+        { cwd: root },
+      ) as { block?: boolean; reason?: string } | undefined;
+      assert.equal(invalidResult?.block, true);
+      assert.match(invalidResult?.reason ?? "", /\[workflow_admission:actor_resolver_invalid_result\]/);
+    }
+
+    const deniedHandlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (deniedHandlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      cwd: root,
+      resolveTrustedToolCallActor: () => ({ kind: "denied", code: "host_profile_mismatch" }),
+      label: "diagnostic-bundle",
+    });
+    const deniedResult = deniedHandlers.tool_call?.[0]?.(
+      { toolName: "write", toolCallId: "adapter-denied", input: { path: "src/app.ts", content: "x" } },
+      { cwd: root },
+    ) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(deniedResult?.block, true);
+    assert.match(deniedResult?.reason ?? "", /\[workflow_admission:host_profile_mismatch\]/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable selected run reports state recovery without exposing or rewriting state", () => {
+  const root = mkdtempSync(join(tmpdir(), "admission-selected-recovery-"));
+  try {
+    const runId = writeWorkflowState(root, {});
+    const controller = selectedController(root);
+    const statePath = runTarget(root, runId).statePath;
+    const damagedState = "{ damaged private-state-sentinel";
+    writeFileSync(statePath, damagedState);
+    const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+    registerTeamWorkflow({
+      setLabel() {},
+      on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+        (handlers[name] ??= []).push(handler);
+      },
+    } as never, {
+      cwd: root,
+      observability: false,
+      getSessionController: () => controller,
+      resolveTrustedToolCallActor: () => ({ kind: "authenticated-interactive-host-no-run" }),
+    });
+    const result = handlers.tool_call[0]!({
+      toolName: "write",
+      toolCallId: "selected-recovery",
+      input: { path: "src/app.ts", content: "x" },
+    }, { cwd: root }) as { block?: boolean; reason?: string };
+    assert.equal(result.block, true);
+    assert.match(result.reason ?? "", /\[workflow_admission:workflow_state_recovery_required\]/);
+    assert.doesNotMatch(result.reason ?? "", /private-state-sentinel/);
+    assert.equal(readFileSync(statePath, "utf8"), damagedState);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 function writeImplementationState(root: string): void {
@@ -1117,9 +1301,9 @@ test("strict orchestrator policy blocks source and canonical-state writes, allow
       orchestratorWriteGate(
         { toolName: "write", input: { path: "xd://report_issue", content: "tool routing failed" } },
         hostContext,
-      )?.block,
-      true,
-      "unregistered mounted diagnostics are not lifecycle write exemptions",
+      ),
+      undefined,
+      "diagnostic reporting is not a filesystem write",
     );
     const worker = orchestratorWriteGate({ toolName: "write", input: { actor: "orchestrator", path: "src/app.ts" } }, { ...hostContext, hasUI: false });
     assert.equal(worker, undefined);
@@ -1219,6 +1403,31 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
     assert.equal(invoke({ path: `.work-state/runs/${runId}/state.json` }, trustedRawContext)?.block, true);
     assert.equal(invoke({ path: join(artifactsDir, "..", "escape.json") }, trustedRawContext)?.block, true);
 
+    for (const path of ["xd://report_issue", "agent://LegacyReachability"]) {
+      assert.equal(invoke({ path, content: "coordination evidence" }, trustedRawContext), undefined);
+      assert.equal(
+        invoke({ path, content: "coordination evidence", paths: ["src/app.ts"] }, trustedRawContext)?.block,
+        true,
+        "mixed service/filesystem inputs cannot claim a service exemption",
+      );
+      assert.equal(
+        toolCall!({ toolName: "edit", input: { path } }, trustedRawContext)?.block,
+        true,
+        "only write is the SDK service transport",
+      );
+    }
+    for (const path of [
+      "xd://unknown-device",
+      "xd://report_issue/child",
+      "agent://LegacyReachability/report",
+      "agent://LegacyReachability?path=src",
+      "agent://LegacyReachability#field",
+      "agent://../src",
+      "agent://",
+    ]) {
+      assert.equal(invoke({ path, content: "not a root service route" }, trustedRawContext)?.block, true);
+    }
+
     const missingParents = join(artifactsDir, "new", "nested", "discovery.json");
     assert.equal(invoke({ path: missingParents }, trustedRawContext), undefined, "ordinary missing artifact parents remain valid");
     const escapeTarget = join(root, "escape-target");
@@ -1284,6 +1493,19 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts", trustedRawContext), undefined);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD", trustedRawContext), undefined);
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline", trustedRawContext), undefined);
+    for (const count of [8, 25, 100]) {
+      assert.equal(invokeBash(`GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -${count} --oneline`, trustedRawContext), undefined);
+    }
+    assert.equal(
+      invokeBashInput(
+        { command: "git --no-pager -c core.fsmonitor=false log -8 --oneline", env: { GIT_OPTIONAL_LOCKS: "0" } },
+        trustedRawContext,
+      ),
+      undefined,
+    );
+    for (const args of ["-0", "-101", "-01", "-8 -2", "-8 --ext-diff", "-8 --textconv", "-8; echo changed"]) {
+      assert.equal(invokeBash(`GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log ${args} --oneline`, trustedRawContext)?.block, true);
+    }
     assert.equal(invokeBash("GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current", trustedRawContext), undefined);
     assert.equal(
       invokeBashInput(
@@ -1420,6 +1642,13 @@ test("registered raw tool_call derives a scoped orchestrator only from the trust
     };
     assert.equal(invoke({ path: join(artifactsDir, "discovery.json") }, foreign)?.block, true);
     assert.equal(invoke({ path: "src/app.ts" }, foreign)?.block, true);
+    for (const path of ["xd://report_issue", "agent://LegacyReachability"]) {
+      assert.equal(
+        invoke({ path, content: "forged sender", actor: "orchestrator" }, foreign)?.block,
+        true,
+        "service classification does not bypass authenticated host admission",
+      );
+    }
     const foreignExplicitOrchestrator = {
       ...foreign,
       actor: "orchestrator",
@@ -1889,8 +2118,9 @@ test("dispatch markers bind to the persisted cursor epoch", () => {
   assert.equal(parseDispatchMarker(marker)?.cursor, "epoch-1");
 });
 
-test("strict runtime issues opaque capabilities and reconciles native task results", () => {
+test("strict runtime issues opaque capabilities and reconciles native task results", async () => {
   const root = mkdtempSync(join(tmpdir(), "dispatch-capability-runtime-"));
+  let harness: Harness | undefined;
   try {
     initGit(root, "feature/capability");
     const profile = loadProfile("lightweight");
@@ -1911,6 +2141,9 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       policy: { strict_orchestrator: true },
       pause: { kind: "none", reason: "" },
     });
+    const registered = registeredAutonomyHarness(root, "feature/capability", { "developer-kotlin": "developer-kotlin" });
+    harness = registered;
+    await bindRegisteredAutonomyHarness(registered, runId);
     publishMapping(root, { "developer-kotlin": "developer-kotlin" });
     writeRequiredArtifact(root, "discovery", { task: "capability test", branch: "feature/capability" });
     const begun = beginCapability(root, undefined, { runId });
@@ -1943,13 +2176,14 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
 
     const stage = profile.stages.find((candidate) => candidate.id === "implementation");
     assert.ok(stage);
-    const controller = selectedController(root, "feature/capability");
+    const controller = registered.controller;
+    const taskCallId = "reliable-runtime-task";
     const marker = buildDispatchMarker(handoff.run_key, stage, ["developer-kotlin"], "developer-kotlin", handoff.cursor_epoch);
     const request = trustedDispatchRequests({
       toolName: "task",
-      toolCallId: "tool-1",
+      toolCallId: taskCallId,
       input: { agent: "developer-kotlin", role: "developer-kotlin", task: marker },
-    }, { cwd: root, session_id: trustedContext(root, "feature/capability").session_id, controller });
+    }, { cwd: root, session_id: registered.context.session_id, controller });
     assert.equal(request.ok, true);
     if (!request.ok) return;
     assert.equal(request.requests.length, 1);
@@ -1965,7 +2199,7 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       loop_iteration: handoff.loop_iteration,
       role: "developer-kotlin",
       token: handoff.dispatch_token,
-      origin_session_id: trustedContext(root, "feature/capability").session_id,
+      origin_session_id: registered.context.session_id,
     });
     assert.equal(preauthorized.ok, true);
     const authorized = authorizeDispatchTrusted(root, request.requests[0]!);
@@ -1976,22 +2210,24 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
     if (!duplicateAuthorization.ok || !duplicateAuthorization.record) return;
     assert.equal(duplicateAuthorization.record.id, authorized.record.id);
 
-    const reconciled = reconcileTrustedTaskResult(root, {
-      run_id: runId,
-      tool_call_id: "tool-1",
-      outcome: "succeeded",
-      evidence: "native task result",
-    });
-    const artifactsDir = runTarget(root, runId).artifactsDir!;
-    mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, "result.json"), "{}");
-    writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "capability test", branch: "feature/capability" }));
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({
-      ready: true,
-      validation_run: true,
-      validation_evidence: "focused durable capability test",
-      files_touched: ["src/main.ts"],
-    }));
+    const worker = await admitOrdinaryWorker(registered, handoff as Handoff, "runtime");
+    const submitted = details((await requireTool(registered, "workflow_submit_result").execute(
+      "runtime-submit",
+      submission({
+        implementation: {
+          ready: true,
+          validation_run: true,
+          validation_evidence: "focused durable capability test",
+          files_touched: ["src/main.ts"],
+        },
+      }),
+      undefined,
+      undefined,
+      worker.childContext,
+    )).details);
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
+    await terminalWorker(registered, worker);
+    assert.equal(selectedState(root).dispatch_capability?.dispatches[0]?.status, "succeeded");
     const replay = completeDispatch(root, {
       token: handoff.dispatch_token,
       run_id: runId,
@@ -2005,11 +2241,11 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
       loop_iteration: handoff.loop_iteration,
       role: "developer-kotlin",
       agent: "developer-kotlin",
-      tool_call_id: "tool-1",
+      tool_call_id: taskCallId,
       dispatch_id: authorized.record.id,
       outcome: "succeeded",
       evidence: "explicit workflow evidence",
-      artifact_ids: ["result"],
+      artifact_ids: ["implementation"],
     }, { runId });
     assert.equal(replay.ok, true, JSON.stringify(replay));
 
@@ -2036,6 +2272,7 @@ test("strict runtime issues opaque capabilities and reconciles native task resul
     assert.equal(advanced.state.stage_cursor, "code_review");
     assert.equal(advanced.handoff?.expected_roster[0]?.role, "code-reviewer");
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -2157,6 +2394,7 @@ test("native task hook leaves spawned and scheduled results pending", () => {
     } as never, {
       observability: false,
       getSessionController: (_ctx, cwd) => cwd === root ? controller : undefined,
+      resolveTrustedToolCallActor: () => undefined,
     });
     const invoke = (name: string, event: unknown): unknown[] => {
       const registered = handlers[name] ?? [];
@@ -2244,13 +2482,15 @@ test("native task hook leaves spawned and scheduled results pending", () => {
   }
 });
 
-test("native task result reconciles its immutable origin after the manager moves to another worktree", () => {
+test("native task result reconciles its immutable origin after the manager moves to another worktree", async () => {
   const rootA = mkdtempSync(join(tmpdir(), "dispatch-origin-a-"));
   const rootB = mkdtempSync(join(tmpdir(), "dispatch-origin-b-"));
+  let harnessA: Harness | undefined;
+  let harnessB: Harness | undefined;
   try {
     const profile = loadProfile("lightweight");
     assert.ok(profile);
-    const seed = (root: string, branch: string, task: string) => {
+    const seed = async (root: string, branch: string, task: string) => {
       initGit(root, branch);
       const runId = writeWorkflowState(root, {
         branch,
@@ -2268,9 +2508,13 @@ test("native task result reconciles its immutable origin after the manager moves
         policy: { strict_orchestrator: true },
         pause: { kind: "none", reason: "" },
       });
+      const registered = registeredAutonomyHarness(root, branch, { "developer-kotlin": "developer-kotlin" });
+      if (root === rootA) harnessA = registered;
+      else harnessB = registered;
+      await bindRegisteredAutonomyHarness(registered, runId);
       publishMapping(root, { "developer-kotlin": "developer-kotlin" });
       writeRequiredArtifact(root, "discovery", { task, branch });
-      const controller = preparedController(root, branch);
+      const controller = registered.controller;
       const begun = beginCapability(root, undefined, { runId });
       assert.equal(begun.ok, true);
       const stage = profile.stages.find((candidate) => candidate.id === "implementation");
@@ -2298,12 +2542,13 @@ test("native task result reconciles its immutable origin after the manager moves
         handoff: begun.handoff,
         taskId,
         controller,
+        harness: registered,
         sessionId: trustedContext(root, branch).session_id,
         taskInput: { agent: "developer-kotlin", role: "developer-kotlin", task: marker },
       };
     };
-    const a = seed(rootA, "feature/origin-a", "origin A");
-    const b = seed(rootB, "feature/origin-b", "origin B");
+    const a = await seed(rootA, "feature/origin-a", "origin A");
+    const b = await seed(rootB, "feature/origin-b", "origin B");
     const controllers = new Map([[rootA, a.controller], [rootB, b.controller]]);
     const preauthorized = authorizeDispatch(rootA, {
       run_id: a.runId,
@@ -2337,13 +2582,16 @@ test("native task result reconciles its immutable origin after the manager moves
     } as never, {
       observability: false,
       getSessionController: (_ctx, cwd) => controllers.get(cwd),
+      resolveTrustedToolCallActor: () => undefined,
     });
-    const invoke = (name: string, event: unknown, ctx: unknown): unknown[] => {
+    const invoke = async (name: string, event: unknown, ctx: unknown): Promise<unknown[]> => {
       const registered = handlers[name] ?? [];
       assert.ok(registered.length > 0, `expected ${name} handler registration`);
-      return registered.map((handler) => handler(event, ctx));
+      const results: unknown[] = [];
+      for (const handler of registered) results.push(await handler(event, ctx));
+      return results;
     };
-    const crossOriginBootstrap = invoke("tool_call", {
+    const crossOriginBootstrap = await invoke("tool_call", {
       toolName: "task",
       toolCallId: "cross-origin-bootstrap",
       input: a.taskInput,
@@ -2362,20 +2610,25 @@ test("native task result reconciles its immutable origin after the manager moves
       "cross-origin bootstrap must not replace the preauthorized work identity",
     );
 
-    const originToolCall = {
-      toolName: "task",
-      toolCallId: "origin-tool",
-      input: a.taskInput,
-    };
-    const toolCallResults = invoke("tool_call", originToolCall, {
-      cwd: rootA,
-      hasUI: false,
-      session_id: a.sessionId,
-    });
-    assertAllowedToolHook(toolCallResults, "origin initial tool call");
+    const worker = await admitOrdinaryWorker(a.harness as Harness, a.handoff as Handoff, "origin");
     const rebound = selectedState(rootA).dispatch_capability?.dispatches[0];
-    assert.equal(rebound?.tool_call_id, "origin-tool", "same-origin first bind records the provider call identity");
+    assert.equal(rebound?.tool_call_id, worker.toolCallId, "same-origin first bind records the provider call identity");
     assert.equal(rebound?.origin_session_id, a.sessionId);
+    const submitted = details((await requireTool(a.harness as Harness, "workflow_submit_result").execute(
+      "origin-submit",
+      submission({
+        implementation: {
+          ready: true,
+          validation_run: true,
+          validation_evidence: "focused origin migration test",
+          files_touched: ["src/main.ts"],
+        },
+      }),
+      undefined,
+      undefined,
+      worker.childContext,
+    )).details);
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
 
 
     const beforeB = readFileSync(runTarget(rootB, b.runId).statePath!, "utf8");
@@ -2386,8 +2639,8 @@ test("native task result reconciles its immutable origin after the manager moves
     const migrationReport = JSON.stringify({ source: "migration", migration_id: "migration-root-1", status: "imported" });
     const resultEvent = {
       toolName: "task",
-      toolCallId: "origin-tool",
-      input: a.taskInput,
+      toolCallId: worker.toolCallId,
+      input: worker.input,
       content: [{ type: "text", text: migrationReport }],
       isError: false,
       details: {
@@ -2395,7 +2648,7 @@ test("native task result reconciles its immutable origin after the manager moves
           index: 0,
           id: "developer-kotlin",
           agent: "developer-kotlin",
-          task: a.taskInput.task,
+          task: worker.input.task,
           exitCode: 0,
           output: migrationReport,
           stderr: "",
@@ -2404,31 +2657,34 @@ test("native task result reconciles its immutable origin after the manager moves
         }],
       },
     };
-    invoke("tool_result", resultEvent, lateResultContext);
+    await invoke("tool_result", resultEvent, lateResultContext);
     const afterA = selectedState(rootA);
     assert.equal(afterA.dispatch_capability?.dispatches[0]?.status, "succeeded");
     assert.equal(afterA.dispatch_capability?.dispatches[0]?.completion?.evidence, migrationReport);
     assert.equal(readFileSync(runTarget(rootB, b.runId).statePath!, "utf8"), beforeB, "the moved manager must not mutate B");
 
     const afterFirstResultA = readFileSync(runTarget(rootA, a.runId).statePath!, "utf8");
-    invoke("tool_result", resultEvent, lateResultContext);
+    await invoke("tool_result", resultEvent, lateResultContext);
     assert.equal(readFileSync(runTarget(rootA, a.runId).statePath!, "utf8"), afterFirstResultA, "replayed result must not add mutation");
 
     const mismatchedInput = {
       ...resultEvent,
       input: b.taskInput,
     };
-    invoke("tool_result", mismatchedInput, lateResultContext);
+    await invoke("tool_result", mismatchedInput, lateResultContext);
     assert.equal(readFileSync(runTarget(rootA, a.runId).statePath!, "utf8"), afterFirstResultA, "mismatched origin input must be rejected");
     const beforeUnknown = readFileSync(runTarget(rootB, b.runId).statePath!, "utf8");
-    invoke("tool_result", { ...resultEvent, toolCallId: "unknown-origin" }, lateResultContext);
+    await invoke("tool_result", { ...resultEvent, toolCallId: "unknown-origin" }, lateResultContext);
+    await terminalWorker(a.harness as Harness, worker);
     assert.equal(readFileSync(runTarget(rootB, b.runId).statePath!, "utf8"), beforeUnknown, "unknown origin must be non-mutating");
   } finally {
+    if (harnessA) await harnessA.close();
+    if (harnessB) await harnessB.close();
     rmSync(rootA, { recursive: true, force: true });
     rmSync(rootB, { recursive: true, force: true });
   }
 });
-test("trusted reconciliation preserves every dispatch in a consilium batch", () => {
+test("trusted reconciliation preserves every dispatch in a consilium batch", async () => {
   const root = mkdtempSync(join(tmpdir(), "dispatch-capability-batch-"));
   try {
     const branch = "feature/batch-capability";
@@ -2458,6 +2714,7 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
     if (!begun.ok || !begun.handoff) return;
     const markerFor = (role: string) => begun.handoff!.dispatch_markers.find((entry) => entry.role === role)?.marker ?? "";
     const taskInput = {
+      context: "shared context",
       tasks: [
         { role: "qa", agent: "qa", task: markerFor("qa") },
         { role: "code-reviewer", agent: "code-reviewer", task: markerFor("code-reviewer") },
@@ -2472,13 +2729,18 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
     } as never, {
       observability: false,
       getSessionController: (_ctx, cwd) => cwd === root ? controller : undefined,
+      resolveTrustedToolCallActor: () => undefined,
     });
-    const invoke = (name: string, event: unknown): unknown[] => {
+    const invoke = async (name: string, event: unknown): Promise<unknown[]> => {
       const registered = handlers[name] ?? [];
       assert.ok(registered.length > 0, `expected ${name} handler registration`);
-      return registered.map((handler) => handler(event, { cwd: root, hasUI: false, session_id: trustedContext(root, branch).session_id }));
+      const results: unknown[] = [];
+      for (const handler of registered) {
+        results.push(await handler(event, { cwd: root, hasUI: false, session_id: trustedContext(root, branch).session_id }));
+      }
+      return results;
     };
-    const toolCallResults = invoke("tool_call", {
+    const toolCallResults = await invoke("tool_call", {
       toolName: "task",
       toolCallId: "tool-batch",
       input: taskInput,
@@ -2486,7 +2748,7 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
     assertAllowedToolHook(toolCallResults, "batch initial tool call");
     const failedRow = { index: 0, id: "qa", agent: "qa", task: markerFor("qa"), exitCode: 1, output: "", stderr: "qa evidence", error: "qa evidence", aborted: false };
     const succeededRow = { index: 1, id: "code-reviewer", agent: "code-reviewer", task: markerFor("code-reviewer"), exitCode: 0, output: "review evidence", stderr: "", error: "", aborted: false };
-    invoke("tool_result", {
+    await invoke("tool_result", {
       toolName: "task",
       toolCallId: "tool-batch",
       input: taskInput,
@@ -2498,9 +2760,9 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
     assert.equal(partialState.dispatch_capability?.dispatches[0]?.status, "pending");
     assert.equal(partialState.dispatch_capability?.dispatches[0]?.pending?.pending_reason, "transport_reconnect");
     assert.equal(partialState.dispatch_capability?.dispatches[1]?.status, "succeeded");
-    const retryInput = { tasks: [taskInput.tasks[0]] };
+    const retryInput = { context: taskInput.context, tasks: [taskInput.tasks[0]] };
     const beforeRetryDispatches = JSON.stringify(selectedState(root).dispatch_capability?.dispatches);
-    const retryResults = invoke("tool_call", {
+    const retryResults = await invoke("tool_call", {
       toolName: "task",
       toolCallId: "tool-batch-retry",
       input: retryInput,
@@ -2518,7 +2780,7 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
       isError: false,
       details: { results: [failedRow, succeededRow] },
     };
-    invoke("tool_result", resultEvent);
+    await invoke("tool_result", resultEvent);
     const reconciledState = selectedState(root);
     assert.deepEqual(
       reconciledState.dispatch_capability?.dispatches.map((dispatch) => dispatch.status),
@@ -2529,7 +2791,7 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
       ["qa evidence", "review evidence"],
     );
     const afterTerminal = readFileSync(runTarget(root, runId).statePath!, "utf8");
-    invoke("tool_result", resultEvent);
+    await invoke("tool_result", resultEvent);
     assert.equal(readFileSync(runTarget(root, runId).statePath!, "utf8"), afterTerminal, "replayed terminal rows are idempotent");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -2538,8 +2800,9 @@ test("trusted reconciliation preserves every dispatch in a consilium batch", () 
 
 
 
-test("advance handoff resolves the next stage roster", () => {
+test("advance handoff resolves the next stage roster", async () => {
   const root = mkdtempSync(join(tmpdir(), "dispatch-handoff-"));
+  let harness: Harness | undefined;
   try {
     const branch = "feat/handoff";
     initGit(root, branch);
@@ -2552,25 +2815,25 @@ test("advance handoff resolves the next stage roster", () => {
       classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
       stage_cursor: "implementation",
       stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" as const : stage.id === "discovery" ? "done" as const : "pending" as const })),
-      artifacts: { discovery: "discovery.json", implementation: "implementation.json" },
+      artifacts: { discovery: "discovery.json" },
       required_inputs: { implementation: [{ artifact_id: "discovery", path: "discovery.json" }] },
       policy: { strict_orchestrator: true },
       profile_hash: persistedProfileHash,
       scope: { scope: ["backend-kotlin"], dev_agent: "developer-kotlin" },
       pause: { kind: "none", reason: "" },
     });
-    publishMapping(root, { "developer-kotlin": "developer-kotlin" });
+    const registered = registeredAutonomyHarness(root, branch, {
+      "developer-kotlin": "developer-kotlin",
+      "code-reviewer": "code-reviewer",
+    });
+    harness = registered;
+    await bindRegisteredAutonomyHarness(registered, runId);
+    publishMapping(root, { "developer-kotlin": "developer-kotlin", "code-reviewer": "code-reviewer" });
     writeRequiredArtifact(root, "discovery", { task: "handoff", branch });
     const begun = beginCapability(root, undefined, { runId });
     assert.equal(begun.ok, true);
     if (!begun.ok || !begun.handoff) return;
     const issued = begun.handoff;
-    writeRequiredArtifact(root, "implementation", {
-      ready: true,
-      validation_run: true,
-      validation_evidence: "focused handoff test",
-      files_touched: ["src/main.ts"],
-    });
     const authInput = {
       run_id: runId,
       token: issued.dispatch_token,
@@ -2585,16 +2848,23 @@ test("advance handoff resolves the next stage roster", () => {
       role: "developer-kotlin",
       agent: "developer-kotlin",
     };
-    const authorized = authorizeDispatch(root, authInput);
-    assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-    const completed = completeDispatch(root, {
-      ...authInput,
-      dispatch_id: authorized.record.id,
-      outcome: "succeeded",
-      evidence: "task completed",
-    }, { runId });
-    assert.equal(completed.ok, true);
+    const worker = await admitOrdinaryWorker(registered, issued as Handoff, "handoff");
+    const submitted = details((await requireTool(registered, "workflow_submit_result").execute(
+      "handoff-submit",
+      submission({
+        implementation: {
+          ready: true,
+          validation_run: true,
+          validation_evidence: "focused handoff test",
+          files_touched: ["src/main.ts"],
+        },
+      }),
+      undefined,
+      undefined,
+      worker.childContext,
+    )).details);
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
+    await terminalWorker(registered, worker);
     recordTypedCheckpoint(root, "implementation", "approve_implementation");
     assert.equal(selectedState(root).typed_checkpoint_decisions?.length, 1);
     const advanced = advanceCursor(root, {
@@ -2608,6 +2878,7 @@ test("advance handoff resolves the next stage roster", () => {
     assert.deepEqual(advanced.state.dispatch_capability?.expected_roster, [{ role: "code-reviewer", agent: "code-reviewer" }]);
     assert.equal(advanced.state.dispatch_capability?.kind, "single");
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

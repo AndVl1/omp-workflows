@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { beginLifecycleTransaction, commitLifecycleTransaction, type LifecycleFileContent } from "./lifecycle-journal.js";
+import { beginLifecycleTransaction, commitLifecycleTransaction, type LifecycleInlineContent as LifecycleFileContent } from "./lifecycle-journal.js";
+import { migrateStageRecoveryLedger, type StageRecoveryLedger } from "./stage-recovery-store.js";
 import { normalizePersistedState } from "./state.js";
 import { candidateForState, readRunControl, runTarget } from "./run-store.js";
 import { withWorkspaceTransaction } from "./state.js";
@@ -393,15 +394,187 @@ function validateReferences(source: LegacySource): string[] {
   for (const reference of references) resolveReferencedFile(source, reference);
   return references;
 }
+const ACTIVE_EXECUTION_STATUSES: Record<string, true> = { authorized: true, running: true, pending: true };
+const TERMINAL_EXECUTION_STATUSES: Record<string, true> = { succeeded: true, failed: true, cancelled: true };
+const ACTIVE_CHILD_STATUSES: Record<string, true> = { planned: true, authorized: true, pending: true, conflict: true };
+const TERMINAL_CHILD_STATUSES: Record<string, true> = { succeeded: true, failed: true, cancelled: true };
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+type CompatibilityIssue = {
+  code: MigrationFailure["code"];
+  error: string;
+};
+
+function stageRecoveryLedgerIssue(state: Record<string, unknown>): CompatibilityIssue | null {
+  if (!Object.prototype.hasOwnProperty.call(state, "stage_recovery")) return null;
+  let ledger: StageRecoveryLedger | undefined;
+  try {
+    ledger = migrateStageRecoveryLedger(state.stage_recovery);
+  } catch (error) {
+    const message = String(error);
+    return {
+      code: /unsupported|schema_version/i.test(message) ? "migration_required" : "recovery_required",
+      error: `legacy stage recovery ledger is unsupported or malformed: ${message}`,
+    };
+  }
+  if (!ledger) return null;
+  for (const [lineageKey, lineage] of Object.entries(ledger.lineages)) {
+    if (lineage.operations.some((operation) => operation.status === "prepared")) {
+      return {
+        code: "run_busy",
+        error: `legacy stage recovery lineage '${lineageKey}' has a prepared recovery operation; finish or verify the old executor before migration`,
+      };
+    }
+    if (lineage.lifecycle === "pending" || lineage.lifecycle === "running" || lineage.lifecycle === "disconnected" || lineage.lifecycle === "unknown") {
+      return {
+        code: "run_busy",
+        error: `legacy stage recovery lineage '${lineageKey}' has active or unknown lifecycle '${lineage.lifecycle}'; finish or verify the old executor before migration`,
+      };
+    }
+    if (lineage.lifecycle === "terminal") {
+      const terminal = lineage.terminal;
+      if (
+        !terminal
+        || terminal.authoritative !== true
+        || terminal.run_id !== lineage.identity.run_id
+        || terminal.dispatch_id !== lineage.identity.dispatch_id
+        || terminal.identity.run_id !== lineage.identity.run_id
+        || terminal.identity.stage_id !== lineage.identity.stage_id
+        || terminal.identity.slot_id !== lineage.identity.slot_id
+        || terminal.identity.dispatch_id !== lineage.identity.dispatch_id
+      ) {
+        return {
+          code: "recovery_required",
+          error: `legacy stage recovery lineage '${lineageKey}' is terminal without a matching authoritative terminal proof`,
+        };
+      }
+    } else if (lineage.lifecycle === "not_started") {
+      const preflight = lineage.preflight;
+      if (
+        !preflight
+        || preflight.authoritative !== true
+        || preflight.run_id !== lineage.identity.run_id
+        || preflight.dispatch_id !== lineage.identity.dispatch_id
+        || preflight.identity.run_id !== lineage.identity.run_id
+        || preflight.identity.stage_id !== lineage.identity.stage_id
+        || preflight.identity.slot_id !== lineage.identity.slot_id
+        || preflight.identity.dispatch_id !== lineage.identity.dispatch_id
+      ) {
+        return {
+          code: "recovery_required",
+          error: `legacy stage recovery lineage '${lineageKey}' is not-started without a matching authoritative preflight proof`,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function loopLedgerIssue(state: Record<string, unknown>): CompatibilityIssue | null {
+  if (!Object.prototype.hasOwnProperty.call(state, "loop_state")) return null;
+  const loop = state.loop_state;
+  if (!plainRecord(loop)) return { code: "recovery_required", error: "legacy loop ledger is malformed" };
+  if (loop.status === "running") {
+    return { code: "run_busy", error: "legacy loop ledger has active execution; finish or verify the old executor before migration" };
+  }
+  if (loop.status !== "complete" && loop.status !== "exhausted") {
+    return { code: "recovery_required", error: "legacy loop ledger has an unknown lifecycle status" };
+  }
+  return null;
+}
+
+function rootExecutionLedgerIssue(state: Record<string, unknown>): CompatibilityIssue | null {
+  const migration = state.migration;
+  if (migration !== undefined) {
+    if (!plainRecord(migration)) return { code: "recovery_required", error: "legacy migration receipt is malformed" };
+    if (migration.from_schema !== undefined && migration.from_schema !== 1) return { code: "migration_required", error: `legacy migration receipt declares unsupported source schema '${String(migration.from_schema)}'` };
+    if (migration.to_schema !== undefined && migration.to_schema !== 2) return { code: "migration_required", error: `legacy migration receipt declares unsupported target schema '${String(migration.to_schema)}'; refusing downgrade` };
+    if (migration.status !== undefined && migration.status !== "complete") return { code: "recovery_required", error: `legacy migration receipt has unfinished status '${String(migration.status)}'` };
+  }
+  const pending = state.pending;
+  if (pending !== undefined) {
+    if (!plainRecord(pending)) return { code: "recovery_required", error: "legacy pending work is malformed" };
+    const status = pending.status;
+    if (ACTIVE_EXECUTION_STATUSES[String(status)] === true) {
+      return { code: "run_busy", error: `legacy source has active pending work with status '${String(status)}'` };
+    }
+    if (TERMINAL_EXECUTION_STATUSES[String(status)] !== true) {
+      return { code: "run_busy", error: "legacy source has pending work with an unknown status; verify the old executor before migration" };
+    }
+  }
+
+  const completion = state.completion_envelope;
+  if (completion !== undefined) {
+    if (!plainRecord(completion)) return { code: "recovery_required", error: "legacy completion envelope is malformed" };
+    const outcome = completion.outcome;
+    if (outcome === "pending") return { code: "run_busy", error: "legacy completion envelope is still pending; finish or verify the old executor before migration" };
+    if (TERMINAL_EXECUTION_STATUSES[String(outcome)] !== true) {
+      return { code: "recovery_required", error: "legacy completion envelope has an unknown outcome" };
+    }
+  }
+
+  for (const key of ["child_join", "child_joins"]) {
+    const value = state[key];
+    if (value === undefined) continue;
+    const entries = key === "child_join" ? [value] : value;
+    if (!Array.isArray(entries)) return { code: "recovery_required", error: `legacy ${key} ledger is malformed` };
+    for (const entry of entries) {
+      if (!plainRecord(entry)) return { code: "recovery_required", error: `legacy ${key} ledger contains a malformed entry` };
+      const status = String(entry.state);
+      if (ACTIVE_CHILD_STATUSES[status] === true) return { code: "run_busy", error: `legacy ${key} ledger has active or unknown child work with status '${status}'` };
+      if (TERMINAL_CHILD_STATUSES[status] !== true) return { code: "run_busy", error: `legacy ${key} ledger has an unknown child status '${status}'` };
+    }
+  }
+
+  if (state.work_identity !== undefined) {
+    const terminal = plainRecord(completion) && TERMINAL_EXECUTION_STATUSES[String(completion.outcome)] === true;
+    if (!terminal) return { code: "run_busy", error: "legacy source retains a current work identity; restored authority requires the current owner" };
+  }
+
+  const capability = state.dispatch_capability;
+  if (plainRecord(capability)) {
+    if (capability.producer_assignment !== undefined) {
+      return { code: "run_busy", error: "legacy source retains a current producer assignment; restored authority requires the current owner" };
+    }
+    if (capability.work_identity !== undefined && capability.status !== "complete" && capability.status !== "invalidated") {
+      return { code: "run_busy", error: "legacy dispatch capability retains a current work identity; finish or verify the old executor before migration" };
+    }
+  }
+
+  for (const key of Object.keys(state)) {
+    if (/(?:active|worker|assignment|execution|dispatch|recovery)[_-]?ledger$/i.test(key)) {
+      return { code: "migration_required", error: `legacy source contains unsupported active ledger '${key}'; refusing a downgrade without a compatible migration` };
+    }
+  }
+  for (const key of ["owner_session", "owner_id", "ownership_epoch", "execution_claim"]) {
+    if (state[key] !== undefined) {
+      return { code: "run_busy", error: `legacy source retains '${key}' authority metadata; restored authority requires the current owner` };
+    }
+  }
+  return null;
+}
+
+function legacyCompatibilityIssue(state: Record<string, unknown>): CompatibilityIssue | null {
+  return stageRecoveryLedgerIssue(state) ?? loopLedgerIssue(state) ?? rootExecutionLedgerIssue(state);
+}
+
 
 function hasActiveLegacyExecution(state: Record<string, unknown>): boolean {
-  const activeStatuses = new Set(["authorized", "running", "pending"]);
-  if (state.pending && typeof state.pending === "object") return true;
+  const pending = state.pending;
+  if (pending !== undefined) {
+    if (!plainRecord(pending)) return true;
+    const status = String(pending.status);
+    if (ACTIVE_EXECUTION_STATUSES[status] === true) return true;
+    if (TERMINAL_EXECUTION_STATUSES[status] !== true) return true;
+  }
   const capability = state.dispatch_capability;
   if (!capability || typeof capability !== "object") return false;
   const value = capability as Record<string, unknown>;
-  if (Array.isArray(value.pending) && value.pending.some((entry) => entry && typeof entry === "object" && activeStatuses.has(String((entry as Record<string, unknown>).status)))) return true;
-  if (Array.isArray(value.dispatches) && value.dispatches.some((entry) => entry && typeof entry === "object" && activeStatuses.has(String((entry as Record<string, unknown>).status)))) return true;
+  if (Array.isArray(value.pending) && value.pending.some((entry) => entry && typeof entry === "object" && ACTIVE_EXECUTION_STATUSES[String((entry as Record<string, unknown>).status)] === true)) return true;
+  if (Array.isArray(value.dispatches) && value.dispatches.some((entry) => entry && typeof entry === "object" && ACTIVE_EXECUTION_STATUSES[String((entry as Record<string, unknown>).status)] === true)) return true;
   return false;
 }
 
@@ -525,6 +698,49 @@ function succeededSlots(state: Record<string, unknown>): Array<{ dispatch_id: st
   });
 }
 
+function canonicalMappingIssue(cwd: string, runId: string): string | null {
+  if (!UUID.test(runId)) return "migration receipt has an invalid canonical run id";
+  const target = runTarget(cwd, runId);
+  if (!target.statePath || !existsSync(target.statePath)) return "migration receipt points to a missing canonical run";
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(target.statePath, "utf8"));
+    if (!plainRecord(parsed)) return "migration receipt points to a non-object canonical state";
+    if (parsed.schema !== 2 || parsed.run_id !== runId || parsed.run_key !== runId) {
+      return "migration receipt points to a non-canonical ordinary state";
+    }
+  } catch {
+    return "migration receipt points to an unreadable canonical state";
+  }
+  return null;
+}
+
+function migrationReceiptCompatibilityIssue(cwd: string, receipt: Record<string, unknown>): CompatibilityIssue | null {
+  if (typeof receipt.run_id !== "string" || !UUID.test(receipt.run_id)) {
+    return { code: "recovery_required", error: "legacy migration receipt has no valid canonical run id" };
+  }
+  if (receipt.from_schema !== undefined && receipt.from_schema !== 1) {
+    return { code: "migration_required", error: `legacy migration receipt declares unsupported source schema '${String(receipt.from_schema)}'` };
+  }
+  if (receipt.to_schema !== undefined && receipt.to_schema !== 2) {
+    return { code: "migration_required", error: `legacy migration receipt declares unsupported target schema '${String(receipt.to_schema)}'; refusing downgrade` };
+  }
+  if (receipt.status !== undefined && receipt.status !== "published") {
+    return { code: "recovery_required", error: `legacy migration receipt has unfinished status '${String(receipt.status)}'` };
+  }
+  const targetIssue = canonicalMappingIssue(cwd, receipt.run_id);
+  return targetIssue ? { code: "recovery_required", error: targetIssue } : null;
+}
+function existingMigrationId(cwd: string, runId: string): string {
+  const stateDir = runTarget(cwd, runId).stateDir;
+  if (!stateDir) return "existing";
+  try {
+    const receipt = JSON.parse(readFileSync(join(stateDir, "migration-receipt.json"), "utf8")) as Record<string, unknown>;
+    return typeof receipt.migration_id === "string" && receipt.migration_id.length > 0 ? receipt.migration_id : "existing";
+  } catch {
+    return "existing";
+  }
+}
+
 function existingMapping(cwd: string, source: LegacySource): string | undefined {
   const runsRoot = join(resolve(cwd, WORK_STATE), RUNS);
   if (!existsSync(runsRoot)) return undefined;
@@ -534,7 +750,9 @@ function existingMapping(cwd: string, source: LegacySource): string | undefined 
     if (!existsSync(path)) continue;
     try {
       const receipt = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-      if (receipt.source_id === source.source_id && receipt.source_hash === source.source_hash && typeof receipt.run_id === "string") return receipt.run_id;
+      if (receipt.source_id !== source.source_id || receipt.source_hash !== source.source_hash || typeof receipt.run_id !== "string") continue;
+      if (migrationReceiptCompatibilityIssue(cwd, receipt)) continue;
+      return receipt.run_id;
     } catch {
       // malformed receipts are not mappings
     }
@@ -554,12 +772,18 @@ export function preflightLegacyMigration(cwd: string, source: LegacySource, cont
           const receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as Record<string, unknown>;
           if (receipt.source_id !== source.source_id) continue;
           if (receipt.source_hash !== source.source_hash) return { ok: false, code: "migration_conflict", error: `legacy source '${source.source_id}' changed after its canonical mapping; refusing duplicate import`, source_id: source.source_id, unchanged: true };
-        } catch { /* malformed receipt is handled as recovery by the canonical run reader */ }
+          const receiptIssue = migrationReceiptCompatibilityIssue(cwd, receipt);
+          if (receiptIssue) return { ok: false, ...receiptIssue, error: `legacy source '${source.source_id}' has an incompatible migration receipt: ${receiptIssue.error}`, source_id: source.source_id, unchanged: true };
+        } catch {
+          return { ok: false, code: "recovery_required", error: `legacy migration receipt '${receiptPath}' is malformed; recover the canonical mapping before importing legacy sources`, source_id: source.source_id, unchanged: true };
+        }
       }
     }
     const mapped = existingMapping(cwd, source);
-    if (mapped) return { ok: true, source, migration_id: "existing", run_id: mapped, existing_run_id: mapped, succeeded_slots: [], referenced_paths: validateReferences(source) };
+    if (mapped) return { ok: true, source, migration_id: existingMigrationId(cwd, mapped), run_id: mapped, existing_run_id: mapped, succeeded_slots: [], referenced_paths: validateReferences(source) };
     const references = validateReferences(source);
+    const compatibilityIssue = legacyCompatibilityIssue(source.state);
+    if (compatibilityIssue) return { ok: false, ...compatibilityIssue, error: "legacy source " + source.source_id + ": " + compatibilityIssue.error, source_id: source.source_id, unchanged: true };
     const ledgerIssue = legacyDispatchLedgerIssue(source.state);
     if (ledgerIssue) return { ok: false, code: "recovery_required", error: "legacy source " + source.source_id + " has malformed dispatch history: " + ledgerIssue, source_id: source.source_id, unchanged: true };
     if (hasActiveLegacyExecution(source.state)) return { ok: false, code: "run_busy", error: `legacy source '${source.source_id}' has active or unknown dispatches; finish or verify the old executor before migration`, source_id: source.source_id, unchanged: true };
@@ -615,6 +839,9 @@ function migratedSucceededSlots(source: LegacySource, fallbackStage: string): Re
 
 function migratedState(source: LegacySource, runId: string, migrationId: string): TeamState {
   const issues: string[] = [];
+  const recoveryLedger = source.state.stage_recovery === undefined
+    ? undefined
+    : migrateStageRecoveryLedger(source.state.stage_recovery);
   // Historical dispatch capability and control-plane projections are retained
   // verbatim in the immutable source revision, but must not pass through the
   // live schema validator: legacy records may be identity-less and have no
@@ -634,7 +861,6 @@ function migratedState(source: LegacySource, runId: string, migrationId: string)
     roster_selection: _legacyRosterSelection,
     roster_selections: _legacyRosterSelections,
     checkpoint_policy_binding: _legacyCheckpointPolicyBinding,
-    loop_state: _legacyLoopState,
     ...legacyRetained
   } = source.state;
   const normalized = normalizePersistedState(legacyRetained, issues);
@@ -654,9 +880,17 @@ function migratedState(source: LegacySource, runId: string, migrationId: string)
     roster_selection: _rosterSelection,
     roster_selections: _rosterSelections,
     checkpoint_policy_binding: _checkpointPolicyBinding,
-    loop_state: _loopState,
     ...retained
   } = normalized;
+  const retainedRecord = retained as unknown as Record<string, unknown>;
+  if (recoveryLedger) retainedRecord.stage_recovery = recoveryLedger;
+  const migrationWarnings = [
+    "active capability, pending work and typed checkpoint proofs were reset; historical evidence is in the migration revision",
+    ...(plainRecord(source.state.stage_recovery) && source.state.stage_recovery.schema_version === undefined
+      ? ["supported stage recovery draft normalized to schema version 1; current ownership was not restored"]
+      : []),
+    ...(retained.observability && !existsSync(join(source.state_dir, "observability")) ? ["optional observability evidence was unavailable at migration time"] : []),
+  ];
   const state = {
     ...retained,
     schema: 2 as const,
@@ -676,7 +910,7 @@ function migratedState(source: LegacySource, runId: string, migrationId: string)
       source_policy_hash: null,
       target_policy_hash: digest(JSON.stringify(retained.checkpoint_policy ?? null)),
       legacy_inputs: [source.source_id, source.state_path],
-      warnings: ["active capability, pending work and typed checkpoint proofs were reset; historical evidence is in the migration revision", ...(retained.observability && !existsSync(join(source.state_dir, "observability")) ? ["optional observability evidence was unavailable at migration time"] : [])],
+      warnings: migrationWarnings,
       status: "complete" as const,
       migrated_at: new Date().toISOString(),
     },
@@ -701,7 +935,10 @@ function controlAfter(control: RunControl, state: TeamState, runId: string): str
 
 export function migrateLegacySource(cwd: string, source: LegacySource, context?: TrustedExecutionContext): MigrationOutcome {
   const mapped = existingMapping(cwd, source);
-  if (mapped) return withWorkspaceTransaction(cwd, () => migrateLegacySourceLocked(cwd, source, context));
+  if (mapped) {
+    const target = runTarget(cwd, mapped);
+    return { ok: true, migration_id: existingMigrationId(cwd, mapped), run_id: mapped, source_id: source.source_id, source_hash: source.source_hash, state_path: target.statePath!, archived_path: null, succeeded_slots: [] };
+  }
   const current = discoverLegacySources(cwd).sources.find((candidate) => candidate.source_id === source.source_id);
   if (!current) return { ok: false, code: "migration_conflict", error: `legacy source '${source.source_id}' is missing or was replaced`, source_id: source.source_id, unchanged: true };
   if (current.source_hash !== source.source_hash) return { ok: false, code: "migration_conflict", error: `legacy source '${source.source_id}' changed since preflight`, source_id: source.source_id, unchanged: true };
@@ -760,7 +997,16 @@ function migrateLegacySourceLocked(cwd: string, source: LegacySource, context?: 
   const migrationId = preflight.migration_id;
   const runId = preflight.run_id;
   const target = runTarget(cwd, runId);
-  const state = rewriteMigratedReferences(migratedState(source, runId, migrationId), source, target.stateDir ?? join(resolve(cwd, WORK_STATE), RUNS, runId), target.artifactsDir ?? join(resolve(cwd, WORK_STATE), RUNS, runId, "artifacts"), "", false, true) as TeamState;
+  let state: TeamState;
+  try {
+    state = rewriteMigratedReferences(migratedState(source, runId, migrationId), source, target.stateDir ?? join(resolve(cwd, WORK_STATE), RUNS, runId), target.artifactsDir ?? join(resolve(cwd, WORK_STATE), RUNS, runId, "artifacts"), "", false, true) as TeamState;
+  } catch (error) {
+    const message = String(error);
+    return { ok: false, code: /schema|identity|unsupported/i.test(message) ? "migration_required" : "recovery_required", error: `legacy source '${source.source_id}' could not produce a canonical migration state: ${message}`, source_id: source.source_id, unchanged: true };
+  }
+  if (state.schema !== 2 || state.run_id !== runId || state.run_key !== runId || state.migration?.to_schema !== 2) {
+    return { ok: false, code: "migration_required", error: `legacy source '${source.source_id}' did not produce a versioned schema-2 migration state`, source_id: source.source_id, unchanged: true };
+  }
   // Recollect the complete source manifest immediately before publication
   // and compare it to the accepted hash; additions/removals are covered too.
   const sourceFiles = collectSourceFiles(source);
@@ -773,7 +1019,8 @@ function migrateLegacySourceLocked(cwd: string, source: LegacySource, context?: 
   const archivePathFor = (file: CollectedSourceFile): string => source.kind === "feature"
     ? (file.source_kind === "artifacts" ? join("artifacts", file.relative) : file.relative)
     : (file.source_kind === "artifacts" ? join("artifacts", file.relative) : join("state", file.relative));
-  const migrationReceipt: { archived_path: string | null; [key: string]: unknown } = { migration_id: migrationId, source_id: source.source_id, source_path: source.state_path, source_hash: source.source_hash, state_sha256: digest(source.raw_state), file_manifest: sourceFiles.map((file) => ({ path: file.relative, source_kind: file.source_kind, source_path: file.source_path, sha256: digest(file.content), archive_path: archivePathFor(file) })), run_id: runId, status: "published", archived_path: null, succeeded_slots: preflight.succeeded_slots, created_at: new Date().toISOString() };
+  const sourceSchema = source.state.schema ?? 1;
+  const migrationReceipt: { archived_path: string | null; [key: string]: unknown } = { migration_id: migrationId, source_id: source.source_id, source_path: source.state_path, source_hash: source.source_hash, from_schema: sourceSchema, to_schema: 2, state_sha256: digest(source.raw_state), file_manifest: sourceFiles.map((file) => ({ path: file.relative, source_kind: file.source_kind, source_path: file.source_path, sha256: digest(file.content), archive_path: archivePathFor(file) })), run_id: runId, status: "published", archived_path: null, succeeded_slots: preflight.succeeded_slots, created_at: new Date().toISOString() };
   const revisionRoot = join(target.stateDir!, "revisions", migrationId);
   const after: Record<string, LifecycleFileContent> = {
     [target.statePath!]: `${JSON.stringify(state, null, 2)}\n`,

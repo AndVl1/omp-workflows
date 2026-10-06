@@ -281,6 +281,8 @@ type HostSessionIdentity = {
   sessionFile?: string;
 };
 type CapturedHostSession = HostSessionIdentity & { manager: object; mode: "tui" | "rpc"; hasUI: true };
+/** Self-session identity only; never actor/controller or parent/worker-grant proof. */
+type CapturedIdleBasicToolsHostSession = HostSessionIdentity & { manager: object };
 type PrimaryHostSessionProfile =
   | CapturedHostSession
   | (HostSessionIdentity & { manager: object; mode: "headless"; hasUI: false });
@@ -289,6 +291,7 @@ type LifecycleIdentityPartResult = { valid: true; identity?: LifecycleIdentityPa
 const workflowSessionRef: { current: WorkflowSessionController | null } = { current: null };
 const workflowSessionCapturedAtHostStart = { current: false };
 const capturedHostSessionRef: { current: CapturedHostSession | null } = { current: null };
+const capturedIdleBasicToolsHostSessionRef: { current: CapturedIdleBasicToolsHostSession | null } = { current: null };
 /** Latest primary host profile; headless marks an explicit fail-closed boundary. */
 const primaryHostSessionRef: { current: PrimaryHostSessionProfile | null } = { current: null };
 type ActiveDispatcher = CapturedHostSession & { stop: () => void };
@@ -344,16 +347,16 @@ function aliasedPathField(value: Record<string, unknown>, first: string, second:
 function explicitSessionFile(value: Record<string, unknown>, manager: SessionManagerIdentity): ExplicitStringField {
   const supplied = aliasedPathField(value, "sessionFile", "session_file");
   if (!supplied.valid) return supplied;
-  if (typeof manager.getSessionFile !== "function") return supplied;
+  if (!("getSessionFile" in manager)) return supplied;
+  if (typeof manager.getSessionFile !== "function") return { valid: false };
   let managerFile: unknown;
   try {
     managerFile = manager.getSessionFile();
   } catch {
-    return supplied.value === undefined ? { valid: true } : { valid: false };
+    return { valid: false };
   }
-  if (typeof managerFile !== "string" || managerFile.length === 0) {
-    return supplied.value === undefined ? { valid: true } : { valid: false };
-  }
+  if (managerFile === undefined) return supplied.value === undefined ? { valid: true } : { valid: false };
+  if (typeof managerFile !== "string" || managerFile.length === 0) return { valid: false };
   if (supplied.value !== undefined && !samePath(supplied.value, managerFile)) return { valid: false };
   return { valid: true, value: managerFile };
 }
@@ -491,9 +494,7 @@ function invalidateHeadlessHostSession(authoritative: HostSessionIdentity): void
   primaryHostSessionRef.current = { ...authoritative, manager: authoritative.manager!, mode: "headless", hasUI: false };
 }
 
-function observePrimaryHostSession(ctx: unknown): void {
-  const authoritative = authoritativeHostSession(ctx);
-  if (!authoritative) return;
+function observePrimaryHostSession(ctx: unknown, authoritative: HostSessionIdentity): void {
   const current = primaryHostSessionRef.current;
   const value = ctx as { mode?: unknown; hasUI?: unknown };
   const headless = value.hasUI === false;
@@ -530,6 +531,43 @@ function clearPrimaryHostSession(ctx: unknown): void {
     && current.manager === authoritative.manager) {
     primaryHostSessionRef.current = null;
   }
+}
+
+function revokeIdleBasicToolsHostSession(ctx: unknown): void {
+  const captured = capturedIdleBasicToolsHostSessionRef.current;
+  if (!captured || !ctx || typeof ctx !== "object" || Array.isArray(ctx)) return;
+  let manager: unknown;
+  try {
+    manager = "sessionManager" in ctx ? ctx.sessionManager : undefined;
+  } catch {
+    return;
+  }
+  if (manager === captured.manager) capturedIdleBasicToolsHostSessionRef.current = null;
+}
+
+function captureIdleBasicToolsHostSession(ctx: unknown, authoritative: HostSessionIdentity): void {
+  if (!ctx || typeof ctx !== "object" || Array.isArray(ctx) || !authoritative.manager) return;
+  let hasUI: unknown;
+  try {
+    hasUI = "hasUI" in ctx ? ctx.hasUI : undefined;
+  } catch {
+    return;
+  }
+  if (hasUI !== false) {
+    revokeIdleBasicToolsHostSession(ctx);
+    return;
+  }
+  const capturedInteractive = capturedHostSessionRef.current;
+  if (capturedInteractive?.manager === authoritative.manager) {
+    capturedIdleBasicToolsHostSessionRef.current = null;
+    return;
+  }
+  const primary = primaryHostSessionRef.current;
+  if (primary?.mode === "headless" && sameHostSessionIdentity(primary, authoritative)) {
+    capturedIdleBasicToolsHostSessionRef.current = null;
+    return;
+  }
+  capturedIdleBasicToolsHostSessionRef.current = { ...authoritative, manager: authoritative.manager };
 }
 
 function trustedHostSession(ctx: unknown): boolean {
@@ -783,7 +821,9 @@ function releaseWorkflowSession(event: unknown, ctx: unknown, teardown: boolean)
     if (!teardown) {
       // A turn-level stop is not a host teardown. Resident CTO ownership and
       // its dispatcher remain bound; ordinary workflow ownership may release.
-      if (!ctoClaim) controller.release("host-session-stop");
+      // Preserve an explicit command intent across the classifier turn so a
+      // later user boundary can perform the first prepare.
+      if (!ctoClaim) controller.release("host-session-stop", { preserveCommandIntent: true });
       return;
     }
     if (ctoClaim) {
@@ -808,62 +848,228 @@ function releaseWorkflowSession(event: unknown, ctx: unknown, teardown: boolean)
  * 18.2.2 omits actor/hasUI on this event, so admission is based only on the
  * already captured interactive host profile plus the exact manager identity.
  */
+function resolveFullstackTrustedToolCallActorUnsafe(
+  ctx: unknown,
+  cwd: string,
+  runId: string | undefined,
+): TrustedToolCallResolution | undefined {
+  if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) {
+    return deniedTrustedToolCall("invalid_host_context");
+  }
+  if (hasUntrustedExplicitActor(ctx)) {
+    return deniedTrustedToolCall("untrusted_actor_context");
+  }
+  const idleCaptured = capturedIdleBasicToolsHostSessionRef.current;
+  let rawManager: unknown;
+  try {
+    rawManager = "sessionManager" in ctx ? ctx.sessionManager : undefined;
+  } catch {
+    rawManager = undefined;
+  }
+  if (idleCaptured && rawManager === idleCaptured.manager) {
+    const primary = primaryHostSessionRef.current;
+    if (primary?.mode === "headless" && sameHostSessionIdentity(primary, idleCaptured)) {
+      return deniedTrustedToolCall("headless_host_session");
+    }
+    const hostContextDenial = fullstackRawHostContextDenial(ctx, cwd, idleCaptured, "idle-basic");
+    if (hostContextDenial) return deniedTrustedToolCall(hostContextDenial);
+    const authoritative = authoritativeHostSession(ctx);
+    if (!authoritative) return deniedTrustedToolCall("invalid_host_context");
+    if (!sameHostSessionIdentity(idleCaptured, authoritative)) {
+      return deniedTrustedToolCall("session_identity_mismatch");
+    }
+    return { kind: "authenticated-host-idle-basic-tools" };
+  }
+
+  const captured = capturedHostSessionRef.current;
+  const primary = primaryHostSessionRef.current;
+  const controller = workflowSessionRef.current;
+  if (primary?.mode === "headless") {
+    return deniedTrustedToolCall("headless_host_session");
+  }
+  if (!workflowSessionCapturedAtHostStart.current || !captured || !primary) {
+    return deniedTrustedToolCall("host_session_not_captured");
+  }
+  if (!controller) {
+    return deniedTrustedToolCall("session_controller_unavailable");
+  }
+  const hostContextDenial = fullstackRawHostContextDenial(ctx, cwd, captured);
+  if (hostContextDenial) return deniedTrustedToolCall(hostContextDenial);
+  const authoritative = authoritativeHostSession(ctx);
+  if (!authoritative) return deniedTrustedToolCall("invalid_host_context");
+  if (primary.manager !== captured.manager || primary.sessionId !== captured.sessionId) {
+    return deniedTrustedToolCall("session_identity_mismatch");
+  }
+  if (!samePath(primary.cwd, captured.cwd)) {
+    return deniedTrustedToolCall("worktree_mismatch");
+  }
+  if (authoritative.manager !== captured.manager || authoritative.sessionId !== captured.sessionId) {
+    return deniedTrustedToolCall("session_identity_mismatch");
+  }
+  if (!samePath(authoritative.cwd, captured.cwd)) {
+    return deniedTrustedToolCall("worktree_mismatch");
+  }
+  if (!sameCapturedHostSession(captured, authoritative)) {
+    return deniedTrustedToolCall("session_identity_mismatch");
+  }
+  const value = ctx as { mode?: unknown; hasUI?: unknown };
+  if (value.hasUI === false) return deniedTrustedToolCall("host_profile_mismatch");
+  if (value.mode !== undefined && value.mode !== captured.mode) {
+    return deniedTrustedToolCall("host_profile_mismatch");
+  }
+  if (value.hasUI !== undefined && value.hasUI !== true) {
+    return deniedTrustedToolCall("host_profile_mismatch");
+  }
+  let controllerContext: TrustedExecutionContext;
+  try {
+    controllerContext = controller.context();
+  } catch {
+    return deniedTrustedToolCall("controller_resolution_failed");
+  }
+  if (
+    controllerContext.session_id !== captured.sessionId
+    || !samePath(controllerContext.worktree, captured.cwd)
+  ) {
+    return deniedTrustedToolCall("controller_context_mismatch");
+  }
+
+  let ctoClaim: CtoClaimScope | undefined;
+  try {
+    ctoClaim = controller.activeCtoClaim();
+  } catch {
+    return deniedTrustedToolCall("controller_resolution_failed");
+  }
+  // CTO authority is a distinct scope owned by the shared controller. An
+  // ordinary selected run or explicit target is unrelated and MUST NOT gate
+  // or downgrade a valid CTO claim.
+  if (ctoClaim !== undefined) {
+    if (
+      typeof ctoClaim.run_id !== "string"
+      || ctoClaim.run_id.length === 0
+      || typeof ctoClaim.ownership_epoch !== "string"
+      || ctoClaim.ownership_epoch.length === 0
+    ) {
+      return deniedTrustedToolCall("execution_claim_mismatch");
+    }
+    return {
+      kind: "authenticated-interactive-host-cto",
+      run_id: ctoClaim.run_id,
+      ownership_epoch: ctoClaim.ownership_epoch,
+    };
+  }
+
+  let selectedRunId: string | undefined;
+  let activeClaimRunId: string | undefined;
+  try {
+    selectedRunId = controller.selectedRunId();
+    if (selectedRunId !== runId) return deniedTrustedToolCall("selected_run_mismatch");
+    activeClaimRunId = controller.activeClaimRunId();
+  } catch {
+    return deniedTrustedToolCall("controller_resolution_failed");
+  }
+  if (runId === undefined) {
+    if (activeClaimRunId !== undefined) {
+      return deniedTrustedToolCall("execution_claim_mismatch");
+    }
+    return { kind: "authenticated-interactive-host-no-run" };
+  }
+  if (!runId || activeClaimRunId !== runId) {
+    return deniedTrustedToolCall("execution_claim_mismatch");
+  }
+
+  let artifactsDir: string | undefined;
+  try {
+    artifactsDir = runTarget(captured.cwd, runId).artifactsDir;
+  } catch {
+    return deniedTrustedToolCall("artifacts_scope_mismatch");
+  }
+  const expectedArtifactsDir = resolve(captured.cwd, ".work-state", "runs", runId, "artifacts");
+  if (
+    typeof artifactsDir !== "string"
+    || artifactsDir.length === 0
+    || resolve(artifactsDir) !== expectedArtifactsDir
+  ) {
+    return deniedTrustedToolCall("artifacts_scope_mismatch");
+  }
+  return { actor: "orchestrator", artifactsDir };
+}
+
 function resolveFullstackTrustedToolCallActor(
   ctx: unknown,
   cwd: string,
   runId: string | undefined,
 ): TrustedToolCallResolution | undefined {
-  if (!ctx || typeof ctx !== "object" || hasUntrustedExplicitActor(ctx)) return undefined;
-  const captured = capturedHostSessionRef.current;
-  const primary = primaryHostSessionRef.current;
-  const controller = workflowSessionRef.current;
-  const authoritative = authoritativeHostSession(ctx);
-  if (
-    !workflowSessionCapturedAtHostStart.current
-    || !captured
-    || !primary
-    || primary.mode === "headless"
-    || !controller
-    || primary.manager !== captured.manager
-    || !sameHostSessionIdentity(primary, captured)
-    || !authoritative
-    || !sameCapturedHostSession(captured, authoritative)
-    || resolve(cwd) !== resolve(captured.cwd)
-    || !toolCallProfileMatches(ctx, captured)
-  ) return undefined;
   try {
-    const controllerContext = controller.context();
-    if (
-      controllerContext.session_id !== captured.sessionId
-      || resolve(controllerContext.worktree) !== resolve(captured.cwd)
-    ) return undefined;
-
-    // CTO authority is a distinct scope owned by the shared controller. An
-    // ordinary selected run or explicit target is unrelated and MUST NOT gate
-    // or downgrade a valid CTO claim.
-    const ctoClaim = controller.activeCtoClaim();
-    if (ctoClaim) {
-      return {
-        kind: "authenticated-interactive-host-cto",
-        run_id: ctoClaim.run_id,
-        ownership_epoch: ctoClaim.ownership_epoch,
-      };
-    }
-
-    // Ordinary workflow authority retains the existing selected-run and
-    // execution-claim checks.
-    const selectedRunId = controller.selectedRunId();
-    if (selectedRunId !== runId) return undefined;
-    if (runId === undefined) return { kind: "authenticated-interactive-host-no-run" };
-    if (!runId || controller.activeClaimRunId() !== runId) return undefined;
-    const target = runTarget(captured.cwd, runId);
-    const artifactsDir = target.artifactsDir;
-    const expectedArtifactsDir = resolve(captured.cwd, ".work-state", "runs", runId, "artifacts");
-    if (!artifactsDir || resolve(artifactsDir) !== expectedArtifactsDir) return undefined;
-    return { actor: "orchestrator", artifactsDir };
+    return resolveFullstackTrustedToolCallActorUnsafe(ctx, cwd, runId);
   } catch {
-    return undefined;
+    return deniedTrustedToolCall("controller_resolution_failed");
   }
+}
+
+type TrustedToolCallDenial = Extract<TrustedToolCallResolution, { readonly kind: "denied" }>;
+type TrustedToolCallDenialCode = TrustedToolCallDenial["code"];
+
+function deniedTrustedToolCall(code: TrustedToolCallDenialCode): TrustedToolCallResolution {
+  return { kind: "denied", code };
+}
+
+function fullstackRawHostContextDenial(
+  ctx: unknown,
+  cwd: string,
+  captured: HostSessionIdentity & {
+    manager: object;
+    mode?: "tui" | "rpc";
+    hasUI?: boolean;
+  },
+  profileMode: "interactive" | "idle-basic" = "interactive",
+): TrustedToolCallDenialCode | undefined {
+  const manager = sessionManagerFromContext(ctx);
+  if (!manager) return "invalid_host_context";
+  if (manager !== captured.manager) return "session_identity_mismatch";
+
+  let managerCwd: unknown;
+  let managerSessionId: unknown;
+  try {
+    managerCwd = manager.getCwd();
+    managerSessionId = manager.getSessionId();
+  } catch {
+    return "invalid_host_context";
+  }
+  if (typeof managerCwd !== "string" || managerCwd.length === 0) return "invalid_host_context";
+  if (typeof managerSessionId !== "string" || managerSessionId.length === 0) {
+    return "invalid_host_context";
+  }
+  if (!samePath(managerCwd, captured.cwd)) return "worktree_mismatch";
+  if (managerSessionId !== captured.sessionId) return "session_identity_mismatch";
+
+  const value = ctx as Record<string, unknown>;
+  const suppliedCwd = explicitStringField(value, "cwd");
+  if (!suppliedCwd.valid) return "invalid_host_context";
+  if (suppliedCwd.value !== undefined && !samePath(suppliedCwd.value, captured.cwd)) {
+    return "worktree_mismatch";
+  }
+  const suppliedId = aliasedStringField(value, "session_id", "sessionId");
+  if (!suppliedId.valid) return "invalid_host_context";
+  if (suppliedId.value !== undefined && suppliedId.value !== captured.sessionId) {
+    return "session_identity_mismatch";
+  }
+  const suppliedFile = explicitSessionFile(value, manager);
+  if (!suppliedFile.valid) return "session_identity_mismatch";
+  if (suppliedFile.value !== undefined && captured.sessionFile !== undefined && !samePath(suppliedFile.value, captured.sessionFile)) {
+    return "session_identity_mismatch";
+  }
+  if (typeof cwd !== "string" || cwd.length === 0) return "invalid_host_context";
+  if (!samePath(cwd, captured.cwd)) return "worktree_mismatch";
+
+  const profile = ctx as { mode?: unknown; hasUI?: unknown };
+  if (profileMode === "idle-basic") {
+    if (profile.hasUI !== undefined && profile.hasUI !== false) return "host_profile_mismatch";
+  } else {
+    if (profile.hasUI === false) return "host_profile_mismatch";
+    if (profile.mode !== undefined && profile.mode !== captured.mode) return "host_profile_mismatch";
+    if (profile.hasUI !== undefined && profile.hasUI !== true) return "host_profile_mismatch";
+  }
+  return undefined;
 }
 
 function toolCallProfileMatches(ctx: unknown, captured: CapturedHostSession): boolean {
@@ -1004,18 +1210,23 @@ function currentCtoClaimForContext(ctx: unknown): CtoClaimScope | undefined {
   return getFullstackWorkflowToolSessionController(ctx, cwd)?.activeCtoClaim();
 }
 
-function exactLifecycleContext(event: unknown, ctx: unknown): boolean {
-  if (!eventMatches(event, "session_start")) return false;
+function exactLifecycleContext(event: unknown, ctx: unknown): HostSessionIdentity | undefined {
+  if (!eventMatches(event, "session_start")) return undefined;
   const identity = lifecycleIdentity(event, ctx);
   const authoritative = authoritativeHostSession(ctx);
-  return Boolean(identity && authoritative && sameHostSessionIdentity(identity, authoritative));
+  return identity && authoritative && sameHostSessionIdentity(identity, authoritative) ? authoritative : undefined;
 }
 
 function registerWorkflowSessionProfile(pi: ExtensionAPI): void {
   if (typeof (pi as { on?: unknown }).on !== "function") return;
   pi.on("session_start", (event: unknown, ctx: unknown) => {
-    if (!exactLifecycleContext(event, ctx)) return;
-    observePrimaryHostSession(ctx);
+    const authoritative = exactLifecycleContext(event, ctx);
+    if (!authoritative) {
+      revokeIdleBasicToolsHostSession(ctx);
+      return;
+    }
+    observePrimaryHostSession(ctx, authoritative);
+    captureIdleBasicToolsHostSession(ctx, authoritative);
   });
 }
 
@@ -1027,9 +1238,18 @@ function registerWorkflowSessionController(pi: ExtensionAPI): void {
   });
   // OMP 18.2.2 mutates this same manager's current session id and emits
   // session_switch for /new and /resume; session_start is not a replacement.
-  pi.on("session_switch", (event: unknown, ctx: unknown) => handleWorkflowSessionSwitch(event, ctx));
-  pi.on("session_stop", (event: unknown, ctx: unknown) => releaseWorkflowSession(event, ctx, false));
-  pi.on("session_shutdown", (event: unknown, ctx: unknown) => releaseWorkflowSession(event, ctx, true));
+  pi.on("session_switch", (event: unknown, ctx: unknown) => {
+    revokeIdleBasicToolsHostSession(ctx);
+    handleWorkflowSessionSwitch(event, ctx);
+  });
+  pi.on("session_stop", (event: unknown, ctx: unknown) => {
+    revokeIdleBasicToolsHostSession(ctx);
+    releaseWorkflowSession(event, ctx, false);
+  });
+  pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
+    revokeIdleBasicToolsHostSession(ctx);
+    releaseWorkflowSession(event, ctx, true);
+  });
 }
 
 

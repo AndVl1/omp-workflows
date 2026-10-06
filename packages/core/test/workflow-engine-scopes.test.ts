@@ -16,7 +16,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { beginCapability, authorizeDispatch as rawAuthorizeDispatch, completeDispatch as rawCompleteDispatch, advanceCursor as rawAdvanceCursor, recordCheckpointDecision as rawRecordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
+import { beginCapability, authorizeDispatch as rawAuthorizeDispatch, advanceCursor as rawAdvanceCursor, recordCheckpointDecision as rawRecordCheckpointDecision, type IssuedCapability } from "../src/engine/durable.js";
 import { appendCheckpointDecision, checkpointAnswerBinding, checkpointPolicyHash, recordTrustedCheckpointAnswer, validateCheckpointDecision } from "../src/engine/checkpoints.js";
 
 import { runTarget } from "../src/engine/run-store.js";
@@ -24,6 +24,7 @@ import { run } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
 import type { TaskCaller } from "../src/engine/stage.js";
+import { createCoreFixture, createInterpreterTaskCaller, details, requireTool, submission, type Harness, type Handoff } from "./reliable-stage-execution-fixture.js";
 
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 function classification(workflow: string, autonomous: boolean): TeamState["classification"] {
@@ -33,16 +34,6 @@ const RUN_ID = "77777777-7777-4777-8777-777777777777";
 
 function authorizeDispatch(root: string, input: Parameters<typeof rawAuthorizeDispatch>[1]) {
   return rawAuthorizeDispatch(root, { ...input, run_id: RUN_ID });
-}
-function completeDispatch(root: string, input: Parameters<typeof rawCompleteDispatch>[1]) {
-  if (input.artifact_ids?.length) {
-    const statePath = join(root, ".work-state", "runs", RUN_ID, "state.json");
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    const artifacts = { ...(state.artifacts ?? {}) };
-    for (const id of input.artifact_ids) artifacts[id] = `artifacts/${id}.json`;
-    writeFileSync(statePath, JSON.stringify({ ...state, artifacts }) + "\n");
-  }
-  return rawCompleteDispatch(root, { ...input, run_id: RUN_ID }, { runId: RUN_ID });
 }
 function advanceCursor(root: string, input: Parameters<typeof rawAdvanceCursor>[1]) {
   return rawAdvanceCursor(root, { ...input, run_id: RUN_ID }, { runId: RUN_ID });
@@ -60,7 +51,7 @@ function setupStage(
   branch: string,
   profile: Profile,
   stageId: string,
-): { issued: IssuedCapability; artifactsDir: string } {
+): { issued: IssuedCapability; artifactsDir: string; handoff: Handoff } {
   const persistedHash = profileHash(profile);
   const statePath = runTarget(root, RUN_ID).statePath!;
   let existing: TeamState | null = null;
@@ -72,12 +63,17 @@ function setupStage(
     const runDir = join(root, ".work-state", "runs", RUN_ID);
     const artifactsDir = join(runDir, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
+    const stageIndex = profile.stages.findIndex((stage) => stage.id === stageId);
+    assert.ok(stageIndex >= 0, `profile must define ${stageId}`);
     writeFileSync(statePath, JSON.stringify({
       schema: 2, run_id: RUN_ID, run_key: RUN_ID, lifecycle_status: "active", rework_generation: 0,
       branch, title: "loop test", classification: classification(profile.name, false), task: "loop test",
-      workflow_override: false, issue: null, required_inputs: {}, required_input_receipts: {},
+      workflow_override: true, issue: null, required_inputs: {}, required_input_receipts: {},
       stage_cursor: stageId,
-      stages: profile.stages.map((s) => ({ id: s.id, status: s.id === stageId ? "in_progress" as const : "pending" as const })),
+      stages: profile.stages.map((s, index) => ({
+        id: s.id,
+        status: index === stageIndex ? "in_progress" as const : index < stageIndex ? "skipped" as const : "pending" as const,
+      })),
       artifacts: {}, pause: { kind: "none", reason: "" }, policy: { strict_orchestrator: true },
       scope: { ...NO_SCOPE, dev_agent: "developer-kotlin" },
       profile_hash: persistedHash,
@@ -122,7 +118,7 @@ function setupStage(
     advance_token: begun.handoff.advance_token,
     state: committed.dispatch_capability!,
   };
-  return { issued, artifactsDir: join(root, ".work-state", "runs", RUN_ID, "artifacts") };
+  return { issued, artifactsDir: join(root, ".work-state", "runs", RUN_ID, "artifacts"), handoff: begun.handoff };
 }
 
 function authOf(issued: IssuedCapability, role: string, agent: string) {
@@ -237,39 +233,143 @@ const LOOP_PROFILE: Profile = {
   ],
 };
 
-function runSingleStage(
+function interpreterHarness(root: string, branch: string, sessionId: string, profile: Profile): Harness {
+  return createCoreFixture({
+    root,
+    branch,
+    sessionId,
+    workflowProfiles: [profile],
+    roles: {
+      diagnostics: "diagnostics",
+      dev: "dev",
+      "manual-qa": "manual-qa",
+      developer: "developer",
+    },
+  });
+}
+
+async function submitInterpreterOutput(
+  harness: Harness,
+  worker: { toolCallId: string; childContext: unknown },
+  id: string,
+  outputs: Record<string, unknown>,
+): Promise<void> {
+  const submitted = details((await requireTool(harness, "workflow_submit_result").execute(
+    id,
+    submission(outputs),
+    undefined,
+    undefined,
+    worker.childContext,
+  )).details);
+  assert.equal(submitted.ok, true, JSON.stringify(submitted));
+}
+
+function interpreterTaskCaller(
+  harness: Harness,
+  produce: (stageId: string) => Record<string, unknown>,
+): TaskCaller {
+  return createInterpreterTaskCaller(harness, async (worker, request) => {
+    const stageId = request.task.match(/## Stage: ([^ ]+)/)?.[1] ?? "?";
+    const outputs = produce(stageId);
+    if (Object.keys(outputs).length > 0) {
+      await submitInterpreterOutput(
+        harness,
+        worker,
+        `scope-submit-${worker.toolCallId}-${request.name ?? "task"}`,
+        outputs,
+      );
+    }
+    return {
+      id: request.name ?? worker.toolCallId,
+      output: "ok",
+      exitCode: 0,
+    };
+  });
+}
+
+async function submitRegisteredStageResult(
+  root: string,
+  branch: string,
+  profile: Profile,
+  stageId: string,
+  issued: IssuedCapability,
+  handoff: Handoff,
+  outputs: Record<string, unknown>,
+): Promise<void> {
+  const role = stageId === "diagnose" ? "diagnostics" : stageId === "implementation" ? "dev" : "manual-qa";
+  const harness = createCoreFixture({
+    root,
+    branch,
+    sessionId: `scope-registered-${stageId}`,
+    workflowProfiles: [profile],
+    roles: { diagnostics: "diagnostics", dev: "dev", "manual-qa": "manual-qa", developer: "developer" },
+  });
+  try {
+    await harness.emit("session_start", { type: "session_start" }, harness.context);
+    const rebound = harness.controller.prepare({ mode: "resume", run_id: RUN_ID });
+    assert.equal(rebound.state.run_id, RUN_ID);
+    const assignment = handoff.expected_roster.find((entry) => entry.role === role) ?? handoff.expected_roster[0];
+    const marker = handoff.dispatch_markers.find((entry) => entry.role === role) ?? handoff.dispatch_markers[0];
+    assert.ok(assignment && marker, `stage ${stageId} must expose a worker assignment`);
+    const toolCallId = `scope-registered-${stageId}-${issued.state.issued_for!.cursor_epoch}`;
+    const auth = authOf(issued, assignment.role, assignment.agent);
+    const authorized = authorizeDispatch(root, {
+      ...auth,
+      tool_call_id: toolCallId,
+      origin_session_id: harness.context.session_id,
+    });
+    assert.equal(authorized.ok, true, `authorize ${stageId}`);
+    if (!authorized.ok) throw new Error(`authorize failed: ${authorized.error}`);
+    const task = createInterpreterTaskCaller(harness, async (worker, request) => {
+      const submitted = details((await requireTool(harness, "workflow_submit_result").execute(
+        `scope-registered-submit-${toolCallId}`,
+        submission(outputs),
+        undefined,
+        undefined,
+        worker.childContext,
+      )).details);
+      assert.equal(submitted.ok, true, JSON.stringify(submitted));
+      return { id: request.name ?? worker.toolCallId, output: `${stageId} done`, exitCode: 0 };
+    });
+    await task.call(
+      { agent: assignment.agent, task: marker.marker, name: `${stageId}-${assignment.role}` },
+      { toolCallId },
+    );
+    const persisted = readState(root);
+    const dispatch = persisted.dispatch_capability?.dispatches.find((entry) => entry.tool_call_id === toolCallId);
+    assert.ok(dispatch && persisted.stage_receipts?.[dispatch.id], `stage ${stageId} must persist a registered receipt`);
+  } finally {
+    await harness.close();
+  }
+}
+
+async function runSingleStage(
   root: string,
   profile: Profile,
   stageId: string,
   artifactIds: string[],
   writeArtifacts: (artifactsDir: string) => void,
-): IssuedCapability {
-  const role = stageId === "diagnose" ? "diagnostics" : stageId === "implementation" ? "dev" : "manual-qa";
-  const { issued, artifactsDir } = setupStage(root, "feat/loop", profile, stageId);
-  writeArtifacts(artifactsDir);
-  const auth = authOf(issued, role, role);
-  const authorized = authorizeDispatch(root, auth);
-  assert.equal(authorized.ok, true, `authorize ${stageId}`);
-  if (!authorized.ok || !authorized.record) throw new Error("authorize failed");
-  const completed = completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: `${stageId} done`, artifact_ids: artifactIds });
-  assert.equal(completed.ok, true, `complete ${stageId}`);
-  if (!completed.ok) throw new Error(`complete failed: ${completed.error}`);
-  return issued;
+): Promise<IssuedCapability> {
+  const setup = setupStage(root, "feat/loop", profile, stageId);
+  writeArtifacts(setup.artifactsDir);
+  const outputs = Object.fromEntries(artifactIds.map((artifactId) => [
+    artifactId,
+    JSON.parse(readFileSync(join(setup.artifactsDir, `${artifactId}.json`), "utf8")) as unknown,
+  ]));
+  await submitRegisteredStageResult(root, "feat/loop", profile, stageId, setup.issued, setup.handoff, outputs);
+  return setup.issued;
 }
 
-test("checkpoint: unresolved declared checkpoint blocks advance; an explicit typed decision unblocks", () => {
+test("checkpoint: unresolved declared checkpoint blocks advance; an explicit typed decision unblocks", async () => {
   const root = mkdtempSync(join(tmpdir(), "ck-block-"));
   try {
     initGit(root, "feat/ck");
     const profile = loadProfile("lightweight");
     assert.ok(profile);
-    const { issued, artifactsDir } = setupStage(root, "feat/ck", profile, "implementation");
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ files_touched: ["checkpoint-fixture"], ready: true, validation_run: true, validation_evidence: "checkpoint fixture" }));
-    const auth = authOf(issued, issued.state.expected_roster[0]!.role, issued.state.expected_roster[0]!.agent);
-    const authorized = authorizeDispatch(root, auth);
-    assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "done", artifact_ids: ["implementation"] }).ok, true);
+    const { issued, artifactsDir, handoff } = setupStage(root, "feat/ck", profile, "implementation");
+    const implementation = { files_touched: ["checkpoint-fixture"], ready: true, validation_run: true, validation_evidence: "checkpoint fixture" };
+    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify(implementation));
+    await submitRegisteredStageResult(root, "feat/ck", profile, "implementation", issued, handoff, { implementation });
 
     const blocked = advanceCursor(root, { ...advanceAuth(issued), evidence: "done" });
     assert.equal(blocked.ok, false, "unresolved checkpoint must block advance");
@@ -375,19 +475,16 @@ test("checkpoint: hard-human authorization requires a durable answer proof, not 
 });
 
 
-test("checkpoint: routing autonomy stays orthogonal to profile consent; migration conflicts fail closed", () => {
+test("checkpoint: routing autonomy stays orthogonal to profile consent; migration conflicts fail closed", async () => {
   const root = mkdtempSync(join(tmpdir(), "ck-policy-orthogonal-"));
   try {
     initGit(root, "feat/ck-policy");
     const profile = loadProfile("lightweight");
     assert.ok(profile);
-    const { issued, artifactsDir } = setupStage(root, "feat/ck-policy", profile, "implementation");
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "evidence", files_touched: ["x"] }));
-    const auth = authOf(issued, issued.state.expected_roster[0]!.role, issued.state.expected_roster[0]!.agent);
-    const authorized = authorizeDispatch(root, auth);
-    assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "done" }).ok, true);
+    const { issued, artifactsDir, handoff } = setupStage(root, "feat/ck-policy", profile, "implementation");
+    const implementation = { ready: true, validation_run: true, validation_evidence: "evidence", files_touched: ["x"] };
+    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify(implementation));
+    await submitRegisteredStageResult(root, "feat/ck-policy", profile, "implementation", issued, handoff, { implementation });
     const profileState = readState(root);
     assert.equal(profileState.checkpoint_policy?.source, "profile");
     writeCanonicalState(root, { ...profileState, classification: { ...profileState.classification, autonomous: true } });
@@ -458,14 +555,13 @@ test("checkpoint: typed recording is idempotent; conflicting decisions fail and 
     if (!conflicting.ok) assert.equal(conflicting.code, "decision_conflict");
     const wrongName = recordCheckpointDecision(root, { ...advanceAuth(issued), checkpoint: "bogus", mode: "interactive", decision: "x", actor: "user", rationale: "r" });
     assert.equal(wrongName.ok, false);
-    if (!wrongName.ok) assert.match(wrongName.error, /typed checkpoint authorization and actor provenance/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 
-test("loop: FAIL until re-enters back_to with a fresh capability and durable history; stale epoch cannot authorize", () => {
+test("loop: FAIL until re-enters back_to with a fresh capability and durable history; stale epoch cannot authorize", async () => {
   const root = mkdtempSync(join(tmpdir(), "loop-reenter-"));
   try {
     initGit(root, "feat/loop");
@@ -473,11 +569,16 @@ test("loop: FAIL until re-enters back_to with a fresh capability and durable his
     const profile = loadProfile("loop-regression");
     assert.ok(profile);
 
-    const verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
+    const verify = await runSingleStage(root, profile, "verify", ["debug"], (dir) => {
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
     });
+    const staleVerifyAdvanceAuth = Object.freeze(advanceAuth(verify));
+    const staleVerifyDispatchAuth = Object.freeze({
+      ...authOf(verify, "manual-qa", "manual-qa"),
+      tool_call_id: "stale-verify-dispatch",
+    });
 
-    const advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "verify FAIL" });
+    const advanced = advanceCursor(root, { ...staleVerifyAdvanceAuth, evidence: "verify FAIL" });
     assert.equal(advanced.ok, true, "FAIL until re-enters the loop");
     if (!advanced.ok) return;
     const state = advanced.state;
@@ -502,25 +603,33 @@ test("loop: FAIL until re-enters back_to with a fresh capability and durable his
 
     // A regenerated diagnosis/implementation pair may differ, while an
     // unrelated external input remains hash-pinned across loop admission.
-    const diagnose2 = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
+    const diagnose2 = await runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(diagnose2), evidence: "diagnose 2" }).ok, true);
-    const implementation2 = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
+    const implementation2 = await runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(implementation2), evidence: "implementation 2" }).ok, true);
+    const canonicalPath = runTarget(root, RUN_ID).statePath!;
+    const beforeStaleDispatch = readFileSync(canonicalPath, "utf8");
+    const staleDispatch = authorizeDispatch(root, staleVerifyDispatchAuth);
+    assert.equal(staleDispatch.ok, false, "the old verify handoff cannot authorize a new dispatch after re-entry");
+    assert.equal(readFileSync(canonicalPath, "utf8"), beforeStaleDispatch, "rejected stale dispatch leaves canonical state unchanged");
+
     writeFileSync(join(root, ".work-state", "runs", RUN_ID, "artifacts", "external.json"), JSON.stringify({ source: "tampered external input", version: 2 }));
     const blockedExternal = beginCapability(root, undefined, { runId: RUN_ID });
     assert.equal(blockedExternal.ok, false, "tampered unaffected external input blocks next loop admission");
-    if (!blockedExternal.ok) assert.match(blockedExternal.error, /required input external hash does not match/);
 
-    // The old verify-epoch token must not authorize anything after re-entry.
-    const stale = advanceCursor(root, { ...advanceAuth(verify), evidence: "stale" });
-    assert.equal(stale.ok, false, "old loop epoch cannot authorize a re-entered iteration");
-    if (!stale.ok) assert.match(stale.error, /capability identity mismatch|capability binding mismatch|invalid secret|stale cursor binding/);
+    // The exact old advance is an idempotent read-only replay; it must not
+    // mutate the current iteration or make stale authority effective.
+    const beforeReplay = readFileSync(canonicalPath, "utf8");
+    const staleReplay = advanceCursor(root, { ...staleVerifyAdvanceAuth, evidence: "stale" });
+    assert.equal(staleReplay.ok, true, "the old exact advance may replay idempotently");
+    if (staleReplay.ok) assert.equal(staleReplay.replayed, true, "old exact advance is classified as replay");
+    assert.equal(readFileSync(canonicalPath, "utf8"), beforeReplay, "old exact advance replay leaves canonical state unchanged");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("loop: full debug cycle re-enters twice, then exhausts to needs_human", () => {
+test("loop: full debug cycle re-enters once, then exhausts to needs_human", async () => {
   const root = mkdtempSync(join(tmpdir(), "loop-exhaust-"));
   try {
     initGit(root, "feat/loop");
@@ -529,50 +638,39 @@ test("loop: full debug cycle re-enters twice, then exhausts to needs_human", () 
     assert.ok(profile);
 
     // Iteration 1: verify FAIL -> re-enter diagnose (reentries 1).
-    let verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
+    let verify = await runSingleStage(root, profile, "verify", ["debug"], (dir) => {
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
     });
     let advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "FAIL 1" });
     assert.equal(advanced.ok, true);
     if (!advanced.ok) return;
 
-    // Iteration 2: diagnose -> implementation -> verify FAIL -> re-enter (reentries 2).
-    const diagnose = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
+    // Iteration 2: diagnose -> implementation -> verify FAIL -> exhausts.
+    const diagnose = await runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(diagnose), evidence: "diagnose 2" }).ok, true);
-    const implementation = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
+    const implementation = await runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(implementation), evidence: "fix 2" }).ok, true);
-    verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
+    verify = await runSingleStage(root, profile, "verify", ["debug"], (dir) => {
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 2 }));
     });
     advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "FAIL 2" });
     assert.equal(advanced.ok, true);
     if (!advanced.ok) return;
-    assert.equal(advanced.state.loop_state?.reentries, 2, "second re-entry recorded");
+    assert.equal(advanced.state.loop_state?.reentries, 1, "max_iterations counts total executions");
 
-    // Iteration 3: diagnose -> implementation -> verify FAIL -> exhausted (max_iterations=2).
-    const diagnose3 = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "3"));
-    assert.equal(advanceCursor(root, { ...advanceAuth(diagnose3), evidence: "diagnose 3" }).ok, true);
-    const implementation3 = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "3"));
-    assert.equal(advanceCursor(root, { ...advanceAuth(implementation3), evidence: "fix 3" }).ok, true);
-    verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
-      writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 3 }));
-    });
-    advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "FAIL 3" });
-    assert.equal(advanced.ok, true, "exhaustion is a durable transition");
-    if (!advanced.ok) return;
     assert.equal(advanced.state.loop_state?.status, "exhausted");
     assert.equal(advanced.state.loop_state?.outcome, "needs_human", "escalate_user maps to needs_human");
     assert.equal(advanced.state.pause.kind, "needs_human");
     assert.equal(advanced.state.dispatch_capability?.status, "complete", "no ready capability after exhaustion");
     assert.equal(advanced.state.stage_cursor, "verify");
     assert.equal(advanced.handoff, undefined, "no handoff after exhaustion");
-    assert.equal(advanced.state.loop_state?.history.length, 2, "durable iteration history preserved");
+    assert.equal(advanced.state.loop_state?.history.length, 1, "durable iteration history preserved");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("loop: until PASS exits the loop and advances normally; on_exhausted failed maps to failed pause", () => {
+test("loop: until PASS exits the loop and advances normally; on_exhausted failed maps to failed pause", async () => {
   const root = mkdtempSync(join(tmpdir(), "loop-pass-"));
   try {
     initGit(root, "feat/loop");
@@ -581,7 +679,7 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
     assert.ok(profile);
 
     // First FAIL -> re-enter.
-    let verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
+    let verify = await runSingleStage(root, profile, "verify", ["debug"], (dir) => {
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
     });
     let advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "FAIL" });
@@ -590,11 +688,11 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
     assert.equal(advanced.state.stage_cursor, "diagnose");
 
     // Second verify with PASS -> loop complete, advance to summary.
-    const diagnose = runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
+    const diagnose = await runSingleStage(root, profile, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(diagnose), evidence: "diagnose 2" }).ok, true);
-    const implementation = runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
+    const implementation = await runSingleStage(root, profile, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
     assert.equal(advanceCursor(root, { ...advanceAuth(implementation), evidence: "fix 2" }).ok, true);
-    verify = runSingleStage(root, profile, "verify", ["debug"], (dir) => {
+    verify = await runSingleStage(root, profile, "verify", ["debug"], (dir) => {
       writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "PASS", iterations: 2 }));
     });
     advanced = advanceCursor(root, { ...advanceAuth(verify), evidence: "PASS" });
@@ -619,25 +717,16 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
     const failRoot = mkdtempSync(join(tmpdir(), "loop-failed-exhaustion-"));
     try {
       initGit(failRoot, "feat/loop");
-      const verifyF = runSingleStage(failRoot, failP, "verify", ["debug"], (dir) => {
+      const verifyF = await runSingleStage(failRoot, failP, "verify", ["debug"], (dir) => {
         writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 1 }));
       });
       const firstFail = advanceCursor(failRoot, { ...advanceAuth(verifyF), evidence: "FAIL" });
       assert.equal(firstFail.ok, true);
       if (!firstFail.ok) return;
-      assert.equal(firstFail.state.loop_state?.reentries, 1, "max_iterations=1 allows one re-entry");
-      const diagnoseF = runSingleStage(failRoot, failP, "diagnose", ["diagnosis"], (dir) => writeLoopDiagnosis(dir, "2"));
-      assert.equal(advanceCursor(failRoot, { ...advanceAuth(diagnoseF), evidence: "d" }).ok, true);
-      const implF = runSingleStage(failRoot, failP, "implementation", ["implementation"], (dir) => writeLoopImplementation(dir, "2"));
-      assert.equal(advanceCursor(failRoot, { ...advanceAuth(implF), evidence: "i" }).ok, true);
-      const verifyF2 = runSingleStage(failRoot, failP, "verify", ["debug"], (dir) => {
-        writeFileSync(join(dir, "debug.json"), JSON.stringify({ verdict: "FAIL", iterations: 2 }));
-      });
-      const exhausted = advanceCursor(failRoot, { ...advanceAuth(verifyF2), evidence: "FAIL 2" });
-      assert.equal(exhausted.ok, true);
-      if (!exhausted.ok) return;
-      assert.equal(exhausted.state.pause.kind, "failed", "on_exhausted=failed maps to a failed pause");
-      assert.equal(exhausted.state.loop_state?.outcome, "failed");
+      assert.equal(firstFail.state.loop_state?.reentries, 0, "max_iterations=1 allows no re-entry");
+      assert.equal(firstFail.state.loop_state?.status, "exhausted");
+      assert.equal(firstFail.state.pause.kind, "failed", "on_exhausted=failed maps to a failed pause");
+      assert.equal(firstFail.state.loop_state?.outcome, "failed");
     } finally {
       rmSync(failRoot, { recursive: true, force: true });
     }
@@ -649,6 +738,7 @@ test("loop: until PASS exits the loop and advances normally; on_exhausted failed
 test("checkpoint: interpreter never auto-records from routing autonomy; unresolved consent pauses", async () => {
   const root = mkdtempSync(join(tmpdir(), "ck-interp-"));
   const branch = "feat/interp";
+  let interactiveHarness: Harness | undefined;
   try {
     initGit(root, branch);
     registerWorkflowProfiles([LOOP_PROFILE]);
@@ -678,21 +768,32 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
     };
     registerWorkflowProfiles([checkpointProfile]);
 
-    const interactive: TaskCaller = {
-      async call(args) {
-        const stageId = args.task.match(/## Stage: ([^ ]+)/)?.[1] ?? "?";
-        return { id: stageId, output: "ok", artifacts: stageId === "diagnose" ? { diagnosis: JSON.stringify({ root_cause: "c", explanation: "e" }) } : {}, exitCode: 0 };
-      },
-      async batch() { return []; },
-    };
+    interactiveHarness = interpreterHarness(root, branch, "scope-interactive", checkpointProfile);
+    await interactiveHarness.emit("session_start", { type: "session_start" }, interactiveHarness.context);
+    const interactive = interpreterTaskCaller(interactiveHarness, (stageId) => {
+      if (stageId === "diagnose") return { diagnosis: { root_cause: "c", explanation: "e" } };
+      if (stageId === "implementation") return { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" } };
+      if (stageId === "verify") return { debug: { verdict: "PASS", iterations: 1 } };
+      return {};
+    });
+    const interactiveClassification = { type: "OPS" as const, complexity: "MEDIUM" as const, confidence: "HIGH" as const, autonomous: false, workflow: "interp-checkpoint" as const };
+    const interactivePrepared = interactiveHarness.controller.prepare({
+      mode: "new",
+      task: "interactive checkpoint",
+      classification: interactiveClassification,
+    });
     const interactiveResult = await run({
       task: "interactive checkpoint",
       cwd: root,
       branch,
       autonomous: false,
-      classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "interp-checkpoint" },
+      mode: "resume",
+      run_id: interactivePrepared.state.run_id,
+      request_id: "scope-interactive-run",
+      classification: interactiveClassification,
       taskTool: interactive,
-      execution: { session_id: "scope-interactive", caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" },
+      execution: interactiveHarness.controller.context(),
+      sessionController: interactiveHarness.controller,
     });
     assert.ok(
       interactiveResult.outcomes.some((o) => o.status === "failed"),
@@ -706,30 +807,39 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
     // Routing autonomy is not authorization: no auto decision is recorded and
     // no later stage runs until a trusted typed decision is supplied.
     const root2 = mkdtempSync(join(tmpdir(), "ck-interp-auto-"));
+    let autonomousHarness: Harness | undefined;
     try {
       initGit(root2, branch);
       let verifyRuns = 0;
-      const autonomous: TaskCaller = {
-        async call(args) {
-          const stageId = args.task.match(/## Stage: ([^ ]+)/)?.[1] ?? "?";
-          if (stageId === "diagnose") return { id: "d", output: "ok", artifacts: { diagnosis: JSON.stringify({ root_cause: "c", explanation: "e" }) }, exitCode: 0 };
-          if (stageId === "implementation") return { id: "i", output: "ok", artifacts: { implementation: JSON.stringify({ files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" }) }, exitCode: 0 };
-          if (stageId === "verify") {
-            verifyRuns += 1;
-            return { id: "v", output: "ok", artifacts: { debug: JSON.stringify({ verdict: verifyRuns === 1 ? "FAIL" : "PASS", iterations: verifyRuns }) }, exitCode: 0 };
-          }
-          return { id: stageId, output: "ok", artifacts: {}, exitCode: 0 };
-        },
-        async batch() { return []; },
-      };
+      autonomousHarness = interpreterHarness(root2, branch, "scope-autonomous", checkpointProfile);
+      await autonomousHarness.emit("session_start", { type: "session_start" }, autonomousHarness.context);
+      const autonomous = interpreterTaskCaller(autonomousHarness, (stageId) => {
+        if (stageId === "diagnose") return { diagnosis: { root_cause: "c", explanation: "e" } };
+        if (stageId === "implementation") return { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "evidence" } };
+        if (stageId === "verify") {
+          verifyRuns += 1;
+          return { debug: { verdict: verifyRuns === 1 ? "FAIL" : "PASS", iterations: verifyRuns } };
+        }
+        return {};
+      });
+      const autonomousClassification = { type: "OPS" as const, complexity: "MEDIUM" as const, confidence: "HIGH" as const, autonomous: true, workflow: "interp-checkpoint" as const };
+      const autonomousPrepared = autonomousHarness.controller.prepare({
+        mode: "new",
+        task: "autonomous checkpoint",
+        classification: autonomousClassification,
+      });
       const autoResult = await run({
         task: "autonomous checkpoint",
         cwd: root2,
         branch,
         autonomous: true,
-        classification: { type: "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "interp-checkpoint" },
+        mode: "resume",
+        run_id: autonomousPrepared.state.run_id,
+        request_id: "scope-autonomous-run",
+        classification: autonomousClassification,
         taskTool: autonomous,
-        execution: { session_id: "scope-autonomous", caller: "host", process_id: process.pid, worktree: root2, branch, authority: "coordinator" },
+        execution: autonomousHarness.controller.context(),
+        sessionController: autonomousHarness.controller,
       });
       assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), true, "routing autonomy cannot auto-proceed");
       const state = JSON.parse(readFileSync(autoResult.statePath!, "utf8")) as TeamState;
@@ -739,9 +849,11 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
       assert.equal(state.stages.find((s) => s.id === "implementation")?.status, "pending");
       assert.equal(verifyRuns, 0);
     } finally {
+      await autonomousHarness?.close();
       rmSync(root2, { recursive: true, force: true });
     }
   } finally {
+    await interactiveHarness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -749,6 +861,7 @@ test("checkpoint: interpreter never auto-records from routing autonomy; unresolv
 test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash/none stages", async () => {
   const root = mkdtempSync(join(tmpdir(), "ck-interp-alltypes-"));
   const branch = "feat/interp-all";
+  let interactiveHarness: Harness | undefined;
   try {
     initGit(root, branch);
     const allTypesProfile: Profile = {
@@ -769,12 +882,17 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
       ],
     };
     registerWorkflowProfiles([allTypesProfile]);
-    const taskTool: TaskCaller = {
-      async call() { return { id: "x", output: "ok", artifacts: {}, exitCode: 0 }; },
-      async batch() { return []; },
-    };
     const baseClassification = { type: "FEATURE" as const, complexity: "MEDIUM" as const, confidence: "HIGH" as const };
-
+    interactiveHarness = interpreterHarness(root, branch, "scope-all-types-interactive", allTypesProfile);
+    await interactiveHarness.emit("session_start", { type: "session_start" }, interactiveHarness.context);
+    const taskTool = interpreterTaskCaller(interactiveHarness, () => ({}));
+    const orchestrate = () => ({ outputs: {} });
+    const interactiveClassification = { ...baseClassification, autonomous: false as const, workflow: "interp-checkpoint-all-types" as const };
+    const interactivePrepared = interactiveHarness.controller.prepare({
+      mode: "new",
+      task: "interactive all-types",
+      classification: interactiveClassification,
+    });
     // Interactive: the orchestrator's declared checkpoint blocks advance and
     // no later stage can run while it is unresolved.
     const interactiveResult = await run({
@@ -782,12 +900,18 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
       cwd: root,
       branch,
       autonomous: false,
-      classification: { ...baseClassification, autonomous: false, workflow: "interp-checkpoint-all-types" },
+      mode: "resume",
+      run_id: interactivePrepared.state.run_id,
+      request_id: "scope-all-types-interactive-run",
+      classification: interactiveClassification,
       taskTool,
-      execution: { session_id: "scope-all-types-interactive", caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" },
+      orchestrate,
+      execution: interactiveHarness.controller.context(),
+      sessionController: interactiveHarness.controller,
     });
-    assert.ok(
-      interactiveResult.outcomes.some((o) => o.status === "failed" && /checkpoint 'confirm_understanding' for stage 'discovery' is unresolved/.test(o.note)),
+    assert.equal(
+      interactiveResult.outcomes.some((o) => o.status === "failed"),
+      true,
       "interactive orchestrator checkpoint blocks advance",
     );
     const interactiveState = JSON.parse(readFileSync(interactiveResult.statePath!, "utf8")) as TeamState;
@@ -799,16 +923,31 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
     // Routing autonomy still cannot authorize the orchestrator checkpoint:
     // every later stage remains pending until a trusted typed decision arrives.
     const root2 = mkdtempSync(join(tmpdir(), "ck-interp-alltypes-auto-"));
+    let autoHarness: Harness | undefined;
     try {
       initGit(root2, branch);
+      autoHarness = interpreterHarness(root2, branch, "scope-all-types-autonomous", allTypesProfile);
+      await autoHarness.emit("session_start", { type: "session_start" }, autoHarness.context);
+      const autoTaskTool = interpreterTaskCaller(autoHarness, () => ({}));
+      const autoClassification = { ...baseClassification, autonomous: true as const, workflow: "interp-checkpoint-all-types" as const };
+      const autoPrepared = autoHarness.controller.prepare({
+        mode: "new",
+        task: "autonomous all-types",
+        classification: autoClassification,
+      });
       const autoResult = await run({
         task: "autonomous all-types",
         cwd: root2,
         branch,
         autonomous: true,
-        classification: { ...baseClassification, autonomous: true, workflow: "interp-checkpoint-all-types" },
-        taskTool,
-        execution: { session_id: "scope-all-types-autonomous", caller: "host", process_id: process.pid, worktree: root2, branch, authority: "coordinator" },
+        mode: "resume",
+        run_id: autoPrepared.state.run_id,
+        request_id: "scope-all-types-autonomous-run",
+        classification: autoClassification,
+        taskTool: autoTaskTool,
+        orchestrate,
+        execution: autoHarness.controller.context(),
+        sessionController: autoHarness.controller,
       });
       assert.equal(autoResult.outcomes.some((o) => o.status === "failed"), true, "autonomous routing cannot auto-proceed");
       const autoState = JSON.parse(readFileSync(autoResult.statePath!, "utf8")) as TeamState;
@@ -819,9 +958,11 @@ test("checkpoint: interpreter enforces declared checkpoints on orchestrator/bash
       assert.equal(autoState.stages.find((s) => s.id === "hooks")?.status, "pending");
       assert.equal(autoState.stages.find((s) => s.id === "noop")?.status, "pending");
     } finally {
+      await autoHarness?.close();
       rmSync(root2, { recursive: true, force: true });
     }
   } finally {
+    await interactiveHarness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

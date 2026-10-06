@@ -56,7 +56,10 @@ import {
   type IssuedCapability,
 } from "../src/engine/durable.js";
 import {
+  checkpointAnswerBinding,
+  checkpointDecisionKey,
   checkpointPolicyHash,
+  findHistoricalCheckpointDecision,
   recordTrustedCheckpointAnswer,
   resolveCheckpointDeclaration,
   validateCheckpointForAdvance,
@@ -80,6 +83,51 @@ import {
 } from "../src/engine/run-store.js";
 import { lifecyclePayloadHash, LifecycleError } from "../src/engine/run-lifecycle.js";
 import type { CheckpointAnswerProof, CheckpointPolicy, LifecycleRequest, PrepareRequestReceipt, Profile, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
+import {
+  admitOrdinaryWorker, createCoreFixture, details, submission, terminalWorker,
+  type Harness, type Handoff,
+} from "./reliable-stage-execution-fixture.js";
+
+async function bindSeededStage(root: string, profile: Profile): Promise<Harness> {
+  const harness = createCoreFixture({
+    root, branch: "main", workflowProfiles: [profile],
+    roles: { dev: "dev", "product-owner": "product-owner", analyst: "analyst", qa: "qa" },
+    scopeMap: [{ glob: ["**/*"], scope: "dev", dev_agent: "dev" }],
+  });
+  updateCanonicalRun(root, RUN_ID, (state) => {
+    const currentIndex = profile.stages.findIndex((stage) => stage.id === state.stage_cursor);
+    return {
+      ...state, workflow_override: true,
+      stages: state.stages.map((stage, index) => index < currentIndex && stage.status === "pending" ? { ...stage, status: "skipped" as const } : stage),
+    };
+  });
+  await harness.emit("session_start", { type: "session_start" }, harness.context);
+  harness.controller.prepare({ mode: "resume", run_id: RUN_ID });
+  return harness;
+}
+
+async function registeredBegin(harness: Harness): Promise<Handoff> {
+  const begun = details((await harness.tools.get("workflow_begin")!.execute(
+    "final-corrections-begin", {}, undefined, undefined, harness.context,
+  )).details);
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  return begun.handoff as Handoff;
+}
+
+async function acceptCoordinatorOutput(harness: Harness, outputs: Record<string, unknown>): Promise<void> {
+  const accepted = details((await harness.tools.get("workflow_submit_result")!.execute(
+    "final-coordinator-submit", submission(outputs), undefined, undefined, harness.context,
+  )).details);
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
+}
+
+async function acceptWorkerOutput(harness: Harness, worker: Parameters<typeof terminalWorker>[1], outputs: Record<string, unknown>): Promise<void> {
+  const accepted = details((await harness.tools.get("workflow_submit_result")!.execute(
+    "final-worker-submit", submission(outputs), undefined, undefined, worker.childContext,
+  )).details);
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
+  await terminalWorker(harness, worker);
+}
 function initGit(root: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
 }
@@ -329,6 +377,51 @@ function productProfile(): Profile {
     ],
   };
 }
+/** A single-worker approval stage used to prove real witness history at the later product gate. */
+function realProductProfile(): Profile {
+  return {
+    name: "final-real-product",
+    title: "Final real product",
+    description: "real approval handoff",
+    match: { type: ["PRODUCT_DISCOVERY"] },
+    stages: [
+      {
+        id: "product_approval",
+        title: "Approval",
+        type: "single",
+        role: "product-owner",
+        produces: "product_approval_record",
+        checkpoint: "product_approval",
+        gate: "product_approval_recorded",
+        checkpoint_policy: productPolicy(),
+      },
+      { id: "product_handoff", title: "Handoff", type: "orchestrator", produces: "product_handoff", gate: "product_approval_recorded" },
+    ],
+  };
+}
+
+/** A consilium checkpoint whose synthetic answer must survive pending fan-in. */
+function consiliumCheckpointProfile(): Profile {
+  return {
+    name: "final-consilium-checkpoint",
+    title: "Final consilium checkpoint",
+    description: "pending fan-in checkpoint",
+    match: { type: ["OPS"] },
+    checkpoint_policy: clarificationPolicy("required_human"),
+    stages: [
+      {
+        id: "research",
+        title: "Research",
+        type: "consilium",
+        roles: ["analyst", "qa"],
+        parallel: true,
+        produces: "research",
+        checkpoint: "gate_ok",
+      },
+      { id: "next", title: "Next", type: "orchestrator", produces: "summary" },
+    ],
+  };
+}
 
 /** Same checkpoint id on both stages, DIFFERENT policies. */
 function stalePolicyProfile(): Profile {
@@ -381,7 +474,7 @@ function seedState(root: string, opts: SeedOptions): void {
     rework_generation: 0,
     branch: "main",
     title: "final corrections",
-    classification: { type: opts.profile.name === "final-product" ? "PRODUCT_DISCOVERY" : "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: opts.profile.name },
+    classification: { type: opts.profile.name === "final-product" || opts.profile.name === "final-real-product" ? "PRODUCT_DISCOVERY" : "OPS", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: opts.profile.name },
     task: "final corrections",
     workflow_override: false,
     issue: null,
@@ -595,29 +688,27 @@ test("final: begin on a no-checkpoint stage persists; the policy mirror is omitt
   }
 });
 
-test("final: advance from a checkpoint stage into a no-checkpoint stage clears every optional mirror by key", () => {
+test("final: advance from a checkpoint stage into a no-checkpoint stage clears every optional mirror by key", async () => {
   const root = mkdtempSync(join(tmpdir(), "final-clear-"));
+  let harness: Harness | undefined;
   try {
     initGit(root);
     const profile = mirrorsProfile();
     registerWorkflowProfiles([profile]);
     const issued = singleCapability(profile, "build", "dev");
     seedState(root, { profile, stageCursor: "build", slug: "final", capability: issued.state });
-    writeArtifacts(root, "final", { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e" } });
-
-    const authorized = authorizeDispatch(root, { ...advanceAuthOf(issued), token: issued.dispatch_token, role: "dev", agent: "dev" });
-    assert.equal(authorized.ok, true, authorized.ok ? "authorized" : authorized.error);
-    if (!authorized.ok) return;
-    const completed = completeDispatch(root, { ...advanceAuthOf(issued), token: issued.dispatch_token, dispatch_id: authorized.record!.id, outcome: "succeeded", evidence: "done", artifact_ids: ["implementation"] });
-    assert.equal(completed.ok, true, completed.ok ? "completed" : completed.error);
+    harness = await bindSeededStage(root, profile);
+    const handoff = await registeredBegin(harness);
+    const worker = await admitOrdinaryWorker(harness, handoff, "clear");
+    await acceptWorkerOutput(harness, worker, { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e" } });
 
     const trusted = mintAnswer(root, "final", "build", "gate_ok", "proceed", "final/clear-answer");
-    const recorded = recordDecision(root, advanceAuthOf(issued), "gate_ok", "clarification", "proceed", { ref: trusted.answer.reference, proof: trusted.proof }, "owner answered");
+    const recorded = recordDecision(root, advanceAuthOfHandoff(handoff), "gate_ok", "clarification", "proceed", { ref: trusted.answer.reference, proof: trusted.proof }, "owner answered");
     assert.equal(recorded.ok, true, recorded.ok ? "recorded" : recorded.error);
 
     // The cursor move into a stage without a checkpoint declaration used to
     // write own undefined mirrors and the persist threw.
-    const advanced = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "build done" });
+    const advanced = advanceCursor(root, { ...advanceAuthOfHandoff(handoff), evidence: "build done" });
     assert.equal(advanced.ok, true, advanced.ok ? "advanced into the no-checkpoint stage" : advanced.error);
     const after = readState(root, "final");
     assert.equal(after.stage_cursor, "ops");
@@ -628,30 +719,35 @@ test("final: advance from a checkpoint stage into a no-checkpoint stage clears e
     assert.equal("completion_envelope" in after, false, "the completed stage's envelope mirror never leaks into the next stage");
     assert.equal(after.pause.kind, "none", "the next stage starts with a clean lifecycle, not the prior pause");
   } finally {
+    await harness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("final: loop re-entry into a no-checkpoint orchestrator stage persists with a coherent iteration", () => {
+test("final: loop re-entry into a no-checkpoint orchestrator stage persists with a coherent iteration", async () => {
   const root = mkdtempSync(join(tmpdir(), "final-loop-"));
+  let harness: Harness | undefined;
   try {
     initGit(root);
     const profile = loopProfile();
     registerWorkflowProfiles([profile]);
     const issued = noneCapability(profile, "prepare");
     seedState(root, { profile, stageCursor: "prepare", slug: "final", capability: issued.state });
-    writeArtifacts(root, "final", { prep: { ok: true } });
+    harness = await bindSeededStage(root, profile);
+    const handoff = await registeredBegin(harness);
+    await acceptCoordinatorOutput(harness, { prep: { ok: true } });
 
-    const toCheck = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "prepared" });
+    const toCheck = advanceCursor(root, { ...advanceAuthOfHandoff(handoff), evidence: "prepared" });
     assert.equal(toCheck.ok, true, toCheck.ok ? "armed check" : toCheck.error);
     if (!toCheck.ok || !toCheck.handoff) return;
     assert.equal(toCheck.handoff.loop_iteration, 1);
-    writeArtifacts(root, "final", { verdict: { pass: false } });
+    const checkHandoff = await registeredBegin(harness);
+    await acceptCoordinatorOutput(harness, { verdict: { pass: false } });
 
     // The blocker: re-entry wrote `work_identity: undefined` (own undefined)
     // and the persist threw before this fix.
 
-    const reentered = advanceCursor(root, { ...advanceAuthOfHandoff(toCheck.handoff), evidence: "FAIL" });
+    const reentered = advanceCursor(root, { ...advanceAuthOfHandoff(checkHandoff), evidence: "FAIL" });
     assert.equal(reentered.ok, true, reentered.ok ? "re-entered prepare" : reentered.error);
     const after = readState(root, "final");
     assert.equal(after.stage_cursor, "prepare");
@@ -663,18 +759,21 @@ test("final: loop re-entry into a no-checkpoint orchestrator stage persists with
 
     // The re-armed iteration agrees with loopIterationForStage semantics:
     // the next pass of the whole window executes at iteration 2.
-    writeArtifacts(root, "final", { prep: { ok: true, pass2: true } });
+    const prepareHandoff = await registeredBegin(harness);
+    await acceptCoordinatorOutput(harness, { prep: { ok: true, pass2: true } });
     if (!reentered.ok || !reentered.handoff) return;
-    const toCheck2 = advanceCursor(root, { ...advanceAuthOfHandoff(reentered.handoff), evidence: "prepared 2" });
+    const toCheck2 = advanceCursor(root, { ...advanceAuthOfHandoff(prepareHandoff), evidence: "prepared 2" });
     assert.equal(toCheck2.ok, true, toCheck2.ok ? "second pass advances" : toCheck2.error);
     if (!toCheck2.ok || !toCheck2.handoff) return;
     assert.equal(toCheck2.handoff.loop_iteration, 2, "check re-arms at iteration 2");
   } finally {
+    await harness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
-test("final: QA loopback invalidates declared output and shared DoD evidence, then begin repins current bytes", () => {
+test("final: QA loopback invalidates declared output and shared DoD evidence, then begin repins current bytes", async () => {
   const root = mkdtempSync(join(tmpdir(), "final-qa-loop-evidence-"));
+  let harness: Harness | undefined;
   try {
     initGit(root);
     const profile = qaLoopProfile();
@@ -754,8 +853,11 @@ test("final: QA loopback invalidates declared output and shared DoD evidence, th
         check: { stage_id: "check", ...receiptBinding, inputs: [qaTestsInput, dodInput] },
       },
     }));
+    harness = await bindSeededStage(root, profile);
+    const handoff = await registeredBegin(harness);
+    await acceptCoordinatorOutput(harness, { verdict: { pass: false } });
 
-    const reentered = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "check failed" });
+    const reentered = advanceCursor(root, { ...advanceAuthOfHandoff(handoff), evidence: "check failed" });
     assert.equal(reentered.ok, true, reentered.ok ? "the check loop re-entered QA" : reentered.error);
     if (!reentered.ok || !reentered.handoff) return;
     const afterLoop = readState(root, "final");
@@ -778,12 +880,13 @@ test("final: QA loopback invalidates declared output and shared DoD evidence, th
         evidence: "QA refreshed the criterion",
       }],
     });
-    const refreshedQaTestsHash = createHash("sha256").update(refreshedQaTests, "utf8").digest("hex");
     const refreshedDodHash = createHash("sha256").update(refreshedDod, "utf8").digest("hex");
-    writeFileSync(join(artifactsDir, "qa_tests.json"), refreshedQaTests);
+    const qaHandoff = await registeredBegin(harness);
+    await acceptCoordinatorOutput(harness, { qa_tests: JSON.parse(refreshedQaTests) });
+    const refreshedQaTestsHash = createHash("sha256").update(readFileSync(join(artifactsDir, "qa_tests.json"), "utf8")).digest("hex");
     writeFileSync(join(artifactsDir, "dod.json"), refreshedDod);
 
-    const toCheck = advanceCursor(root, { ...advanceAuthOfHandoff(reentered.handoff), evidence: "QA refreshed" });
+    const toCheck = advanceCursor(root, { ...advanceAuthOfHandoff(qaHandoff), evidence: "QA refreshed" });
     assert.equal(toCheck.ok, true, toCheck.ok ? "QA advanced to check" : toCheck.error);
     const began = beginCapability(root);
     assert.equal(began.ok, true, began.ok ? "check begin repinned refreshed QA and DoD" : began.error);
@@ -793,6 +896,7 @@ test("final: QA loopback invalidates declared output and shared DoD evidence, th
     assert.equal(receipt?.inputs.find((input) => input.artifact_id === "qa_tests")?.sha256, refreshedQaTestsHash);
     assert.equal(receipt?.inputs.find((input) => input.artifact_id === "dod")?.sha256, refreshedDodHash);
   } finally {
+    await harness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -992,31 +1096,35 @@ test("final: the committed result of a transaction is the exact normalized/stamp
 // HIGH: historical product approval survives capability rotation
 // ---------------------------------------------------------------------------
 
-test("final: the product_approval decision authorizes the product_handoff gate across the epoch rotation", () => {
+test("final: the product_approval decision authorizes the product_handoff gate across the epoch rotation", async () => {
   const root = mkdtempSync(join(tmpdir(), "final-product-"));
+  let harness: Harness | undefined;
   try {
     initGit(root);
     const profile = productProfile();
     registerWorkflowProfiles([profile]);
     const issued = noneCapability(profile, "product_approval");
     seedState(root, { profile, stageCursor: "product_approval", slug: "final", capability: issued.state });
+    harness = await bindSeededStage(root, profile);
+    const handoff = await registeredBegin(harness);
 
     const trusted = mintAnswer(root, "final", "product_approval", "product_approval", "proceed", "final/product-answer");
-    const recorded = recordDecision(root, advanceAuthOf(issued), "product_approval", "product_approval", "proceed", { ref: trusted.answer.reference, proof: trusted.proof }, "product owner approved");
+    const recorded = recordDecision(root, advanceAuthOfHandoff(handoff), "product_approval", "product_approval", "proceed", { ref: trusted.answer.reference, proof: trusted.proof }, "product owner approved");
     assert.equal(recorded.ok, true, recorded.ok ? "approval recorded" : recorded.error);
 
-    writeArtifacts(root, "final", { product_approval_record: { decision: "proceed", approved_by: "product owner", rationale: "product owner approved", decided_at: new Date().toISOString() } });
-    const toHandoff = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "approval done" });
+    await acceptCoordinatorOutput(harness, { product_approval_record: { decision: "proceed", approved_by: "product owner", rationale: "product owner approved", decided_at: new Date().toISOString() } });
+    const toHandoff = advanceCursor(root, { ...advanceAuthOfHandoff(handoff), evidence: "approval done" });
     assert.equal(toHandoff.ok, true, toHandoff.ok ? "cursor moved to product_handoff" : toHandoff.error);
     if (!toHandoff.ok || !toHandoff.handoff) return;
     assert.notEqual(toHandoff.handoff.cursor_epoch, issued.state.issued_for!.cursor_epoch, "the capability epoch rotated with the cursor");
 
-    writeArtifacts(root, "final", { product_handoff: { decision: "proceed", next_workflow: "spec-preparation", product_spec_artifact: "product_spec", instructions: "spec the approved direction" } });
+    const handoffStage = await registeredBegin(harness);
+    await acceptCoordinatorOutput(harness, { product_handoff: { decision: "proceed", next_workflow: "spec-preparation", product_spec_artifact: "product_spec", instructions: "spec the approved direction" } });
     // The gate re-validates the approval under the DECISION'S OWN immutable
     // scope (capability epoch at mint time) — previously it recomputed the
     // proof hash against the NEW capability and rejected the normal durable
     // flow.
-    const advanced = advanceCursor(root, { ...advanceAuthOfHandoff(toHandoff.handoff), evidence: "handoff done" });
+    const advanced = advanceCursor(root, { ...advanceAuthOfHandoff(handoffStage), evidence: "handoff done" });
     assert.equal(advanced.ok, true, advanced.ok ? "the historical approval authorizes the handoff gate" : advanced.error);
     const after = readState(root, "final");
     assert.equal(after.pause.kind, "done");
@@ -1024,25 +1132,180 @@ test("final: the product_approval decision authorizes the product_handoff gate a
     assert.equal(decisions.length, 1);
     assert.equal(decisions[0]!.capability_epoch, issued.state.issued_for!.cursor_epoch, "the decision keeps its mint-time binding as audit scope");
   } finally {
+    await harness?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("final: a new real product approval survives advance and satisfies the later historical product gate", async () => {
+  const root = mkdtempSync(join(tmpdir(), "final-real-product-"));
+  let harness: Harness | undefined;
+  try {
+    initGit(root);
+    const profile = realProductProfile();
+    registerWorkflowProfiles([profile]);
+    const issued = singleCapability(profile, "product_approval", "product-owner");
+    seedState(root, { profile, stageCursor: "product_approval", slug: "final", capability: issued.state });
+    harness = await bindSeededStage(root, profile);
+    const handoff = await registeredBegin(harness);
+    const worker = await admitOrdinaryWorker(harness, handoff, "real-product");
+
+    const trusted = mintAnswer(root, "final", "product_approval", "product_approval", "proceed", "final/real-product-answer");
+    assert.ok(trusted.answer.work_identity_witness, "the real approval must retain its engine witness");
+    const recorded = recordDecision(root, advanceAuthOfHandoff(handoff), "product_approval", "product_approval", "proceed", { ref: trusted.answer.reference, proof: trusted.proof }, "real product owner approved");
+    assert.equal(recorded.ok, true, recorded.ok ? "real approval recorded" : recorded.error);
+
+    await acceptWorkerOutput(harness, worker, {
+      product_approval_record: {
+        decision: "proceed",
+        approved_by: "product owner",
+        rationale: "real product owner approved",
+        decided_at: new Date().toISOString(),
+      },
+    });
+
+    const toHandoff = advanceCursor(root, { ...advanceAuthOfHandoff(handoff), evidence: "real approval done" });
+    assert.equal(toHandoff.ok, true, toHandoff.ok ? "cursor moved to product_handoff" : toHandoff.error);
+    if (!toHandoff.ok || !toHandoff.handoff) return;
+
+    const handoffStage = await registeredBegin(harness);
+    await acceptCoordinatorOutput(harness, {
+      product_handoff: {
+        decision: "proceed",
+        next_workflow: "spec-preparation",
+        product_spec_artifact: "product_spec",
+        instructions: "spec the approved direction",
+      },
+    });
+    const advanced = advanceCursor(root, { ...advanceAuthOfHandoff(handoffStage), evidence: "handoff done" });
+    assert.equal(advanced.ok, true, advanced.ok ? "the real historical approval authorizes the handoff gate" : advanced.error);
+    const after = readState(root, "final");
+    assert.equal(after.typed_checkpoint_decisions?.length, 1);
+    const retainedAnswer = after.trusted_checkpoint_answers?.[0];
+    assert.ok(retainedAnswer?.work_identity_witness, "the historical witness remains in the answer audit record");
+    const retainedDecision = after.typed_checkpoint_decisions?.[0];
+    assert.ok(retainedDecision, "the historical decision remains in the typed ledger");
+    if (!retainedAnswer || !retainedAnswer.work_identity_witness || !retainedDecision) return;
+    // Recompute the witness hash and answer binding, but do not rewrite the
+    // immutable proof/final key. Historical authorization must reject this
+    // self-redigested metadata rather than treating it as engine provenance.
+    const forgedWitness = { ...retainedAnswer.work_identity_witness, worker_id: "forged-worker" };
+    const forgedWitnessJson = JSON.stringify(Object.fromEntries(
+      Object.entries(forgedWitness).sort(([left], [right]) => left.localeCompare(right)),
+    ));
+    const forgedAnswer = {
+      ...retainedAnswer,
+      work_identity_witness: forgedWitness,
+      work_identity_hash: createHash("sha256").update(forgedWitnessJson).digest("hex"),
+      binding: "",
+    };
+    forgedAnswer.binding = checkpointAnswerBinding(forgedAnswer);
+    const forgedState: TeamState = {
+      ...after,
+      trusted_checkpoint_answers: [forgedAnswer],
+    };
+    const approvalStage = profile.stages.find((candidate) => candidate.id === "product_approval");
+    assert.ok(approvalStage?.checkpoint_policy, "real product approval declaration must remain available");
+    if (!approvalStage?.checkpoint_policy) return;
+    const declaration = resolveCheckpointDeclaration(approvalStage, profile.checkpoint_policy, forgedState, "authorize");
+    assert.ok(declaration.ok && declaration.declaration, "forged historical declaration must resolve before proof validation");
+    if (!declaration.ok || !declaration.declaration) return;
+    const historical = findHistoricalCheckpointDecision(forgedState, declaration.declaration, {
+      decision_key: checkpointDecisionKey(retainedDecision),
+    });
+    assert.equal(historical.ok, false, "self-redigested historical witness metadata must fail closed");
+  } finally {
+    await harness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("review: product handoff selects its stamped approval generation after a differing reopen", () => {
+test("final: synthetic consilium approval remains valid while fan-in slots are pending", () => {
+  const root = mkdtempSync(join(tmpdir(), "final-consilium-checkpoint-"));
+  try {
+    initGit(root);
+    const profile = consiliumCheckpointProfile();
+    registerWorkflowProfiles([profile]);
+    const issued = createCapability({
+      run_key: RUN_ID,
+      branch: "main",
+      workflow: profile.name,
+      profile_hash: profileHash(profile),
+      stage_cursor: "research",
+      kind: "consilium",
+      expected_roster: [
+        { role: "analyst", agent: "analyst" },
+        { role: "qa", agent: "qa" },
+      ],
+    });
+    seedState(root, { profile, stageCursor: "research", slug: "final", capability: issued.state });
+
+    // No singular root exists for this capability, so this is the ordinary
+    // deterministic synthetic answer path.
+    const trusted = mintAnswer(root, "final", "research", "gate_ok", "proceed", "final/consilium-answer");
+    assert.equal(trusted.answer.work_identity_witness, undefined);
+    const recorded = recordDecision(
+      root,
+      advanceAuthOf(issued),
+      "gate_ok",
+      "clarification",
+      "proceed",
+      { ref: trusted.answer.reference, proof: trusted.proof },
+      "consilium checkpoint approved",
+    );
+    assert.equal(recorded.ok, true, recorded.ok ? "synthetic consilium approval recorded" : recorded.error);
+
+    const dispatched = authorizeDispatch(root, {
+      ...advanceAuthOf(issued),
+      token: issued.dispatch_token,
+      role: "analyst",
+      agent: "analyst",
+    });
+    assert.equal(dispatched.ok, true, dispatched.ok ? "first consilium slot dispatched" : dispatched.error);
+    if (!dispatched.ok) return;
+
+    const pendingState = readState(root, "final");
+    const researchStage = profile.stages.find((candidate) => candidate.id === "research");
+    assert.ok(researchStage, "consilium research stage must remain declared");
+    if (!researchStage) return;
+    const declaration = resolveCheckpointDeclaration(researchStage, profile.checkpoint_policy, pendingState, "authorize");
+    assert.ok(declaration.ok && declaration.declaration, "pending consilium declaration must resolve");
+    if (!declaration.ok || !declaration.declaration) return;
+    const checkpoint = validateCheckpointForAdvance(
+      { id: "research", checkpoint: "gate_ok" },
+      pendingState,
+      declaration.declaration,
+    );
+    assert.equal(checkpoint.ok, true, checkpoint.ok ? "synthetic approval remains valid" : checkpoint.error);
+
+    // Fan-in completion is independent: the pending slot blocks the cursor,
+    // but does not invalidate the already-finalized synthetic approval.
+    const premature = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "one slot still pending" });
+    assert.equal(premature.ok, false, premature.ok ? "pending fan-in must not advance" : premature.error);
+    assert.equal(readState(root, "final").stage_cursor, "research");
+    assert.equal(readState(root, "final").typed_checkpoint_decisions?.length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("review: product handoff selects its stamped approval generation after a differing reopen", async () => {
   const root = mkdtempSync(join(tmpdir(), "review-product-generation-"));
+  let harness: Harness | undefined;
   try {
     initGit(root);
     const profile = productProfile();
     registerWorkflowProfiles([profile]);
     const firstCapability = noneCapability(profile, "product_approval");
     seedState(root, { profile, stageCursor: "product_approval", slug: "final", capability: firstCapability.state });
+    harness = await bindSeededStage(root, profile);
+    const handoff = await registeredBegin(harness);
     const firstAnswer = mintAnswer(root, "final", "product_approval", "product_approval", "proceed", "review/product-first");
-    const firstRecorded = recordDecision(root, advanceAuthOf(firstCapability), "product_approval", "product_approval", "proceed", { ref: firstAnswer.answer.reference, proof: firstAnswer.proof }, "first approval");
+    const firstRecorded = recordDecision(root, advanceAuthOfHandoff(handoff), "product_approval", "product_approval", "proceed", { ref: firstAnswer.answer.reference, proof: firstAnswer.proof }, "first approval");
     assert.equal(firstRecorded.ok, true, firstRecorded.ok ? "recorded" : firstRecorded.error);
-    writeArtifacts(root, "final", {
+    await acceptCoordinatorOutput(harness, {
       product_approval_record: { decision: "proceed", approved_by: "product owner", rationale: "first approval", decided_at: new Date().toISOString() },
     });
-    const toHandoff = advanceCursor(root, { ...advanceAuthOf(firstCapability), evidence: "first approval complete" });
+    const toHandoff = advanceCursor(root, { ...advanceAuthOfHandoff(handoff), evidence: "first approval complete" });
     assert.equal(toHandoff.ok, true, toHandoff.ok ? "handoff armed" : toHandoff.error);
     if (!toHandoff.ok || !toHandoff.handoff) return;
     const handoffState = readState(root, "final");
@@ -1090,14 +1353,16 @@ test("review: product handoff selects its stamped approval generation after a di
     delete resumed.pending;
     delete resumed.completion_envelope;
     writeCanonicalState(root, resumed);
-    writeArtifacts(root, "final", {
+    const handoffStage = await registeredBegin(harness);
+    await acceptCoordinatorOutput(harness, {
       product_handoff: { decision: "proceed", next_workflow: "spec-preparation", product_spec_artifact: "product_spec", instructions: "handoff the first approved direction" },
     });
 
-    const advanced = advanceCursor(root, { ...advanceAuthOfHandoff(toHandoff.handoff), evidence: "exact generation handoff" });
+    const advanced = advanceCursor(root, { ...advanceAuthOfHandoff(handoffStage), evidence: "exact generation handoff" });
     assert.equal(advanced.ok, true, advanced.ok ? "stamped generation selected" : advanced.error);
     assert.equal(readState(root, "final").pause.kind, "done");
   } finally {
+    await harness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1682,8 +1947,9 @@ test("final: trim decides emptiness only — decision labels and rationale are p
 // MEDIUM: status coherent after resolved pause / provider wait
 // ---------------------------------------------------------------------------
 
-test("final: after a provider wait and a resolved checkpoint the next stage reports a clean ready status", () => {
+test("final: after a provider wait and a resolved checkpoint the next stage reports a clean ready status", async () => {
   const root = mkdtempSync(join(tmpdir(), "final-status-"));
+  let harness: Harness | undefined;
   try {
     initGit(root);
     const profile = loadProfile("lightweight");
@@ -1694,32 +1960,32 @@ test("final: after a provider wait and a resolved checkpoint the next stage repo
     // the upstream fixture schema valid before exercising provider wait.
     writeArtifacts(root, "final", { discovery: { task: "loop test", branch: "main" } });
 
-    const authorized = authorizeDispatch(root, { ...advanceAuthOf(issued), token: issued.dispatch_token, role: "dev", agent: "dev" });
-    assert.equal(authorized.ok, true, authorized.ok ? "authorized" : authorized.error);
-    if (!authorized.ok) return;
-    const pending = persistPendingDispatch(root, { ...advanceAuthOf(issued), token: issued.dispatch_token, dispatch_id: authorized.record!.id, pending_reason: "provider_running", provider_ref: "provider-1" }, { runId: RUN_ID });
+    harness = await bindSeededStage(root, profile);
+    const handoff = await registeredBegin(harness);
+    const worker = await admitOrdinaryWorker(harness, handoff, "provider-wait");
+    const record = readState(root, "final").dispatch_capability!.dispatches.find((entry) => entry.tool_call_id === worker.toolCallId);
+    assert.ok(record);
+    const pending = persistPendingDispatch(root, { ...advanceAuthOfHandoff(handoff), token: handoff.dispatch_token, dispatch_id: record.id, pending_reason: "provider_running", provider_ref: "provider-1" }, { runId: RUN_ID });
     assert.equal(pending.ok, true, pending.ok ? "pending persisted" : pending.error);
 
     const pausedContract = resolveWorkflowContract(root);
     assert.equal(pausedContract.status.lifecycle, "pending", "the provider wait reports pending for the CURRENT stage");
     assert.equal(pausedContract.status.pause, "background_wait");
 
-    writeArtifacts(root, "final", { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e" } });
-    const completed = completeDispatch(root, { ...advanceAuthOf(issued), token: issued.dispatch_token, dispatch_id: authorized.record!.id, outcome: "succeeded", evidence: "done", artifact_ids: ["implementation"] });
-    assert.equal(completed.ok, true, completed.ok ? "completed" : completed.error);
+    await acceptWorkerOutput(harness, worker, { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e" } });
     assert.equal(readState(root, "final").pause.kind, "none", "the last completion clears the background wait");
 
     // Checkpoint unresolved -> resumable pause; then the human answer
     // resolves it and the cursor moves with a CLEAN lifecycle.
-    const blocked = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "fix done" });
+    const blocked = advanceCursor(root, { ...advanceAuthOfHandoff(handoff), evidence: "fix done" });
     assert.equal(blocked.ok, false, "the checkpoint blocks until resolved");
     assert.equal(readState(root, "final").pause.kind, "user_checkpoint");
 
     const trusted = mintAnswer(root, "final", "implementation", "approve_implementation", "proceed", "final/status-answer");
-    const recorded = recordDecision(root, advanceAuthOf(issued), "approve_implementation", "implementation_approval", "proceed", { ref: trusted.answer.reference, proof: trusted.proof }, "owner approved");
+    const recorded = recordDecision(root, advanceAuthOfHandoff(handoff), "approve_implementation", "implementation_approval", "proceed", { ref: trusted.answer.reference, proof: trusted.proof }, "owner approved");
     assert.equal(recorded.ok, true, recorded.ok ? "recorded" : recorded.error);
 
-    const advanced = advanceCursor(root, { ...advanceAuthOf(issued), evidence: "fix done" });
+    const advanced = advanceCursor(root, { ...advanceAuthOfHandoff(handoff), evidence: "fix done" });
     assert.equal(advanced.ok, true, advanced.ok ? "advanced to code_review" : advanced.error);
     const after = readState(root, "final");
     assert.equal(after.stage_cursor, "code_review");
@@ -1732,6 +1998,7 @@ test("final: after a provider wait and a resolved checkpoint the next stage repo
     assert.equal(contract.status.lifecycle, "ready", "the next stage's lifecycle is derived from the NEW stage, not the carried mirrors");
     assert.equal(contract.status.pause, "none");
   } finally {
+    await harness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

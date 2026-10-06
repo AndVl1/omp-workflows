@@ -27,8 +27,12 @@ import {
   workflowOwnerFor,
   run,
   registerWorkflowProfiles,
-  type TaskCaller,
 } from "../src/index.js";
+import {
+  admitOrdinaryBatchWorkers, createCoreFixture, createInterpreterTaskCaller,
+  details, ordinaryIngress, submission, terminalOrdinaryBatchWorkers,
+  type Harness,
+} from "./reliable-stage-execution-fixture.js";
 import { acquireCtoIngress, suspendCtoSession } from "../src/cto/run.js";
 import { appendWave, newCtoState, readCtoState, writeCtoState } from "../src/cto/state.js";
 import { authorizeDispatch, completeDispatch, createCapability, materializeMigratedDispatches } from "../src/engine/durable.js";
@@ -42,6 +46,7 @@ import { prepareWorkflowState } from "../src/engine/run.js";
 import { publishCtoClaim, readRunControl, releaseExecutionClaim } from "../src/engine/run-store.js";
 import { normalizePersistedState } from "../src/engine/state.js";
 import { DISPATCH_ORIGIN_LOCATOR_ENV, rememberDispatchOriginLocator } from "../src/dispatch-origin-locator.js";
+import type { Profile, TeamState, TrustedExecutionContext, WorkIdentity } from "../src/engine/types.js";
 const coreIndexUrl = new URL("../src/index.ts", import.meta.url).href;
 const ctoStateUrl = new URL("../src/cto/state.ts", import.meta.url).href;
 const ctoRunEngineUrl = new URL("../src/cto/run.ts", import.meta.url).href;
@@ -233,7 +238,12 @@ test("process acceptance: host tool events rotate observability from A to B with
     initGit(root);
     const controller = createWorkflowSessionController({ cwd: root, context: context(root, "host-observability") });
     const bus = fakePi();
-    registerTeamWorkflow(bus.pi as never, { cwd: root, observability: true, getSessionController: () => controller });
+    registerTeamWorkflow(bus.pi as never, {
+      cwd: root,
+      observability: true,
+      getSessionController: () => controller,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const a = controller.prepare({ mode: "new", task: "A", classification: CLASSIFICATION });
     await bus.emit("tool_call", { toolName: "workflow_status", toolCallId: "call-a", input: {} }, { cwd: root, session_id: "host-observability" });
     const b = controller.prepare({ mode: "new", task: "B", classification: CLASSIFICATION });
@@ -346,6 +356,7 @@ test("process acceptance: registered cto_state performs read/CAS/barrier/termina
         : value === foreignContext
           ? foreignController
           : undefined,
+      resolveTrustedToolCallActor: () => undefined,
     };
     registerTeamWorkflow(bus.pi as never, registrationOptions);
     registerWorkflowTools(bus.pi as never, registrationOptions);
@@ -605,6 +616,7 @@ test("process acceptance: registered CTO journal faults retain A and protect for
         resolveCwd: () => root,
         observability: false,
         getSessionController: (ctx) => controllers.get(ctx),
+        resolveTrustedToolCallActor: () => undefined,
       };
       registerTeamWorkflow(pi, registration);
       registerWorkflowTools(pi, registration);
@@ -905,14 +917,15 @@ test("process acceptance: interrupted rework snapshot preserves prior ownership"
       import fs from "node:fs";
       import { syncBuiltinESMExports } from "node:module";
       const [root, runId] = process.argv.slice(1);
-      const originalRead = fs.readFileSync.bind(fs);
+      const originalRead = fs.openSync.bind(fs);
       const blocker = new Int32Array(new SharedArrayBuffer(4));
-      fs.readFileSync = ((path, ...args) => {
-        if (String(path).includes("/runs/" + runId + "/artifacts/")) {
+      fs.openSync = ((path, ...args) => {
+        const fd = originalRead(path, ...args);
+        if (String(path).includes("/lifecycle-staging/") && String(path).includes("/blobs/")) {
           console.log("rework-snapshot-read");
           Atomics.wait(blocker, 0, 0);
         }
-        return originalRead(path, ...args);
+        return fd;
       });
       syncBuiltinESMExports();
       const { prepareWorkflowState } = await import(${JSON.stringify(runEngineUrl)});
@@ -963,7 +976,12 @@ test("process acceptance: cold native result replay mutates the origin run once"
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
     const bus = fakePi();
-    registerTeamWorkflow(bus.pi as never, { cwd: root, observability: false, getSessionController: () => controller });
+    registerTeamWorkflow(bus.pi as never, {
+      cwd: root,
+      observability: false,
+      getSessionController: () => controller,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const hookResults = await bus.emit("tool_call", { toolName: "task", toolCallId: "cold-tool", input }, { cwd: root, hasUI: false, session_id: owner.session_id });
     assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
     assert.equal(readRunState(root, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
@@ -976,7 +994,12 @@ test("process acceptance: cold native result replay mutates the origin run once"
         on(name, handler) { (handlers[name] ??= []).push(handler); },
       };
       const controller = createWorkflowSessionController({ cwd: root, context: { session_id: originSession, caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
-      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      registerTeamWorkflow(pi, {
+        cwd: root,
+        observability: false,
+        getSessionController: () => controller,
+        resolveTrustedToolCallActor: () => undefined,
+      });
       console.log(JSON.stringify({ registeredHandlers: Object.keys(handlers), originSession }));
       const event = {
         toolName: "task", toolCallId: "cold-tool",
@@ -1032,7 +1055,12 @@ test("process acceptance: fresh-session late native result uses exact durable lo
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
     const ownerBus = fakePi();
-    registerTeamWorkflow(ownerBus.pi as never, { cwd: root, observability: false, getSessionController: () => ownerController });
+    registerTeamWorkflow(ownerBus.pi as never, {
+      cwd: root,
+      observability: false,
+      getSessionController: () => ownerController,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "fresh-session-tool", input }, { cwd: root, hasUI: false, session_id: owner.session_id });
     assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
     assert.equal(readRunState(root, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
@@ -1047,7 +1075,12 @@ test("process acceptance: fresh-session late native result uses exact durable lo
       };
       const controller = createWorkflowSessionController({ cwd: root, context: { session_id: "fresh-host-session", caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
       if (controller.selectedRunId() !== undefined) throw new Error("fresh host session unexpectedly inherited a selected run");
-      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      registerTeamWorkflow(pi, {
+        cwd: root,
+        observability: false,
+        getSessionController: () => controller,
+        resolveTrustedToolCallActor: () => undefined,
+      });
       const event = {
         toolName: "task", toolCallId: "fresh-session-tool",
         input: { agent: "dev", role: "dev", task: marker },
@@ -1095,7 +1128,12 @@ test("process acceptance: fresh restart uses the persisted origin workspace", as
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
     const ownerBus = fakePi();
-    registerTeamWorkflow(ownerBus.pi as never, { cwd: rootA, observability: false, getSessionController: () => ownerController });
+    registerTeamWorkflow(ownerBus.pi as never, {
+      cwd: rootA,
+      observability: false,
+      getSessionController: () => ownerController,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "cross-worktree-tool", input }, { cwd: rootA, hasUI: false, session_id: owner.session_id });
     assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
     assert.equal(readRunState(rootA, runId)?.dispatch_capability?.dispatches[0]?.status, "authorized");
@@ -1108,7 +1146,12 @@ test("process acceptance: fresh restart uses the persisted origin workspace", as
         on(name, handler) { (handlers[name] ??= []).push(handler); },
       };
       const controller = createWorkflowSessionController({ cwd: root, context: { session_id: "fresh-cross-worktree-host", caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
-      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      registerTeamWorkflow(pi, {
+        cwd: root,
+        observability: false,
+        getSessionController: () => controller,
+        resolveTrustedToolCallActor: () => undefined,
+      });
       const event = {
         toolName: "task", toolCallId: "cross-worktree-tool",
         input: { agent: "dev", role: "dev", task: marker },
@@ -1158,7 +1201,12 @@ test("process acceptance: ambiguous durable locator candidates reject without mu
     const marker = buildDispatchMarker(begun.handoff.run_key, stage, ["dev"], "dev", begun.handoff.cursor_epoch);
     const input = { agent: "dev", role: "dev", task: marker };
     const ownerBus = fakePi();
-    registerTeamWorkflow(ownerBus.pi as never, { cwd: rootA, observability: false, getSessionController: () => ownerController });
+    registerTeamWorkflow(ownerBus.pi as never, {
+      cwd: rootA,
+      observability: false,
+      getSessionController: () => ownerController,
+      resolveTrustedToolCallActor: () => undefined,
+    });
     const hookResults = await ownerBus.emit("tool_call", { toolName: "task", toolCallId: "ambiguous-origin-tool", input }, { cwd: rootA, hasUI: false, session_id: owner.session_id });
     assert.ok(hookResults.every((result) => !result || !(typeof result === "object" && (result as Record<string, unknown>).block === true)), JSON.stringify(hookResults));
     const originState = readRunState(rootA, runId)!;
@@ -1186,7 +1234,12 @@ test("process acceptance: ambiguous durable locator candidates reject without mu
         on(name, handler) { (handlers[name] ??= []).push(handler); },
       };
       const controller = createWorkflowSessionController({ cwd: root, context: { session_id: "ambiguous-callback", caller: "host", process_id: process.pid, worktree: root, branch: ${JSON.stringify(BRANCH)}, authority: "coordinator" } });
-      registerTeamWorkflow(pi, { cwd: root, observability: false, getSessionController: () => controller });
+      registerTeamWorkflow(pi, {
+        cwd: root,
+        observability: false,
+        getSessionController: () => controller,
+        resolveTrustedToolCallActor: () => undefined,
+      });
       const event = {
         toolName: "task", toolCallId: "ambiguous-origin-tool",
         input: { agent: "dev", role: "dev", task: marker },
@@ -1814,17 +1867,26 @@ test("process acceptance: completed stage A resume advances stage B once", async
     match: { type: ["FEATURE"] },
     stages: [
       { id: "stage_a", title: "A", type: "single", role: "dev" },
-      { id: "stage_b", title: "B", type: "single", role: "dev" },
+      { id: "stage_b", title: "B", type: "single", role: "dev", produces: "stage_b" },
     ],
   };
   registerWorkflowProfiles([profile]);
+  initGit(root);
+  const harness = createCoreFixture({
+    route: "ordinary",
+    root,
+    branch: BRANCH,
+    sessionId: "resume-next",
+    workflowProfiles: [profile],
+    roles: { dev: "dev" },
+    scopeMap: [{ glob: ["**/*"], scope: "default", dev_agent: "dev" }],
+  });
   try {
-    initGit(root); publishMapping(root);
-    const execution = context(root, "resume-next");
-    const prepared = prepareWorkflowState({
-      cwd: root, branch: BRANCH, task: "resume next", autonomous: false,
-      classification: { ...CLASSIFICATION, workflow: profile.name }, files: [], issue: null,
-      mode: "new", request_id: "resume-next-new", execution,
+    const execution = harness.controller.context();
+    const prepared = harness.controller.prepare({
+      mode: "new",
+      task: "resume next",
+      classification: { ...CLASSIFICATION, workflow: profile.name },
     });
     const runId = prepared.state.run_id!;
     updateCanonicalRun(root, runId, (state) => {
@@ -1836,23 +1898,33 @@ test("process acceptance: completed stage A resume advances stage B once", async
     });
     assert.equal(readRunState(root, runId)?.run_id, runId);
     let calls = 0;
-    const taskTool: TaskCaller = {
-      async call() {
-        calls += 1;
-        return { id: "stage-b-result", output: "B done", artifacts: {}, exitCode: 0 };
-      },
-      async batch() { return []; },
-    };
+    const taskTool = createInterpreterTaskCaller(harness, async (worker, request) => {
+      calls += 1;
+      const submitted = await harness.tools.get("workflow_submit_result")!.execute(
+        `${worker.toolCallId}-submit`,
+        submission({ stage_b: { completed: true } }),
+        undefined,
+        undefined,
+        worker.childContext,
+      );
+      const submittedDetails = details(submitted.details);
+      assert.equal(submittedDetails.ok, true, JSON.stringify(submittedDetails));
+      assert.ok(submittedDetails.receipt && typeof submittedDetails.receipt === "object", "registered worker output must return its receipt");
+      return { id: `${worker.toolCallId}-result`, output: `${request.name ?? "stage-b"} done`, exitCode: 0 };
+    });
     const result = await run({
       cwd: root, branch: BRANCH, task: "resume next", autonomous: false,
       classification: { ...CLASSIFICATION, workflow: profile.name }, files: [], issue: null,
-      mode: "resume", run_id: runId, request_id: "resume-next-run", execution, taskTool,
+      mode: "resume", run_id: runId, request_id: "resume-next-run", execution, sessionController: harness.controller, taskTool,
     });
     assert.equal(result.outcomes[0]?.status, "done", JSON.stringify(result));
     assert.equal(calls, 1);
     assert.equal(readRunState(root, runId)?.stages.find((stage) => stage.id === "stage_a")?.status, "done");
     assert.equal(readRunState(root, runId)?.stages.find((stage) => stage.id === "stage_b")?.status, "done");
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally {
+    await harness.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // Native begin must persist a hash-bound input receipt and refuse a missing input.
@@ -2173,6 +2245,179 @@ test("process acceptance: migration source conflict is unchanged and succeeded b
     assert.deepEqual(preserved, binary);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+// Legacy sources carrying the new recovery/active ledgers must fail closed
+// before publication; no refusal is allowed to rewrite the source snapshot.
+test("process acceptance: migration refuses active, unknown, and unsupported ledgers byte-exactly", () => {
+  const makeState = (extra: Record<string, unknown>): Record<string, unknown> => ({
+    schema: 1,
+    branch: BRANCH,
+    run_key: BRANCH,
+    classification: CLASSIFICATION,
+    task: "legacy ledger compatibility",
+    workflow_override: false,
+    issue: null,
+    stage_cursor: "implementation",
+    stages: [{ id: "implementation", status: "pending" }],
+    artifacts: {},
+    pause: { kind: "none", reason: "" },
+    updated_at: "2026-09-30T00:00:00.000Z",
+    ...extra,
+  });
+  const identity = {
+    run_id: BRANCH,
+    wave_id: "legacy-wave",
+    slice_id: "legacy-slice",
+    session_id: "legacy-session",
+    workflow: "lightweight",
+    stage_id: "implementation",
+    stage_cursor: "implementation",
+    capability_id: "legacy-capability",
+    capability_epoch: "legacy-epoch",
+    loop_iteration: 1,
+    slot_id: "developer",
+    task_id: "legacy-task",
+    dispatch_id: "legacy-dispatch",
+    attempt: 1,
+    worker_id: "legacy-worker",
+  };
+  const cases: Array<{ label: string; extra: Record<string, unknown>; code: "run_busy" | "migration_required" }> = [
+    { label: "unsupported recovery schema", extra: { stage_recovery: { schema_version: 2, lineages: {} } }, code: "migration_required" },
+    {
+      label: "active recovery lineage",
+      extra: {
+        stage_recovery: {
+          schema_version: 1,
+          lineages: {
+            ["a".repeat(64)]: { generation: 0, identity, lifecycle: "running", budgets: [], grants: [], operations: [] },
+          },
+        },
+      },
+      code: "run_busy",
+    },
+    { label: "active loop ledger", extra: { loop_state: { status: "running", history: [] } }, code: "run_busy" },
+    { label: "unsupported active ledger", extra: { active_ledger: { schema_version: 9, status: "running" } }, code: "migration_required" },
+  ];
+  for (const fixture of cases) {
+    const root = scratch(`rl-migration-${fixture.label.replaceAll(" ", "-")}`);
+    try {
+      initGit(root);
+      const legacyDir = join(root, ".work-state", "features", "ledger-compat");
+      mkdirSync(legacyDir, { recursive: true });
+      const statePath = join(legacyDir, "state.json");
+      const bytes = `${JSON.stringify(makeState(fixture.extra), null, 2)}\n`;
+      writeFileSync(statePath, bytes);
+      const source = discoverLegacySources(root).sources.find((candidate) => candidate.source_id === "feature:ledger-compat");
+      assert.ok(source, fixture.label);
+      const refused = migrateLegacySource(root, source!);
+      assert.equal(refused.ok, false, fixture.label);
+      if (!refused.ok) assert.equal(refused.code, fixture.code, fixture.label);
+      assert.equal(readFileSync(statePath, "utf8"), bytes, `${fixture.label} keeps source bytes unchanged`);
+      assert.equal(existsSync(join(root, ".work-state", "runs")), false, `${fixture.label} publishes no canonical run`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("process acceptance: quiescent migration receipt is schema-versioned and repeatable", () => {
+  const root = scratch("rl-migration-versioned-repeat");
+  try {
+    initGit(root);
+    const legacyDir = join(root, ".work-state", "features", "versioned-repeat");
+    mkdirSync(legacyDir, { recursive: true });
+    const statePath = join(legacyDir, "state.json");
+    const terminalIdentity = {
+      run_id: BRANCH,
+      wave_id: "legacy-wave",
+      slice_id: "legacy-slice",
+      session_id: "legacy-session",
+      workflow: "lightweight",
+      stage_id: "implementation",
+      stage_cursor: "implementation",
+      capability_id: "legacy-capability",
+      capability_epoch: "legacy-epoch",
+      loop_iteration: 1,
+      slot_id: "developer",
+      task_id: "legacy-task",
+      dispatch_id: "legacy-dispatch",
+      attempt: 1,
+      worker_id: "legacy-worker",
+    };
+    const sourceState = {
+      schema: 1,
+      branch: BRANCH,
+      run_key: BRANCH,
+      classification: CLASSIFICATION,
+      task: "versioned quiescent history",
+      workflow_override: false,
+      issue: null,
+      stage_cursor: "implementation",
+      stages: [{ id: "implementation", status: "pending" }],
+      artifacts: {},
+      pause: { kind: "none", reason: "" },
+      updated_at: "2026-09-30T00:00:00.000Z",
+      stage_recovery: {
+        schema_version: 1,
+        lineages: {
+          ["a".repeat(64)]: {
+            generation: 0,
+            identity: terminalIdentity,
+            lifecycle: "terminal",
+            terminal: {
+              authoritative: true,
+              run_id: BRANCH,
+              dispatch_id: "legacy-dispatch",
+              identity: terminalIdentity,
+              outcome: "succeeded",
+              terminal_event_id: "legacy-terminal-event",
+              observed_at: "2026-09-30T00:00:01.000Z",
+              proof: {
+                authenticated: true,
+                source: "legacy-terminal",
+                event_id: "legacy-terminal-event",
+                binding_id: "legacy-binding",
+                observed_at: "2026-09-30T00:00:01.000Z",
+              },
+            },
+            budgets: [],
+            grants: [],
+            operations: [],
+          },
+        },
+      },
+    };
+    const sourceBytes = `${JSON.stringify(sourceState, null, 2)}\n`;
+    writeFileSync(statePath, sourceBytes);
+    const source = discoverLegacySources(root).sources.find((candidate) => candidate.source_id === "feature:versioned-repeat");
+    assert.ok(source);
+    const first = migrateLegacySource(root, source!);
+    assert.equal(first.ok, true, first.ok ? "" : first.error);
+    if (!first.ok) return;
+    const targetStatePath = join(root, ".work-state", "runs", first.run_id, "state.json");
+    const targetBeforeRepeat = readFileSync(targetStatePath, "utf8");
+    const migratedState = JSON.parse(targetBeforeRepeat) as Record<string, unknown>;
+    assert.equal(migratedState.schema, 2);
+    assert.equal((migratedState.migration as Record<string, unknown>).from_schema, 1);
+    assert.equal((migratedState.migration as Record<string, unknown>).to_schema, 2);
+    const migratedLedger = migratedState.stage_recovery as Record<string, unknown>;
+    assert.equal(migratedLedger.schema_version, 1);
+    assert.equal(((migratedLedger.lineages as Record<string, unknown>)["a".repeat(64)] as Record<string, unknown>).lifecycle, "terminal");
+    assert.equal(migratedState.dispatch_capability, undefined, "historical ledger cannot restore dispatch authority");
+    assert.equal(migratedState.work_identity, undefined, "historical ledger cannot restore current identity");
+    const receipt = JSON.parse(readFileSync(join(root, ".work-state", "runs", first.run_id, "migration-receipt.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(receipt.from_schema, 1);
+    assert.equal(receipt.to_schema, 2);
+    assert.equal(readFileSync(join(root, ".work-state", "legacy-archive", first.migration_id, "versioned-repeat", "state.json"), "utf8"), sourceBytes);
+    const repeated = migrateLegacySource(root, source!);
+    assert.equal(repeated.ok, true, repeated.ok ? "" : repeated.error);
+    if (!repeated.ok) return;
+    assert.equal(repeated.run_id, first.run_id);
+    assert.equal(readFileSync(targetStatePath, "utf8"), targetBeforeRepeat);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // Identity-less legacy success imports as a migration projection while the remaining live slot stays executable.
 test("process acceptance: identity-less migration preserves a live consilium slot", () => {
   const root = scratch("rl-migration-identityless-live-slot");
@@ -2434,45 +2679,47 @@ test("process acceptance: identity-less migration preserves a live consilium slo
 // A durable fan-in artifact write survives a child exception after state publication.
 test("process acceptance: fan-in artifact journal recovers after state rename exception", async () => {
   const root = scratch("rl-fan-in-artifact-journal");
+  let harness: Harness | undefined;
   try {
-    initGit(root); publishMapping(root);
-    writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: { analyst: "analyst", "tech-researcher": "tech-researcher" } }) + "\n");
-    const config = resolveConfig(root);
-    writeAgentMapping(root, buildAgentMapping({ roles: config.roles, availableAgents: ["analyst", "tech-researcher"], extraRoles: config.scope_map.map((entry) => entry.dev_agent), genericFallbackRoles: ["analyst", "tech-researcher"] }));
-    const runId = randomUUID();
+    initGit(root);
     const profile = loadProfile("spec-preparation")!;
-    const stageId = "intake_repo_map";
-    const owner = context(root, "fan-in-owner");
-    const capability = createCapability({
-      run_key: runId, branch: BRANCH, workflow: profile.name, profile_hash: profileHash(profile),
-      stage_cursor: stageId, rework_generation: 0, kind: "consilium",
-      expected_roster: [{ role: "analyst", agent: "analyst" }, { role: "tech-researcher", agent: "tech-researcher" }],
+    harness = createCoreFixture({
+      root, branch: BRANCH, workflowProfiles: [profile],
+      roles: { analyst: "analyst", "tech-researcher": "tech-researcher" },
+      scopeMap: [{ glob: ["**/*"], scope: "analyst", dev_agent: "analyst" }],
     });
-    persistCanonicalRun(root, canonicalState(runId, {
+    const config = resolveConfig(root);
+    writeAgentMapping(root, buildAgentMapping({
+      roles: config.roles, availableAgents: ["analyst", "tech-researcher"],
+      extraRoles: config.scope_map.map((entry) => entry.dev_agent),
+      genericFallbackRoles: ["analyst", "tech-researcher"],
+    }));
+    const { runId, handoff } = await ordinaryIngress(harness, {
+      task: "recover real accepted fan-in outputs after a publication fault",
       classification: { ...CLASSIFICATION, workflow: profile.name },
-      profile_hash: profileHash(profile), stage_cursor: stageId, cursor_epoch: capability.state.issued_for.cursor_epoch,
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === stageId ? "in_progress" as const : "pending" as const })),
-      artifacts: { spec_intake_repo_map: "artifacts/spec_intake_repo_map.json" },
-      scope: { scope: ["analyst", "tech-researcher"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "analyst" },
-      dispatch_capability: capability.state,
-    }), { context: owner });
+    });
+    assert.equal(handoff.stage_cursor, "intake_repo_map");
+    const batch = await admitOrdinaryBatchWorkers(harness, handoff, "artifact-journal");
+    const facts = [{ source: "analyst" }, { source: "research" }];
+    const acceptedRefs: string[] = [];
+    for (const [index, worker] of batch.entries()) {
+      const accepted = details((await harness.tools.get("workflow_submit_result")!.execute(
+        `fan-in-slot-submit-${index}`,
+        submission({ spec_intake_repo_map: { facts: [facts[index]] } }),
+        undefined, undefined, worker.childContext,
+      )).details);
+      assert.equal(accepted.ok, true, JSON.stringify(accepted));
+      const receipt = accepted.receipt as { outputs: Array<{ immutable_ref: string }> };
+      acceptedRefs.push(receipt.outputs[0]!.immutable_ref);
+    }
+    await terminalOrdinaryBatchWorkers(harness, batch);
     const artifacts = join(root, ".work-state", "runs", runId, "artifacts");
-    mkdirSync(artifacts, { recursive: true });
     const authBase = {
-      run_id: runId, run_key: runId, branch: BRANCH, workflow: profile.name, profile_hash: profileHash(profile),
-      stage_cursor: stageId, cursor_epoch: capability.state.issued_for.cursor_epoch, loop_iteration: 1,
-      capability_id: capability.state.capability_id, token: capability.dispatch_token,
+      run_id: runId, run_key: handoff.run_key, branch: handoff.branch,
+      workflow: handoff.workflow, profile_hash: handoff.profile_hash,
+      stage_cursor: handoff.stage_cursor, cursor_epoch: handoff.cursor_epoch,
+      loop_iteration: handoff.loop_iteration, capability_id: handoff.capability_id,
     };
-    const complete = (role: string, agent: string, value: object): void => {
-      writeFileSync(join(artifacts, "spec_intake_repo_map.json"), JSON.stringify(value));
-      const authorized = authorizeDispatch(root, { ...authBase, role, agent });
-      assert.equal(authorized.ok, true, authorized.ok ? "" : authorized.error);
-      assert.ok(authorized.ok && authorized.record, JSON.stringify(authorized));
-      const result = completeDispatch(root, { ...authBase, role, agent, dispatch_id: authorized.record!.id, outcome: "succeeded", evidence: "slot complete", artifact_ids: ["spec_intake_repo_map"] }, { runId });
-      assert.equal(result.ok, true, result.ok ? "" : result.error);
-    };
-    complete("analyst", "analyst", { facts: [{ source: "analyst" }] });
-    complete("tech-researcher", "tech-researcher", { facts: [{ source: "research" }] });
     const committedEpoch = readRunState(root, runId)?.dispatch_capability?.issued_for.cursor_epoch;
     assert.ok(committedEpoch);
     const child = await childScript(`
@@ -2494,7 +2741,7 @@ test("process acceptance: fan-in artifact journal recovers after state rename ex
       const result = advanceCursor(root, auth, { runId: auth.run_id });
       console.log(JSON.stringify({ injected, result }));
     `, [root, JSON.stringify({
-      ...authBase, cursor_epoch: committedEpoch, token: capability.advance_token, evidence: "fan-in advance",
+      ...authBase, cursor_epoch: committedEpoch, token: handoff.advance_token, evidence: "fan-in advance",
     })]);
     assert.match(child.output, /"injected":true/, child.output);
     assert.equal(child.code, 0, child.output);
@@ -2511,10 +2758,16 @@ test("process acceptance: fan-in artifact journal recovers after state rename ex
     const recovered = readRunState(root, runId)!;
     assert.equal(recovered.stage_cursor, "requirements_edge_cases");
     const synthesized = JSON.parse(readFileSync(join(artifacts, "spec_intake_repo_map.json"), "utf8")) as { facts?: unknown[] };
-    assert.equal(synthesized.facts?.length, 2);
-    assert.equal(existsSync(join(artifacts, "spec_intake_repo_map-analyst.json")), true);
-    assert.equal(existsSync(join(artifacts, "spec_intake_repo_map-tech-researcher.json")), true);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+    assert.deepEqual(synthesized.facts, facts, "recovery preserves both accepted slot payloads without loss or replay");
+    assert.deepEqual(
+      acceptedRefs.map((ref) => JSON.parse(readFileSync(join(artifacts, ref), "utf8"))),
+      facts.map((fact) => ({ facts: [fact] })),
+      "recovery retains each accepted immutable slot output",
+    );
+  } finally {
+    await harness?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // Root-source archival interruption repairs unchanged observability bytes after the state rename.

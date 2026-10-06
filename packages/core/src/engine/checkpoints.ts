@@ -30,6 +30,7 @@ import {
   validateActiveDispatchCapabilityValue,
   validateTrustedCheckpointAnswerValue,
   validateTypedCheckpointDecisionValue,
+  validateWorkIdentityValue,
 } from "./control-plane-contract.js";
 import type {
   CheckpointAnswerProof,
@@ -130,6 +131,9 @@ function canonicalize(value: unknown): unknown {
 
 function canonicalJson(value: unknown): string {
   return JSON.stringify(canonicalize(value));
+}
+function workIdentityDigest(identity: WorkIdentity): string {
+  return createHash("sha256").update(canonicalJson(identity)).digest("hex");
 }
 
 /** SHA-256 over canonical policy JSON; persisted migration uses the same rule. */
@@ -232,19 +236,14 @@ function capabilityBinding(state: TeamState): { id: string; epoch: string; loop_
  * A top-level `work_identity` is used only when it provably belongs to THIS
  * binding and stage; anything else (a stale prior-stage identity) is
  * ignored and the synthetic checkpoint identity under the given binding is
- * hashed instead — a stale top-level identity can never influence proof
- * hashing, and the hash is stable whether or not the stale mirror is
- * present.
+ * hashed instead.
  */
-function checkpointWorkIdentityHash(state: TeamState, stageId: string, binding: { id: string; epoch: string; loop_iteration: number }): string {
-  const identity = identityBoundToActiveCapability(state);
-  const bound = identity !== null
-    && identity.capability_id === binding.id
-    && identity.capability_epoch === binding.epoch
-    && identity.loop_iteration === binding.loop_iteration
-    && identity.stage_id === stageId
-    && identity.stage_cursor === stageId;
-  const effective = bound ? identity : {
+function syntheticCheckpointWorkIdentityHash(
+  state: TeamState,
+  stageId: string,
+  binding: { id: string; epoch: string; loop_iteration: number },
+): string {
+  const effective = {
     run_id: expectedRunId(state),
     wave_id: "checkpoint",
     slice_id: "checkpoint",
@@ -262,6 +261,66 @@ function checkpointWorkIdentityHash(state: TeamState, stageId: string, binding: 
     worker_id: "engine",
   };
   return createHash("sha256").update(canonicalJson(effective)).digest("hex");
+}
+
+function checkpointWorkIdentityHash(state: TeamState, stageId: string, binding: { id: string; epoch: string; loop_iteration: number }): string | null {
+  const identity = identityBoundToActiveCapability(state);
+  const bound = identity !== null
+    && identity.capability_id === binding.id
+    && identity.capability_epoch === binding.epoch
+    && identity.loop_iteration === binding.loop_iteration
+    && identity.stage_id === stageId
+    && identity.stage_cursor === stageId;
+  if (!bound) return syntheticCheckpointWorkIdentityHash(state, stageId, binding);
+  // A projected real identity is never silently downgraded to a synthetic
+  // hash. It is a trusted mint only when the exact root identity is still
+  // retained by the singular dispatch ledger.
+  const witness = trustedRootIdentityWitness(state, stageId, binding);
+  return witness ? workIdentityDigest(witness) : null;
+}
+function sameWorkIdentity(left: WorkIdentity, right: WorkIdentity): boolean {
+  return left.run_id === right.run_id
+    && left.wave_id === right.wave_id
+    && left.slice_id === right.slice_id
+    && left.session_id === right.session_id
+    && left.workflow === right.workflow
+    && left.stage_id === right.stage_id
+    && left.stage_cursor === right.stage_cursor
+    && left.capability_id === right.capability_id
+    && left.capability_epoch === right.capability_epoch
+    && left.loop_iteration === right.loop_iteration
+    && left.slot_id === right.slot_id
+    && left.task_id === right.task_id
+    && left.dispatch_id === right.dispatch_id
+    && left.attempt === right.attempt
+    && left.worker_id === right.worker_id;
+}
+
+function trustedRootIdentityWitness(
+  state: TeamState,
+  stageId: string,
+  binding: { id: string; epoch: string; loop_iteration: number },
+): WorkIdentity | undefined {
+  const identity = identityBoundToActiveCapability(state);
+  const capability = state.dispatch_capability;
+  if (
+    !identity
+    || !validateWorkIdentityValue(identity).ok
+    || !capability
+    || capability.kind !== "single"
+    || capability.expected_count !== 1
+    || identity.stage_id !== stageId
+    || identity.stage_cursor !== stageId
+    || identity.capability_id !== binding.id
+    || identity.capability_epoch !== binding.epoch
+    || identity.loop_iteration !== binding.loop_iteration
+  ) return undefined;
+  const issued = (capability.dispatches ?? []).some((record) =>
+    record.work_identity !== undefined
+    && validateWorkIdentityValue(record.work_identity).ok
+    && sameWorkIdentity(record.work_identity, identity)
+  );
+  return issued ? { ...identity } : undefined;
 }
 
 /** The proof envelope a caller may hold for one durable answer record. */
@@ -319,15 +378,29 @@ export function recordTrustedCheckpointAnswer(
   const policyHash = checkpointPolicyHash(policy);
   const runId = expectedRunId(state);
   const workIdentityHash = checkpointWorkIdentityHash(state, input.stage_id, binding);
+  const workIdentityWitness = trustedRootIdentityWitness(state, input.stage_id, binding);
+  if (workIdentityHash === null) {
+    throw new Error("checkpoint_unverified: projected real work identity has no exact retained singular dispatch provenance");
+  }
+  if (
+    workIdentityWitness !== undefined
+    && workIdentityHash !== workIdentityDigest(workIdentityWitness)
+  ) {
+    throw new Error("checkpoint_unverified: projected work identity witness/hash mismatch");
+  }
   const existing = (state.trusted_checkpoint_answers ?? []).find((candidate) => candidate.answer_id === input.answer_id);
   const existingShape = existing ? validateTrustedCheckpointAnswerValue(existing) : null;
   if (existingShape && !existingShape.ok) {
     throw new Error(`checkpoint_unverified: trusted answer is malformed: ${existingShape.issues.map((issue) => `${issue.path} ${issue.message}`).join("; ")}`);
   }
   if (existing) {
+    const witnessMatches = existing.work_identity_witness === undefined
+      ? workIdentityWitness === undefined
+      : workIdentityWitness !== undefined && sameWorkIdentity(existing.work_identity_witness, workIdentityWitness);
     const expected = checkpointAnswerBinding(existing);
     if (
       existing.binding !== expected
+      || !witnessMatches
       || existing.channel !== input.channel
       || existing.reference !== input.reference
       || existing.run_id !== runId
@@ -353,6 +426,7 @@ export function recordTrustedCheckpointAnswer(
     stage_id: input.stage_id,
     checkpoint_id: input.checkpoint_id,
     work_identity_hash: workIdentityHash,
+    ...(workIdentityWitness ? { work_identity_witness: workIdentityWitness } : {}),
     capability_id: binding.id,
     capability_epoch: binding.epoch,
     loop_iteration: binding.loop_iteration,
@@ -662,6 +736,7 @@ function trustedHumanAnswerError(
   state: TeamState,
   candidate: TypedCheckpointDecision,
   stage: StageCheckpointRef,
+  mode: "current" | "historical",
 ): CheckpointValidationFailure | null {
   if (candidate.actor.kind !== "user") {
     return fail("checkpoint_unverified", "human checkpoint authorization requires a user actor", "needs_human");
@@ -677,6 +752,15 @@ function trustedHumanAnswerError(
   if (!answer) {
     return fail("checkpoint_unverified", "human checkpoint authorization answer identity is not present in the durable answer ledger", "needs_human");
   }
+  const binding = {
+    id: candidate.capability_id,
+    epoch: candidate.capability_epoch,
+    loop_iteration: candidate.loop_iteration,
+  };
+  const identityProvenance = checkpointAnswerIdentityHashIsIssued(state, candidate, stage, answer, mode);
+  const workIdentityMatches = answer.work_identity_hash === checkpointWorkIdentityHash(state, stage.id, binding);
+  const finalizedContinuity = mode === "current"
+    && allowsFinalizedIdentityContinuity(state, candidate, stage, answer);
   if (
     answer.answer_id !== proof.answer_id
     || answer.nonce !== proof.nonce
@@ -696,7 +780,8 @@ function trustedHumanAnswerError(
     // historical mode it lets a decision survive capability rotation (the
     // product_approval -> product_handoff gate) instead of being compared
     // against whatever capability is active now.
-    || answer.work_identity_hash !== checkpointWorkIdentityHash(state, stage.id, { id: candidate.capability_id, epoch: candidate.capability_epoch, loop_iteration: candidate.loop_iteration })
+    || !identityProvenance
+    || (mode === "current" && !workIdentityMatches && !finalizedContinuity)
   ) {
     return fail("checkpoint_unverified", "human checkpoint authorization answer binding is stale or mismatched", "needs_human");
   }
@@ -734,6 +819,130 @@ function trustedHumanAnswerError(
   }
   return null;
 }
+
+function checkpointAnswerIdentityHashIsIssued(
+  state: TeamState,
+  candidate: TypedCheckpointDecision,
+  stage: StageCheckpointRef,
+  answer: TrustedCheckpointAnswer,
+  mode: "current" | "historical",
+): boolean {
+  const binding = {
+    id: candidate.capability_id,
+    epoch: candidate.capability_epoch,
+    loop_iteration: candidate.loop_iteration,
+  };
+  const workflow = state.classification?.workflow;
+  if (!nonEmpty(workflow)) return false;
+  const inDecisionScope = (identity: WorkIdentity): boolean => {
+    return (
+      identity.run_id === candidate.run_id
+      && identity.workflow === workflow
+      && identity.stage_id === stage.id
+      && identity.stage_cursor === stage.id
+      && identity.capability_id === candidate.capability_id
+      && identity.capability_epoch === candidate.capability_epoch
+      && identity.loop_iteration === candidate.loop_iteration
+    );
+  };
+  const capability = state.dispatch_capability;
+  const issued = capability?.issued_for;
+  const activeSameScope = capability !== undefined
+    && capability.capability_id === candidate.capability_id
+    && issued?.run_key === candidate.run_id
+    && issued?.workflow === workflow
+    && issued.stage_cursor === stage.id
+    && issued.cursor_epoch === candidate.capability_epoch
+    && issued.loop_iteration === candidate.loop_iteration;
+  const retainedSingularIdentity = (identity: WorkIdentity): boolean => {
+    return capability?.kind === "single"
+      && capability.expected_count === 1
+      && (capability.dispatches ?? []).some((record) =>
+        record.work_identity !== undefined
+        && validateWorkIdentityValue(record.work_identity).ok
+        && sameWorkIdentity(record.work_identity, identity));
+  };
+
+  if (answer.work_identity_witness !== undefined) {
+    const witness = answer.work_identity_witness;
+    // A witness is a complete WorkIdentity, not an opaque caller-chosen hash.
+    // Loop-scoped witness identities are mandatory even though old identities
+    // remain readable elsewhere.
+    if (
+      !validateWorkIdentityValue(witness).ok
+      || witness.loop_iteration !== candidate.loop_iteration
+      || !inDecisionScope(witness)
+      || answer.work_identity_hash !== workIdentityDigest(witness)
+    ) return false;
+    // While the minting capability is still this scope, engine state can
+    // prove whether a singular root was eligible. Consilium slot identities
+    // are never accepted as a root witness. Once that capability is rotated
+    // or cleared, the bound witness is the retained mint-time provenance.
+    if (activeSameScope || mode === "current") return retainedSingularIdentity(witness);
+    return true;
+  }
+
+  // Synthetic answers are deterministic and intentionally witness-free.
+  if (answer.work_identity_hash === syntheticCheckpointWorkIdentityHash(state, stage.id, binding)) return true;
+
+  // A real answer without a witness is legacy-compatible only while its exact
+  // engine-owned singular dispatch identity remains retained. No arbitrary
+  // non-empty hash becomes historical authority after that evidence is gone.
+  if (mode === "current" || activeSameScope) {
+    if (capability?.kind !== "single" || capability.expected_count !== 1) return false;
+  }
+  return capability?.kind === "single"
+    && capability.expected_count === 1
+    && (capability.dispatches ?? []).some((record) => {
+      const identity = record.work_identity;
+      return identity !== undefined
+        && validateWorkIdentityValue(identity).ok
+        && inDecisionScope(identity)
+        && answer.work_identity_hash === workIdentityDigest(identity);
+    });
+}
+
+
+/**
+ * Preserve an exact finalized answer across legitimate singular-worker
+ * identity projection within one immutable checkpoint scope. New answers
+ * still bind to the current projected identity; this is only a read-time
+ * continuity proof for the immutable answer already finalized before or
+ * between dispatches.
+ */
+function allowsFinalizedIdentityContinuity(
+  state: TeamState,
+  candidate: TypedCheckpointDecision,
+  stage: StageCheckpointRef,
+  answer: TrustedCheckpointAnswer,
+): boolean {
+  if (
+    answer.consumed_at === undefined
+    || answer.consumed_reason !== "finalized"
+    || answer.finalized_decision_key !== checkpointDecisionKey(candidate)
+    || !checkpointAnswerIdentityHashIsIssued(state, candidate, stage, answer, "current")
+  ) return false;
+  const identity = identityBoundToActiveCapability(state);
+  if (
+    !identity
+    || !validateWorkIdentityValue(identity).ok
+    || identity.run_id !== candidate.run_id
+    || identity.workflow !== state.classification.workflow
+    || identity.stage_id !== stage.id
+    || identity.stage_cursor !== stage.id
+    || identity.capability_id !== candidate.capability_id
+    || identity.capability_epoch !== candidate.capability_epoch
+    || identity.loop_iteration !== candidate.loop_iteration
+  ) return false;
+  const capability = state.dispatch_capability;
+  if (!capability || capability.kind !== "single" || capability.expected_count !== 1) return false;
+  return (capability.dispatches ?? []).some((record) => {
+    const recordIdentity = record.work_identity;
+    if (!recordIdentity || !validateWorkIdentityValue(recordIdentity).ok) return false;
+    return sameWorkIdentity(recordIdentity, identity);
+  });
+}
+
 
 /**
  * Validate one policy-bound decision.  This is intentionally independent from
@@ -824,7 +1033,7 @@ export function validateCheckpointDecision(
     return fail("policy_invalid", `hard-human checkpoint '${checkpointId}' cannot permit autonomous authorization`, "needs_human");
   }
   if (candidate.authorization === "human") {
-    const provenanceError = trustedHumanAnswerError(state, candidate, stage);
+    const provenanceError = trustedHumanAnswerError(state, candidate, stage, mode);
     if (provenanceError) return provenanceError;
   } else if (candidate.authorization === "policy_auto") {
     if (floor) return fail("policy_invalid", `policy_auto is forbidden for hard-human checkpoint '${checkpointId}'`, "needs_human");
@@ -894,13 +1103,15 @@ export function validateCheckpointForAdvance(
     return candidateScope !== null && sameScope(candidateScope, active);
   });
   if (candidates.length === 0) return unresolved();
-
   const validated: TypedCheckpointDecision[] = [];
+
+
   for (const candidate of candidates) {
     const result = validateCheckpointDecision(state, candidate, { stage, declaration, mode: "current" });
     if (!result.ok) return result;
     validated.push(result.decision);
   }
+  if (validated.length === 0) return unresolved();
   const keys = new Set(validated.map((decision) => checkpointDecisionKey(decision)));
   if (keys.size > 1) {
     return fail(
@@ -982,8 +1193,19 @@ export function findHistoricalCheckpointDecision(
     const id = "checkpoint_id" in decision ? decision.checkpoint_id : decision.checkpoint;
     return decision.stage_id === declaration.stage_id && id === declaration.checkpoint_id;
   });
+  const selectedDecisions = !selector
+    ? decisions
+    : "decision_key" in selector
+      ? decisions.filter((decision) => {
+          const prepared = typedInput(decision);
+          return !("ok" in prepared) && checkpointDecisionKey(prepared.candidate) === selector.decision_key;
+        })
+      : decisions.filter((decision) => {
+          const scope = decisionScopeOf(decision);
+          return scope !== null && sameScope(scope, selector.scope);
+        });
   const validated = new Map<string, { decision: TypedCheckpointDecision; scope: CheckpointScope }>();
-  for (const decision of decisions) {
+  for (const decision of selectedDecisions) {
     const result = validateCheckpointDecision(state, decision, { stage, declaration, mode: "historical" });
     if (!result.ok) {
       return {

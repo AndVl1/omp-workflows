@@ -40,10 +40,10 @@ import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engin
 import { createCapability, authorizeDispatch as rawAuthorizeDispatch, completeDispatch as rawCompleteDispatch, advanceCursor as rawAdvanceCursor, type CapabilityHandoff } from "../src/engine/durable.js";
 import { checkMonotonic } from "../src/engine/state.js";
 import { buildDispatchMarker, dispatchGate } from "../src/gates/dispatch.js";
-import { run, prepareWorkflowState } from "../src/engine/run.js";
+import { run } from "../src/engine/run.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
-import type { TaskCaller } from "../src/engine/stage.js";
+import { createCoreFixture, createInterpreterTaskCaller, details, requireTool, submission, type Harness } from "./reliable-stage-execution-fixture.js";
 
 const NO_RUNTIME: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
 const WITH_RUNTIME: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
@@ -363,6 +363,7 @@ test("WF-3: skip_if evaluation failures fail closed — nothing is skipped, arme
 test("WF-3: interpreter parity — run() skips the skip_if stage without dispatching it and completes through the durable advance", async () => {
   const root = mkdtempSync(join(tmpdir(), "w3-skip-interp-"));
   const branch = "interp-skip";
+  let harness: Harness | undefined;
   try {
     initGit(root, branch);
     const interpProfile: Profile = {
@@ -378,62 +379,78 @@ test("WF-3: interpreter parity — run() skips the skip_if stage without dispatc
       ],
     };
     registerWorkflowProfiles([interpProfile]);
-    const execution = {
-      session_id: "skip-interpreter-session",
-      caller: "host",
-      process_id: process.pid,
-      worktree: root,
+    harness = createCoreFixture({
+      root,
       branch,
-      authority: "coordinator",
-    } as const;
-    const prepared = prepareWorkflowState({
-      task: "interpreter skip",
-      cwd: root,
-      branch,
-      autonomous: true,
-      classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "skip-interp" },
-      files: [],
-      mode: "new",
-      execution,
+      sessionId: "skip-interpreter-session",
+      workflowProfiles: [interpProfile],
+      roles: { dev: "dev", qa: "qa" },
     });
+    const classification = {
+      type: "FEATURE" as const,
+      complexity: "MEDIUM" as const,
+      confidence: "HIGH" as const,
+      autonomous: true,
+      workflow: "skip-interp" as const,
+    };
+    const prepared = harness.controller.prepare({
+      mode: "new",
+      task: "interpreter skip",
+      classification,
+    });
+    const runId = prepared.state.run_id;
+    assert.ok(runId);
+    assert.equal(harness.controller.selectedRunId(), runId);
+    const execution = harness.controller.context();
     const preparedState = JSON.parse(readFileSync(prepared.statePath, "utf8")) as TeamState;
     writeFileSync(prepared.statePath, JSON.stringify({
       ...preparedState,
-      artifacts: { ...(preparedState.artifacts ?? {}), qa_tests: "artifacts/qa_tests.json" },
+      artifacts: {
+        ...(preparedState.artifacts ?? {}),
+        review: "artifacts/review.json",
+        qa_tests: "artifacts/qa_tests.json",
+      },
     }) + "\n");
     const artifactsDir = prepared.artifactsDir;
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(join(artifactsDir, "review.json"), JSON.stringify({ findings: [] }) + "\n");
     const dispatchedAgents: string[] = [];
-    const taskTool: TaskCaller = {
-      async call({ agent }) {
-        dispatchedAgents.push(agent);
-        return {
-          id: "x",
-          output: "ok",
-          artifacts: agent === "qa"
-            ? {
-              qa_tests: {
-                tests_added: [],
-                build_status: "pass",
-                based_on_manual_qa: false,
-                coverage_note: "interpreter parity fixture",
-              },
-            }
-            : {},
-          exitCode: 0,
-        };
-      },
-      async batch() { return []; },
-    };
+    const taskTool = createInterpreterTaskCaller(harness, async (worker, request) => {
+      dispatchedAgents.push(request.agent);
+      if (request.agent === "qa") {
+        const submitted = details((await requireTool(harness!, "workflow_submit_result").execute(
+          `${worker.toolCallId}-submit`,
+          submission({
+            qa_tests: {
+              tests_added: [],
+              build_status: "pass",
+              based_on_manual_qa: false,
+              coverage_note: "interpreter parity fixture",
+            },
+          }),
+          undefined,
+          undefined,
+          worker.childContext,
+        )).details);
+        assert.equal(submitted.ok, true, JSON.stringify(submitted));
+        assert.ok(submitted.receipt && typeof submitted.receipt === "object", "registered worker output must return its receipt");
+      }
+      return {
+        id: `${worker.toolCallId}-result`,
+        output: "ok",
+        exitCode: 0,
+      };
+    });
     const result = await run({
       task: "interpreter skip",
       cwd: root,
       branch,
-      classification: { type: "FEATURE", complexity: "MEDIUM", confidence: "HIGH", autonomous: true, workflow: "skip-interp" },
+      autonomous: true,
+      classification,
       mode: "resume",
-      run_id: prepared.state.run_id,
+      run_id: runId,
       execution,
+      sessionController: harness.controller,
       taskTool,
     });
     assert.equal(result.outcomes.some((o) => o.status === "failed"), false, `the run completes without failures: ${JSON.stringify(result.outcomes)}`);
@@ -452,6 +469,7 @@ test("WF-3: interpreter parity — run() skips the skip_if stage without dispatc
     assert.equal(final.stages.find((s) => s.id === "review_fixes")?.status, "skipped", "the durable state marks the skip_if stage skipped");
     assert.ok(checkMonotonic(final).ok);
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

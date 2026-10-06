@@ -36,6 +36,28 @@ npm install @andvl1/omp-workflows-core
 npm install @andvl1/omp-workflows-fullstack
 ```
 
+For an existing npm-plugin installation, update **both packages to the same
+published version**, core first, using `omp plugin install ... --force`.
+`omp plugin upgrade` is for marketplace plugins, not npm-installed packages.
+Follow the [paired update instructions](packages/fullstack/README.md), then start
+a new OMP session to load the updated extensions.
+
+### Приватный runtime этого монорепозитория
+
+В этом worktree `.omp/settings.json` загружает пакет
+`packages/omp-workflows-internal` по каноническому workspace-пути, а не через
+`node_modules` alias. Указывай каталог пакета, не отдельный `dist/index.js`:
+каталог сохраняет discovery приватных агентов и skills. Команды здесь —
+`/omp-do-work`, `/omp-team` и `/omp-cto`.
+
+Project override `.omp/plugin-overrides.json` отключает установленный
+`@andvl1/omp-workflows-fullstack` только для этого проекта, оставляя один private
+workflow owner. Это не отключает gates и не меняет глобальную установку для
+других репозиториев. После обновления build или конфигурации полностью перезапусти
+OMP; уже загруженные factories и controllers не обновляются от изменений файлов.
+Существующий run продолжай через `/omp-do-work --resume --run <run-id>` —
+удалять его state или маркеры не требуется.
+
 ### Slash command bootstrap and compatibility copies
 
 When the extension is loaded, its registered `/do-work`, `/team`, and `/cto`
@@ -311,6 +333,86 @@ resume.
 [`core lifecycle contract`](packages/core/README.md) и
 [`fullstack command guide`](packages/fullstack/README.md).
 
+### Сдача результата, approvals и recovery
+
+Producer сдаёт результат через `workflow_submit_result({ outputs })`: ключи
+`outputs` — объявленные артефакты текущего назначения, значения — данные их
+схем. Identity, роль, slot, run и authority не задаются в model input: core
+выводит их из подтверждённого host binding. Запись JSON вручную не заменяет
+сдачу результата.
+
+Для больших, вложенных или многострочных результатов при наличии авторизованного программного writer
+обязателен `workflow_submit_result({ outputs_path: path })`. Файл имеет ровно формат `{ "outputs": { ... } }`.
+Inline остаётся для небольших простых результатов и read-only producers без writer;
+их результат должен быть кратким, но полным по схеме. В вызове разрешён ровно один вариант.
+Путь относителен к workspace подтверждённого producer; absolute/`..`/symlink запрещены.
+Каждый producer occurrence создаёт уникальный файл, не общий `stage-output.json`.
+В JS eval: `const path = 'stage-output-' + crypto.randomUUID() + '.json'; await Bun.write(path, JSON.stringify({ outputs }));`.
+При разрешённом general Bash используйте Node с `randomUUID` из `node:crypto` и
+`writeFileSync(path, JSON.stringify({ outputs }), { flag: 'wx' })` из `node:fs`;
+выведите path и передайте именно его в tool. Не собирайте JSON вручную.
+После inline parse error переключитесь на файл, если writer разрешён; иначе исправьте
+и упростите inline payload без потери обязательных полей. Не повторяйте исследование.
+Read-only ast-index-only allowlist не разрешает Node; не обходите ограничения tools.
+Только принятый tool receipt подтверждает публикацию. При отказе исправьте файл/вызов без повторного исследования.
+Read/path/JSON ошибки возвращают `code`/`error` без `field_errors`; schema ошибки
+после чтения идут обычным validation path. Это доставка payload, не восстановление
+уже завершённого worker и не новая authority.
+
+- **Producer ownership.** Worker публикует только собственный slot;
+  orchestrator — объявленный ему этап. Tool producer использует
+  `registerStageProducerTool` и publisher, действующий только внутри
+  зарегистрированного callback. Обычный model call не может присвоить себе
+  tool authority. `lecture_acquire` сохраняет main-session restriction.
+- **Receipt и terminal — разные факты.** Core проверяет схему и evidence,
+  публикует immutable payload вместе с receipt и различает точный повтор
+  от конфликтующей сдачи. Worker terminal без принятого результата не
+  завершает этап; receipt не заменяет worker terminal, DoD или approval.
+  Orchestrator/tool не требуют фиктивного worker terminal.
+- **Переходы.** Ordinary route использует `workflow_checkpoint_ask` и
+  `workflow_advance`. В native CTO root вызывает
+  `cto_checkpoint_ask({ slice_id })` и `cto_stage_advance({ slice_id })`;
+  configured lead и roster сохраняют собственные границы authority.
+  Planning consent не является approval завершённой реализации.
+- **Recovery.** `workflow_recover` диагностирует и согласует текущее
+  canonical состояние без model-supplied stage token. Неизвестный исход
+  worker не является подтверждённым завершением и не разрешает второго
+  writer. Format repair возвращается тому же producer, а replacement
+  требует подтверждённого исхода и bounded budget.
+  Budget привязан к canonical stage/slot lineage, а не к новому SDK session/task:
+  restart и повторная доставка не обнуляют использованные попытки. Историческое
+  `running` после смены owner не доказывает liveness без свежего host evidence;
+  поздний terminal прежнего worker не снимает reservation его replacement.
+- **Граница OMP 18.** Continuation через `sendMessage` означает
+  `queued`/`not_started`, не запуск worker. Новый dispatch проходит обычный
+  admission; только runtime подтверждает start/terminal. Неподтверждённые
+  inspect/resume/reconnect capabilities не выдаются за поддерживаемые.
+- **Standalone API.** `run`, `runStage` и `createTaskCaller` остаются
+  низкоуровневыми API исполнения. `TaskResult` содержит только transport result,
+  без `artifacts`; worker публикует `outputs` через свой зарегистрированный
+  `workflow_submit_result`. Orchestrator callback возвращает `outputs`, которые
+  engine публикует через trusted current-stage binding.
+  Registered interpreter передаёт `sessionController` и
+  `execution: sessionController.context()`: lifecycle preparation обновляет
+  canonical claim и приватную привязку одного controller вместе.
+  Несовпадающий controller/context/workspace отклоняется до записи.
+  Executor сохраняет реальные SDK admission hooks и child lineage; standalone
+  caller без зарегистрированного producer не получает synthetic worker binding.
+
+Для автоматической проверки из корня доступны `npm run test:workflow-scenarios`
+(D) и `npm run test:workflow-process` (P). Они используют изолированные roots,
+no-network окружение и scenario report с фактическими событиями и source
+locators; missing/skipped cases и trace gaps не считаются PASS. Целевые
+длительности — D ≤ 60 секунд и P ≤ 180 секунд; фактическое время и соблюдение
+бюджета записываются в report. Превышение бюджета завершает команду с ошибкой,
+даже если все сценарии прошли. Эти проверки не заменяют отдельные H1/H2/H3
+на установленном OMP.
+D ограничивает одновременное выполнение тремя test files, P — одним;
+длинные файлы запускаются первыми через стандартный `node:test.run`.
+Build/typecheck и отдельные тяжёлые команды запускаются последовательно.
+Безопасные промежуточные строки содержат только scenario ID, outcome и время,
+поэтому зависший gate не скрывает уже завершённые cases до итогового report.
+
 ### Bootstrap custom-TS commands into your project
 
 Bootstrapping is automatic for both install paths — see *Slash command bootstrap — works for both install paths* above. The CLI script below remains available for explicit re-sync (for example, after editing a shipped command in the source repo and wanting to refresh a downstream checkout before the next session).
@@ -465,6 +567,16 @@ extension entry point: it wires gates/config/observability, but not the
 `workflow_*` tools or slash commands. Compose all three seams under one owner
 identity as shown in
 [`docs/adding-agents.md`](docs/adding-agents.md#4-регистрация-workflow).
+
+Passing `getSessionController` to `registerTeamWorkflow` also requires the
+bundle's `resolveTrustedToolCallActor`; an incomplete pair fails at registration
+with `[workflow_registration:missing_actor_resolver]`. An authenticated idle
+host is distinct from an unknown caller, even when no workflow is selected.
+Admission failures include a stable `[workflow_admission:<code>]`, an action,
+and safe report guidance. See the
+[host/session contract and troubleshooting guide](docs/adding-agents.md#hostsession-authority--обязательный-контракт)
+before upgrading a custom bundle; do not bypass admission by removing its
+controller or trusting raw `actor`/`hasUI` fields.
 
 ## Observability
 

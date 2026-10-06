@@ -204,7 +204,7 @@ export function ensureScratchPackageLinks(scratchDir: string, targets: ScratchPa
 }
 
 /** Materialize the scratch project. Returns the scratch dir path. */
-export function runBootstrap(args: BootstrapArgs): string {
+export function runBootstrap(args: BootstrapArgs, env: NodeJS.ProcessEnv = process.env): string {
   const monorepo = args.monorepo ?? defaultMonorepoRoot();
   const scratchDir = join(args.workdir, `omp-ux-e2e-${args.slug}`);
   if (existsSync(scratchDir)) {
@@ -215,8 +215,8 @@ export function runBootstrap(args: BootstrapArgs): string {
   }
   mkdirSync(scratchDir, { recursive: true });
 
-  execSync('git init', { cwd: scratchDir, stdio: 'inherit' });
-  execSync(`git checkout -b ${shellQuote(args.branch)}`, { cwd: scratchDir, stdio: 'inherit' });
+  execSync('git init', { cwd: scratchDir, env, stdio: 'inherit' });
+  execSync(`git checkout -b ${shellQuote(args.branch)}`, { cwd: scratchDir, env, stdio: 'inherit' });
 
   writeFileSync(
     join(scratchDir, 'package.json'),
@@ -249,7 +249,7 @@ export function runBootstrap(args: BootstrapArgs): string {
   // Materialize custom-TS commands into <scratch>/.omp/commands/.
   const copyScript = join(fullstackPkg, 'scripts', 'copy-commands.mjs');
   if (existsSync(copyScript)) {
-    execSync(`${process.execPath} ${shellQuote(copyScript)} ${shellQuote(scratchDir)}`, { stdio: 'inherit', env: { ...process.env, OMP_PROJECT_DIR: scratchDir } });
+    execSync(`${process.execPath} ${shellQuote(copyScript)} ${shellQuote(scratchDir)}`, { stdio: 'inherit', env: { ...env, OMP_PROJECT_DIR: scratchDir } });
   }
 
   materializeWorkspaceActivation(monorepo, scratchDir);

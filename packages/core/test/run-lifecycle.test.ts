@@ -56,6 +56,7 @@ import type {
   TrustedExecutionContext,
   WorkIdentity,
 } from "../src/engine/types.js";
+import type { TaskCaller } from "../src/engine/stage.js";
 const BRANCH = "feature/lifecycle-regression";
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const CLASSIFICATION = {
@@ -115,15 +116,15 @@ type HeldChildClaim = {
 };
 
 function childClaim(root: string, runId: string, sessionId: string, workerIds?: string[]): Promise<ChildClaimResult>;
-function childClaim(root: string, runId: string, sessionId: string, workerIds: string[], options: { holdOpen: true }): HeldChildClaim;
+function childClaim(root: string, runId: string, sessionId: string, workerIds: string[] | undefined, options: { holdOpen: true }): HeldChildClaim;
 function childClaim(
   root: string,
   runId: string,
   sessionId: string,
-  workerIds: string[] = [],
+  workerIds?: string[],
   options?: { holdOpen: true },
 ): Promise<ChildClaimResult> | HeldChildClaim {
-  const workerIdsLiteral = JSON.stringify(workerIds);
+  const workerIdsOption = workerIds === undefined ? "" : `worker_ids: ${JSON.stringify(workerIds)},`;
   const holdOpen = options?.holdOpen === true;
   const script = `
     import { acquireExecutionClaim } from './packages/core/src/index.ts';
@@ -140,7 +141,7 @@ function childClaim(
           branch: '${BRANCH}',
           authority: 'coordinator'
         },
-        worker_ids: ${workerIdsLiteral}
+        ${workerIdsOption}
       });
       outcome = 'acquired';
     } catch (error) {
@@ -734,7 +735,7 @@ test("direct run new creates independent canonical transition receipts on one br
     initGit(root);
     const taskTool = {
       async call() {
-        return { id: "unused-call", output: "unused", artifacts: {}, exitCode: 0 };
+        return { id: "unused-call", output: "unused", exitCode: 0 };
       },
       async batch() {
         return [];
@@ -1825,6 +1826,62 @@ test("unknown coordinator liveness cannot displace an execution claim", () => {
   }
 });
 
+test("same-session claim replay requires process identity and dead-owner handover preserves reservations", async () => {
+  const replayRoot = scratch("omp-lifecycle-claim-replay-process");
+  const handoverRoot = scratch("omp-lifecycle-claim-handover-process");
+  const runId = "51515151-5151-4515-8515-515151515151";
+  let held: HeldChildClaim | undefined;
+  try {
+    initGit(replayRoot);
+    persistCanonicalRun(replayRoot, state(runId));
+    const execution = context(replayRoot, "same-sdk-session");
+    const first = acquireExecutionClaim(replayRoot, {
+      run_id: runId,
+      context: execution,
+      worker_ids: ["worker-pending"],
+    });
+    const replay = acquireExecutionClaim(replayRoot, {
+      run_id: runId,
+      context: execution,
+      worker_ids: ["must-not-replace"],
+    });
+    assert.equal(replay.idempotent, true);
+    assert.equal(replay.claim.token, first.claim.token);
+    assert.equal(replay.claim.ownership_epoch, first.claim.ownership_epoch);
+    assert.deepEqual(replay.claim.worker_ids, ["worker-pending"]);
+
+    initGit(handoverRoot);
+    persistCanonicalRun(handoverRoot, state(runId));
+    held = childClaim(handoverRoot, runId, "same-sdk-session", ["worker-pending"], { holdOpen: true });
+    const heldAttempt = await held.attempt;
+    assert.equal(heldAttempt.outcome, "acquired", heldAttempt.output);
+    const before = readRunControl(handoverRoot);
+    const liveContender = await childClaim(handoverRoot, runId, "same-sdk-session");
+    assert.equal(liveContender.code, 1, liveContender.output);
+    assert.match(liveContender.output, /run_busy/);
+    assert.deepEqual(readRunControl(handoverRoot), before);
+
+    held.terminate();
+    await held.closed;
+    held = undefined;
+    const resumed = await childClaim(handoverRoot, runId, "same-sdk-session");
+    assert.equal(resumed.code, 0, resumed.output);
+    assert.match(resumed.output, /acquired/);
+    const after = readRunControl(handoverRoot);
+    assert.ok(after.execution_claim);
+    assert.notEqual(after.execution_claim.token, before.execution_claim?.token);
+    assert.notEqual(after.execution_claim.ownership_epoch, before.execution_claim?.ownership_epoch);
+    assert.deepEqual(after.execution_claim.worker_ids, ["worker-pending"]);
+  } finally {
+    if (held) {
+      held.terminate();
+      await held.closed;
+    }
+    rmSync(replayRoot, { recursive: true, force: true });
+    rmSync(handoverRoot, { recursive: true, force: true });
+  }
+});
+
 test("same-run dead-owner resume rotates ownership epoch without changing rework or pending identity", async () => {
   const root = scratch("omp-lifecycle-handover-resume");
   const runId = "45454545-4545-4454-8454-454545454545";
@@ -1855,11 +1912,11 @@ test("same-run dead-owner resume rotates ownership epoch without changing rework
     const taskTool: TaskCaller = {
       async call() {
         calls.call += 1;
-        return { id: "unexpected-call", output: "unexpected", artifacts: {}, exitCode: 0 };
+        return { id: "unexpected-call", output: "unexpected", exitCode: 0 };
       },
       async batch() {
         calls.batch += 1;
-        return [{ id: "unexpected-batch", output: "unexpected", artifacts: {}, exitCode: 0 }];
+        return [{ id: "unexpected-batch", output: "unexpected", exitCode: 0 }];
       },
     };
 
@@ -1931,11 +1988,11 @@ test("run resume does not invoke task.call or task.batch for pending or succeede
     const taskTool: TaskCaller = {
       async call() {
         calls.call += 1;
-        return { id: "unexpected-call", output: "unexpected", artifacts: {}, exitCode: 0 };
+        return { id: "unexpected-call", output: "unexpected", exitCode: 0 };
       },
       async batch() {
         calls.batch += 1;
-        return [{ id: "unexpected-batch", output: "unexpected", artifacts: {}, exitCode: 0 }];
+        return [{ id: "unexpected-batch", output: "unexpected", exitCode: 0 }];
       },
     };
     const pending = {

@@ -58,6 +58,16 @@ test("write_scope: worker writes outside the declared scope are blocked", () => 
       { cwd, actor: "worker", hasUI: false, writeScope: SCOPE },
     );
     assert.equal(mountedTool, undefined, "mounted xd tools bypass project write scope");
+    for (const path of ["xd://report_issue", "agent://Coordinator"]) {
+      const context = { cwd, actor: "worker" as const, hasUI: false, writeScope: SCOPE };
+      assert.equal(workerWriteScopeGate({ toolName: "write", input: { path, content: "progress" } }, context), undefined);
+      assert.equal(workerWriteScopeGate({ toolName: "write", input: { path, paths: ["lib/other.ts"] } }, context)?.block, true);
+      assert.equal(workerWriteScopeGate({ toolName: "edit", input: { path } }, context)?.block, true);
+    }
+    assert.equal(
+      workerWriteScopeGate({ toolName: "write", input: { path: "xd://unknown-device" } }, { cwd, actor: "worker", hasUI: false, writeScope: SCOPE })?.block,
+      true,
+    );
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

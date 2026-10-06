@@ -24,7 +24,7 @@ import {
   type TeamDef,
 } from "@andvl1/omp-workflows-core";
 import { readRunControl } from "../src/engine/run-store.js";
-import { acquireCtoIngress } from "../src/cto/run.js";
+import { acquireCtoIngress, suspendCtoSession } from "../src/cto/run.js";
 import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 import { LifecycleError } from "../src/engine/run-lifecycle.js";
 import type { TrustedExecutionContext } from "../src/engine/types.js";
@@ -90,6 +90,29 @@ test("cto-owner: exact --run selector cannot replace a live foreign claim", () =
       (error: unknown) => error instanceof LifecycleError && error.code === "run_busy",
       "an explicit run selector identifies but does not prove ownership",
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-owner: tagged core ingress binds and releases only the exact shared controller", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-owner-tagged-"));
+  try {
+    const replicaUrl = new URL("../src/engine/host-controller.ts", import.meta.url);
+    replicaUrl.searchParams.set("cto-credential-replica", "ownership");
+    const replica = await import(replicaUrl.href) as typeof import("../src/engine/host-controller.js");
+    const context = executionContext(root, "tagged-owner");
+    const owner = replica.createWorkflowSessionController({ cwd: root, context });
+    const ingress = acquireCtoIngress({ cwd: root, branch: "main", task: "tagged CTO ownership", controller: owner });
+    assert.deepEqual(owner.activeCtoClaim(), {
+      run_id: ingress.run_id,
+      ownership_epoch: ingress.claim.claim.ownership_epoch,
+    });
+    const copied = replica.createWorkflowSessionController({ cwd: root, context });
+    assert.equal(copied.activeCtoClaim(), undefined, "copied identity does not recover the private receiver binding");
+    suspendCtoSession(owner, "session-shutdown");
+    assert.equal(owner.activeCtoClaim(), undefined);
+    assert.equal(readRunControl(root).execution_claim, null, "cross-graph shutdown releases the exact canonical claim");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -37,5 +37,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Deterministic workflow scenarios
+        run: npm run test:workflow-scenarios
+
+      - name: Workflow process scenarios
+        run: npm run test:workflow-process
+
       - name: Test
         run: npm test

@@ -3,7 +3,13 @@ import { isAbsolute, resolve } from "node:path";
 import { hasStrictOrchestratorState } from "./gates/orchestrator-write.js";
 import { assertCtoSliceDispatchable, parseCtoSliceMarker } from "./cto/slice-gate.js";
 import { isCtoRunTerminal, readCtoState } from "./cto/state.js";
-import { readRunControlNoRecovery, readRunState, reserveExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
+import { bindNativeStageAssignment, reserveNativeStageAssignmentsBatch, settleNativeStageWorkerTerminal, type NativeAcceptedStageReceiptLineage } from "./cto/native-stage.js";
+import type { NativeStagePreflightTerminalSignal } from "./cto/types.js";
+import { loadTeamDefs } from "./cto/plan.js";
+import { readRunControlNoRecovery, readRunState, reserveNativeExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, settleExecutionClaimWorkers, type DispatchOrigin, type NativeRecoveryReservationPermit } from "./engine/run-store.js";
+import { resolveAgentForRole, resolveConfig, type ResolvedConfig } from "./engine/config.js";
+import type { TeamDef } from "./cto/types.js";
+import type { CtoClaimScope, TrustedExecutionContext, WorkIdentity } from "./engine/types.js";
 type ManagedCtoGrantAuthority = {
   run_id: string;
   token: string;
@@ -28,12 +34,20 @@ type LegacyAuthorityResolver = (ctx: unknown, cwd: string, runId: string | undef
 const REGISTRY_SYMBOL = Symbol.for("omp-workflows.native-worker-authority");
 const REGISTRY_VERSION = 3 as const;
 const LIFECYCLE_CHANNEL = "task:subagent:lifecycle";
+export class NativeWorkerRouteError extends Error {
+  readonly code = "native_authority_route_denied" as const;
+
+  constructor() {
+    super("native worker configured CTO route denied");
+    this.name = "NativeWorkerRouteError";
+  }
+}
 
 type NativeActor = "worker" | "lead";
 type ParentActor = "orchestrator" | "lead";
 
 type EventBusLike = {
-  on?: (channel: string, handler: (data: unknown) => void) => (() => void) | void;
+  on?: (channel: string, handler: (data: unknown) => void | Promise<void>) => (() => void) | void;
 };
 
 type SessionHeaderLike = {
@@ -69,6 +83,18 @@ type TaskItem = {
   task?: unknown;
   [key: string]: unknown;
 };
+type CtoTeamRoute = {
+  runId: string;
+  sliceId: string;
+  teamId: string;
+  lead: string;
+  roster: ReadonlySet<string>;
+};
+type CtoRouteResolution =
+  | { ok: true; route: CtoTeamRoute }
+  | { ok: false; kind: "canonical" | "binding" };
+
+
 type Candidate = {
   key: string;
   slotKey: string;
@@ -81,12 +107,15 @@ type Candidate = {
   ctoRunId?: string;
   ctoAuthority?: CtoGrantAuthority;
   ctoWorkerId?: string;
+  ctoTeamId?: string;
   input: unknown;
   inputShape: string;
   item: TaskItem;
   index: number;
   expectedAgent?: string;
+  assignedIdentity?: WorkIdentity;
   ctoSlice?: { runId: string; sliceId: string };
+  ctoActor?: NativeActor;
   dispatchOrigin?: DispatchOrigin;
   lifecycle?: StartedLifecycle;
   executionShape?: string;
@@ -104,11 +133,13 @@ type Grant = {
   ctoRunId?: string;
   ctoAuthority?: CtoGrantAuthority;
   ctoWorkerId?: string;
+  ctoTeamId?: string;
   index: number;
   agent: string;
   sessionFile: string;
   lifecycleId: string;
   actor: NativeActor;
+  assignedIdentity?: WorkIdentity;
   ctoSlice?: { runId: string; sliceId: string };
   dispatchOrigin?: DispatchOrigin;
 };
@@ -147,6 +178,12 @@ type Binding = {
   cwd: string;
 };
 
+type RootAuthorityEntry = {
+  readonly authority_owner: symbol;
+  readonly owner: object;
+  read: (runId?: string) => NativeRootAuthoritySnapshot | undefined;
+};
+
 type OwnerState = {
   candidates: Set<Candidate>;
   grants: Set<Grant>;
@@ -164,6 +201,7 @@ type Registry = {
   bindings: Map<string, Binding>;
   settlements: Map<string, SettlementWitness>;
   generations: Map<string, number>;
+  rootAuthorities?: Map<string, RootAuthorityEntry[]>;
 };
 
 type RegistrySlot = Record<PropertyKey, unknown>;
@@ -174,11 +212,95 @@ export type NativeWorkerResolution = {
   runId: string;
 };
 
+/**
+ * Private claim witness carried only by a verified native CTO binding. It is
+ * never accepted from model input and is not serialized into stage receipts.
+ */
+export type NativeWorkerPublicationOwner = {
+  run_id: string;
+  claim_token: string;
+  ownership_epoch: string;
+  coordinator_session_id: string;
+  coordinator_process_id?: number;
+  worker_id: string;
+  assignment_dispatch_id: string;
+};
+
+/**
+ * Host-attested assignment details for a currently bound child session.
+ *
+ * The model never receives or supplies these fields.  They are exposed only
+ * to engine-owned lifecycle services after `resolve` has verified the exact
+ * session-manager/header lineage and active grant.
+ */
+export type NativeWorkerBinding = {
+  resolution: NativeWorkerResolution;
+  session_id: string;
+  session_file: string;
+  cwd: string;
+  parent_session_file: string;
+  parent_tool_call_id: string;
+  agent: string;
+  lifecycle_id: string;
+  assigned_identity?: WorkIdentity;
+  /** Verified CTO claim/assignment witness for native receipt publication. */
+  publication_owner?: NativeWorkerPublicationOwner;
+  dispatch_origin?: DispatchOrigin;
+  cto_slice?: { runId: string; sliceId: string };
+  cto_team_id?: string;
+};
+/**
+ * Root context is host-attested by the callback. Ordinary integrations may
+ * omit the authority discriminator; CTO integrations must provide coordinator.
+ */
+export type NativeRootAuthorityContext = Omit<TrustedExecutionContext, "authority"> & {
+  readonly authority?: TrustedExecutionContext["authority"];
+};
+
+/**
+ * Private live-root authority snapshots used only by cold-revive host routing.
+ * The callback that produces one must reread the actual root SDK context and
+ * current controller claim on every lookup; these fields are never model-facing.
+ */
+export type NativeRootAuthoritySnapshot =
+  | {
+      readonly authority: "ordinary";
+      readonly root_ctx: unknown;
+      readonly context: NativeRootAuthorityContext;
+      readonly run_id: string;
+    }
+  | {
+      readonly authority: "cto";
+      readonly root_ctx: unknown;
+      readonly context: NativeRootAuthorityContext;
+      readonly run_id: string;
+      readonly claim_scope: CtoClaimScope;
+    };
+
+export type NativeRootAuthorityRegistration = {
+  readonly cwd: string;
+  readonly owner: object;
+  readonly read: (runId?: string) => NativeRootAuthoritySnapshot | undefined;
+};
+
+
 export type NativeWorkerTaskCall = {
   toolName?: string;
   toolCallId?: string;
   input?: unknown;
 };
+export type NativePreflightRejectionInput = {
+  ctx: unknown;
+  event: NativeWorkerTaskCall;
+  actor: ParentActor;
+  runId: string | undefined;
+  dispatchOrigins?: readonly DispatchOrigin[];
+  terminal_signal: NativeStagePreflightTerminalSignal;
+};
+
+export type NativePreflightRejectionResult =
+  | { ok: true; identities: readonly WorkIdentity[] }
+  | { ok: false; code: string; error: string };
 
 export type NativeWorkerAuthority = {
   observeToolExecutionStart(event: unknown, ctx: unknown): void;
@@ -189,8 +311,15 @@ export type NativeWorkerAuthority = {
     actor: ParentActor,
     runId: string | undefined,
     dispatchOrigins?: readonly DispatchOrigin[],
-  ): boolean;
+    preflightTerminalSignal?: NativeStagePreflightTerminalSignal,
+  ): boolean | NativePreflightRejectionResult;
+  rejectTaskPreflight(input: NativePreflightRejectionInput): Promise<NativePreflightRejectionResult>;
   resolve(ctx: unknown, cwd: string, selectedRunId?: string): NativeWorkerResolution | undefined;
+  binding(ctx: unknown, cwd: string, selectedRunId?: string): NativeWorkerBinding | undefined;
+  /** Internal host-only live root registration for cold-revive routing. */
+  registerRootAuthority(input: NativeRootAuthorityRegistration): boolean;
+  unregisterRootAuthority(input: { readonly cwd: string; readonly owner: object }): void;
+  resolveRootAuthority(cwd: string, runId?: string): NativeRootAuthoritySnapshot | undefined;
   observeSessionStart(ctx: unknown): void;
   observeSessionShutdown(ctx: unknown): void;
   teardown(): void;
@@ -236,6 +365,7 @@ function getRegistry(create: boolean): Registry | undefined {
     bindings: new Map(),
     settlements: new Map(),
     generations: new Map(),
+    rootAuthorities: new Map(),
   };
   try {
     Object.defineProperty(slot, REGISTRY_SYMBOL, {
@@ -250,6 +380,13 @@ function getRegistry(create: boolean): Registry | undefined {
   const installed = slot[REGISTRY_SYMBOL];
   return isRegistry(installed) ? installed : undefined;
 }
+function rootAuthorityEntries(registry: Registry): Map<string, RootAuthorityEntry[]> {
+  if (registry.rootAuthorities instanceof Map) return registry.rootAuthorities;
+  const entries = new Map<string, RootAuthorityEntry[]>();
+  registry.rootAuthorities = entries;
+  return entries;
+}
+
 
 function ownerState(registry: Registry, owner: symbol): OwnerState {
   const current = registry.owners.get(owner);
@@ -302,6 +439,26 @@ function readSnapshot(ctx: unknown): SessionSnapshot | undefined {
     return undefined;
   }
 }
+/**
+ * Return the host-attested child lineage tuple used by the read-only native
+ * accepted-receipt resolver. This deliberately exposes no claim credential;
+ * the caller must still authenticate the current root owner separately.
+ */
+export function nativeReadonlyReplayLineage(
+  ctx: unknown,
+  cwd: string,
+): NativeAcceptedStageReceiptLineage | undefined {
+  const snapshot = readSnapshot(ctx);
+  if (!snapshot || resolve(snapshot.cwd) !== resolve(cwd) || !snapshotStillCurrent(snapshot)) return undefined;
+  const parentSession = snapshot.header.parentSession;
+  if (typeof parentSession !== "string" || !isAbsolute(parentSession)) return undefined;
+  return {
+    session_id: snapshot.sessionId,
+    session_file: snapshot.sessionFile,
+    parent_session_file: resolve(parentSession),
+  };
+}
+
 
 function snapshotStillCurrent(snapshot: SessionSnapshot): boolean {
   try {
@@ -327,6 +484,58 @@ function snapshotStillCurrent(snapshot: SessionSnapshot): boolean {
 function namespaceKey(bundleLabel: string, cwd: string): string {
   return `${bundleLabel}\u0000${resolve(cwd)}`;
 }
+function nativeRootAuthorityKey(bundleLabel: string, cwd: string): string | undefined {
+  if (typeof cwd !== "string" || cwd.length === 0) return undefined;
+  return namespaceKey(bundleLabel, cwd);
+}
+
+function validNativeRootAuthoritySnapshot(
+  snapshot: NativeRootAuthoritySnapshot | undefined,
+  cwd: string,
+  runId?: string,
+): snapshot is NativeRootAuthoritySnapshot {
+  if (
+    !snapshot
+    || !snapshot.root_ctx
+    || typeof snapshot.root_ctx !== "object"
+    || Array.isArray(snapshot.root_ctx)
+    || (snapshot.authority !== "ordinary" && snapshot.authority !== "cto")
+    || typeof snapshot.run_id !== "string"
+    || snapshot.run_id.length === 0
+    || !/^[A-Za-z0-9._-]+$/.test(snapshot.run_id)
+    || snapshot.run_id === "."
+    || snapshot.run_id === ".."
+    || runId !== undefined && snapshot.run_id !== runId
+  ) return false;
+  const context = snapshot.context;
+  if (
+    !context
+    || context.caller !== "host"
+    || typeof context.session_id !== "string"
+    || context.session_id.length === 0
+    || typeof context.worktree !== "string"
+    || resolve(context.worktree) !== resolve(cwd)
+    || typeof context.branch !== "string"
+    || context.branch.length === 0
+  ) return false;
+  if (snapshot.authority === "ordinary") {
+    if (
+      context.authority !== undefined
+      && context.authority !== "coordinator"
+      && context.authority !== "read"
+    ) return false;
+    return !Object.hasOwn(snapshot, "claim_scope");
+  }
+  if (context.authority !== "coordinator") return false;
+  const scope = snapshot.claim_scope;
+  return (
+    !!scope
+    && scope.run_id === snapshot.run_id
+    && typeof scope.ownership_epoch === "string"
+    && scope.ownership_epoch.length > 0
+  );
+}
+
 
 function sameParentSnapshot(left: SessionSnapshot, right: SessionSnapshot): boolean {
   return left.manager === right.manager
@@ -355,6 +564,80 @@ function snapshotMatchesContext(snapshot: SessionSnapshot, ctx: unknown, cwd: st
 function samePath(left: string, right: string): boolean {
   return resolve(left) === resolve(right);
 }
+function resolvedRosterAgent(role: string, config: ResolvedConfig): string | undefined {
+  if (typeof role !== "string" || role.length === 0) return undefined;
+  if (config.agent_mapping) {
+    const mapped = config.agent_mapping.resolved_roles[role];
+    return typeof mapped === "string" && mapped.length > 0 ? mapped : undefined;
+  }
+  if (!Object.prototype.hasOwnProperty.call(config.roles, role)) return undefined;
+  const configured = resolveAgentForRole(role, config);
+  return typeof configured === "string" && configured.length > 0 ? configured : undefined;
+}
+
+/**
+ * Resolve a CTO slice through the same canonical links used to construct
+ * runtime state: runtime team id -> plan.team -> consumer TeamDef. The
+ * marker, title, scope, and agent names are never used as substitutes for
+ * those links.
+ */
+function configuredCtoRoute(cwd: string, runId: string, sliceId: string): CtoRouteResolution {
+  if (
+    !/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === ".."
+    || !/^[A-Za-z0-9._-]+$/.test(sliceId) || sliceId === "." || sliceId === ".."
+  ) return { ok: false, kind: "canonical" };
+  try {
+    const state = readCtoState(runId, cwd);
+    if (!state || state.id !== runId || isCtoRunTerminal(state)) return { ok: false, kind: "canonical" };
+    if (!assertCtoSliceDispatchable(state, { sliceId, root: cwd, markerRunId: runId }).ok) {
+      return { ok: false, kind: "canonical" };
+    }
+    const runtimeMatches = state.teams.filter((team) => team && team.slice_id === sliceId);
+    if (runtimeMatches.length !== 1) return { ok: false, kind: "binding" };
+    const runtimeTeam = runtimeMatches[0]!;
+    const runtimeIdMatches = state.teams.filter((team) => team && team.id === runtimeTeam.id);
+    if (runtimeIdMatches.length !== 1) return { ok: false, kind: "binding" };
+    const planMatches = state.plan.teams.filter((entry) => entry && entry.team === runtimeTeam.id);
+    if (planMatches.length !== 1) return { ok: false, kind: "binding" };
+    const defMatches = loadTeamDefs(cwd).filter((def) => def.id === planMatches[0]!.team);
+    if (defMatches.length !== 1) return { ok: false, kind: "binding" };
+    const def: TeamDef = defMatches[0]!;
+    if (typeof def.lead !== "string" || def.lead.length === 0 || !Array.isArray(def.roster)) {
+      return { ok: false, kind: "binding" };
+    }
+    const config = resolveConfig(cwd);
+    const roster = new Set<string>();
+    for (const role of def.roster) {
+      const agent = resolvedRosterAgent(role, config);
+      if (!agent) return { ok: false, kind: "binding" };
+      roster.add(agent);
+    }
+    return {
+      ok: true,
+      route: {
+        runId,
+        sliceId,
+        teamId: runtimeTeam.id,
+        lead: def.lead,
+        roster,
+      },
+    };
+  } catch {
+    return { ok: false, kind: "canonical" };
+  }
+}
+function configuredCtoAssignment(cwd: string, route: CtoTeamRoute, agent: string): WorkIdentity | undefined {
+  try {
+    const state = readCtoState(route.runId, cwd);
+    const team = state?.teams.find((entry) => entry.id === route.teamId && entry.slice_id === route.sliceId);
+    const identity = team?.pending?.identity ?? team?.work_identity;
+    if (!identity || (identity.slot_id !== agent && identity.worker_id !== agent)) return undefined;
+    return structuredClone(identity);
+  } catch {
+    return undefined;
+  }
+}
+
 
 function structuralShape(value: unknown, stack = new Set<object>()): string | undefined {
   if (value === null) return "null";
@@ -470,6 +753,19 @@ function ctoWorkerId(toolCallId: string, ownershipEpoch: string, index: number):
   return `cto:${ownershipEpoch}:${toolCallId}:${index}`;
 }
 
+function ctoWorkerToolCallId(workerId: string): string | undefined {
+  if (!workerId.startsWith("cto:")) return undefined;
+  const firstSeparator = workerId.indexOf(":", 4);
+  const lastSeparator = workerId.lastIndexOf(":");
+  if (lastSeparator <= 4 || lastSeparator === workerId.length - 1) return undefined;
+  const indexText = workerId.slice(lastSeparator + 1);
+  if (!/^(0|[1-9][0-9]*)$/.test(indexText)) return undefined;
+  const toolCallId = firstSeparator === lastSeparator
+    ? workerId.slice(4, lastSeparator)
+    : workerId.slice(firstSeparator + 1, lastSeparator);
+  return toolCallId || undefined;
+}
+
 function lifecyclePayload(value: unknown): StartedLifecycle | undefined {
   if (!value || typeof value !== "object") return undefined;
   const payload = value as Record<string, unknown>;
@@ -522,7 +818,7 @@ function leadSliceCurrent(grant: Grant): boolean {
   }).ok;
 }
 
-function currentCtoAuthority(
+function resolveCurrentCtoAuthority(
   cwd: string,
   runId: string | undefined,
   coordinator: SessionSnapshot,
@@ -653,6 +949,7 @@ function lifecycleTerminal(value: unknown): {
   parentToolCallId: string;
   index: number;
   sessionFile: string;
+  agent?: string;
 } | undefined {
   if (!value || typeof value !== "object") return undefined;
   const payload = value as Record<string, unknown>;
@@ -667,13 +964,78 @@ function lifecycleTerminal(value: unknown): {
     parentToolCallId: payload.parentToolCallId,
     index: payload.index,
     sessionFile: resolve(payload.sessionFile),
+    ...(typeof payload.agent === "string" && payload.agent.length > 0 ? { agent: payload.agent } : {}),
   };
 }
+function publicationOwnerForGrant(grant: Grant, identity: WorkIdentity): NativeWorkerPublicationOwner | undefined {
+  const authority = grant.ctoAuthority;
+  if (
+    !authority
+    || "legacy" in authority
+    || !ctoAuthorityCurrent(grant, false)
+    || !grant.ctoWorkerId
+    || authority.run_id !== grant.runId
+    || authority.run_id !== identity.run_id
+    || grant.ctoWorkerId !== identity.worker_id
+    || grant.assignedIdentity?.dispatch_id !== identity.dispatch_id
+  ) return undefined;
+  return {
+    run_id: authority.run_id,
+    claim_token: authority.token,
+    ownership_epoch: authority.ownership_epoch,
+    coordinator_session_id: authority.coordinator_session_id,
+    ...(authority.coordinator_process_id === undefined ? {} : { coordinator_process_id: authority.coordinator_process_id }),
+    worker_id: grant.ctoWorkerId,
+    assignment_dispatch_id: identity.dispatch_id,
+  };
+}
+
+
+export type OrdinaryWorkerTerminalSettlement = {
+  cwd: string;
+  run_id: string;
+  dispatch_id: string;
+  tool_call_id: string;
+  dispatch_origin: DispatchOrigin;
+  parent_session_id: string;
+  parent_session_file: string;
+  parent_manager: object;
+  lifecycle_id: string;
+  agent: string;
+  index: number;
+  session_file: string;
+  outcome: "succeeded" | "failed" | "cancelled";
+};
+
+export type OrdinaryWorkerTerminalSettlementCallback = (
+  settlement: OrdinaryWorkerTerminalSettlement,
+) => void | Promise<void>;
+
+export type NativeWorkerTerminalSettlement = {
+  cwd: string;
+  run_id: string;
+  dispatch_id: string;
+  tool_call_id: string;
+  identity: WorkIdentity;
+  outcome: "succeeded" | "failed" | "cancelled";
+  worker_terminal_required: boolean;
+};
+
+/**
+ * Optional host callback invoked only after a canonical native worker
+ * assignment has been settled. The payload contains no claim authority or
+ * model-supplied fields; it is derived from the matched lifecycle grant.
+ */
+export type NativeWorkerTerminalSettlementCallback = (
+  settlement: NativeWorkerTerminalSettlement,
+) => void | Promise<void>;
 
 export type NativeWorkerAuthorityOptions = {
   bundleLabel?: string;
   legacyAuthority?: LegacyAuthorityResolver;
   legacyAuthorityCurrent?: LegacyAuthorityCurrentResolver;
+  onTerminalSettlement?: NativeWorkerTerminalSettlementCallback;
+  onOrdinaryTerminalSettlement?: OrdinaryWorkerTerminalSettlementCallback;
 };
 
 export function createNativeWorkerAuthority(
@@ -683,6 +1045,7 @@ export function createNativeWorkerAuthority(
   const bundleLabel = typeof options.bundleLabel === "string" && options.bundleLabel.length > 0
     ? options.bundleLabel
     : "omp-workflows";
+  const onTerminalSettlement = options.onTerminalSettlement;
   const registry = getRegistry(true);
   const legacyAuthorityCurrent = options.legacyAuthorityCurrent;
   const legacyAuthority = options.legacyAuthority;
@@ -700,8 +1063,7 @@ export function createNativeWorkerAuthority(
     if (prior) revokeGrant(registry, prior);
     const generation = (registry.generations.get(candidate.slotKey) ?? 0) + 1;
     registry.generations.set(candidate.slotKey, generation);
-    const leadAgent = candidate.expectedAgent === "team-lead" || candidate.expectedAgent === "omp-team-lead";
-    const actor: NativeActor = leadAgent && candidate.ctoSlice ? "lead" : "worker";
+    const actor: NativeActor = candidate.ctoActor ?? "worker";
     const grant: Grant = {
       slotKey: candidate.slotKey,
       generation,
@@ -716,12 +1078,14 @@ export function createNativeWorkerAuthority(
         ctoAuthority: candidate.ctoAuthority,
         ...(candidate.ctoWorkerId ? { ctoWorkerId: candidate.ctoWorkerId } : {}),
       } : {}),
+      ...(candidate.ctoTeamId ? { ctoTeamId: candidate.ctoTeamId } : {}),
       index: candidate.index,
       agent: candidate.lifecycle.agent,
       sessionFile: candidate.lifecycle.sessionFile,
       lifecycleId: candidate.lifecycle.id,
       actor,
       ...(candidate.ctoSlice ? { ctoSlice: candidate.ctoSlice } : {}),
+      ...(candidate.assignedIdentity ? { assignedIdentity: candidate.assignedIdentity } : {}),
       ...(candidate.dispatchOrigin ? { dispatchOrigin: candidate.dispatchOrigin } : {}),
     };
     registry.grants.set(grant.slotKey, grant);
@@ -754,7 +1118,7 @@ export function createNativeWorkerAuthority(
     }
   };
 
-  const handleLifecycle = (value: unknown): void => {
+  const handleLifecycle = async (value: unknown): Promise<void> => {
     if (!registry || !value || typeof value !== "object") return;
     const payload = value as Record<string, unknown>;
     const status = payload.status;
@@ -781,6 +1145,7 @@ export function createNativeWorkerAuthority(
       && grant.parentToolCallId === terminal.parentToolCallId
       && grant.index === terminal.index
       && grant.sessionFile === terminal.sessionFile
+      && (!grant.dispatchOrigin || grant.agent === terminal.agent)
     );
     const witnesses = [...registry.settlements.values()].filter((witness) =>
       witness.owner === owner
@@ -794,17 +1159,80 @@ export function createNativeWorkerAuthority(
     const witness = witnesses[0];
     const authority = grant?.ctoAuthority ?? witness?.ctoAuthority;
     const workerId = grant?.ctoWorkerId ?? witness?.ctoWorkerId;
-    if (authority && workerId && !("legacy" in authority)) {
+    const terminalOutcome = status === "completed" ? "succeeded" : status === "failed" ? "failed" : "cancelled";
+    const origin = grant?.dispatchOrigin;
+    if (
+      grant
+      && origin
+      && !grant.ctoAuthority
+      && !grant.ctoRunId
+      && !grant.ctoSlice
+      && terminal.agent === grant.agent
+      && origin.origin_session_id === grant.parent.sessionId
+      && grantCanonicalCurrent(grant)
+      && options.onOrdinaryTerminalSettlement
+    ) {
       try {
+        await options.onOrdinaryTerminalSettlement({
+          cwd: grant.parent.cwd,
+          run_id: origin.run_id,
+          dispatch_id: origin.dispatch_id,
+          tool_call_id: grant.parentToolCallId,
+          dispatch_origin: structuredClone(origin),
+          parent_session_id: grant.parent.sessionId,
+          parent_session_file: grant.parent.sessionFile,
+          parent_manager: grant.parent.manager,
+          lifecycle_id: terminal.id,
+          agent: terminal.agent,
+          index: terminal.index,
+          session_file: terminal.sessionFile,
+          outcome: terminalOutcome,
+        });
+      } catch {
+        // A rejected ordinary canonical join must not manufacture another writer.
+      }
+    }
+    // The grant witness is private process state; the canonical settlement below rechecks it under lock.
+    if (grant && grant.assignedIdentity && authority && workerId && !("legacy" in authority)) {
+      const terminalSettlement = settleNativeStageWorkerTerminal(grant.parent.cwd, {
+        run_id: authority.run_id,
+        claim_token: authority.token,
+        ownership_epoch: authority.ownership_epoch,
+        coordinator_session_id: authority.coordinator_session_id,
+        ...(authority.coordinator_process_id === undefined ? {} : { coordinator_process_id: authority.coordinator_process_id }),
+        dispatch_id: grant.assignedIdentity.dispatch_id,
+        worker_id: workerId,
+      });
+      if (terminalSettlement.ok && terminalSettlement.worker_terminal_required && onTerminalSettlement) {
+        try {
+          await onTerminalSettlement({
+            cwd: grant.parent.cwd,
+            run_id: authority.run_id,
+            dispatch_id: grant.assignedIdentity.dispatch_id,
+            tool_call_id: grant.parentToolCallId,
+            identity: structuredClone(grant.assignedIdentity),
+            outcome: terminalOutcome,
+            worker_terminal_required: terminalSettlement.worker_terminal_required,
+          });
+        } catch {
+          // Host persistence is best-effort; canonical terminal and cleanup
+          // must retain their existing failure behavior.
+        }
+      }
+    }
+    if (authority && workerId && !("legacy" in authority)) {
+      const toolCallId = ctoWorkerToolCallId(workerId);
+      if (toolCallId) try {
         settleCtoExecutionClaimWorkersByToolCall(grant?.parent.cwd ?? witness!.cwd, {
           run_id: authority.run_id,
-          tool_call_id: grant?.parentToolCallId ?? witness!.parentToolCallId,
+          tool_call_id: toolCallId,
           token: authority.token,
           ownership_epoch: authority.ownership_epoch,
           worker_ids: [workerId],
         });
       } catch {
-        return;
+        // A stale claim must not preserve a process-local grant. The
+        // release-aware provenance check remains the source of truth.
       }
     }
     if (grant) revokeGrant(registry, grant);
@@ -845,7 +1273,12 @@ export function createNativeWorkerAuthority(
   const authority: NativeWorkerAuthority = {
     observeToolExecutionStart: handleExecutionStart,
     observeToolExecutionEnd: handleExecutionEnd,
-    admitTaskCall(ctx, event, actor, runId, dispatchOrigins) {
+    admitTaskCall(ctx, event, actor, runId, dispatchOrigins, preflightTerminalSignal) {
+      if (
+        preflightTerminalSignal !== undefined
+        && preflightTerminalSignal !== "preflight:missing_prompt"
+        && preflightTerminalSignal !== "preflight:invalid_arguments"
+      ) return { ok: false, code: "native_preflight_invalid", error: "unsupported native preflight terminal signal" };
       if (!registry || event.toolName !== "task" || !event.toolCallId || (actor !== "orchestrator" && actor !== "lead")) return false;
       ownerState(registry, owner);
       const inputShape = structuralShape(event.input);
@@ -853,20 +1286,46 @@ export function createNativeWorkerAuthority(
       const parent = readSnapshot(ctx);
       if (!inputShape || !items || !parent) return false;
       const leadMarkers = items.map((item) => parseCtoSliceMarker(typeof item.task === "string" ? item.task : ""));
+      const routeCache = new Map<string, CtoRouteResolution>();
+      const routeResolutions = leadMarkers.map((marker) => {
+        if (!marker) return undefined;
+        const key = `${marker.runId}\u0000${marker.sliceId}`;
+        if (!routeCache.has(key)) routeCache.set(key, configuredCtoRoute(parent.cwd, marker.runId, marker.sliceId));
+        return routeCache.get(key);
+      });
+      const leadRoutes = routeResolutions.map((resolution) => resolution?.ok ? resolution.route : undefined);
       const allLeadItems = actor === "orchestrator" && items.every((item, index) => {
         const agent = typeof item.agent === "string" ? item.agent : "";
         const marker = leadMarkers[index];
-        return (agent === "team-lead" || agent === "omp-team-lead") && !!marker;
+        const route = leadRoutes[index];
+        return !!marker && !!route && agent === route.lead;
       });
-      const leadItemsHaveMarkers = items.every((item, index) => {
-        const agent = typeof item.agent === "string" ? item.agent : "";
-        return (agent !== "team-lead" && agent !== "omp-team-lead") || !!leadMarkers[index];
-      });
-      if (!leadItemsHaveMarkers || runId && (!/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === "..")) return false;
+      if (runId && (!/^[A-Za-z0-9._-]+$/.test(runId) || runId === "." || runId === "..")) return false;
       if (!runId && !allLeadItems) return false;
-      const markerRunIds = leadMarkers.filter((marker): marker is { runId: string; sliceId: string } => !!marker).map((marker) => marker.runId);
+      const markerRunIds = leadMarkers
+        .filter((marker): marker is { runId: string; sliceId: string } => !!marker)
+        .map((marker) => marker.runId);
+      const routeBindingFailure = leadMarkers.some((marker, index) => {
+        if (!marker) return false;
+        const resolution = routeResolutions[index];
+        return !!resolution && !resolution.ok && resolution.kind === "binding";
+      });
+      const routeCanonicalFailure = leadMarkers.some((marker, index) => {
+        if (!marker) return false;
+        const resolution = routeResolutions[index];
+        return !!resolution && !resolution.ok && resolution.kind === "canonical";
+      });
+      const routeRoleMismatch = items.some((item, index) => {
+        const marker = leadMarkers[index];
+        const resolution = routeResolutions[index];
+        if (!marker || !resolution?.ok) return false;
+        const agent = typeof item.agent === "string" ? item.agent : "";
+        return agent !== resolution.route.lead;
+      });
       const authorityRunId = runId ?? markerRunIds[0];
       let parentBinding: Binding | undefined;
+      let inheritedRoute: CtoTeamRoute | undefined;
+      let inheritedRouteResolution: CtoRouteResolution | undefined;
       if (actor === "lead") {
         // A lead runs in its own session, so coordinator-session lookup cannot
         // authenticate this call. Inherit only the original grant's live
@@ -888,14 +1347,34 @@ export function createNativeWorkerAuthority(
           || !ctoAuthorityCurrent(parentGrant, false)
           || !parentGrant.ctoSlice
         ) return false;
+        const inheritedSlice = parentGrant.ctoSlice;
+        if (!inheritedSlice) return false;
         const everyMarkerMatches = items.every((item) => {
           const text = typeof item.task === "string" ? item.task : "";
           const marker = parseCtoSliceMarker(text);
           return !!marker
-            && marker.runId === parentBinding!.grant.ctoSlice!.runId
-            && marker.sliceId === parentBinding!.grant.ctoSlice!.sliceId;
+            && marker.runId === inheritedSlice.runId
+            && marker.sliceId === inheritedSlice.sliceId;
         });
         if (!everyMarkerMatches) return false;
+        inheritedRouteResolution = configuredCtoRoute(
+          parent.cwd,
+          inheritedSlice.runId,
+          inheritedSlice.sliceId,
+        );
+        if (!inheritedRouteResolution.ok) {
+          if (inheritedRouteResolution.kind === "binding") throw new NativeWorkerRouteError();
+          return false;
+        }
+        inheritedRoute = inheritedRouteResolution.route;
+        if (
+          parentBinding.grant.agent !== inheritedRoute.lead
+          || parentBinding.grant.ctoTeamId !== inheritedRoute.teamId
+        ) throw new NativeWorkerRouteError();
+        if (!items.every((item) => {
+          const agent = typeof item.agent === "string" ? item.agent : "";
+          return agent.length > 0 && inheritedRoute!.roster.has(agent);
+        })) throw new NativeWorkerRouteError();
       }
       const inheritedCtoSlice = actor === "lead" ? parentBinding?.grant.ctoSlice : undefined;
       const inheritedCtoAuthority = actor === "lead" ? parentBinding?.grant.ctoAuthority : undefined;
@@ -910,7 +1389,7 @@ export function createNativeWorkerAuthority(
         }
       }
       const parentCtoAuthority = actor === "orchestrator"
-        ? currentCtoAuthority(
+        ? resolveCurrentCtoAuthority(
           parent.cwd,
           authorityRunId,
           parent,
@@ -926,37 +1405,161 @@ export function createNativeWorkerAuthority(
         && (!ctoAuthority || markerRunIds.some((markerRunId) => markerRunId !== ctoAuthority.run_id))
       ) return false;
       if (requestedCtoState && (!ctoAuthority || ctoAuthority.run_id !== runId)) return false;
-      if (allLeadItems && (!ctoAuthority || ctoAuthority.run_id !== authorityRunId)) return false;
-      if (ctoAuthority && !("legacy" in ctoAuthority)) {
-        try {
-          reserveExecutionClaimWorkers(parent.cwd, {
-            run_id: ctoAuthority.run_id,
-            token: ctoAuthority.token,
-            worker_ids: items.map((_item, index) => ctoWorkerId(event.toolCallId!, ctoAuthority.ownership_epoch, index)),
-          });
-        } catch {
-          return false;
+      if (actor === "orchestrator" && ctoAuthority && !allLeadItems) {
+        if (markerRunIds.length > 0 && !routeCanonicalFailure && (routeBindingFailure || routeRoleMismatch)) {
+          throw new NativeWorkerRouteError();
         }
+        return false;
+      }
+      if (allLeadItems && (!ctoAuthority || ctoAuthority.run_id !== authorityRunId)) return false;
+      const currentCtoAuthority = ctoAuthority && !("legacy" in ctoAuthority) ? ctoAuthority : undefined;
+      const provisionalWorkerIds = currentCtoAuthority
+        ? items.map((_item, index) => ctoWorkerId(event.toolCallId!, currentCtoAuthority.ownership_epoch, index))
+        : [];
+      const newlyReservedWorkerIds = new Set<string>();
+      const nativeClaimReservation = currentCtoAuthority && preflightTerminalSignal === undefined
+        ? {
+            reserve: (input: { readonly worker_ids: readonly string[]; readonly recovery_permits: readonly NativeRecoveryReservationPermit[] }) => {
+              const newlyReserved = reserveNativeExecutionClaimWorkers(parent.cwd, {
+                run_id: currentCtoAuthority.run_id,
+                token: currentCtoAuthority.token,
+                worker_ids: [...input.worker_ids],
+                recovery_permits: [...input.recovery_permits],
+              });
+              for (const workerId of newlyReserved) newlyReservedWorkerIds.add(workerId);
+              return newlyReserved;
+            },
+            settle: (workerIds: readonly string[]) => {
+              settleExecutionClaimWorkers(parent.cwd, {
+                run_id: currentCtoAuthority.run_id,
+                token: currentCtoAuthority.token,
+                worker_ids: [...workerIds],
+              });
+              for (const workerId of workerIds) newlyReservedWorkerIds.delete(workerId);
+            },
+          }
+        : undefined;
+      const nativeAssignments = new Map<number, WorkIdentity>();
+      if (currentCtoAuthority) {
+        const nativeGroups = new Map<string, {
+          readonly route: CtoTeamRoute;
+          readonly leadCandidate: boolean;
+          readonly items: Array<{ index: number; agent: string; worker_id: string }>;
+        }>();
+        for (const [index, item] of items.entries()) {
+          const expectedAgent = typeof item.agent === "string" && item.agent.length > 0 ? item.agent : "";
+          const text = typeof item.task === "string" ? item.task : "";
+          const marker = parseCtoSliceMarker(text);
+          const leadCandidate = actor === "orchestrator"
+            && !!marker
+            && !!leadRoutes[index]
+            && expectedAgent === leadRoutes[index]!.lead;
+          const route = leadCandidate ? leadRoutes[index] : inheritedRoute;
+          if (!route) throw new NativeWorkerRouteError();
+          const routeKey = [
+            route.teamId,
+            route.sliceId,
+            leadCandidate ? "lead" : "worker",
+            route.lead,
+            [...route.roster].sort().join("\u0000"),
+          ].join("\u0000");
+          let group = nativeGroups.get(routeKey);
+          if (!group) {
+            group = { route, leadCandidate, items: [] };
+            nativeGroups.set(routeKey, group);
+          }
+          group.items.push({
+            index,
+            agent: expectedAgent,
+            worker_id: provisionalWorkerIds[index]!,
+          });
+        }
+        const groups = [...nativeGroups.values()];
+        const assignments = reserveNativeStageAssignmentsBatch(groups.map((group) => ({
+          cwd: parent.cwd,
+          runId: currentCtoAuthority.run_id,
+          teamId: group.route.teamId,
+          sliceId: group.route.sliceId,
+          actor: group.leadCandidate ? "lead" : "worker",
+          lead: group.route.lead,
+          roster: [...group.route.roster],
+          toolCallId: event.toolCallId!,
+          ownershipEpoch: currentCtoAuthority.ownership_epoch,
+          parentSessionId: parent.sessionId,
+          preflight_terminal_signal: preflightTerminalSignal,
+          items: group.items,
+          claim_reservation: nativeClaimReservation,
+        })));
+        if (assignments.some((assignment) => !assignment.ok)) {
+          if (preflightTerminalSignal === undefined && newlyReservedWorkerIds.size > 0) try {
+            nativeClaimReservation?.settle([...newlyReservedWorkerIds]);
+          } catch {
+            // The original admission failure remains authoritative.
+          }
+          throw new NativeWorkerRouteError();
+        }
+        for (const [groupIndex, assignment] of assignments.entries()) {
+          const group = groups[groupIndex]!;
+          if (!assignment.ok) continue;
+          for (const [offset, groupItem] of group.items.entries()) {
+            const identity = assignment.identities[offset];
+            if (identity) nativeAssignments.set(groupItem.index, identity);
+          }
+        }
+        // These IDs are now backed by the persisted canonical assignments.
+        newlyReservedWorkerIds.clear();
       }
       for (const candidate of [...registry.candidates.values()]) {
         if (candidate.owner === owner && sameParentSnapshot(candidate.parent, parent) && candidate.parentToolCallId === event.toolCallId) {
           removeCandidate(registry, candidate);
         }
       }
+      if (preflightTerminalSignal !== undefined) {
+        if (nativeAssignments.size === 0) return { ok: false, code: "native_preflight_missing_receipt", error: "native preflight produced no canonical native identity" };
+        return { ok: true, identities: [...nativeAssignments.values()] };
+      }
+      const assignedIdentities = new Map<number, WorkIdentity>();
+      for (const [index, item] of items.entries()) {
+        const expectedAgent = typeof item.agent === "string" && item.agent.length > 0 ? item.agent : undefined;
+        const text = typeof item.task === "string" ? item.task : "";
+        const marker = parseCtoSliceMarker(text);
+        const leadCandidate = actor === "orchestrator"
+          && !!marker
+          && !!leadRoutes[index]
+          && expectedAgent === leadRoutes[index]!.lead;
+        const assignmentRoute = !leadCandidate ? inheritedRoute : undefined;
+        const assignedIdentity = nativeAssignments.get(index)
+          ?? (assignmentRoute && expectedAgent ? configuredCtoAssignment(parent.cwd, assignmentRoute, expectedAgent) : undefined);
+        if (assignmentRoute && !assignedIdentity) {
+          if (currentCtoAuthority && newlyReservedWorkerIds.size > 0) try {
+            nativeClaimReservation?.settle([...newlyReservedWorkerIds]);
+          } catch {
+            // The original route failure remains authoritative.
+          }
+          throw new NativeWorkerRouteError();
+        }
+        if (assignedIdentity) assignedIdentities.set(index, assignedIdentity);
+      }
+      
+
       items.forEach((item, index) => {
         const expectedAgent = typeof item.agent === "string" && item.agent.length > 0 ? item.agent : undefined;
         const text = typeof item.task === "string" ? item.task : "";
         const marker = parseCtoSliceMarker(text);
         const leadCandidate = actor === "orchestrator"
           && !!marker
-          && (expectedAgent === "team-lead" || expectedAgent === "omp-team-lead");
+          && !!leadRoutes[index]
+          && expectedAgent === leadRoutes[index]!.lead;
         const candidateRunId = ctoAuthority?.run_id
           ?? inheritedCtoSlice?.runId
           ?? (leadCandidate ? marker!.runId : runId);
         const dispatchOrigin = dispatchOrigins?.[index];
-        const workerId = ctoAuthority && !("legacy" in ctoAuthority)
-          ? ctoWorkerId(event.toolCallId!, ctoAuthority.ownership_epoch, index)
+        const assignedIdentity = assignedIdentities.get(index);
+        const workerId = currentCtoAuthority
+          ? (assignedIdentity?.worker_id ?? provisionalWorkerIds[index])
           : undefined;
+        const assignmentRoute = !leadCandidate ? inheritedRoute : undefined;
+        if (assignmentRoute && !assignedIdentity) throw new NativeWorkerRouteError();
         const candidate: Candidate = {
           key: `${candidateKey(parent.sessionId, event.toolCallId!, token)}\u0000${index}`,
           slotKey: slotKey(parent.sessionId, event.toolCallId!, index, token),
@@ -976,7 +1579,11 @@ export function createNativeWorkerAuthority(
           item,
           index,
           ...(expectedAgent ? { expectedAgent } : {}),
+          ...(assignedIdentity ? { assignedIdentity } : {}),
           ...(inheritedCtoSlice ? { ctoSlice: inheritedCtoSlice } : leadCandidate ? { ctoSlice: marker! } : {}),
+          ...(leadCandidate
+            ? { ctoActor: "lead" as const, ctoTeamId: leadRoutes[index]!.teamId }
+            : inheritedRoute ? { ctoTeamId: inheritedRoute.teamId } : {}),
           ...(dispatchOrigin && samePath(dispatchOrigin.cwd, parent.cwd) ? { dispatchOrigin } : {}),
         };
         registry.candidates.set(candidate.key, candidate);
@@ -984,6 +1591,81 @@ export function createNativeWorkerAuthority(
       });
       return true;
     },
+    async rejectTaskPreflight(input) {
+      const result = authority.admitTaskCall(
+        input.ctx,
+        input.event,
+        input.actor,
+        input.runId,
+        input.dispatchOrigins,
+        input.terminal_signal,
+      );
+      if (typeof result === "object") return result;
+      if (!result) return { ok: false, code: "native_preflight_denied", error: "native task preflight was not admitted" };
+      return { ok: false, code: "native_preflight_missing_receipt", error: "native task preflight did not produce a canonical receipt" };
+    },
+    registerRootAuthority(input) {
+      if (!registry || !input || typeof input.owner !== "object" || input.owner === null || typeof input.read !== "function") return false;
+      const key = nativeRootAuthorityKey(bundleLabel, input.cwd);
+      if (!key) return false;
+      const entriesByKey = rootAuthorityEntries(registry);
+      const entries = entriesByKey.get(key) ?? [];
+      const existing = entries.find((entry) => entry.owner === input.owner);
+      if (existing) {
+        if (existing.authority_owner !== owner) return false;
+        existing.read = input.read;
+        return true;
+      }
+      entries.push({ authority_owner: owner, owner: input.owner, read: input.read });
+      entriesByKey.set(key, entries);
+      return true;
+    },
+    unregisterRootAuthority(input) {
+      if (!registry || !input || typeof input.owner !== "object" || input.owner === null) return;
+      const key = nativeRootAuthorityKey(bundleLabel, input.cwd);
+      if (!key) return;
+      const entriesByKey = rootAuthorityEntries(registry);
+      const entries = entriesByKey.get(key);
+      if (!entries) return;
+      const kept = entries.filter((entry) => entry.owner !== input.owner || entry.authority_owner !== owner);
+      if (kept.length === 0) entriesByKey.delete(key);
+      else entriesByKey.set(key, kept);
+    },
+    resolveRootAuthority(cwd, runId) {
+      const current = getRegistry(false);
+      if (!current) return undefined;
+      const key = nativeRootAuthorityKey(bundleLabel, cwd);
+      if (!key) return undefined;
+      const entries = rootAuthorityEntries(current).get(key);
+      if (!entries || entries.length === 0) return undefined;
+      const snapshots: NativeRootAuthoritySnapshot[] = [];
+      for (const entry of entries) {
+        let snapshot: NativeRootAuthoritySnapshot | undefined;
+        try {
+          snapshot = entry.read(runId);
+        } catch {
+          snapshot = undefined;
+        }
+        if (validNativeRootAuthoritySnapshot(snapshot, cwd, runId)) snapshots.push(snapshot);
+      }
+      if (snapshots.length !== 1) return undefined;
+      const snapshot = snapshots[0]!;
+      return snapshot.authority === "cto"
+        ? {
+            authority: "cto" as const,
+            root_ctx: snapshot.root_ctx,
+            context: { ...snapshot.context },
+            run_id: snapshot.run_id,
+            claim_scope: { ...snapshot.claim_scope },
+          }
+        : {
+            authority: "ordinary" as const,
+            root_ctx: snapshot.root_ctx,
+            context: { ...snapshot.context },
+            run_id: snapshot.run_id,
+          };
+    },
+
 
     resolve(ctx, cwd, selectedRunId) {
       if (!registry) return undefined;
@@ -1070,6 +1752,36 @@ export function createNativeWorkerAuthority(
         runId: grant.ctoAuthority?.run_id ?? grant.ctoSlice?.runId ?? grant.ctoRunId ?? grant.runId,
       };
     },
+    binding(ctx, cwd, selectedRunId) {
+      const resolution = this.resolve(ctx, cwd, selectedRunId);
+      if (!resolution || !registry) return undefined;
+      const current = readSnapshot(ctx);
+      if (!current) return undefined;
+      const currentBinding = registry.bindings.get(current.sessionFile);
+      const grant = currentBinding ? registry.grants.get(currentBinding.grant.slotKey) : undefined;
+      if (!currentBinding || !grant || grant !== currentBinding.grant) return undefined;
+      const boundIdentity = resolution.kind === "cto" && grant.assignedIdentity
+        ? bindNativeStageAssignment(current.cwd, resolution.runId, grant.assignedIdentity.dispatch_id, current.sessionId) ?? grant.assignedIdentity
+        : grant.assignedIdentity;
+      const publicationOwner = resolution.kind === "cto" && boundIdentity
+        ? publicationOwnerForGrant(grant, boundIdentity)
+        : undefined;
+      return {
+        resolution,
+        session_id: grant.sessionFile === current.sessionFile ? current.sessionId : grant.sessionFile,
+        session_file: grant.sessionFile,
+        cwd: current.cwd,
+        parent_session_file: grant.parent.sessionFile,
+        parent_tool_call_id: grant.parentToolCallId,
+        agent: grant.agent,
+        lifecycle_id: grant.lifecycleId,
+        ...(boundIdentity ? { assigned_identity: structuredClone(boundIdentity) } : {}),
+        ...(publicationOwner ? { publication_owner: publicationOwner } : {}),
+        ...(grant.dispatchOrigin ? { dispatch_origin: grant.dispatchOrigin } : {}),
+        ...(grant.ctoSlice ? { cto_slice: grant.ctoSlice } : {}),
+        ...(grant.ctoTeamId ? { cto_team_id: grant.ctoTeamId } : {}),
+      };
+    },
 
     observeSessionStart(ctx) {
       if (!registry) return;
@@ -1115,6 +1827,12 @@ export function createNativeWorkerAuthority(
     teardown() {
       const current = getRegistry(false);
       if (!current) return;
+      const entriesByKey = rootAuthorityEntries(current);
+      for (const [key, entries] of entriesByKey) {
+        const kept = entries.filter((entry) => entry.authority_owner !== owner);
+        if (kept.length === 0) entriesByKey.delete(key);
+        else if (kept.length !== entries.length) entriesByKey.set(key, kept);
+      }
       const state = current.owners.get(owner);
       if (!state) return;
       for (const candidate of [...state.candidates]) removeCandidate(current, candidate);

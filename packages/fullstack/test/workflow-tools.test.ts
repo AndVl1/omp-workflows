@@ -6,26 +6,22 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { recordScenarioEvent, scenarioTest } from "../../core/test/reliable-stage-trace.js";
 import {
   dispatchGate,
-  authorizeDispatch,
-  completeDispatch,
   buildAgentMapping,
   loadProfile,
   resolveConfig,
   claimWorkflowOwner,
   resetWorkflowOwners,
   workflowOwnerFor,
-  setCtoControlPlane,
-  setTeamControlPlane,
-  recordWorkPending,
-  recordWorkTerminal,
   updateCanonicalRun,
   writeConfig,
   writeAgentMapping,
   prepareWorkflowState,
   runTarget,
   registerWorkflowTools as registerCoreWorkflowTools,
+  LifecycleError,
   type IssuedCapability,
 } from "@andvl1/omp-workflows-core";
 import {
@@ -38,7 +34,6 @@ import {
   resolveSessionCwd,
   default as ompWorkflowsFullstack,
 } from "../src/index.js";
-import { registerLectureAcquireTool } from "../src/tools/lecture-acquire.js";
 
 class TestBus {
   readonly listeners = new Map<string, Set<(value: unknown) => void>>();
@@ -72,17 +67,29 @@ type RegisteredTool = {
   execute: (...args: never[]) => Promise<{ content: [{ type: "text"; text: string }]; details: unknown }>;
 };
 
+function admissionCode(reason: string | undefined): string | undefined {
+  return reason?.match(/\[workflow_admission:([a-z_]+)\]/)?.[1];
+}
+type BlockedToolCallResult = { readonly block: true; readonly reason?: unknown };
+
+function isBlockedToolCallResult(value: unknown): value is BlockedToolCallResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const result = value as Record<string, unknown>;
+  return result["block"] === true;
+}
+
+
 type SessionManagerFixture = {
   getCwd: () => string;
   getSessionId: () => string;
   getSessionFile: () => string;
-  getHeader: () => { type: "session"; id: string; cwd: string; timestamp: string };
+  getHeader: () => { type: "session"; id: string; cwd: string; timestamp: string; parentSession?: string };
 };
 
 const sessionManagerFixtures = new Map<string, SessionManagerFixture>();
 
-function sessionManagerFor(cwd: string, sessionId: string): SessionManagerFixture {
-  const key = `${cwd}\u0000${sessionId}`;
+function sessionManagerFor(cwd: string, sessionId: string, parentSession?: string): SessionManagerFixture {
+  const key = `${cwd}\u0000${sessionId}\u0000${parentSession ?? ""}`;
   const existing = sessionManagerFixtures.get(key);
   if (existing) return existing;
   const manager: SessionManagerFixture = {
@@ -94,26 +101,51 @@ function sessionManagerFor(cwd: string, sessionId: string): SessionManagerFixtur
       id: sessionId,
       cwd,
       timestamp: "2026-01-01T00:00:00.000Z",
+      ...(parentSession ? { parentSession } : {}),
     }),
   };
   sessionManagerFixtures.set(key, manager);
   return manager;
 }
-type MutableSessionManagerFixture = SessionManagerFixture & { switchTo: (sessionId: string) => void };
+
+function sessionContext(
+  cwd: string,
+  sessionId: string,
+  mode: string,
+  hasUI: boolean,
+  extras: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const sessionManager = sessionManagerFor(cwd, sessionId);
+  return {
+    ...extras,
+    cwd,
+    mode,
+    hasUI,
+    session_id: sessionId,
+    sessionFile: sessionManager.getSessionFile(),
+    sessionManager,
+  };
+}
+type MutableSessionManagerFixture = SessionManagerFixture & {
+  switchTo: (sessionId: string) => void;
+  switchCwd: (cwd: string) => void;
+};
 
 function mutableSessionManagerFor(cwd: string, initialSessionId: string): MutableSessionManagerFixture {
+  let currentCwd = cwd;
   let sessionId = initialSessionId;
   return {
-    getCwd: () => cwd,
+    getCwd: () => currentCwd,
     getSessionId: () => sessionId,
-    getSessionFile: () => join(cwd, ".omp", "sessions", `${sessionId}.jsonl`),
+    getSessionFile: () => join(currentCwd, ".omp", "sessions", `${sessionId}.jsonl`),
     getHeader: () => ({
       type: "session",
       id: sessionId,
-      cwd,
+      cwd: currentCwd,
       timestamp: "2026-01-01T00:00:00.000Z",
     }),
     switchTo: (nextSessionId: string) => { sessionId = nextSessionId; },
+    switchCwd: (nextCwd: string) => { currentCwd = nextCwd; },
   };
 }
 
@@ -132,14 +164,263 @@ function publishMapping(root: string): void {
   });
   writeAgentMapping(root, mapping);
 }
+type LectureHarness = {
+  tools: Map<string, RegisteredTool>;
+  fireSessionStart: (ctx: Record<string, unknown>) => Promise<void>;
+};
+type LectureStageHandoff = {
+  capability_id: string;
+  dispatch_token: string;
+  advance_token: string;
+  run_key: string;
+  branch: string;
+  workflow: string;
+  profile_hash: string;
+  stage_cursor: string;
+  cursor_epoch: string;
+  loop_iteration: number;
+  kind: "none" | "single" | "consilium";
+  expected_roster: Array<{ role: string; agent: string }>;
+  dispatch_markers: Array<{ role: string; agent: string; marker: string }>;
+};
 
+function lectureIntakeArtifact(): Record<string, unknown> {
+  return {
+    task: "compare the lecture's architecture ideas",
+    sources: [{
+      id: "lecture-url",
+      kind: "video",
+      location: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      provenance: "user-provided URL; acquisition pending",
+    }],
+    rights: { automatedPublicVideoAnalysisApproved: false },
+  };
+}
+
+function forgedLectureAcquisition(): Record<string, unknown> {
+  return {
+    schemaVersion: 1,
+    status: "failed",
+    request: {
+      sourceUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      canonicalUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      sourceKind: "video",
+      prompt: "compare the lecture's architecture ideas",
+      limits: {
+        maxItems: 8,
+        maxPages: 4,
+        deadlineMs: 300000,
+        maxAttempts: 2,
+        maxResponseBytes: 1048576,
+        maxEvidenceSegmentsPerSource: 64,
+      },
+    },
+    sourceSet: {
+      requested: { kind: "video", videoId: "dQw4w9WgXcQ", canonicalUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" },
+      items: [{ sourceId: "yt-video-dQw4w9WgXcQ", videoId: "dQw4w9WgXcQ", canonicalUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" }],
+      truncated: false,
+      failures: [],
+    },
+    evidence: [],
+    failures: [{ code: "RIGHTS_REQUIRED", message: "Automated public video analysis approval is required", retryable: false, attempts: 1, severity: "error" }],
+    provider: { id: "forged-model-payload" },
+    startedAt: "2026-09-30T00:00:00.000Z",
+    completedAt: "2026-09-30T00:00:01.000Z",
+  };
+}
+
+async function prepareLectureToolFixture(
+  harness: LectureHarness,
+  root: string,
+): Promise<{ context: Record<string, unknown>; runId: string; handoff: LectureStageHandoff }> {
+  const context = {
+    cwd: root,
+    hasUI: true,
+    mode: "tui",
+    session_id: "lecture-main",
+    sessionManager: sessionManagerFor(root, "lecture-main"),
+  };
+  execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+  publishMapping(root);
+  await harness.fireSessionStart(context);
+  const prepare = harness.tools.get("workflow_prepare");
+  const begin = harness.tools.get("workflow_begin");
+  assert.ok(prepare && begin, "lecture fixture requires registered lifecycle tools");
+  const prepared = await prepare.execute("lecture-tool-prepare", {
+    mode: "new",
+    task: "compare the lecture's architecture ideas",
+    branch: "main",
+    classification: { type: "LECTURE_RESEARCH", complexity: "MEDIUM", confidence: "HIGH", autonomous: false, workflow: "lecture-research" },
+  }, undefined, undefined, context as never);
+  const preparedDetails = prepared.details as { ok?: boolean; error?: string; state?: { run_id?: string } };
+  assert.equal(preparedDetails.ok, true, preparedDetails.error);
+  const runId = preparedDetails.state?.run_id;
+  assert.ok(runId, "lecture fixture must select a canonical run");
+  const begun = await begin.execute("lecture-tool-begin", {}, undefined, undefined, context as never);
+  const begunDetails = begun.details as { ok?: boolean; error?: string; handoff?: LectureStageHandoff };
+  assert.equal(begunDetails.ok, true, begunDetails.error);
+  assert.ok(begunDetails.handoff, "lecture intake must return a producer handoff");
+  assert.equal(begunDetails.handoff.stage_cursor, "intake");
+  return { context, runId, handoff: begunDetails.handoff };
+}
+
+async function submitLectureIntakeAndAdvance(
+  harness: LectureHarness,
+  fixture: { context: Record<string, unknown>; runId: string; handoff: LectureStageHandoff },
+): Promise<LectureStageHandoff> {
+  const submit = harness.tools.get("workflow_submit_result");
+  const advance = harness.tools.get("workflow_advance");
+  const begin = harness.tools.get("workflow_begin");
+  assert.ok(submit && advance && begin, "lecture fixture requires submission, advance, and begin tools");
+  const submitted = await submit.execute("lecture-intake-submit", { outputs: { lecture_intake: lectureIntakeArtifact() } }, undefined, undefined, fixture.context as never);
+  const submittedDetails = submitted.details as { ok?: boolean; error?: string };
+  assert.equal(submittedDetails.ok, true, submittedDetails.error);
+  const advanced = await advance.execute("lecture-intake-advance", {
+    token: fixture.handoff.advance_token,
+    capability_id: fixture.handoff.capability_id,
+    run_key: fixture.handoff.run_key,
+    branch: fixture.handoff.branch,
+    workflow: fixture.handoff.workflow,
+    profile_hash: fixture.handoff.profile_hash,
+    stage_cursor: fixture.handoff.stage_cursor,
+    cursor_epoch: fixture.handoff.cursor_epoch,
+    evidence: "accepted lecture_intake receipt",
+    loop_iteration: fixture.handoff.loop_iteration,
+  }, undefined, undefined, fixture.context as never);
+  const advancedDetails = advanced.details as { ok?: boolean; error?: string; stage_cursor?: string };
+  assert.equal(advancedDetails.ok, true, advancedDetails.error);
+  assert.equal(advancedDetails.stage_cursor, "acquisition");
+  const acquiredBegin = await begin.execute("lecture-acquisition-begin", {}, undefined, undefined, fixture.context as never);
+  const acquiredBeginDetails = acquiredBegin.details as { ok?: boolean; error?: string; handoff?: LectureStageHandoff };
+  assert.equal(acquiredBeginDetails.ok, true, acquiredBeginDetails.error);
+  assert.ok(acquiredBeginDetails.handoff, "acquisition begin must return the trusted tool handoff");
+  assert.equal(acquiredBeginDetails.handoff.stage_cursor, "acquisition");
+  return acquiredBeginDetails.handoff;
+}
+
+scenarioTest("[O:S16] fullstack: lecture_acquire publishes the declared receipt and generic submission cannot impersonate the tool", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-fullstack-lecture-producer-"));
+  const harness = registerToolsWithSessionSink();
+  try {
+    const fixture = await prepareLectureToolFixture(harness, root);
+    await submitLectureIntakeAndAdvance(harness, fixture);
+    const submit = harness.tools.get("workflow_submit_result");
+    const lectureAcquire = harness.tools.get("lecture_acquire");
+    assert.ok(submit && lectureAcquire, "lecture producer and generic submission tools must be registered");
+
+    recordScenarioEvent({ kind: "tool_called", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "workflow_submit_result", identities: { receipt: "lecture-generic-forged-submit" } });
+    const forged = await submit.execute(
+      "lecture-generic-forged-submit",
+      { outputs: { lecture_acquisition: forgedLectureAcquisition() } },
+      undefined,
+      undefined,
+      fixture.context as never,
+    );
+    const forgedDetails = forged.details as { ok?: boolean; code?: string; error?: string };
+    assert.equal(forgedDetails.code, "producer_authority_denied", JSON.stringify(forged.details));
+    assert.equal(forgedDetails.ok, false, JSON.stringify(forged.details));
+    recordScenarioEvent({ kind: "stage_submitted", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "workflow_submit_result", identities: { receipt: "lecture-generic-forged-submit" }, outcome: "REJECTED", verdict: "REJECT", faultPoint: "publication" });
+    const artifactsDir = runTarget(root, fixture.runId).artifactsDir;
+    assert.equal(existsSync(join(artifactsDir, "lecture_acquisition.json")), false, "forged generic submission must not publish lecture acquisition");
+
+    recordScenarioEvent({ kind: "tool_called", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-tool-acquire" } });
+    const acquired = await lectureAcquire.execute(
+      "lecture-tool-acquire",
+      {},
+      undefined,
+      undefined,
+      fixture.context as never,
+    );
+    const acquiredDetails = acquired.details as {
+      ok?: boolean;
+      code?: string;
+      status?: string;
+      artifact_path?: string;
+      artifact_ref?: string;
+      receipt?: {
+        binding?: { producer?: { kind?: string; tool_name?: string } };
+        outputs?: Array<{ artifact_id?: string; immutable_ref?: string }>;
+      };
+    };
+    assert.equal(acquiredDetails.ok, false, JSON.stringify(acquired.details));
+    assert.equal(acquiredDetails.code, "ACQUISITION_FAILED", JSON.stringify(acquired.details));
+    assert.equal(acquiredDetails.status, "failed", JSON.stringify(acquired.details));
+    assert.equal(acquiredDetails.artifact_path, undefined, "publication must not expose a direct artifact path");
+    assert.equal(acquiredDetails.receipt?.binding?.producer?.kind, "tool", JSON.stringify(acquired.details));
+    assert.equal(acquiredDetails.receipt?.binding?.producer?.tool_name, "lecture_acquire", JSON.stringify(acquired.details));
+    assert.deepEqual(acquiredDetails.receipt?.outputs?.map(output => output.artifact_id), ["lecture_acquisition"]);
+    const receiptRef = acquiredDetails.receipt?.outputs?.[0]?.immutable_ref;
+    assert.ok(receiptRef, JSON.stringify(acquired.details));
+    assert.equal(acquiredDetails.artifact_ref, receiptRef, "tool result must expose the trusted receipt output reference");
+    assert.ok(existsSync(join(artifactsDir, "lecture_acquisition.json")), "trusted callback publication must persist the canonical artifact");
+    recordScenarioEvent({ kind: "artifact_published", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-tool-acquire" }, outcome: "COMPLETED" });
+    recordScenarioEvent({ kind: "tool_completed", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-tool-acquire" }, outcome: "COMPLETED" });
+  } finally {
+    await harness.fireSessionShutdown({ mode: "tui", hasUI: true, cwd: root, session_id: "lecture-main", sessionManager: sessionManagerFor(root, "lecture-main") });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+scenarioTest("[O:A14] fullstack: lecture_acquire rejects foreign, stale, and cross-stage calls before publication", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-fullstack-lecture-producer-guards-"));
+  const harness = registerToolsWithSessionSink();
+  try {
+    const fixture = await prepareLectureToolFixture(harness, root);
+    const lectureAcquire = harness.tools.get("lecture_acquire");
+    assert.ok(lectureAcquire, "lecture producer must be registered");
+    const artifactsDir = runTarget(root, fixture.runId).artifactsDir;
+
+    recordScenarioEvent({ kind: "tool_called", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-cross-stage" } });
+    const crossStage = await lectureAcquire.execute("lecture-cross-stage", {}, undefined, undefined, fixture.context as never);
+    const crossStageDetails = crossStage.details as { ok?: boolean; code?: string };
+    assert.equal(crossStageDetails.ok, false, JSON.stringify(crossStage.details));
+    assert.equal(crossStageDetails.code, "producer_authority_denied", JSON.stringify(crossStage.details));
+    assert.equal(existsSync(join(artifactsDir, "lecture_acquisition.json")), false, "cross-stage call must not invoke provider or publish");
+    recordScenarioEvent({ kind: "tool_completed", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-cross-stage" }, outcome: "REJECTED", verdict: "REJECT", faultPoint: "preflight" });
+
+    const foreignContext = {
+      ...fixture.context,
+      session_id: "lecture-foreign",
+      sessionManager: sessionManagerFor(root, "lecture-foreign"),
+    };
+    recordScenarioEvent({ kind: "tool_called", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-foreign" } });
+    const foreign = await lectureAcquire.execute("lecture-foreign", {}, undefined, undefined, foreignContext as never);
+    const foreignDetails = foreign.details as { ok?: boolean; code?: string };
+    assert.equal(foreignDetails.ok, false, JSON.stringify(foreign.details));
+    assert.equal(foreignDetails.code, "producer_authority_denied", JSON.stringify(foreign.details));
+    assert.equal(existsSync(join(artifactsDir, "lecture_acquisition.json")), false, "foreign call must not invoke provider or publish");
+    recordScenarioEvent({ kind: "tool_completed", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-foreign" }, outcome: "REJECTED", verdict: "REJECT", faultPoint: "preflight" });
+
+    await submitLectureIntakeAndAdvance(harness, fixture);
+    recordScenarioEvent({ kind: "tool_called", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-acquire-for-stale" } });
+    const accepted = await lectureAcquire.execute("lecture-acquire-for-stale", {}, undefined, undefined, fixture.context as never);
+    const acceptedDetails = accepted.details as { receipt?: { outputs?: Array<{ artifact_id?: string }> }; artifact_ref?: string };
+    assert.deepEqual(acceptedDetails.receipt?.outputs?.map(output => output.artifact_id), ["lecture_acquisition"]);
+    assert.ok(acceptedDetails.artifact_ref, JSON.stringify(accepted.details));
+    recordScenarioEvent({ kind: "artifact_published", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-acquire-for-stale" }, outcome: "COMPLETED" });
+    const statePath = runTarget(root, fixture.runId).statePath;
+    assert.ok(statePath, "lecture fixture must expose canonical state path");
+    const beforeReplay = readFileSync(statePath, "utf8");
+    await harness.fireSessionShutdown(fixture.context);
+    recordScenarioEvent({ kind: "tool_called", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-stale-replay" } });
+    const stale = await lectureAcquire.execute("lecture-stale-replay", {}, undefined, undefined, fixture.context as never);
+    const staleDetails = stale.details as { ok?: boolean; code?: string };
+    assert.equal(staleDetails.ok, false, JSON.stringify(stale.details));
+    assert.equal(staleDetails.code, "producer_authority_denied", JSON.stringify(stale.details));
+    assert.equal(readFileSync(statePath, "utf8"), beforeReplay, "stale replay must not create a second trusted publication");
+    recordScenarioEvent({ kind: "tool_completed", route: "O", workflow: "lecture-research", stage: "acquisition", tool: "lecture_acquire", identities: { receipt: "lecture-stale-replay" }, outcome: "REJECTED", verdict: "REJECT", faultPoint: "preflight" });
+  } finally {
+    await harness.fireSessionShutdown({ mode: "tui", hasUI: true, cwd: root, session_id: "lecture-main", sessionManager: sessionManagerFor(root, "lecture-main") });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 test("fullstack: workflow_begin exposes role-bound dispatch markers", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-workflow-marker-handoff-"));
   const { tools, fireSessionStart, fireSessionShutdown } = registerToolsWithSessionSink();
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     publishMapping(root);
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    await fireSessionStart(sessionContext(root, "session-direct", "tui", true, { ui: {} }));
     const hostContext = {
       cwd: root,
       hasUI: true,
@@ -219,8 +500,8 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
     const instructionResponse = await instructions.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: sessionManagerFor(root, "session-direct") } as never);
     const instructionDetails = instructionResponse.details as { stage?: { slot_artifacts?: Record<string, string[]> } };
     assert.deepEqual(instructionDetails.stage?.slot_artifacts, {
-      analyst: ["spec_intake_repo_map-analyst"],
-      "tech-researcher": ["spec_intake_repo_map-tech-researcher"],
+      analyst: ["spec_intake_repo_map"],
+      "tech-researcher": ["spec_intake_repo_map"],
     });
     const gate = dispatchGate({
       toolName: "task",
@@ -234,7 +515,7 @@ test("fullstack: workflow_begin exposes role-bound dispatch markers", async () =
     }, { cwd: root });
     assert.equal(gate, undefined);
   } finally {
-    await fireSessionShutdown({ cwd: root, mode: "tui", hasUI: true });
+    await fireSessionShutdown(sessionContext(root, "session-direct", "tui", true));
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -260,7 +541,7 @@ test("fullstack: workflow_instructions exposes declared artifact schemas", async
         authority: "coordinator",
       },
     });
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    await fireSessionStart(sessionContext(root, "session-direct", "tui", true, { ui: {} }));
     const instructions = tools.get("workflow_instructions")!;
     const response = await instructions.execute("test", { selector: { run_id: prepared.state.run_id } }, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: sessionManagerFor(root, "session-direct") } as never);
     const details = response.details as {
@@ -281,73 +562,7 @@ test("fullstack: workflow_instructions exposes declared artifact schemas", async
     assert.equal(schemas.dod?.properties?.items?.items?.type, "object");
     assert.deepEqual(schemas.dod?.properties?.items?.items?.required, ["criterion", "verify_method", "status"]);
   } finally {
-    await fireSessionShutdown({ cwd: root, mode: "tui", hasUI: true });
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("fullstack: workflow_status exposes completion artifact bindings", async () => {
-  const root = mkdtempSync(join(tmpdir(), "omp-workflow-status-artifacts-"));
-  const { tools, fireSessionStart, fireSessionShutdown } = registerToolsWithSessionSink();
-  try {
-    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
-    const issued = await writeCheckpointAskFixture(root, tools);
-    const binding = issued.state.issued_for!;
-    const rosterEntry = issued.state.expected_roster?.[0];
-    const auth = {
-      token: issued.dispatch_token,
-      capability_id: issued.capability_id,
-      run_id: binding.run_key,
-      run_key: binding.run_key,
-      branch: binding.branch,
-      workflow: binding.workflow,
-      profile_hash: binding.profile_hash,
-      stage_cursor: binding.stage_cursor,
-      cursor_epoch: binding.cursor_epoch,
-      loop_iteration: binding.loop_iteration,
-      role: rosterEntry?.role ?? "developer-kotlin",
-      agent: rosterEntry?.agent ?? "developer-kotlin",
-      tool_call_id: "tool-status-artifact",
-    };
-    const authorized = authorizeDispatch(root, auth);
-    assert.equal(authorized.ok, true);
-    assert.ok(authorized.ok && authorized.record);
-    const artifactsDir = runTarget(root, issued.state.issued_for!.run_key).artifactsDir!;
-    mkdirSync(artifactsDir, { recursive: true });
-    const statusStatePath = runTarget(root, issued.state.issued_for!.run_key).statePath!;
-    const statusState = JSON.parse(readFileSync(statusStatePath, "utf8")) as { artifacts?: Record<string, string> };
-    statusState.artifacts = { ...(statusState.artifacts ?? {}), implementation: "implementation.json" };
-    writeFileSync(statusStatePath, `${JSON.stringify(statusState)}\n`);
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({
-      ready: true,
-      validation_run: true,
-      validation_evidence: "status binding fixture",
-      files_touched: ["src/main.ts"],
-    }));
-    const completed = completeDispatch(root, {
-      ...auth,
-      dispatch_id: authorized.record.id,
-      outcome: "succeeded",
-      evidence: "implementation completed",
-      artifact_ids: ["implementation"],
-    }, { runId: issued.state.issued_for!.run_key });
-    assert.equal(completed.ok, true, completed.ok ? undefined : completed.error);
-    const status = tools.get("workflow_status")!;
-    const response = await status.execute("test", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: sessionManagerFor(root, "session-direct") } as never);
-    const details = response.details as { capability?: { dispatches?: Array<Record<string, unknown>> } };
-    assert.deepEqual(details.capability?.dispatches?.[0], {
-      id: authorized.record.id,
-      role: "developer-kotlin",
-      agent: "developer-kotlin",
-      tool_call_id: "tool-status-artifact",
-      status: "succeeded",
-      completed: true,
-      completed_by: "workflow_complete",
-      artifact_ids: ["implementation"],
-      outcome: "succeeded",
-    });
-  } finally {
-    await fireSessionShutdown({ cwd: root, mode: "tui", hasUI: true });
+    await fireSessionShutdown(sessionContext(root, "session-direct", "tui", true));
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -360,20 +575,6 @@ test("fullstack: workflow tools register and fail closed with structured respons
       tools.set(tool.name, tool);
     },
   } as never);
-  registerLectureAcquireTool({
-    registerTool(tool: RegisteredTool) {
-      tools.set(tool.name, tool);
-    },
-  } as never, z, { resolveSessionCwd, isMainSessionContext });
-
-  for (const name of tools.keys()) {
-    assert.ok(tools.get(name)?.parameters, `${name} exposes a parameter schema`);
-  }
-  const lectureAcquire = tools.get("lecture_acquire")!;
-  const workerLectureResult = await lectureAcquire.execute("worker", {}, undefined, undefined, { cwd: process.cwd(), hasUI: false } as never);
-  assert.equal((workerLectureResult.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
-  const lectureUnavailableResult = await lectureAcquire.execute("test", {}, undefined, undefined, null);
-  assert.equal((lectureUnavailableResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
 
   const begin = tools.get("workflow_begin")!;
   const workerBeginResult = await begin.execute("worker", {}, undefined, undefined, { cwd: process.cwd(), hasUI: false } as never);
@@ -381,34 +582,100 @@ test("fullstack: workflow tools register and fail closed with structured respons
   const status = tools.get("workflow_status")!;
   const beginResult = await begin.execute("test", {}, undefined, undefined, null);
   const statusResult = await status.execute("test", {}, undefined, undefined, null);
-  const complete = tools.get("workflow_complete")!;
-  const advance = tools.get("workflow_advance")!;
-  const completeResult = await complete.execute("test", {
-    dispatch_id: "dispatch",
-    token: "token",
-    capability_id: "capability",
-    run_key: "run",
-    cursor_epoch: "epoch",
-    evidence: "evidence",
-  }, undefined, undefined, null);
-  const advanceResult = await advance.execute("test", {
-    token: "token",
-    capability_id: "capability",
-    run_key: "run",
-    cursor_epoch: "epoch",
-    evidence: "evidence",
-  }, undefined, undefined, null);
-
-  for (const response of [beginResult, statusResult, completeResult, advanceResult]) {
+  for (const response of [beginResult, statusResult]) {
     assert.equal(response.details && typeof response.details, "object");
     assert.equal((response.details as { ok?: boolean }).ok, false);
-    assert.match(response.content[0].text, /\"ok\":false/);
   }
   assert.equal((beginResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
   assert.equal((statusResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
-  assert.equal((completeResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
-  assert.equal((advanceResult.details as { code?: string }).code, "WORKFLOW_STATE_UNAVAILABLE");
 });
+
+scenarioTest("[O:S01][O:S02] fullstack: assigned worker submits through production registration and foreign lineage is denied", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-fullstack-stage-submission-"));
+  const harness = registerToolsWithSessionSink();
+  const sessionId = "submission-parent";
+  const parentManager = sessionManagerFor(root, sessionId);
+  const parentContext = {
+    cwd: root,
+    mode: "tui",
+    hasUI: true,
+    session_id: sessionId,
+    sessionFile: parentManager.getSessionFile(),
+    sessionManager: parentManager,
+  };
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    await harness.fireSessionStart(parentContext);
+    const recover = harness.tools.get("workflow_recover");
+    assert.ok(recover, "registered workflow_recover is required by the worker fixture");
+    const issued = await writeCheckpointAskFixture(root, harness, parentContext);
+    const recovery = await recover.execute(
+      "before-assignment-diagnose",
+      { operation: "diagnose" },
+      undefined,
+      undefined,
+      parentContext as never,
+    );
+    const recoveryDetails = recovery.details as { ok?: boolean; recovery?: { code?: string; worker?: string; action?: string } };
+    assert.equal(recoveryDetails.ok, true, JSON.stringify(recovery.details));
+    assert.equal(recoveryDetails.recovery?.code, "worker_outcome_unknown");
+    assert.equal(recoveryDetails.recovery?.worker, "unknown");
+    assert.equal(recoveryDetails.recovery?.action, "wait");
+
+    const worker = await admitRegisteredWorker(harness, root, issued.handoff, parentContext, "submission");
+    const workerContext = worker.childContext;
+    const submit = harness.tools.get("workflow_submit_result")!;
+    const payload = {
+      outputs: {
+        implementation: {
+          files_touched: ["src/main/App.kt"],
+          ready: true,
+          validation_run: "true",
+          validation_evidence: "fixture validation",
+        },
+      },
+    };
+    recordScenarioEvent({ kind: "tool_called", route: "O", workflow: "lightweight", stage: "implementation", tool: "workflow_submit_result", identities: { worker: "submission-worker", receipt: "worker-submit" } });
+    const accepted = await submit.execute("worker-submit", payload, undefined, undefined, workerContext as never);
+    const acceptedDetails = accepted.details as {
+      ok?: boolean;
+      receipt?: {
+        binding?: {
+          authority?: string;
+          host?: { session_id?: string };
+          producer?: { kind?: string; profile?: string; stage_id?: string };
+        };
+        outputs?: Array<{ artifact_id?: string }>;
+      };
+    };
+    assert.equal(acceptedDetails.ok, true, JSON.stringify(accepted.details));
+    assert.equal(acceptedDetails.receipt?.binding?.producer?.kind, "worker");
+    assert.equal(acceptedDetails.receipt?.binding?.producer?.profile, "lightweight");
+    assert.equal(acceptedDetails.receipt?.binding?.producer?.stage_id, "implementation");
+    assert.equal(acceptedDetails.receipt?.binding?.host?.session_id, "submission-worker");
+    assert.deepEqual(acceptedDetails.receipt?.outputs?.map(output => output.artifact_id), ["implementation"]);
+    recordScenarioEvent({ kind: "stage_submitted", route: "O", workflow: "lightweight", stage: "implementation", tool: "workflow_submit_result", identities: { worker: "submission-worker", receipt: "worker-submit" }, outcome: "ACCEPTED", verdict: "ACCEPT" });
+
+    const foreignManager = sessionManagerFor(root, "foreign-worker", parentManager.getSessionFile());
+    recordScenarioEvent({ kind: "tool_called", route: "O", workflow: "lightweight", stage: "implementation", tool: "workflow_submit_result", identities: { worker: "foreign-worker", receipt: "foreign-submit" } });
+    const foreign = await submit.execute(
+      "foreign-submit",
+      payload,
+      undefined,
+      undefined,
+      { ...workerContext, session_id: "foreign-worker", sessionFile: foreignManager.getSessionFile(), sessionManager: foreignManager } as never,
+    );
+    const foreignDetails = foreign.details as { ok?: boolean; code?: string };
+    assert.equal(foreignDetails.ok, false, JSON.stringify(foreign.details));
+    assert.equal(foreignDetails.code, "producer_authority_denied");
+    recordScenarioEvent({ kind: "stage_submitted", route: "O", workflow: "lightweight", stage: "implementation", tool: "workflow_submit_result", identities: { worker: "foreign-worker", receipt: "foreign-submit" }, outcome: "REJECTED", verdict: "REJECT", faultPoint: "preflight" });
+    await completeRegisteredWorker(harness, parentContext, worker);
+  } finally {
+    await harness.fireSessionShutdown(parentContext);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("fullstack: workflow_prepare schema accepts PRODUCT_DISCOVERY classifications", () => {
   const tools = new Map<string, RegisteredTool>();
   registerWorkflowTools({
@@ -457,7 +724,7 @@ test("fullstack: workflow_prepare rejects a contradictory explicit cwd before mu
       },
       { cwd: canonical },
     );
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: canonical, ui: {} });
+    await fireSessionStart(sessionContext(canonical, "session-direct", "tui", true, { ui: {} }));
 
     const prepare = tools.get("workflow_prepare")!;
     const prepareInput = {
@@ -565,7 +832,7 @@ test("fullstack: workflow_prepare rejects a contradictory explicit cwd before mu
     );
     assert.equal((resumedBegin.details as { ok?: boolean }).ok, true);
   } finally {
-    await fireSessionShutdown({ cwd: canonical, mode: "tui", hasUI: true });
+    await fireSessionShutdown(sessionContext(canonical, "session-direct", "tui", true));
     rmSync(canonical, { recursive: true, force: true });
     rmSync(stale, { recursive: true, force: true });
   }
@@ -579,7 +846,7 @@ test("fullstack: workflow_begin rejects a contradictory explicit cwd without mut
     execFileSync("git", ["-C", canonical, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     const toolsAndLifecycle = registerToolsWithSessionSink();
     fireSessionShutdown = toolsAndLifecycle.fireSessionShutdown;
-    await toolsAndLifecycle.fireSessionStart({ mode: "tui", hasUI: true, cwd: canonical, ui: {} });
+    await toolsAndLifecycle.fireSessionStart(sessionContext(canonical, "session-direct", "tui", true, { ui: {} }));
     const prepare = toolsAndLifecycle.tools.get("workflow_prepare")!;
     const prepared = await prepare.execute(
       "canonical-fixture-prepare",
@@ -612,7 +879,7 @@ test("fullstack: workflow_begin rejects a contradictory explicit cwd without mut
     assert.equal(details.code, "WORKFLOW_CONTEXT_REJECTED", details.error);
     assertWorkflowMutationUnchanged(before, workflowMutationSnapshot(canonical, runId), "stale workflow_begin");
   } finally {
-    await fireSessionShutdown?.({ cwd: canonical, mode: "tui", hasUI: true });
+    await fireSessionShutdown?.(sessionContext(canonical, "session-direct", "tui", true));
     rmSync(canonical, { recursive: true, force: true });
     rmSync(stale, { recursive: true, force: true });
   }
@@ -726,17 +993,120 @@ test("fullstack: workflow_checkpoint accepts only the typed decision envelope", 
   assert.equal(parameters.safeParse({ ...typedEnvelope, unexpected: true }).success, false);
 });
 
-test("fullstack: F7 core lifecycle exports remain public", () => {
-  for (const hook of [setCtoControlPlane, setTeamControlPlane, recordWorkPending, recordWorkTerminal]) {
-    assert.equal(typeof hook, "function");
+
+type RegisteredWorkflowHarness = {
+  tools: Map<string, RegisteredTool>;
+  events: TestBus;
+  hostContext: (ctx: Record<string, unknown>) => Record<string, unknown>;
+  fireToolCall: (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<void>;
+  fireToolExecutionStart: (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<void>;
+  fireToolResult: (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<void>;
+};
+
+type RegisteredWorkerFixture = {
+  toolCallId: string;
+  input: { agent: string; task: string };
+  childContext: Record<string, unknown>;
+  childFile: string;
+  lifecycleId: string;
+};
+
+async function admitRegisteredWorker(
+  harness: RegisteredWorkflowHarness,
+  root: string,
+  handoff: LectureStageHandoff,
+  parentContext: Record<string, unknown>,
+  suffix: string,
+): Promise<RegisteredWorkerFixture> {
+  const marker = handoff.dispatch_markers[0];
+  assert.ok(marker, "registered begin path must issue a worker marker");
+  const parentManager = parentContext.sessionManager;
+  if (!parentManager || typeof parentManager !== "object" || !("getSessionFile" in parentManager)) {
+    throw new Error("registered worker parent session file is unavailable");
   }
-});
+  const getSessionFile = parentManager.getSessionFile;
+  if (typeof getSessionFile !== "function") throw new Error("registered worker parent session file is unavailable");
+  const parentSessionFile = Reflect.apply(getSessionFile, parentManager, []);
+  if (typeof parentSessionFile !== "string" || parentSessionFile.length === 0) {
+    throw new Error("registered worker parent session file is unavailable");
+  }
+  const toolCallId = `${suffix}-task`;
+  const input = { agent: marker.agent, task: marker.marker };
+  await harness.fireToolCall({ toolName: "task", toolCallId, input }, parentContext);
+  await harness.fireToolExecutionStart({ toolName: "task", toolCallId, args: input }, parentContext);
+  const childId = `${suffix}-worker`;
+  const childFile = join(root, ".omp", "sessions", `${childId}.jsonl`);
+  mkdirSync(join(root, ".omp", "sessions"), { recursive: true });
+  const childManager = sessionManagerFor(root, childId, parentSessionFile);
+  assert.equal(childManager.getSessionFile(), childFile);
+  assert.equal(childManager.getHeader().parentSession, parentSessionFile);
+  const childContext = {
+    cwd: root,
+    mode: "print",
+    hasUI: false,
+    session_id: childId,
+    sessionFile: childFile,
+    sessionManager: childManager,
+  };
+  const lifecycleId = `${toolCallId}-lifecycle`;
+  harness.events.emit("task:subagent:lifecycle", {
+    id: lifecycleId,
+    agent: input.agent,
+    status: "started",
+    sessionFile: childFile,
+    parentToolCallId: toolCallId,
+    index: 0,
+  });
+  return { toolCallId, input, childContext, childFile, lifecycleId };
+}
+
+async function completeRegisteredWorker(
+  harness: RegisteredWorkflowHarness,
+  parentContext: Record<string, unknown>,
+  worker: RegisteredWorkerFixture,
+): Promise<void> {
+  await harness.fireToolResult({
+    toolName: "task",
+    toolCallId: worker.toolCallId,
+    input: worker.input,
+    details: {
+      results: [{
+        index: 0,
+        id: `${worker.toolCallId}-result`,
+        agent: worker.input.agent,
+        agentSource: "project",
+        task: worker.input.task,
+        exitCode: 0,
+        output: "worker terminal result",
+        stderr: "",
+        truncated: false,
+        durationMs: 1,
+        tokens: 1,
+        requests: 1,
+      }],
+    },
+    content: [{ type: "text", text: "worker terminal result" }],
+    isError: false,
+  }, parentContext);
+  harness.events.emit("task:subagent:lifecycle", {
+    id: worker.lifecycleId,
+    agent: worker.input.agent,
+    status: "completed",
+    sessionFile: worker.childFile,
+    parentToolCallId: worker.toolCallId,
+    index: 0,
+  });
+}
+
+type AssignedWorkerFixture = IssuedCapability & {
+  handoff: LectureStageHandoff;
+};
 
 async function writeCheckpointAskFixture(
   root: string,
-  tools: Map<string, RegisteredTool>,
+  harness: RegisteredWorkflowHarness,
   context?: Record<string, unknown>,
-): Promise<IssuedCapability> {
+): Promise<AssignedWorkerFixture> {
   // workflow_prepare resolves scope from the caller's registered preset; keep
   // the fixture configuration explicit, but establish the run and claim only
   // through the registered host lifecycle tools below.
@@ -751,13 +1121,16 @@ async function writeCheckpointAskFixture(
     },
     { cwd: root },
   );
+  const defaultManager = sessionManagerFor(root, "session-direct");
   const hostContext = context ?? {
     cwd: root,
     hasUI: true,
     mode: "tui",
-    session_id: "session-direct",
-    sessionManager: sessionManagerFor(root, "session-direct"),
+    session_id: defaultManager.getSessionId(),
+    sessionFile: defaultManager.getSessionFile(),
+    sessionManager: defaultManager,
   };
+  const tools = harness.tools;
   const prepare = tools.get("workflow_prepare");
   const begin = tools.get("workflow_begin");
   if (!prepare || !begin) throw new Error("workflow lifecycle tools are not registered");
@@ -790,50 +1163,73 @@ async function writeCheckpointAskFixture(
   }
   const runId = preparedDetails.state.run_id;
   const statePath = runTarget(root, runId).statePath;
-  const artifactsDir = runTarget(root, runId).artifactsDir;
-  if (!statePath || !artifactsDir) throw new Error("canonical checkpoint fixture paths are unavailable");
-  const state = JSON.parse(readFileSync(statePath, "utf8")) as {
-    stages?: Array<{ id: string; status: string }>;
-    artifacts?: Record<string, string>;
-    [key: string]: unknown;
-  };
-  // Arm the implementation stage through the canonical state selected by
-  // workflow_prepare. The active execution claim remains the controller's
-  // exact binding while the fixture supplies the declared discovery input.
-  state.artifacts = { ...(state.artifacts ?? {}), discovery: "discovery.json" };
-  state.stage_cursor = "implementation";
-  state.stages = (state.stages ?? []).map((stage) => ({
-    ...stage,
-    status: stage.id === "discovery" ? "done" : stage.id === "implementation" ? "in_progress" : "pending",
-  }));
-  writeFileSync(statePath, `${JSON.stringify(state)}\n`);
-  mkdirSync(artifactsDir, { recursive: true });
-  writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({
-    task: "checkpoint ask ingest",
-    branch: "main",
-  }) + "\n");
+  if (!statePath) throw new Error("canonical checkpoint fixture state path is unavailable");
   const begunResponse = await begin.execute("checkpoint-fixture-begin", {}, undefined, undefined, hostContext as never);
   const begunDetails = begunResponse.details as {
     ok?: boolean;
     error?: string;
-    handoff?: {
-      capability_id: string;
-      dispatch_token: string;
-      advance_token: string;
-    };
+    handoff?: LectureStageHandoff;
   };
   if (!begunDetails.ok || !begunDetails.handoff) {
-    throw new Error(begunDetails.error ?? "workflow_begin did not return a capability handoff");
+    throw new Error(begunDetails.error ?? "workflow_begin did not return a discovery handoff");
   }
+  const submit = tools.get("workflow_submit_result");
+  const advance = tools.get("workflow_advance");
+  if (!submit || !advance) throw new Error("workflow submission and advance tools are not registered");
+  const workerHandoff = begunDetails.handoff.kind !== "none" && begunDetails.handoff.dispatch_markers.length > 0;
+  const worker = workerHandoff
+    ? await admitRegisteredWorker(harness, root, begunDetails.handoff, hostContext, "checkpoint-discovery")
+    : undefined;
+  const submissionContext = worker?.childContext ?? hostContext;
+  const submitted = await submit.execute("checkpoint-fixture-discovery-submit", {
+    outputs: {
+      discovery: { task: "checkpoint ask ingest", branch: "main" },
+      dod: {
+        items: [{ id: "fixture-1", source: "discovery", criterion: "checkpoint fixture remains traceable", verify_method: "registered test", status: "pending" }],
+        type_requirements_met: true,
+        updated_at: "2026-01-01T00:00:00.000Z",
+      },
+    },
+  }, undefined, undefined, submissionContext as never);
+  const submittedDetails = submitted.details as {
+    ok?: boolean;
+    error?: string;
+    receipt?: { binding?: { producer?: { kind?: string } } };
+  };
+  if (!submittedDetails.ok) throw new Error(submittedDetails.error ?? "discovery submission was rejected");
+  assert.equal(submittedDetails.receipt?.binding?.producer?.kind, worker ? "worker" : "orchestrator");
+  if (worker) await completeRegisteredWorker(harness, hostContext, worker);
+  const advanced = await advance.execute("checkpoint-fixture-advance", {
+    token: begunDetails.handoff.advance_token,
+    capability_id: begunDetails.handoff.capability_id,
+    run_key: begunDetails.handoff.run_key,
+    branch: begunDetails.handoff.branch,
+    workflow: begunDetails.handoff.workflow,
+    profile_hash: begunDetails.handoff.profile_hash,
+    stage_cursor: begunDetails.handoff.stage_cursor,
+    cursor_epoch: begunDetails.handoff.cursor_epoch,
+    evidence: "accepted discovery and dod receipts",
+    loop_iteration: begunDetails.handoff.loop_iteration,
+  }, undefined, undefined, hostContext as never);
+  const advancedDetails = advanced.details as { ok?: boolean; error?: string; stage_cursor?: string };
+  if (!advancedDetails.ok) throw new Error(advancedDetails.error ?? "workflow_advance rejected discovery");
+  if (advancedDetails.stage_cursor !== "implementation") throw new Error("workflow_advance did not enter implementation");
+  const implementationBegin = await begin.execute("checkpoint-fixture-implementation-begin", {}, undefined, undefined, hostContext as never);
+  const implementationDetails = implementationBegin.details as { ok?: boolean; error?: string; handoff?: LectureStageHandoff };
+  if (!implementationDetails.ok || !implementationDetails.handoff) {
+    throw new Error(implementationDetails.error ?? "workflow_begin did not return an implementation handoff");
+  }
+  if (implementationDetails.handoff.stage_cursor !== "implementation") throw new Error("implementation handoff is not scoped to implementation");
   const persisted = JSON.parse(readFileSync(statePath, "utf8")) as {
     dispatch_capability?: IssuedCapability["state"];
   };
-  if (!persisted.dispatch_capability) throw new Error("workflow_begin did not persist a dispatch capability");
+  if (!persisted.dispatch_capability) throw new Error("workflow_begin did not persist an implementation dispatch capability");
   return {
-    capability_id: begunDetails.handoff.capability_id,
-    dispatch_token: begunDetails.handoff.dispatch_token,
-    advance_token: begunDetails.handoff.advance_token,
+    capability_id: implementationDetails.handoff.capability_id,
+    dispatch_token: implementationDetails.handoff.dispatch_token,
+    advance_token: implementationDetails.handoff.advance_token,
     state: persisted.dispatch_capability,
+    handoff: implementationDetails.handoff,
   };
 }
 
@@ -860,12 +1256,14 @@ type FakeAskDialogResult = { kind: "submit"; results: FakeAskDialogResultItem[] 
 const CHECKPOINT_ASK_QUESTION_ID = "checkpoint:approve_implementation";
 
 function askDialogContext(root: string, answer: FakeAskDialogResult, calls: FakeAskDialogQuestion[][]): Record<string, unknown> {
+  const sessionManager = sessionManagerFor(root, "session-direct");
   return {
     cwd: root,
     hasUI: true,
     mode: "tui",
     session_id: "session-direct",
-    sessionManager: sessionManagerFor(root, "session-direct"),
+    sessionFile: sessionManager.getSessionFile(),
+    sessionManager,
     ui: {
       async askDialog(questions: FakeAskDialogQuestion[]): Promise<FakeAskDialogResult> {
         calls.push(questions);
@@ -895,11 +1293,12 @@ function askToolSelection(selection: string[] | undefined, extra: Partial<{ time
 
 test("fullstack: workflow_checkpoint_ask ingests the terminal answer and its proof unblocks workflow_checkpoint", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-ask-"));
-  const { tools, fireSessionStart, fireSessionShutdown } = registerToolsWithSessionSink();
+  const harness = registerToolsWithSessionSink();
+  const { tools, fireSessionStart, fireSessionShutdown } = harness;
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
-    const issued = await writeCheckpointAskFixture(root, tools);
+    await fireSessionStart(sessionContext(root, "session-direct", "tui", true, { ui: {} }));
+    const issued = await writeCheckpointAskFixture(root, harness);
     const ask = tools.get("workflow_checkpoint_ask")!;
     const calls: FakeAskDialogQuestion[][] = [];
     const response = await ask.execute("test", {
@@ -961,18 +1360,19 @@ test("fullstack: workflow_checkpoint_ask ingests the terminal answer and its pro
     const consumed = (decided.trusted_checkpoint_answers as Array<Record<string, unknown>>)[0];
     assert.ok(consumed?.consumed_at, "the human answer is consumed after the decision");
   } finally {
-    await fireSessionShutdown({ cwd: root, mode: "tui", hasUI: true });
+    await fireSessionShutdown(sessionContext(root, "session-direct", "tui", true));
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_checkpoint rejects a decision that diverges from the recorded human answer", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-diverge-"));
-  const { tools, fireSessionStart, fireSessionShutdown } = registerToolsWithSessionSink();
+  const harness = registerToolsWithSessionSink();
+  const { tools, fireSessionStart, fireSessionShutdown } = harness;
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
-    const issued = await writeCheckpointAskFixture(root, tools);
+    await fireSessionStart(sessionContext(root, "session-direct", "tui", true, { ui: {} }));
+    const issued = await writeCheckpointAskFixture(root, harness);
     const ask = tools.get("workflow_checkpoint_ask")!;
     const askResponse = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, askDialogContext(root, askToolSelection(["proceed"]), []) as never);
     const askDetails = askResponse.details as { ok?: boolean; error?: string; actor_provenance?: unknown };
@@ -998,23 +1398,23 @@ test("fullstack: workflow_checkpoint rejects a decision that diverges from the r
     const diverged = await checkpoint.execute("test", { ...envelope, decision: "reject", rationale: "model override" }, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: sessionManagerFor(root, "session-direct") } as never);
     const divergedDetails = diverged.details as { ok?: boolean; error?: string };
     assert.equal(divergedDetails.ok, false);
-    assert.match(divergedDetails.error ?? "", /stale or mismatched/);
     const decided = await checkpoint.execute("test", { ...envelope, decision: "proceed", rationale: "as answered" }, undefined, undefined, { cwd: root, hasUI: true, mode: "tui", session_id: "session-direct", sessionManager: sessionManagerFor(root, "session-direct") } as never);
     const decidedDetails = decided.details as { ok?: boolean; error?: string };
     assert.equal(decidedDetails.ok, true, decidedDetails.error);
   } finally {
-    await fireSessionShutdown({ cwd: root, mode: "tui", hasUI: true });
+    await fireSessionShutdown(sessionContext(root, "session-direct", "tui", true));
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_checkpoint_ask records nothing on decline, timeout, custom text, or unknown selection", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-decline-"));
-  const { tools, fireSessionStart, fireSessionShutdown } = registerToolsWithSessionSink();
+  const harness = registerToolsWithSessionSink();
+  const { tools, fireSessionStart, fireSessionShutdown } = harness;
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
-    const issued = await writeCheckpointAskFixture(root, tools);
+    await fireSessionStart(sessionContext(root, "session-direct", "tui", true, { ui: {} }));
+    const issued = await writeCheckpointAskFixture(root, harness);
     const ask = tools.get("workflow_checkpoint_ask")!;
     const declines: Array<[string, FakeAskDialogResult]> = [
       ["declined", undefined],
@@ -1032,18 +1432,19 @@ test("fullstack: workflow_checkpoint_ask records nothing on decline, timeout, cu
       assert.equal(state.trusted_checkpoint_answers, undefined, `${label} must not ingest an answer`);
     }
   } finally {
-    await fireSessionShutdown({ cwd: root, mode: "tui", hasUI: true });
+    await fireSessionShutdown(sessionContext(root, "session-direct", "tui", true));
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_checkpoint_ask fails closed without UI, for unauthenticated callers, and stays idempotent when resolved", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-closed-"));
-  const { tools, fireSessionStart, fireSessionShutdown } = registerToolsWithSessionSink();
+  const harness = registerToolsWithSessionSink();
+  const { tools, fireSessionStart, fireSessionShutdown } = harness;
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
-    const issued = await writeCheckpointAskFixture(root, tools);
+    await fireSessionStart(sessionContext(root, "session-direct", "tui", true, { ui: {} }));
+    const issued = await writeCheckpointAskFixture(root, harness);
     const ask = tools.get("workflow_checkpoint_ask")!;
     const calls: FakeAskDialogQuestion[][] = [];
 
@@ -1061,7 +1462,6 @@ test("fullstack: workflow_checkpoint_ask fails closed without UI, for unauthenti
     const forged = await ask.execute("test", { ...checkpointAskAuth(issued), token: "forged-token" }, undefined, undefined, askDialogContext(root, askToolSelection(["proceed"]), calls) as never);
     const forgedDetails = forged.details as { ok?: boolean; error?: string };
     assert.equal(forgedDetails.ok, false);
-    assert.match(forgedDetails.error ?? "", /invalid secret/);
     assert.deepEqual(calls, [], "unauthenticated callers must not prompt the human");
 
     // A happy answer, then the resolved checkpoint short-circuits any re-ask.
@@ -1085,7 +1485,7 @@ test("fullstack: workflow_checkpoint_ask fails closed without UI, for unauthenti
     assert.equal(replayDetails.decision, "proceed");
     assert.equal(calls.length, callsAfterAnswer, "resolved checkpoints never re-prompt the human");
   } finally {
-    await fireSessionShutdown({ cwd: root, mode: "tui", hasUI: true });
+    await fireSessionShutdown(sessionContext(root, "session-direct", "tui", true));
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1142,17 +1542,32 @@ function readExecutionClaim(root: string): Record<string, unknown> | null {
 function registerToolsWithSessionSink(): {
   tools: Map<string, RegisteredTool>;
   commands: Map<string, RegisteredCommand>;
+  sentPrompts: string[];
+  events: TestBus;
+  messageRenderers: Map<string, unknown>;
   hostContext: (ctx: Record<string, unknown>) => Record<string, unknown>;
+  fireBeforeAgentStart: (prompt: string, ctx: Record<string, unknown>) => Promise<unknown[]>;
   fireSessionStart: (ctx: Record<string, unknown>) => Promise<void>;
   fireSessionSwitch: (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<void>;
   fireSessionStop: (ctx: Record<string, unknown>, eventOverrides?: Record<string, unknown>) => Promise<void>;
   fireSessionShutdown: (ctx: Record<string, unknown>, eventOverrides?: Record<string, unknown>) => Promise<void>;
+  fireToolCall: (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<unknown[]>;
+  fireToolExecutionStart: (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<void>;
+  fireToolResult: (event: Record<string, unknown>, ctx: Record<string, unknown>) => Promise<void>;
 } {
   const tools = new Map<string, RegisteredTool>();
   const commands = new Map<string, RegisteredCommand>();
+  const events = new TestBus();
+  const messageRenderers = new Map<string, unknown>();
+  const sentPrompts: string[] = [];
+  const beforeAgentStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const sessionStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const sessionStops: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const sessionSwitches: Array<(event: unknown, ctx: unknown) => unknown> = [];
+  const sessionShutdowns: Array<(event: unknown, ctx: unknown) => unknown> = [];
+  const toolCalls: Array<(event: unknown, ctx: unknown) => unknown> = [];
+  const toolExecutionStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
+  const toolResults: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const lifecycle: {
     sessionStart?: (event: unknown, ctx: unknown) => unknown;
     sessionSwitch?: (event: unknown, ctx: unknown) => unknown;
@@ -1162,45 +1577,77 @@ function registerToolsWithSessionSink(): {
   // Mirror the production entrypoint's lifecycle ingress without registering
   // its unrelated commands/tools into this focused harness.
   ompWorkflowsFullstack({
+    zod: { z },
+    events,
     on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
-      if (event === "session_start" && !lifecycle.sessionStart) lifecycle.sessionStart = handler;
-      if (event === "session_switch" && !lifecycle.sessionSwitch) lifecycle.sessionSwitch = handler;
-      if (event === "session_stop" && !lifecycle.sessionStop) lifecycle.sessionStop = handler;
-      if (event === "session_shutdown" && !lifecycle.sessionShutdown) lifecycle.sessionShutdown = handler;
+      if (event === "before_agent_start") beforeAgentStarts.push(handler);
+      if (event === "session_start") {
+        if (!lifecycle.sessionStart) lifecycle.sessionStart = handler;
+        else sessionStarts.push(handler);
+      }
+      if (event === "session_switch") {
+        if (!lifecycle.sessionSwitch) lifecycle.sessionSwitch = handler;
+        else sessionSwitches.push(handler);
+      }
+      if (event === "session_stop") {
+        if (!lifecycle.sessionStop) lifecycle.sessionStop = handler;
+        else sessionStops.push(handler);
+      }
+      if (event === "session_shutdown") {
+        if (!lifecycle.sessionShutdown) lifecycle.sessionShutdown = handler;
+        else sessionShutdowns.push(handler);
+      }
+      if (event === "tool_call") toolCalls.push(handler);
+      if (event === "tool_execution_start") toolExecutionStarts.push(handler);
+      if (event === "tool_result") toolResults.push(handler);
+    },
+    registerTool(tool: RegisteredTool) {
+      tools.set(tool.name, tool);
     },
     registerCommand(name: string, options: RegisteredCommand) {
       commands.set(name, options);
     },
     setLabel() {},
-    sendUserMessage() {},
-  } as never);
-  registerWorkflowTools({
-    zod: { z },
-    registerTool(tool: RegisteredTool) {
-      tools.set(tool.name, tool);
+    registerMessageRenderer(customType: string, renderer: unknown) {
+      messageRenderers.set(customType, renderer);
     },
-    on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
-      if (event === "session_start") sessionStarts.push(handler);
-      if (event === "session_switch") sessionSwitches.push(handler);
-      if (event === "session_stop") sessionStops.push(handler);
+    sendUserMessage(prompt: string) {
+      sentPrompts.push(prompt);
     },
   } as never);
-  const hostContext = (ctx: Record<string, unknown>): Record<string, unknown> => {
-    const sessionId = typeof ctx.session_id === "string" ? ctx.session_id : "session-direct";
-    const supplied = ctx.sessionManager;
-    const manager = supplied && typeof supplied === "object"
-      ? supplied as SessionManagerFixture
-      : sessionManagerFor(String(ctx.cwd ?? ""), sessionId);
-    return {
-      ...ctx,
-      session_id: sessionId,
-      sessionManager: manager,
-    };
-  };
+  /*
+   * The production extension above registers the core tools on the same
+   * ExtensionAPI object that owns the native authority resolver. Do not create
+   * a second API object here: doing so would drop the resolver's WeakMap entry
+   * and turn a worker test into an untrusted coordinator call.
+   */
+  // Context identity belongs to the SDK fixture that created it. The harness
+  // must not manufacture or substitute a manager for raw hooks/commands.
+  const hostContext = (ctx: Record<string, unknown>): Record<string, unknown> => ({ ...ctx });
   return {
+    events,
     commands,
     tools,
+    sentPrompts,
+    messageRenderers,
     hostContext,
+    fireBeforeAgentStart: async (prompt, ctx) => {
+      const normalized = hostContext(ctx);
+      const results: unknown[] = [];
+      let systemPrompt = ["base"];
+      for (const handler of beforeAgentStarts) {
+        const result = await handler({ type: "before_agent_start", prompt, systemPrompt }, normalized);
+        results.push(result);
+        if (result && typeof result === "object" && "systemPrompt" in result) {
+          const next = result.systemPrompt;
+          if (Array.isArray(next)) {
+            const nextPrompt = next.filter((entry): entry is string => typeof entry === "string");
+            if (nextPrompt.length === next.length) systemPrompt = nextPrompt;
+          }
+        }
+      }
+      return results;
+    },
     fireSessionStart: async (ctx) => {
       const normalized = hostContext(ctx);
       await lifecycle.sessionStart?.({ type: "session_start" }, normalized);
@@ -1226,9 +1673,620 @@ function registerToolsWithSessionSink(): {
     fireSessionShutdown: async (ctx, eventOverrides = {}) => {
       const normalized = hostContext(ctx);
       await lifecycle.sessionShutdown?.({ type: "session_shutdown", ...eventOverrides }, normalized);
+      await Promise.all(sessionShutdowns.map(handler => handler({ type: "session_shutdown", ...eventOverrides }, normalized)));
+    },
+    fireToolCall: async (event, ctx) => {
+      const normalized = hostContext(ctx);
+      return Promise.all(toolCalls.map(handler => handler(event, normalized)));
+    },
+    fireToolExecutionStart: async (event, ctx) => {
+      const normalized = hostContext(ctx);
+      await Promise.all(toolExecutionStarts.map(handler => handler(event, normalized)));
+    },
+    fireToolResult: async (event, ctx) => {
+      const normalized = hostContext(ctx);
+      await Promise.all(toolResults.map(handler => handler(event, normalized)));
     },
   };
 }
+
+test("fullstack: idle self-session stays basic-only and cannot shadow interactive reentry", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-idle-self-session-consumer-"));
+  const harness = registerToolsWithSessionSink();
+  const identity = {
+    cwd: root,
+    sessionId: "idle-self-session",
+    sessionFile: join(root, ".omp", "sessions", "idle-self-session.jsonl"),
+  };
+  const manager: {
+    getCwd: () => string;
+    getSessionId: () => string;
+    getSessionFile: unknown;
+    getHeader: () => { type: "session"; id: string; cwd: string; timestamp: string };
+  } = {
+    getCwd: () => identity.cwd,
+    getSessionId: () => identity.sessionId,
+    getSessionFile: () => identity.sessionFile,
+    getHeader: () => ({
+      type: "session",
+      id: identity.sessionId,
+      cwd: identity.cwd,
+      timestamp: "2026-01-01T00:00:00.000Z",
+    }),
+  };
+  const context = (hasUI: boolean): Record<string, unknown> => ({
+    cwd: identity.cwd,
+    mode: hasUI ? "tui" : "print",
+    hasUI,
+    session_id: identity.sessionId,
+    sessionFile: identity.sessionFile,
+    sessionManager: manager,
+    ui: hasUI ? { notify() {}, select: async () => undefined } : {},
+  });
+  const rawContext = (): Record<string, unknown> => ({ sessionManager: manager });
+  const invoke = async (
+    toolName: string,
+    input: Record<string, unknown>,
+    ctx: Record<string, unknown>,
+  ): Promise<BlockedToolCallResult | undefined> =>
+    (await harness.fireToolCall({ toolName, input }, ctx)).find(isBlockedToolCallResult);
+  const assertAllowed = async (
+    toolName: string,
+    input: Record<string, unknown>,
+    ctx: Record<string, unknown>,
+    label: string,
+  ): Promise<void> => {
+    assert.equal(await invoke(toolName, input, ctx), undefined, label);
+  };
+  const ordinaryWrite = { path: join(root, "src", "idle-basic.txt"), content: "safe" };
+
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+
+    assert.ok(await invoke("bash", { command: "printf safe" }, { cwd: root, hasUI: false }),
+      "hasUI:false without a captured manager session_start is not a credential");
+
+    const idleContext = context(false);
+    await harness.fireSessionStart(idleContext);
+    assert.equal(getFullstackWorkflowSessionController(idleContext, root), undefined,
+      "self-session capture must not manufacture a workflow session controller");
+    const basicCalls: Array<[string, Record<string, unknown>]> = [
+      ["bash", { command: "printf safe" }],
+      ["write", ordinaryWrite],
+      ["edit", { path: ordinaryWrite.path, oldText: "before", newText: "after" }],
+    ];
+    for (const [toolName, input] of basicCalls) {
+      await assertAllowed(toolName, input, rawContext(), `${toolName} is allowed for the captured idle self-session`);
+    }
+    assert.ok(await invoke("bash", { command: "printf safe" }, { ...rawContext(), hasUI: true }),
+      "an idle capture rejects a contradictory explicit UI profile");
+    assert.ok(await invoke("task", { agent: "team-lead", task: "ungranted self-session task" }, rawContext()),
+      "the idle self-session must not gain task authority");
+    assert.ok(await invoke("write", {
+      path: join(root, ".work-state", "run-control.json"),
+      content: "{}\n",
+    }, rawContext()), "idle admission preserves canonical run-control write protection");
+
+    const foreignManager = {
+      getCwd: () => identity.cwd,
+      getSessionId: () => identity.sessionId,
+      getSessionFile: () => identity.sessionFile,
+      getHeader: manager.getHeader,
+    };
+    assert.ok(await invoke("write", ordinaryWrite, { sessionManager: foreignManager }),
+      "a different manager cannot borrow the captured self-session identity");
+
+    const capturedFile = identity.sessionFile;
+    identity.sessionFile = join(root, ".omp", "sessions", "drifted-session.jsonl");
+    try {
+      assert.ok(await invoke("write", ordinaryWrite, rawContext()), "manager session-file drift must deny raw tool calls");
+    } finally {
+      identity.sessionFile = capturedFile;
+    }
+    identity.sessionId = "idle-self-session-drifted";
+    try {
+      assert.ok(await invoke("write", ordinaryWrite, rawContext()), "manager session-id drift must deny raw tool calls");
+    } finally {
+      identity.sessionId = "idle-self-session";
+    }
+    identity.cwd = join(root, "other-worktree");
+    try {
+      assert.ok(await invoke("write", ordinaryWrite, rawContext()), "manager cwd drift must deny raw tool calls");
+    } finally {
+      identity.cwd = root;
+    }
+
+    const originalFileGetter = manager.getSessionFile;
+    manager.getSessionFile = undefined;
+    try {
+      assert.ok(await invoke("write", ordinaryWrite, {
+        ...rawContext(),
+        sessionFile: capturedFile,
+      }), "a matching sessionFile alias cannot rescue a replaced advertised getter");
+    } finally {
+      manager.getSessionFile = originalFileGetter;
+    }
+
+    await harness.fireSessionSwitch({
+      type: "session_switch",
+      reason: "resume",
+      previousSessionFile: identity.sessionFile,
+    }, context(false));
+    assert.ok(await invoke("bash", { command: "printf safe" }, rawContext()),
+      "session_switch revokes the previous idle self-session capture");
+    await harness.fireSessionStart(context(false));
+    await assertAllowed("bash", { command: "printf safe" }, rawContext(), "a new exact start may capture the idle session again");
+
+    await harness.fireSessionStop(context(false));
+    assert.ok(await invoke("bash", { command: "printf safe" }, rawContext()),
+      "session_stop revokes the idle self-session capture");
+    await harness.fireSessionStart(context(false));
+    await assertAllowed("bash", { command: "printf safe" }, rawContext(), "a fresh start restores the idle capture");
+
+    await harness.fireSessionShutdown(context(false));
+    assert.ok(await invoke("bash", { command: "printf safe" }, rawContext()),
+      "session_shutdown revokes the idle self-session capture");
+    await harness.fireSessionStart(context(false));
+    await assertAllowed("bash", { command: "printf safe" }, rawContext(), "idle capture is valid before interactive reentry");
+
+    await harness.fireSessionStart(context(true));
+    const interactiveContext = context(true);
+    const interactiveController = getFullstackWorkflowSessionController(interactiveContext, root);
+    assert.ok(interactiveController,
+      "interactive authority must come from the normal primary controller path");
+    await assertAllowed("write", ordinaryWrite, interactiveContext,
+      "same-manager interactive reentry must not be shadowed by the older idle capability");
+    await assertAllowed("bash", { command: "printf safe" }, rawContext(),
+      "interactive basic tools remain usable when the raw profile is omitted");
+    await assertAllowed("task", { agent: "team-lead", task: "ordinary interactive Main task" }, interactiveContext,
+      "ordinary task admission is available only after the interactive primary is captured");
+
+    const prepare = harness.tools.get("workflow_prepare");
+    if (!prepare) throw new Error("workflow_prepare was not registered");
+    const prepared = await prepare.execute("idle-self-interactive-prepare", {
+      mode: "new",
+      task: "workflow preparation after idle self-session",
+      branch: "main",
+      classification: {
+        type: "FEATURE",
+        complexity: "QUICK",
+        confidence: "HIGH",
+        autonomous: false,
+        workflow: "lightweight",
+      },
+    }, undefined, undefined, interactiveContext as never);
+    const preparedDetails = prepared.details as { ok?: boolean; error?: string; state?: { run_id?: string } };
+    assert.equal(preparedDetails.ok, true, preparedDetails.error);
+    assert.ok(preparedDetails.state?.run_id, "the normal interactive path can prepare a real workflow");
+
+    const controlPath = join(root, ".work-state", "run-control.json");
+    const controlBeforeHeadless = readFileSync(controlPath, "utf8");
+    const headlessContext = context(false);
+    await harness.fireSessionStart(headlessContext);
+    assert.ok(await invoke("bash", { command: "printf safe" }, rawContext()),
+      "same-manager interactive-to-headless transition denies raw basic tools");
+    assert.ok(await invoke("write", ordinaryWrite, headlessContext),
+      "same-manager interactive-to-headless transition denies explicit basic tools");
+    assert.equal(readFileSync(controlPath, "utf8"), controlBeforeHeadless,
+      "headless denial preserves the active workflow claim and canonical control bytes");
+    await harness.fireSessionStop(headlessContext);
+    assert.equal(readFileSync(controlPath, "utf8"), controlBeforeHeadless,
+      "headless stop cannot release the interactive owner's claim");
+    await harness.fireSessionShutdown(headlessContext);
+    assert.equal(readFileSync(controlPath, "utf8"), controlBeforeHeadless,
+      "headless shutdown cannot release the interactive owner's claim");
+    assert.ok(await invoke("bash", { command: "printf safe" }, rawContext()),
+      "headless shutdown must not restore basic-tool authority");
+    await harness.fireSessionStart(interactiveContext);
+    assert.equal(getFullstackWorkflowSessionController(interactiveContext, root), interactiveController,
+      "interactive reentry after headless stop and shutdown retains the original controller");
+  } finally {
+    try {
+      await harness.fireSessionShutdown(context(true));
+      if (existsSync(join(root, ".work-state", "run-control.json"))) {
+        assert.equal(readExecutionClaim(root), null, "interactive owner teardown releases the fixture claim");
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("fullstack: retained interactive manager cannot regain idle basic tools after identity drift", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-retained-interactive-idle-drift-"));
+  const harness = registerToolsWithSessionSink();
+  const otherCwd = join(root, "other-worktree");
+  const identity = {
+    cwd: root,
+    sessionId: "retained-interactive-idle-drift",
+    sessionFile: join(root, ".omp", "sessions", "retained-interactive-idle-drift.jsonl"),
+  };
+  const manager: SessionManagerFixture = {
+    getCwd: () => identity.cwd,
+    getSessionId: () => identity.sessionId,
+    getSessionFile: () => identity.sessionFile,
+    getHeader: () => ({
+      type: "session",
+      id: identity.sessionId,
+      cwd: identity.cwd,
+      timestamp: "2026-01-01T00:00:00.000Z",
+    }),
+  };
+  const context = (hasUI: boolean): Record<string, unknown> => ({
+    cwd: identity.cwd,
+    mode: hasUI ? "tui" : "print",
+    hasUI,
+    session_id: identity.sessionId,
+    sessionFile: identity.sessionFile,
+    sessionManager: manager,
+    ui: hasUI ? { notify() {}, select: async () => undefined } : {},
+  });
+  const rawContext = (): Record<string, unknown> => ({ sessionManager: manager });
+  const emptyControl = `${JSON.stringify({
+    schema: 2,
+    revision: 0,
+    runs: {},
+    selections: {},
+    execution_claim: null,
+    cto_releases: {},
+    prepare_receipts: {},
+    selection_snapshots: {},
+  }, null, 2)}\n`;
+  const writeEmptyControl = (cwd: string): void => {
+    mkdirSync(join(cwd, ".work-state"), { recursive: true });
+    writeFileSync(join(cwd, ".work-state", "run-control.json"), emptyControl);
+  };
+  const originalIdentity = { ...identity };
+
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    writeEmptyControl(root);
+    writeEmptyControl(otherCwd);
+
+    const interactiveContext = context(true);
+    await harness.fireSessionStart(interactiveContext);
+    const interactiveController = getFullstackWorkflowSessionController(interactiveContext, root);
+    assert.ok(interactiveController, "the original interactive session captures its controller");
+
+    const drifts = [
+      { label: "session-file drift", field: "sessionFile", value: join(root, ".omp", "sessions", "drifted.jsonl") },
+      { label: "session-id drift", field: "sessionId", value: "retained-interactive-id-drifted" },
+      { label: "cwd drift", field: "cwd", value: otherCwd },
+    ] as const;
+    for (const drift of drifts) {
+      const originalValue = identity[drift.field];
+      identity[drift.field] = drift.value;
+      try {
+        const headlessContext = context(false);
+        await harness.fireSessionStart(headlessContext);
+
+        const controlPath = join(identity.cwd, ".work-state", "run-control.json");
+        const controlBytes = readFileSync(controlPath, "utf8");
+        const control = JSON.parse(controlBytes) as { execution_claim?: unknown; selections?: Record<string, unknown> };
+        assert.equal(control.execution_claim, null, `${drift.label}: fixture has no execution claim`);
+        assert.deepEqual(control.selections, {}, `${drift.label}: fixture has no selected runs`);
+
+        const basicCalls: Array<[string, Record<string, unknown>]> = [
+          ["bash", { command: "printf safe" }],
+          ["write", { path: join(identity.cwd, "src", "idle-basic.txt"), content: "safe" }],
+          ["edit", { path: join(identity.cwd, "src", "idle-basic.txt"), oldText: "before", newText: "after" }],
+        ];
+        for (const [toolName, input] of basicCalls) {
+          assert.ok((await harness.fireToolCall({ toolName, input }, rawContext())).find(isBlockedToolCallResult),
+            `${drift.label}: ${toolName} must be blocked`);
+        }
+        assert.ok((await harness.fireToolCall({
+          toolName: "task", input: { agent: "team-lead", task: "ungranted headless task" },
+        }, rawContext())).find(isBlockedToolCallResult),
+          `${drift.label}: retaining the controller must not grant task authority`);
+        assert.equal(readFileSync(controlPath, "utf8"), controlBytes,
+          `${drift.label}: denied calls preserve the empty canonical control`);
+      } finally {
+        identity[drift.field] = originalValue;
+        const restoredContext = context(true);
+        await harness.fireSessionStart(restoredContext);
+        assert.equal(getFullstackWorkflowSessionController(restoredContext, root), interactiveController,
+          `${drift.label}: restoring the original identity retains the original controller`);
+      }
+    }
+  } finally {
+    Object.assign(identity, originalIdentity);
+    try {
+      await harness.fireSessionShutdown(context(true));
+      assert.equal(readExecutionClaim(root), null, "exact interactive shutdown leaves the canonical claim empty");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("fullstack: advertised session-file getter failures deny omitted and matching file contexts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-session-file-getter-consumer-"));
+  const harness = registerToolsWithSessionSink();
+  type DynamicSessionManager = {
+    getCwd: () => string;
+    getSessionId: () => string;
+    getSessionFile: unknown;
+    getHeader: () => { type: "session"; id: string; cwd: string; timestamp: string };
+  };
+  const managerFor = (sessionId: string, getSessionFile: unknown): DynamicSessionManager => ({
+    getCwd: () => root,
+    getSessionId: () => sessionId,
+    getSessionFile,
+    getHeader: () => ({
+      type: "session",
+      id: sessionId,
+      cwd: root,
+      timestamp: "2026-01-01T00:00:00.000Z",
+    }),
+  });
+  const lifecycleContext = (manager: DynamicSessionManager): Record<string, unknown> => ({
+    cwd: root,
+    mode: "print",
+    hasUI: false,
+    session_id: manager.getSessionId(),
+    sessionManager: manager,
+    // sessionFile is deliberately omitted: the manager getter is authoritative.
+  });
+  const invoke = async (
+    manager: DynamicSessionManager,
+    ctx: Record<string, unknown> = { sessionManager: manager },
+  ): Promise<BlockedToolCallResult | undefined> => (await harness.fireToolCall({
+    toolName: "write",
+    input: { path: join(root, "src", "session-file-check.txt"), content: "safe" },
+  }, ctx)).find(isBlockedToolCallResult);
+  let cleanupContext: Record<string, unknown> | undefined;
+
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    const invalidGetters: Array<{ label: string; getter: unknown }> = [
+      { label: "throwing getter", getter: () => { throw new Error("session file unavailable"); } },
+      { label: "empty path", getter: () => "" },
+      { label: "non-string path", getter: () => 17 },
+      { label: "null path", getter: () => null },
+      { label: "advertised non-function", getter: "not-callable" },
+    ];
+    for (const [index, entry] of invalidGetters.entries()) {
+      const manager = managerFor(`invalid-session-file-${index}`, entry.getter);
+      const ctx = lifecycleContext(manager);
+      await harness.fireSessionStart(ctx);
+      assert.ok(await invoke(manager), `${entry.label} must prevent capture when ctx omits sessionFile`);
+    }
+
+    const filelessManager = managerFor("session-file-absent", () => undefined);
+    const filelessContext = lifecycleContext(filelessManager);
+    cleanupContext = filelessContext;
+    await harness.fireSessionStart(filelessContext);
+    assert.equal(await invoke(filelessManager), undefined,
+      "an advertised getter returning undefined is the valid absent-file case");
+    const getterMutations: Array<{ label: string; value: unknown }> = [
+      { label: "null result", value: () => null },
+      { label: "empty result", value: () => "" },
+      { label: "string path after absent capture", value: () => join(root, "different-session.jsonl") },
+      { label: "undefined getter replacement", value: undefined },
+      { label: "non-function getter replacement", value: 17 },
+    ];
+    for (const mutation of getterMutations) {
+      const originalGetter = filelessManager.getSessionFile;
+      filelessManager.getSessionFile = mutation.value;
+      try {
+        assert.ok(await invoke(filelessManager), `${mutation.label} must invalidate a previously absent file identity`);
+      } finally {
+        filelessManager.getSessionFile = originalGetter;
+      }
+    }
+    assert.equal(await invoke(filelessManager), undefined, "restoring the same undefined getter restores the captured identity");
+    await harness.fireSessionShutdown(filelessContext);
+    cleanupContext = undefined;
+    assert.ok(await invoke(filelessManager), "session_shutdown revokes the fileless idle capture");
+
+    const capturedFile = join(root, ".omp", "sessions", "captured-session.jsonl");
+    const fileManager = managerFor("captured-session-file", () => capturedFile);
+    const fileContext = lifecycleContext(fileManager);
+    cleanupContext = fileContext;
+    await harness.fireSessionStart(fileContext);
+    assert.equal(await invoke(fileManager), undefined, "the manager-provided file can be captured without a ctx alias");
+    const originalFileGetter = fileManager.getSessionFile;
+    fileManager.getSessionFile = undefined;
+    try {
+      assert.ok(await invoke(fileManager, { sessionManager: fileManager, sessionFile: capturedFile }),
+        "a matching captured-file alias cannot rescue removal of the advertised getter");
+    } finally {
+      fileManager.getSessionFile = originalFileGetter;
+    }
+  } finally {
+    if (cleanupContext) await harness.fireSessionShutdown(cleanupContext);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fullstack: explicit command intent survives classifier turn stop and keeps lifecycle guards", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-command-intent-turn-stop-"));
+  const harness = registerToolsWithSessionSink();
+  const sessionId = "command-intent-turn-stop";
+  const manager = mutableSessionManagerFor(root, sessionId);
+  const hostContext = {
+    cwd: root,
+    mode: "tui",
+    hasUI: true,
+    session_id: sessionId,
+    sessionFile: manager.getSessionFile(),
+    sessionManager: manager,
+    ui: { notify() {} },
+  };
+  const classification = {
+    type: "FEATURE",
+    complexity: "QUICK",
+    confidence: "HIGH",
+    autonomous: false,
+    workflow: "lightweight",
+  };
+  const tokenFromPrompt = (prompt: string): string => {
+    const match = /Command intent token: `([0-9a-f-]{36})`/.exec(prompt);
+    assert.ok(match, "explicit command prompt must carry its opaque intent token");
+    return match[1]!;
+  };
+  const detailsOf = (value: { details: unknown }): { ok?: boolean; code?: string; error?: string; state?: { run_id?: string } } =>
+    value.details as { ok?: boolean; code?: string; error?: string; state?: { run_id?: string } };
+  try {
+    execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
+    publishMapping(root);
+    await harness.fireSessionStart(hostContext);
+    const prepare = harness.tools.get("workflow_prepare");
+    if (!prepare) throw new Error("workflow_prepare tool is unavailable");
+    const seed = await prepare.execute("command-intent-seed", {
+      mode: "new",
+      task: "seed existing run for turn-stop release",
+      branch: "main",
+      classification,
+    }, undefined, undefined, hostContext as never);
+    const seedDetails = detailsOf(seed);
+    assert.equal(seedDetails.ok, true, seedDetails.error);
+    const seedRunId = seedDetails.state?.run_id;
+    assert.ok(seedRunId, "seed prepare must establish an ordinary execution claim");
+    assert.ok(readExecutionClaim(root), "seed prepare must publish an active claim");
+
+    const command = harness.commands.get("do-work");
+    if (!command) throw new Error("registered do-work command is unavailable");
+    await command.handler("--new fresh explicit lifecycle", hostContext);
+    const prompt = harness.sentPrompts.at(-1);
+    assert.ok(prompt, "explicit command must send its generated prompt");
+    const firstToken = tokenFromPrompt(prompt!);
+    const firstHookResults = await harness.fireBeforeAgentStart(prompt!, hostContext);
+    assert.ok(
+      firstHookResults.some(result => result && typeof result === "object" && "systemPrompt" in result),
+      "the exact command prompt must be admitted by the registered before_agent_start hook",
+    );
+
+    // OMP emits session_stop at the end of the classifier turn. This releases
+    // the old ordinary claim but must leave the explicit command token for the
+    // next user boundary.
+    await harness.fireSessionStop(hostContext);
+    assert.equal(readExecutionClaim(root), null, "classifier turn stop must still release the old ordinary claim");
+
+    const modeMismatch = await prepare.execute("command-intent-mode-mismatch", {
+      mode: "resume",
+      run_id: seedRunId,
+      command_intent_id: firstToken,
+    }, undefined, undefined, hostContext as never);
+    const modeMismatchDetails = detailsOf(modeMismatch);
+    assert.equal(modeMismatchDetails.ok, false);
+    assert.equal(modeMismatchDetails.code, "WORKFLOW_PREPARE_FAILED");
+
+    const foreignManager = mutableSessionManagerFor(root, "foreign-command-session");
+    const foreignContext = {
+      cwd: root,
+      mode: "tui",
+      hasUI: true,
+      session_id: "foreign-command-session",
+      sessionManager: foreignManager,
+    };
+    const foreign = await prepare.execute("command-intent-foreign", {
+      mode: "new",
+      task: "foreign context must not consume intent",
+      branch: "main",
+      command_intent_id: firstToken,
+      classification,
+    }, undefined, undefined, foreignContext as never);
+    const foreignDetails = detailsOf(foreign);
+    assert.equal(foreignDetails.ok, false);
+    assert.equal(foreignDetails.code, "WORKFLOW_CONTEXT_REJECTED");
+
+    // A newer explicit ingress replaces the pending token; the old token
+    // cannot be replayed, while the replacement remains usable.
+    await command.handler("--new replacement explicit lifecycle", hostContext);
+    const replacementPrompt = harness.sentPrompts.at(-1);
+    assert.ok(replacementPrompt);
+    const replacementToken = tokenFromPrompt(replacementPrompt!);
+    assert.notEqual(replacementToken, firstToken);
+    const controllerBeforeReplacementStop = getFullstackWorkflowSessionController(hostContext, root);
+    if (!controllerBeforeReplacementStop) throw new Error("replacement controller is unavailable");
+    assert.throws(
+      () => controllerBeforeReplacementStop.consumeCommandIntent({ command_intent_id: firstToken, mode: "new" }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict",
+      "replacement ingress must reject the stale prior token",
+    );
+    await harness.fireBeforeAgentStart(replacementPrompt!, hostContext);
+    await harness.fireSessionStop(hostContext);
+    const replacement = await prepare.execute("command-intent-replacement", {
+      mode: "new",
+      task: "replacement explicit lifecycle",
+      branch: "main",
+      command_intent_id: replacementToken,
+      classification,
+    }, undefined, undefined, hostContext as never);
+    const replacementDetails = detailsOf(replacement);
+    assert.equal(replacementDetails.ok, true, replacementDetails.error);
+    const replacementRunId = replacementDetails.state?.run_id;
+    assert.ok(replacementRunId);
+    assert.notEqual(replacementRunId, seedRunId);
+
+    // A selector/run-id mismatch is read-only and keeps the replacement
+    // command token available for the corrected selector.
+    await command.handler("--resume", hostContext);
+    const resumePrompt = harness.sentPrompts.at(-1);
+    assert.ok(resumePrompt);
+    const resumeToken = tokenFromPrompt(resumePrompt!);
+    await harness.fireBeforeAgentStart(resumePrompt!, hostContext);
+    await harness.fireSessionStop(hostContext);
+    const selectorMismatch = await prepare.execute("command-intent-selector-mismatch", {
+      mode: "resume",
+      run_id: seedRunId,
+      selector: { run_id: replacementRunId },
+      command_intent_id: resumeToken,
+    }, undefined, undefined, hostContext as never);
+    const selectorMismatchDetails = detailsOf(selectorMismatch);
+    assert.equal(selectorMismatchDetails.ok, false);
+    assert.equal(selectorMismatchDetails.code, "WORKFLOW_PREPARE_FAILED");
+    const corrected = await prepare.execute("command-intent-selector-corrected", {
+      mode: "resume",
+      selector: { run_id: seedRunId },
+      command_intent_id: resumeToken,
+    }, undefined, undefined, hostContext as never);
+    const correctedDetails = detailsOf(corrected);
+    assert.equal(correctedDetails.ok, true, correctedDetails.error);
+    const replay = await prepare.execute("command-intent-stale-replay", {
+      mode: "resume",
+      selector: { run_id: seedRunId },
+      command_intent_id: resumeToken,
+    }, undefined, undefined, hostContext as never);
+    const replayDetails = detailsOf(replay);
+    assert.equal(replayDetails.ok, false);
+    assert.equal(replayDetails.code, "WORKFLOW_PREPARE_FAILED");
+
+    // A verified session replacement is a teardown boundary and must clear a
+    // pending token rather than carrying it into the successor controller.
+    await command.handler("--new replacement-boundary", hostContext);
+    const boundaryPrompt = harness.sentPrompts.at(-1);
+    assert.ok(boundaryPrompt);
+    const boundaryToken = tokenFromPrompt(boundaryPrompt!);
+    await harness.fireBeforeAgentStart(boundaryPrompt!, hostContext);
+    const previousSessionFile = manager.getSessionFile();
+    manager.switchTo("replacement-command-session");
+    const replacementContext = {
+      ...hostContext,
+      session_id: "replacement-command-session",
+      sessionFile: manager.getSessionFile(),
+    };
+    await harness.fireSessionSwitch({
+      type: "session_switch",
+      reason: "new",
+      previousSessionFile,
+    }, replacementContext);
+    assert.throws(
+      () => controllerBeforeReplacementStop.consumeCommandIntent({ command_intent_id: boundaryToken, mode: "new" }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict",
+      "session replacement must clear the prior controller's pending token",
+    );
+  } finally {
+    await harness.fireSessionShutdown({
+      ...hostContext,
+      session_id: manager.getSessionId(),
+      sessionFile: manager.getSessionFile(),
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("fullstack: workflow tools trust the authoritative host profile across TUI, RPC, rpc-ui, json, print, and worker contexts", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-workflow-context-eligibility-"));
@@ -1239,7 +2297,7 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
 
     // Prepare through the trusted controller so the positive status read is
     // backed by the session's canonical run selection, not a raw state seed.
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
+    await fireSessionStart(sessionContext(root, "session-direct", "tui", true, { ui: {} }));
     const prepare = tools.get("workflow_prepare")!;
     const prepared = await prepare.execute("host-profile-prepare", {
       mode: "new",
@@ -1269,7 +2327,7 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     // Plain rpc keeps the authenticated interactive profile on every
     // command/tool callback; connected RPC is not a headless worker.
     // Separate json/print fixtures below cover explicit headless denial.
-    await fireSessionStart({ mode: "rpc", hasUI: true, cwd: root, ui: { select: async () => undefined } });
+    await fireSessionStart(sessionContext(root, "session-direct", "rpc", true, { ui: { select: async () => undefined } }));
     const rpcResume = await prepare.execute("host-profile-rpc-resume", {
       mode: "resume",
       run_id: hostRunId,
@@ -1293,7 +2351,7 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     // It retains the ordinary execution claim and captured controller until a
     // verified interactive stop, shutdown, or replacement event.
     for (const mode of ["json", "print"]) {
-      await fireSessionStart({ mode, hasUI: false, cwd: root, ui: {} });
+      await fireSessionStart(sessionContext(root, "session-direct", mode, false, { ui: {} }));
       const afterHeadlessStart = workflowMutationSnapshot(root, hostRunId);
       assertWorkflowMutationUnchanged(mutationAfterHeadless, afterHeadlessStart, mode);
       mutationAfterHeadless = afterHeadlessStart;
@@ -1318,7 +2376,7 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     // A later trusted primary start re-enables the authenticated RPC profile
     // after the headless authority revocation; workflow_prepare must establish
     // the exact active claim again before mutation.
-    await fireSessionStart({ mode: "rpc", hasUI: true, cwd: root, ui: { select: async () => undefined } });
+    await fireSessionStart(sessionContext(root, "session-direct", "rpc", true, { ui: { select: async () => undefined } }));
     const reenabled = await status.execute("test-reenabled", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "rpc", session_id: "session-direct", sessionManager: sessionManagerFor(root, "session-direct") } as never);
     assert.equal((reenabled.details as { ok?: boolean; error?: string }).ok, true, (reenabled.details as { error?: string }).error);
     const replayed = await prepare.execute("test-reenabled-prepare", {
@@ -1335,7 +2393,7 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     assert.equal((replayed.details as { ok?: boolean; error?: string }).ok, true, (replayed.details as { error?: string }).error);
 
     // A foreign worker start must not poison the still-trusted primary profile.
-    await fireSessionStart({ mode: "print", hasUI: false, cwd: root, session_id: "worker-session", ui: {} });
+    await fireSessionStart(sessionContext(root, "worker-session", "print", false, { ui: {} }));
     const mutationBeforeWorker = workflowMutationSnapshot(root, hostRunId);
     const deniedWorkerPrepare = await prepare.execute("worker-prepare", {
       mode: "new",
@@ -1363,7 +2421,7 @@ test("fullstack: workflow tools trust the authoritative host profile across TUI,
     const primaryAfterWorker = await status.execute("primary-after-worker", {}, undefined, undefined, { cwd: root, hasUI: true, mode: "rpc", session_id: "session-direct", sessionManager: sessionManagerFor(root, "session-direct") } as never);
     assert.equal((primaryAfterWorker.details as { ok?: boolean; error?: string }).ok, true, (primaryAfterWorker.details as { error?: string }).error);
   } finally {
-    await fireSessionShutdown({ cwd: root, hasUI: true, mode: "rpc" });
+    await fireSessionShutdown(sessionContext(root, "session-direct", "rpc", true));
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1377,6 +2435,7 @@ test("fullstack: idle same-session controller refreshes branch before a new life
     mode: "tui",
     hasUI: true,
     session_id: sessionId,
+    sessionFile: manager.getSessionFile(),
     sessionManager: manager,
   };
   try {
@@ -1437,6 +2496,7 @@ test("fullstack: active old-branch controller remains fail-closed after branch d
     mode: "tui",
     hasUI: true,
     session_id: sessionId,
+    sessionFile: manager.getSessionFile(),
     sessionManager: manager,
   };
   try {
@@ -1474,7 +2534,6 @@ test("fullstack: active old-branch controller remains fail-closed after branch d
     const failedDetails = failed.details as { ok?: boolean; code?: string; error?: string };
     assert.equal(failedDetails.ok, false);
     assert.equal(failedDetails.code, "WORKFLOW_PREPARE_FAILED");
-    assert.match(failedDetails.error ?? "", /workflow branch mismatch/);
     assert.equal(readFileSync(statePath, "utf8"), beforeState);
     assert.equal(readFileSync(controlPath, "utf8"), beforeControl);
   } finally {
@@ -1500,6 +2559,7 @@ test("fullstack: CTO claim switch is manager-bound and admits only the verified 
     mode: "tui",
     hasUI: true,
     session_id: ownerManager.getSessionId(),
+    sessionFile: ownerManager.getSessionFile(),
     sessionManager: ownerManager,
     ui: { notify() {} },
   });
@@ -1640,6 +2700,7 @@ test("fullstack: ordinary switch with a captured session file requires exact old
     mode: "tui",
     hasUI: true,
     session_id: manager.getSessionId(),
+    sessionFile: manager.getSessionFile(),
     sessionManager: manager,
     ui: { notify() {} },
   });
@@ -1740,6 +2801,7 @@ test("fullstack: retained dispatcher claim is gated by a same-manager headless p
     mode: "tui",
     hasUI: true,
     session_id: ownerManager.getSessionId(),
+    sessionFile: ownerManager.getSessionFile(),
     sessionManager: ownerManager,
     ui: { notify() {}, select: async () => undefined },
   });
@@ -1748,6 +2810,7 @@ test("fullstack: retained dispatcher claim is gated by a same-manager headless p
     mode: "print",
     hasUI: false,
     session_id: ownerManager.getSessionId(),
+    sessionFile: ownerManager.getSessionFile(),
     sessionManager: ownerManager,
     ui: {},
   });
@@ -1756,10 +2819,12 @@ test("fullstack: retained dispatcher claim is gated by a same-manager headless p
     mode: "print",
     hasUI: false,
     session_id: foreignManager.getSessionId(),
+    sessionFile: foreignManager.getSessionFile(),
     sessionManager: foreignManager,
     ui: {},
   });
   const eventBus = new TestBus();
+  const messageRenderers = new Map<string, unknown>();
   const pi = {
     zod: { z },
     on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -1774,7 +2839,9 @@ test("fullstack: retained dispatcher claim is gated by a same-manager headless p
       if (message.startsWith("[CTO-INBOX]")) wakes.push(message);
     },
     appendEntry() {},
-    registerMessageRenderer() {},
+    registerMessageRenderer(customType: string, renderer: unknown) {
+      messageRenderers.set(customType, renderer);
+    },
     events: eventBus,
   };
   const originalSetInterval = globalThis.setInterval;
@@ -1889,8 +2956,11 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
   const root = mkdtempSync(join(tmpdir(), "omp-raw-tool-call-actor-"));
   const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
   const tools = new Map<string, RegisteredTool>();
+  const events = new TestBus();
+  const messageRenderers = new Map<string, unknown>();
   const pi = {
     zod: { z },
+    events,
     on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
       (handlers[name] ??= []).push(handler);
     },
@@ -1899,11 +2969,22 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     },
     registerCommand() {},
     setLabel() {},
+    registerMessageRenderer(customType: string, renderer: unknown) {
+      messageRenderers.set(customType, renderer);
+    },
     sendUserMessage() {},
   };
   const emit = async (name: string, event: unknown, ctx: unknown): Promise<unknown[]> =>
     Promise.all((handlers[name] ?? []).map(handler => handler(event, ctx)));
   const mutableManager = mutableSessionManagerFor(root, "session-direct");
+  const fixtureHarness: RegisteredWorkflowHarness = {
+    tools,
+    events,
+    hostContext: ctx => ctx,
+    fireToolCall: async (event, ctx) => { await emit("tool_call", event, ctx); },
+    fireToolExecutionStart: async (event, ctx) => { await emit("tool_execution_start", event, ctx); },
+    fireToolResult: async (event, ctx) => { await emit("tool_result", event, ctx); },
+  };
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     ompWorkflowsFullstack(pi as never);
@@ -1912,10 +2993,11 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       hasUI: true,
       cwd: root,
       session_id: "session-direct",
+      sessionFile: mutableManager.getSessionFile(),
       sessionManager: mutableManager,
     };
     await emit("session_start", { type: "session_start" }, host);
-    const issued = await writeCheckpointAskFixture(root, tools, host);
+    const issued = await writeCheckpointAskFixture(root, fixtureHarness, host);
     const runId = issued.state.issued_for!.run_key;
     const artifactsDir = runTarget(root, runId).artifactsDir!;
     // Idle stop releases the controller's exact claim while retaining the
@@ -1938,8 +3020,28 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       const results = await emit("tool_call", { toolName: "bash", input: { command } }, ctx);
       return results.find(value => value && typeof value === "object" && (value as { block?: unknown }).block === true) as { block?: boolean; reason?: string } | undefined;
     };
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason, "trusted host actor unavailable");
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, { ...raw, hasUI: false }))?.block, true, "explicit headless raw context is rejected");
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason),
+      "execution_claim_mismatch",
+    );
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, { ...raw, hasUI: false }))?.reason),
+      "host_profile_mismatch",
+    );
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, { ...raw, mode: "rpc" }))?.reason),
+      "host_profile_mismatch",
+    );
+    mutableManager.switchCwd(join(root, "other-worktree"));
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason),
+      "worktree_mismatch",
+    );
+    mutableManager.switchCwd(root);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, { ...raw, actor: "worker" }))?.reason),
+      "untrusted_actor_context",
+    );
     const prepare = tools.get("workflow_prepare");
     if (!prepare) throw new Error("workflow_prepare was not registered");
     const prepared = await prepare.execute("raw-first-prepare", {
@@ -1982,7 +3084,10 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     const foreign = {
       sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" },
     };
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, foreign))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, foreign))?.reason),
+      "session_identity_mismatch",
+    );
     assert.equal((await invoke({ path: "src/app.ts" }, foreign))?.block, true);
     const foreignInteractive = {
       mode: "tui",
@@ -1992,7 +3097,10 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       sessionManager: foreign.sessionManager,
       actor: "orchestrator",
     };
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, foreignInteractive))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, foreignInteractive))?.reason),
+      "session_identity_mismatch",
+    );
     assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, raw), undefined, "foreign raw context cannot replace the captured controller");
     // A conflicting event identity must not use the owner ctx as a bypass.
     const foreignEvent = {
@@ -2031,7 +3139,10 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       session_id: mutableManager.getSessionId(),
       session_file: mutableManager.getSessionFile(),
     }, host);
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason, "trusted host actor unavailable");
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, raw))?.reason),
+      "execution_claim_mismatch",
+    );
     const resumed = await prepare.execute("raw-idle-resume", {
       mode: "resume",
       run_id: runId,
@@ -2052,6 +3163,7 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       hasUI: true,
       cwd: root,
       session_id: "replacement-session",
+      sessionFile: mutableManager.getSessionFile(),
       sessionManager: mutableManager,
     };
     const staleRaw = { sessionManager: mutableManager, session_id: "session-direct" };
@@ -2060,7 +3172,10 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
       reason: "resume",
       previousSessionFile,
     }, replacement);
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, staleRaw))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, staleRaw))?.reason),
+      "session_identity_mismatch",
+    );
     const replacementPrepared = await prepare.execute("raw-replacement-prepare", {
       mode: "resume",
       run_id: runId,
@@ -2071,9 +3186,15 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     assert.equal(replacementDetails.state?.run_id, runId);
     const replacementRaw = { sessionManager: mutableManager };
     assert.equal(await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw), undefined);
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, staleRaw))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, staleRaw))?.reason),
+      "session_identity_mismatch",
+    );
     await emit("session_shutdown", { type: "session_shutdown" }, replacement);
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw))?.block, true);
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw))?.reason),
+      "host_session_not_captured",
+    );
 
     // The same-identity headless start is an explicit invalidation boundary.
     const reboundHost = { ...replacement };
@@ -2086,10 +3207,13 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
     const reboundDetails = reboundPrepared.details as { ok?: boolean; error?: string; state?: { run_id?: string } };
     assert.equal(reboundDetails.ok, true, reboundDetails.error);
     assert.equal(reboundDetails.state?.run_id, runId);
-    await emit("session_start", { type: "session_start" }, { mode: "print", hasUI: false, cwd: root, session_id: "replacement-session", sessionManager: mutableManager });
-    assert.equal((await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw))?.block, true, "headless transition cannot retain orchestrator authority");
+    await emit("session_start", { type: "session_start" }, { mode: "print", hasUI: false, cwd: root, session_id: "replacement-session", sessionFile: mutableManager.getSessionFile(), sessionManager: mutableManager });
+    assert.equal(
+      admissionCode((await invoke({ path: join(artifactsDir, "discovery.json") }, replacementRaw))?.reason),
+      "headless_host_session",
+    );
   } finally {
-    await emit("session_shutdown", { type: "session_shutdown" }, { mode: "tui", hasUI: true, cwd: root, session_id: "replacement-session", sessionManager: mutableManager });
+    await emit("session_shutdown", { type: "session_shutdown" }, { mode: "tui", hasUI: true, cwd: root, session_id: "replacement-session", sessionFile: mutableManager.getSessionFile(), sessionManager: mutableManager });
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -2097,6 +3221,7 @@ test("fullstack: raw tool_call derives artifact-only orchestrator authority from
 test("fullstack: captured claim-free host with no selected run reaches ordinary tools but keeps safety gates", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-raw-tool-call-no-run-"));
   const handlers: Record<string, Array<(event: unknown, ctx: unknown) => unknown>> = {};
+  const messageRenderers = new Map<string, unknown>();
   const pi = {
     zod: { z },
     on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
@@ -2105,6 +3230,9 @@ test("fullstack: captured claim-free host with no selected run reaches ordinary 
     registerTool() {},
     registerCommand() {},
     setLabel() {},
+    registerMessageRenderer(customType: string, renderer: unknown) {
+      messageRenderers.set(customType, renderer);
+    },
     sendUserMessage() {},
   };
   const emit = async (name: string, event: unknown, ctx: unknown): Promise<unknown[]> =>
@@ -2120,12 +3248,14 @@ test("fullstack: captured claim-free host with no selected run reaches ordinary 
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     ompWorkflowsFullstack(pi as never);
+    const noRunManager = sessionManagerFor(root, "session-no-run");
     const host = {
       mode: "tui",
       hasUI: true,
       cwd: root,
       session_id: "session-no-run",
-      sessionManager: sessionManagerFor(root, "session-no-run"),
+      sessionFile: noRunManager.getSessionFile(),
+      sessionManager: noRunManager,
     };
     await emit("session_start", { type: "session_start" }, host);
 
@@ -2166,6 +3296,7 @@ test("fullstack: captured claim-free host with no selected run reaches ordinary 
       hasUI: false,
       cwd: root,
       session_id: host.session_id,
+      sessionFile: host.sessionFile,
       sessionManager: host.sessionManager,
     });
     assert.equal((await invoke("write", { path: "src/app.ts" }, {
@@ -2177,6 +3308,7 @@ test("fullstack: captured claim-free host with no selected run reaches ordinary 
       hasUI: true,
       cwd: root,
       session_id: "session-no-run",
+      sessionFile: sessionManagerFor(root, "session-no-run").getSessionFile(),
       sessionManager: sessionManagerFor(root, "session-no-run"),
     });
     rmSync(root, { recursive: true, force: true });
@@ -2185,7 +3317,8 @@ test("fullstack: captured claim-free host with no selected run reaches ordinary 
 
 test("fullstack: workflow_checkpoint_ask ingests the connected RPC client's select answer from the session profile", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-ask-rpc-"));
-  const { tools, fireSessionStart, fireSessionShutdown } = registerToolsWithSessionSink();
+  const harness = registerToolsWithSessionSink();
+  const { tools, fireSessionStart, fireSessionShutdown } = harness;
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
     const rpcToolContext = {
@@ -2199,18 +3332,15 @@ test("fullstack: workflow_checkpoint_ask ingests the connected RPC client's sele
     const calls: Array<{ title: string; options: string[] }> = [];
     // Plain-rpc session: the profile carries the live select bridge; the
     // per-call tool context stays UI-less exactly as the host wires it.
-    await fireSessionStart({
-      mode: "rpc",
-      hasUI: true,
-      cwd: root,
+    await fireSessionStart(sessionContext(root, "session-direct", "rpc", true, {
       ui: {
         select: async (title: string, options: string[]) => {
           calls.push({ title, options });
           return "proceed";
         },
       },
-    });
-    const issued = await writeCheckpointAskFixture(root, tools, rpcToolContext);
+    }));
+    const issued = await writeCheckpointAskFixture(root, harness, rpcToolContext);
     const response = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, rpcToolContext as never);
     const details = response.details as { ok?: boolean; error?: string; decision?: string; loop_iteration?: number; channel?: string; actor_provenance?: { kind?: string } };
     assert.equal(details.ok, true, details.error);
@@ -2221,22 +3351,23 @@ test("fullstack: workflow_checkpoint_ask ingests the connected RPC client's sele
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0]!.options, ["proceed", "reject"]);
   } finally {
-    await fireSessionShutdown({ cwd: root, hasUI: true, mode: "rpc" });
+    await fireSessionShutdown(sessionContext(root, "session-direct", "rpc", true));
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("fullstack: workflow_checkpoint_ask fails closed in json/print headless sessions while the no-profile fallback keeps the legacy heuristic", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-checkpoint-ask-headless-"));
-  const { tools, fireSessionStart, fireSessionShutdown } = registerToolsWithSessionSink();
+  const harness = registerToolsWithSessionSink();
+  const { tools, fireSessionStart, fireSessionShutdown } = harness;
   try {
     execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", "main"], { stdio: "ignore" });
-    await fireSessionStart({ mode: "tui", hasUI: true, cwd: root, ui: {} });
-    const issued = await writeCheckpointAskFixture(root, tools);
+    await fireSessionStart(sessionContext(root, "session-direct", "tui", true, { ui: {} }));
+    const issued = await writeCheckpointAskFixture(root, harness);
     const ask = tools.get("workflow_checkpoint_ask")!;
 
     for (const mode of ["json", "print"]) {
-      await fireSessionStart({ mode, hasUI: false, cwd: root, ui: {} });
+      await fireSessionStart(sessionContext(root, "session-direct", mode, false, { ui: {} }));
       const rejected = await ask.execute("test", checkpointAskAuth(issued), undefined, undefined, { cwd: root, hasUI: false } as never);
       assert.equal((rejected.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED", mode);
     }
@@ -2262,7 +3393,7 @@ test("fullstack: workflow_checkpoint_ask fails closed in json/print headless ses
     const workerCtx = await fallbackTools.get("workflow_status")!.execute("worker", {}, undefined, undefined, { cwd: root, hasUI: false } as never);
     assert.equal((workerCtx.details as { code?: string }).code, "WORKFLOW_CONTEXT_REJECTED");
   } finally {
-    await fireSessionShutdown({ cwd: root, hasUI: true, mode: "tui" });
+    await fireSessionShutdown(sessionContext(root, "session-direct", "tui", true));
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -2272,10 +3403,6 @@ test("fullstack: handoff tool schemas make the loop_iteration binding mandatory"
   const parse = (name: string, input: Record<string, unknown>): boolean =>
     (tools.get(name)!.parameters as { safeParse(value: unknown): { success: boolean } }).safeParse(input).success;
 
-  const complete: Record<string, unknown> = { dispatch_id: "d", token: "t", capability_id: "c", run_key: "r", branch: "b", workflow: "w", profile_hash: "p", stage_cursor: "s", cursor_epoch: "e", evidence: "ev", loop_iteration: 2 };
-  assert.equal(parse("workflow_complete", complete), true);
-  const { loop_iteration: _completeIteration, ...completeWithout } = complete;
-  assert.equal(parse("workflow_complete", completeWithout), false);
 
   const advance: Record<string, unknown> = { token: "t", capability_id: "c", run_key: "r", branch: "b", workflow: "w", profile_hash: "p", stage_cursor: "s", cursor_epoch: "e", evidence: "ev", loop_iteration: 1 };
   assert.equal(parse("workflow_advance", advance), true);

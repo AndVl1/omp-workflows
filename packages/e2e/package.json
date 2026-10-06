@@ -25,7 +25,8 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --import tsx test/*.test.ts"
+    "test": "node --test --import tsx test/*.test.ts",
+    "host-smoke": "tsx src/host-smoke.ts"
   },
   "dependencies": {
     "node-pty": "^1.1.0",

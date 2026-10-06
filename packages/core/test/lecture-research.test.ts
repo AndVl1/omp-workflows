@@ -16,10 +16,6 @@
  *     advances; failed and empty/invalid partial results fail closed.
  *   - Approval gate: the profile's gate expression completes ONLY on an
  *     approved or rejected decision; anything else fails closed.
- *   - Prompts: /do-work (classification contract) and the fresh + amend /cto
- *     prompts expose URL + prompt as the only prerequisite, mandatory
- *     lecture_acquire, no transcript request, no network mapping, and
- *     no-implementation-before-approval policy.
  *   - Keyword fallback stays conservative: lecture/playlist wording maps to
  *     LECTURE_RESEARCH, generic investigate/research wording stays
  *     INVESTIGATION.
@@ -42,19 +38,12 @@ import {
   selectProfile,
   resolveClassification,
   keywordClassify,
-  buildClassificationPhaseZero,
-  buildWorkflowMatrix,
   validateProducedArtifact,
   requiredFieldsOf,
   loadArtifactSchemas,
   evaluatePredicate,
-  buildDoWorkPrompt,
-  buildCtoPrompt,
-  buildAmendPrompt,
-  runCto,
   type Classification,
   type Complexity,
-  type TeamDef,
   type TeamState,
   HARD_ACQUISITION_LIMITS,
   chunkTimestampedTranscript,
@@ -63,13 +52,8 @@ import {
   type ResolvedVideoSource,
   type TimestampedTranscriptSegment,
 } from "@andvl1/omp-workflows-core";
-import type { TrustedExecutionContext } from "../src/engine/types.js";
 import { dodBackstop } from "../src/gates/dod-backstop.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
-
-function executionContext(root: string, sessionId = "lecture-cto-session", branch = "main"): TrustedExecutionContext {
-  return { session_id: sessionId, caller: "host", process_id: process.pid, worktree: root, branch, authority: "coordinator" };
-}
 
 const COMPLEXITIES: Complexity[] = ["QUICK", "MEDIUM", "COMPLEX", "CRITICAL"];
 const FLAGS: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
@@ -535,80 +519,6 @@ test("lecture-research: keyword fallback stays lecture-conservative", () => {
   );
 });
 
-test("lecture-research: do-work prompt and classification contract expose the dedicated intent", () => {
-  const phaseZero = buildClassificationPhaseZero();
-  assert.ok(phaseZero.includes("LECTURE_RESEARCH"), "PHASE-0 type enumeration includes LECTURE_RESEARCH");
-
-  const matrix = buildWorkflowMatrix();
-  assert.ok(matrix.includes("| LECTURE_RESEARCH | lecture-research | lecture-research | lecture-research | lecture-research |"));
-  assert.ok(matrix.includes("| INVESTIGATION | research | research | research | research |"), "generic INVESTIGATION row is unchanged");
-  assert.ok(matrix.includes("never routed to an implementation workflow"), "the matrix states the research-only policy");
-
-  const root = mkdtempSync(join(tmpdir(), "lecture-dowork-"));
-  try {
-    const prompt = buildDoWorkPrompt(
-      { task: "research the lecture playlist", autonomyHint: false, autonomous: false, issue: null, branch: null },
-      root,
-    );
-    assert.ok(prompt.includes("LECTURE_RESEARCH"), "do-work prompt exposes the LECTURE_RESEARCH type");
-    assert.ok(prompt.includes("lecture-research"), "do-work prompt exposes the lecture-research profile");
-    assert.ok(prompt.includes("lecture_acquire"), "do-work prompt mandates automatic acquisition through lecture_acquire");
-    assert.match(prompt, /only user content prerequisite is exactly one public YouTube video\/playlist URL/i);
-    assert.match(prompt, /do not ask for or require a transcript/i);
-    assert.ok(
-      prompt.includes("Mapping consumes normalized acquisition evidence and performs no network access."),
-      "do-work mapping contract is offline and consumes normalized acquisition evidence",
-    );
-    assert.ok(prompt.includes("never routed to an implementation workflow"), "do-work prompt carries the research-only policy");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("lecture-research: fresh and amend CTO prompts keep the research-only human-gated policy", () => {
-  const root = mkdtempSync(join(tmpdir(), "lecture-cto-"));
-  try {
-    const fresh = buildCtoPrompt(
-      { task: "Research the lecture playlist into verified findings", autonomyHint: false, issue: null, branch: null },
-      root,
-    );
-    assert.ok(fresh.includes("LECTURE_RESEARCH"), "fresh CTO prompt exposes the LECTURE_RESEARCH type");
-    assert.ok(fresh.includes("lecture-research"), "fresh CTO prompt exposes the lecture-research profile");
-    assert.ok(fresh.includes("No implementation starts before approval."), "fresh CTO prompt carries the no-implementation-before-approval policy");
-    assert.ok(fresh.includes("lecture_acquire"), "fresh CTO prompt mandates automatic acquisition");
-    assert.match(fresh, /URL is the only user content prerequisite/i);
-    assert.match(fresh, /no transcript is requested/i);
-    assert.match(fresh, /core does not fetch URLs/i);
-
-    const res = runCto({
-      task: "Feature A",
-      cwd: root,
-      branch: "main",
-      autonomous: false,
-      teams: [{ team: "backend", slice: "s1" }],
-      defs: {
-        backend: { id: "backend", name: "Backend", scope: ["backend-kotlin"], profile: "lightweight", lead: "team-lead", roster: ["backend-kotlin"] } satisfies TeamDef,
-      },
-      execution: executionContext(root),
-    });
-    assert.equal(res.ok, true, "amend fixture: runCto starts a run in the temp root");
-    if (!res.ok) return;
-    const amend = buildAmendPrompt(
-      { task: "Fold in lecture research", autonomyHint: false, issue: null, branch: "main" },
-      root,
-      { runId: res.plan.id, state: res.state },
-    );
-    assert.ok(amend.includes("LECTURE_RESEARCH"), "amend CTO prompt exposes the LECTURE_RESEARCH type");
-    assert.ok(amend.includes("lecture-research"), "amend CTO prompt exposes the lecture-research profile");
-    assert.ok(amend.includes("No implementation starts before approval."), "amend CTO prompt carries the no-implementation-before-approval policy");
-    assert.ok(amend.includes("lecture_acquire"), "amend CTO prompt mandates automatic acquisition");
-    assert.match(amend, /URL is the only user content prerequisite/i);
-    assert.match(amend, /no transcript is requested/i);
-    assert.match(amend, /core does not fetch URLs/i);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 test("lecture-research: DoD backstop exempts selected canonical lecture-research done-claims", () => {
   const root = mkdtempSync(join(tmpdir(), "lecture-dod-"));

@@ -3,7 +3,7 @@ name: manual-qa
 model: ["@manual-qa", "@task"]
 thinkingLevel: auto
 description: Manual QA and runtime verification specialist for web UI through OMP browser, mobile through configured device automation, and backend or CLI services. USE PROACTIVELY for runtime verification.
-tools: read, glob, grep, bash, edit, write, browser
+tools: read, glob, grep, bash, edit, write, browser, workflow_submit_result, workflow_recover
 ---
 
 # Manual QA Tester
@@ -28,17 +28,29 @@ inside `debug`. Pick the **mode** from scope and record it:
 - **runtime** (backend/CLI, no UI): run the app/binary, `curl` the affected endpoints or invoke
   the CLI; evidence = the command + actual response/exit code + relevant log lines.
 
-Write `.work-state/artifacts/manual_qa.json`:
+Submit the stage payload through the registered `workflow_submit_result` tool:
 
 ```json
-{ "verdict": "PASS",
+{ "outputs": { "<artifact-id-from-current-stage>": {
+  "verdict": "PASS",
   "mode": "runtime",
   "evidence": ["curl -s :8080/health → 200 {\"status\":\"UP\"}; log: 'Started App in 2.1s, migrations applied'"],
   "regressions": [],
   "dod_additions": [
     { "criterion": "/orders rejects missing auth with 401", "verify_method": "curl", "status": "met", "evidence": "curl -i :8080/orders → 401", "source": "manual_qa" }
-  ] }
+  ]
+} } }
 ```
+
+The artifact id is supplied by the current stage/slot declaration (normally
+`manual_qa`). Preserve the schema object exactly, including every required
+field; do not write `.work-state/artifacts/manual_qa.json` or any other
+workflow-owned JSON file. The `outputs` object MUST NOT contain run ids,
+dispatch ids, slot ids, tokens, paths, ownership, role, or authority fields.
+Those values come from the authenticated runtime assignment. Wait for the
+submission receipt and terminal result; a receipt is not approval or stage
+completion. If field errors are returned, repair and resubmit this payload
+only. Never use a legacy completion alias or fabricate evidence.
 
 - `verdict`: **PASS** only if every acceptance criterion was observed working at runtime; a
   missing verdict is treated as FAIL.

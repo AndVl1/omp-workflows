@@ -503,7 +503,7 @@ function validateTrustedAnswerInto(value: unknown, path: string, issues: Control
   }
   unknownKeys(value, [
     "answer_id", "nonce", "channel", "reference", "run_id", "stage_id", "checkpoint_id",
-    "work_identity_hash", "capability_id", "capability_epoch", "loop_iteration", "policy_hash",
+    "work_identity_hash", "work_identity_witness", "capability_id", "capability_epoch", "loop_iteration", "policy_hash",
     "decision", "binding", "issued_at", "consumed_at", "consumed_reason", "finalized_decision_key",
   ], path, issues);
   for (const key of [
@@ -512,6 +512,7 @@ function validateTrustedAnswerInto(value: unknown, path: string, issues: Control
     "decision", "binding", "issued_at",
   ]) requireString(value, key, path, issues);
   requireEnum(value, "channel", ["terminal", "escalation"], path, issues);
+  if (value.work_identity_witness !== undefined) validateWorkIdentityInto(value.work_identity_witness, `${path}.work_identity_witness`, issues);
   if (value.loop_iteration !== undefined && (!Number.isInteger(value.loop_iteration) || (value.loop_iteration as number) < 1)) {
     add(issues, `${path}.loop_iteration`, "must be an integer >= 1");
   }
@@ -617,7 +618,7 @@ export function validateTypedCheckpointDecisionValue(
 const CAPABILITY_KEYS = [
   "run", "workflow", "profile_hash", "stage", "roles",
   "capability_id", "dispatch_token_hash", "advance_token_hash", "issued_for", "kind",
-  "expected_roles", "expected_count", "expected_roster", "roster_selection", "work_identity",
+  "expected_roles", "expected_count", "expected_roster", "roster_selection", "work_identity", "producer_assignment",
   "pending", "status", "dispatches",
 ] as const;
 
@@ -632,7 +633,7 @@ function completionEnvelopeIssues(value: unknown, path: string, issues: ControlP
   if (value.schema_version !== 1) add(issues, `${path}.schema_version`, "must be 1");
   validateWorkIdentityInto(value.identity, `${path}.identity`, issues);
   requireEnum(value, "outcome", ["pending", "succeeded", "failed", "cancelled"], path, issues);
-  if (!hasOwn(value, "terminal_signal") || (value.terminal_signal !== null && value.terminal_signal !== undefined && !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure"].includes(value.terminal_signal as string))) {
+  if (!hasOwn(value, "terminal_signal") || (value.terminal_signal !== null && value.terminal_signal !== undefined && !["workflow_complete", "native_tool_result", "provider_terminal", "contract_failure", "preflight:missing_prompt", "preflight:invalid_arguments"].includes(value.terminal_signal as string))) {
     add(issues, `${path}.terminal_signal`, "unknown or missing terminal signal");
   }
   if (!Array.isArray(value.artifact_refs)) {
@@ -790,12 +791,13 @@ function validateDispatchRecordInto(recordValue: unknown, recordPath: string, is
     validateMigrationDispatchRecordInto(recordValue, recordPath, issues, capability, issued);
     return;
   }
-  unknownKeys(recordValue, ["id", "role", "agent", "tool_call_id", "origin_session_id", "status", "attempt", "created_at", "completed_at", "completion", "work_identity", "pending", "completion_envelope"], recordPath, issues);
+  unknownKeys(recordValue, ["id", "role", "agent", "tool_call_id", "origin_session_id", "origin_ownership_epoch", "status", "attempt", "created_at", "completed_at", "completion", "work_identity", "pending", "completion_envelope"], recordPath, issues);
   for (const key of ["id", "role", "agent", "created_at"]) requireString(recordValue, key, recordPath, issues);
   requireEnum(recordValue, "status", ["authorized", "running", "pending", "succeeded", "failed", "cancelled"], recordPath, issues);
   requireInteger(recordValue, "attempt", recordPath, issues, 1);
   if (recordValue.tool_call_id !== undefined && !nonEmptyString(recordValue.tool_call_id)) add(issues, `${recordPath}.tool_call_id`, "must be a non-empty string");
   if (recordValue.origin_session_id !== undefined && !nonEmptyString(recordValue.origin_session_id)) add(issues, `${recordPath}.origin_session_id`, "must be a non-empty string");
+  if (recordValue.origin_ownership_epoch !== undefined && !nonEmptyString(recordValue.origin_ownership_epoch)) add(issues, `${recordPath}.origin_ownership_epoch`, "must be a non-empty string");
   const expectedRoles = Array.isArray(capability.expected_roles) ? capability.expected_roles as string[] : [];
   if (nonEmptyString(recordValue.role) && expectedRoles.length > 0 && !expectedRoles.includes(recordValue.role)) {
     add(issues, `${recordPath}.role`, "is not part of the capability's expected roles");
@@ -1004,6 +1006,7 @@ export function validateDispatchCapabilityValue(value: unknown, path = "$"): Con
     if (!isRecord(value.roster_selection)) add(issues, `${path}.roster_selection`, "must be an object");
   }
   if (value.work_identity !== undefined) validateWorkIdentityInto(value.work_identity, `${path}.work_identity`, issues);
+  if (value.producer_assignment !== undefined) validateWorkIdentityInto(value.producer_assignment, `${path}.producer_assignment`, issues);
   if (value.pending !== undefined) {
     const pending = validatePendingStateValue(value.pending, `${path}.pending`, "array");
     if (!pending.ok) issues.push(...pending.issues);
@@ -1233,6 +1236,7 @@ export function validateActiveDispatchCapabilityValue(value: unknown, path = "$"
   } else if (cap.work_identity !== undefined) {
     add(issues, `${path}.work_identity`, "is forbidden for a capability without one singular dispatch identity");
   }
+  if (cap.kind !== "none" && cap.producer_assignment !== undefined) add(issues, `${path}.producer_assignment`, "is only valid for a non-dispatch capability");
   validateActiveNestedDispatchIdentities(cap, issued, path, issues);
   return issues.length > 0 ? { ok: false, issues } : { ok: true };
 }
@@ -1275,6 +1279,25 @@ export function validateActiveCapabilityStateBinding(state: unknown, path = "$")
       add(issues, `${path}.dispatch_capability.issued_for.${field}`, "must be present on both the workflow state and the capability binding");
     } else if (stateValue !== issuedValue) {
       add(issues, `${path}.dispatch_capability.issued_for.${field}`, "does not match the workflow state");
+    }
+  }
+  const producerAssignment = capability.producer_assignment;
+  if (producerAssignment !== undefined) {
+    validateWorkIdentityInto(producerAssignment, `${path}.dispatch_capability.producer_assignment`, issues);
+    if (isRecord(producerAssignment)) {
+      if (capability.kind !== "none") add(issues, `${path}.dispatch_capability.producer_assignment`, "is only valid for a non-dispatch capability");
+      const producerBindings: Array<[string, unknown, unknown]> = [
+        ["run_id", producerAssignment.run_id, issued.run_key],
+        ["workflow", producerAssignment.workflow, issued.workflow],
+        ["stage_id", producerAssignment.stage_id, issued.stage_cursor],
+        ["stage_cursor", producerAssignment.stage_cursor, issued.stage_cursor],
+        ["capability_id", producerAssignment.capability_id, capability.capability_id],
+        ["capability_epoch", producerAssignment.capability_epoch, issued.cursor_epoch],
+        ["loop_iteration", producerAssignment.loop_iteration, issued.loop_iteration],
+      ];
+      for (const [field, actual, expected] of producerBindings) {
+        if (actual === undefined || expected === undefined || actual !== expected) add(issues, `${path}.dispatch_capability.producer_assignment.${field}`, "does not match the active capability binding");
+      }
     }
   }
   const projectedIdentity = capability.work_identity;

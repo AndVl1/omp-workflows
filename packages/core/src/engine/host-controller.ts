@@ -79,7 +79,12 @@ export interface WorkflowSessionController {
   clearCommandIntent(): void;
   prepare(request: WorkflowControllerPrepareRequest): PreparedWorkflowState;
   bind(runId: string, token?: string): void;
-  release(receipt?: string): void;
+  /**
+   * Release the ordinary execution claim. By default this also clears any
+   * pending command intent; a verified turn-level stop may preserve that
+   * intent for the next user boundary while still releasing the claim.
+   */
+  release(receipt?: string, options?: { preserveCommandIntent?: boolean }): void;
 }
 
 export interface CtoClaimCredentials {
@@ -88,7 +93,37 @@ export interface CtoClaimCredentials {
   readonly ownership_epoch: string;
 }
 
-const ctoClaimBindings = new WeakMap<WorkflowSessionController, CtoClaimCredentials>();
+interface CtoClaimBindingRegistry {
+  readonly version: 1;
+  readonly bindings: WeakMap<WorkflowSessionController, CtoClaimCredentials>;
+}
+
+const CTO_CLAIM_BINDINGS = Symbol.for("omp-workflows.cto-claim-bindings");
+
+function getCtoClaimBindings(): CtoClaimBindingRegistry["bindings"] {
+  const host = globalThis as unknown as Record<symbol, unknown>;
+  const existing = host[CTO_CLAIM_BINDINGS];
+  if (existing !== undefined) {
+    const registry = existing as Partial<CtoClaimBindingRegistry> | null;
+    if (!registry || registry.version !== 1 || !(registry.bindings instanceof WeakMap)) {
+      throw new Error("[cto_claim_registry:unsupported] Restart OMP with compatible core modules.");
+    }
+    return registry.bindings;
+  }
+  // Bundle aliases may call CTO ingress through another tagged core graph.
+  // The exact controller object remains the credential key; IDs and cwd
+  // never recover or transfer a claim.
+  const registry: CtoClaimBindingRegistry = { version: 1, bindings: new WeakMap() };
+  Object.defineProperty(host, CTO_CLAIM_BINDINGS, {
+    value: registry,
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  });
+  return registry.bindings;
+}
+
+const ctoClaimBindings = getCtoClaimBindings();
 
 function exactActiveClaim(
   claim: unknown,
@@ -163,6 +198,18 @@ function selectionRunId(
   const result = selector.resolve(mode, request.selector, request.snapshot);
   if (result.ok) return result.candidate.run_id;
   throw result.error;
+}
+
+function readSelectedRunState(cwd: string, runId: string) {
+  try {
+    return readRunStateNoRecovery(cwd, runId);
+  } catch (error) {
+    if (error instanceof LifecycleError) throw error;
+    throw new LifecycleError("recovery_required", "selected workflow state could not be read safely", {
+      run_id: runId,
+      next_action: "recover lifecycle state before mutating",
+    });
+  }
 }
 
 export function createWorkflowSessionController(options: WorkflowSessionControllerOptions): WorkflowSessionController {
@@ -271,8 +318,8 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
     return prepared;
   }
 
-  function release(receipt?: string): void {
-    clearCommandIntent();
+  function release(receipt?: string, options: { preserveCommandIntent?: boolean } = {}): void {
+    if (!options.preserveCommandIntent) clearCommandIntent();
     if (!boundRunId || !boundToken) return;
     releaseExecutionClaim(cwd, { run_id: boundRunId, token: boundToken, ...(receipt ? { receipt } : {}) });
     boundToken = undefined;
@@ -284,7 +331,7 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
     readSelector: () => selector,
     selectedRunId: () => {
       if (boundRunId) {
-        const state = readRunStateNoRecovery(cwd, boundRunId);
+        const state = readSelectedRunState(cwd, boundRunId);
         if (!state) {
           throw new LifecycleError("recovery_required", `bound workflow run '${boundRunId}' is missing or unreadable; recover lifecycle state before mutating`);
         }
@@ -298,7 +345,7 @@ export function createWorkflowSessionController(options: WorkflowSessionControll
       }
       const selection = readRunControlNoRecovery(cwd).selections[trusted.session_id];
       if (!selection?.active) return undefined;
-      const state = readRunStateNoRecovery(cwd, selection.run_id);
+      const state = readSelectedRunState(cwd, selection.run_id);
       if (!state) {
         throw new LifecycleError("recovery_required", `selected workflow run '${selection.run_id}' is missing or unreadable; recover lifecycle state before mutating`);
       }
