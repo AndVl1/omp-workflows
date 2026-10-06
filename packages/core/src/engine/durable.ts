@@ -3,7 +3,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync, unlinkSync } from "n
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadProfile, profileHash } from "./profile.js";
 import { normalizePersistedState, resolveCanonicalRun, isSafeStateSegment, resolveActiveBranch, updateStateAtomically, invalidateReentryInputEvidence, withWorkspaceReadNoRecovery, type ResolvedState, type StateMutation, type StateUpdateResult, type StateSnapshot, type StatePublication } from "./state.js";
-import type { LifecycleFileContent } from "./lifecycle-journal.js";
+import type { LifecycleInlineContent as LifecycleFileContent } from "./lifecycle-journal.js";
 import { consumePreparedRecoveryAdmission, migrateStageRecoveryLedger, STAGE_RECOVERY_FIELD, type StageRecoveryLedger } from "./stage-recovery-store.js";
 import { agentMappingIssueForRole, resolveConfig, resolveAgentForRole, type ResolvedConfig } from "./config.js";
 import { validateAgentMappingState, type AgentMappingDiagnostic, type AgentMappingState } from "./agent-mapping.js";

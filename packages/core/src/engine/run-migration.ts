@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { beginLifecycleTransaction, commitLifecycleTransaction, type LifecycleFileContent } from "./lifecycle-journal.js";
+import { beginLifecycleTransaction, commitLifecycleTransaction, type LifecycleInlineContent as LifecycleFileContent } from "./lifecycle-journal.js";
 import { migrateStageRecoveryLedger, type StageRecoveryLedger } from "./stage-recovery-store.js";
 import { normalizePersistedState } from "./state.js";
 import { candidateForState, readRunControl, runTarget } from "./run-store.js";

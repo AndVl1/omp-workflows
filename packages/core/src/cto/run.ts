@@ -28,7 +28,7 @@ import {
   beginLifecycleTransaction,
   commitLifecycleTransaction,
   lifecycleTransactionStatus,
-  type LifecycleFileContent,
+  type LifecycleInlineContent as LifecycleFileContent,
 } from "../engine/lifecycle-journal.js";
 import { withWorkspaceReadNoRecovery, withWorkspaceTransaction } from "../engine/state.js";
 import type { ModelClassification } from "../engine/run.js";

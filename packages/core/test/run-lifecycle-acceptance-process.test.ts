@@ -917,14 +917,15 @@ test("process acceptance: interrupted rework snapshot preserves prior ownership"
       import fs from "node:fs";
       import { syncBuiltinESMExports } from "node:module";
       const [root, runId] = process.argv.slice(1);
-      const originalRead = fs.readFileSync.bind(fs);
+      const originalRead = fs.openSync.bind(fs);
       const blocker = new Int32Array(new SharedArrayBuffer(4));
-      fs.readFileSync = ((path, ...args) => {
-        if (String(path).includes("/runs/" + runId + "/artifacts/")) {
+      fs.openSync = ((path, ...args) => {
+        const fd = originalRead(path, ...args);
+        if (String(path).includes("/lifecycle-staging/") && String(path).includes("/blobs/")) {
           console.log("rework-snapshot-read");
           Atomics.wait(blocker, 0, 0);
         }
-        return originalRead(path, ...args);
+        return fd;
       });
       syncBuiltinESMExports();
       const { prepareWorkflowState } = await import(${JSON.stringify(runEngineUrl)});

@@ -401,6 +401,17 @@ handoff, не будит старого агента и не запрашива�
 diagnosis возвращает этот же permit без расхода бюджета. Consumed значит admitted;
 running требует отдельного authoritative lifecycle.
 
+Rework snapshots preserve binary evidence on disk. The lifecycle journal stores relative
+references to transaction-owned immutable blobs with SHA-256 and byte size, not APK
+contents in JSON or mutable producer paths. Copy/hash/CAS use bounded buffers.
+Preparation stages under `.work-state/lifecycle-staging` and atomically publishes a
+complete transaction; an interrupted unpublished staging directory carries no authority.
+Prepared transactions roll back without overwriting independent updates; committing
+transactions repair forward from verified blobs. Retained terminal blobs are integrity
+checked but never replayed over newer results. Do not manually delete journal blobs.
+Snapshots exclude earlier `revisions/` before traversal. Legacy inline journals remain
+readable for recovery. This trades disk space and hashing I/O for bounded memory.
+
 
 `workflow_submit_result` принимает ровно один вариант: `{ outputs }` или
 `{ outputs_path: path }`. Большие/вложенные результаты при доступном writer сдавайте файлом.
