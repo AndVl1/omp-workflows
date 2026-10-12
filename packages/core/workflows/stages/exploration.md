@@ -60,9 +60,14 @@
 
 ### DoD fan-in (source: exploration)
 
-Seed `.work-state/artifacts/dod.json` and **append** product-level criteria you own:
+Если `stage.produces` объявляет `dod`, передай свои критерии в логическом
+`outputs.dod` вместе с `outputs.exploration` через `workflow_submit_result`.
+Физические slot-файлы и fan-in публикует движок; read-only исследователь
+не пишет shared sidecar вручную.
 - **analyst**: user flows, edge cases, UI-flow acceptance criteria.
 - **tech-researcher**: test-coverage criteria for the existing patterns you found.
 
-Each appended item gets `source: "exploration"` and a unique `id: "exploration-<n>"`. Bump
-`updated_at`. See `commands/team.md` § Multi-source fan-in.
+Каждому своему критерию задай `source: "exploration"` и уникальный
+`id: "exploration-<slot>-<n>"`, не закрывай его без фактического evidence.
+Если этап не объявляет `dod`, верни предложения критериев объявленному writer,
+не добавляй необъявленный output и не меняй sidecar самостоятельно.

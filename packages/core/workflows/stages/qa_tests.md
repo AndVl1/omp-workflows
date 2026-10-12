@@ -52,7 +52,10 @@ missing/unknown manual_qa verdict while runtime exists, never passes this gate.
     - coverage_note: what is and isn't covered, including any CONDITIONAL blocker"
    ```
 
-2. Write `.work-state/artifacts/qa_tests.json`.
+2. Submit the direct `qa_tests` schema payload under the declared artifact id with
+   `workflow_submit_result({ "outputs": { "qa_tests": <payload> } })`. The host derives
+   producer, slot, and dispatch identity; core publishes immutable canonical references. Do not
+   write canonical artifacts by path.
 
 **Feeds**: `summary` consumes `qa_tests`.
 

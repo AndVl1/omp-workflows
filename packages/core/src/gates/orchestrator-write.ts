@@ -9,21 +9,25 @@
  */
 import { isAbsolute, relative, resolve, dirname, join, sep } from "node:path";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { isAllowedAstIndexBash } from "./read-only-bash.js";
 interface ToolCallEvent {
   toolName: string;
   input?: Record<string, unknown> | string;
 }
-const REGISTERED_LIFECYCLE_DEVICE_ROUTES = new Set([
-  "xd://workflow_prepare",
-  "xd://workflow_instructions",
-  "xd://workflow_begin",
-  "xd://workflow_status",
-  "xd://workflow_complete",
-  "xd://workflow_checkpoint",
-  "xd://workflow_checkpoint_ask",
-  "xd://workflow_advance",
-  "xd://cto_state",
-]);
+const REGISTERED_LIFECYCLE_DEVICE_ROUTES: Record<string, true> = {
+  "xd://workflow_prepare": true,
+  "xd://workflow_instructions": true,
+  "xd://workflow_begin": true,
+  "xd://workflow_status": true,
+  "xd://workflow_submit_result": true,
+  "xd://workflow_recover": true,
+  "xd://workflow_checkpoint": true,
+  "xd://workflow_checkpoint_ask": true,
+  "xd://workflow_advance": true,
+  "xd://cto_state": true,
+  "xd://cto_checkpoint_ask": true,
+  "xd://cto_stage_advance": true,
+};
 
 type Actor = "orchestrator" | "worker" | "lead";
 
@@ -48,6 +52,8 @@ export function createTrustedOrchestratorWriteProof(artifactsDir: string): Trust
 
 interface ToolCallContext {
   cwd: string;
+  /** Actual tool cwd when this gate checks another authenticated policy root. */
+  executionCwd?: string;
   run_id?: string;
   cto_run_id?: string;
   hasUI?: boolean;
@@ -60,11 +66,15 @@ export function orchestratorWriteGate(
   ctx: ToolCallContext,
 ): { block?: boolean; reason?: string } | void {
   const actor = trustedActorOf(ctx);
+  const executionCwd = ctx.executionCwd ?? ctx.cwd;
   const policyActive = hasStrictOrchestratorState(ctx.cwd, ctx.run_id) || hasActiveCtoState(ctx.cwd, ctx.cto_run_id);
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
   // Registered lifecycle devices use the generic write transport, but only
   // exact route writes are exempt from project-write policy.
   if (isRegisteredLifecycleDeviceWrite(event)) return;
+  // Messaging and diagnostics are host services, not filesystem writes.
+  // Unlike lifecycle devices, they retain the preceding actor/claim admission.
+  if (isTrustedHostServiceWrite(event, ctx)) return;
 
   // Canonical CTO state is engine-owned even when no ordinary strict run or
   // active CTO scope is selected (for example, immediately after a managed
@@ -74,13 +84,13 @@ export function orchestratorWriteGate(
   if (event.toolName === "bash") {
     const earlyBash = bashProofInput(event.input);
     if (earlyBash.valid) {
-      const canonical = bashMutationTargets(earlyBash.command).find((path) => isCanonicalStatePath(path, ctx.cwd));
+      const canonical = bashMutationTargets(earlyBash.command).find((path) => isCanonicalStatePath(path, ctx.cwd, executionCwd));
       if (canonical || looksLikeWorkflowStateMutation(earlyBash.command)) {
         return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused bash mutation${canonical ? ` '${canonical}'` : ""}` };
       }
     }
   } else {
-    const canonical = pathsFromInput(event.input).find((path) => isCanonicalStatePath(path, ctx.cwd));
+    const canonical = pathsFromInput(event.input).find((path) => isCanonicalStatePath(path, ctx.cwd, executionCwd));
     if (canonical) {
       return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused '${canonical}'` };
     }
@@ -90,9 +100,9 @@ export function orchestratorWriteGate(
   const bashCommand = event.toolName === "bash" && bashSnapshot?.valid ? bashSnapshot.command : "";
 
   // A proof-derived artifact scope is deliberately a positive allowlist:
-  // read-only status/log/diff/show plus exactly `branch --show-current`
-  // may run through bash.
-  // Accepted command encodings are not mutually exclusive transports:
+  // AST lookup/index refresh and sanitized read-only Git inspection may run
+  // through bash; source writes and arbitrary shell commands remain blocked.
+  // Accepted Git command encodings are not mutually exclusive transports:
   // inline `GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false ...`
   // accepts env absent or the exact own one-key `{ GIT_OPTIONAL_LOCKS: "0" }`;
   // non-inline `git --no-pager -c core.fsmonitor=false ...` requires that
@@ -102,8 +112,8 @@ export function orchestratorWriteGate(
   // remain blocked.
   const artifactsDir = trustedArtifactsDirOf(ctx, actor);
   if (event.toolName === "bash" && artifactsDir) {
-    if (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv)) {
-      return { block: true, reason: "orchestrator policy: trusted host artifact proof permits only sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false; diff/show also require --no-ext-diff --no-textconv" };
+    if (!isAllowedAstIndexBash(event.input, executionCwd) && (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv))) {
+      return { block: true, reason: "orchestrator policy: trusted host artifact proof permits allowlisted ast-index lookup/rebuild/update or sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false: status, log (at most one -N, 1..100), diff, show, or branch --show-current; only diff/show require --no-ext-diff --no-textconv" };
     }
   }
 
@@ -113,11 +123,11 @@ export function orchestratorWriteGate(
   if (event.toolName === "bash") {
     const command = bashCommand;
     const targets = bashMutationTargets(command);
-    const canonical = targets.find((path) => isCanonicalStatePath(path, ctx.cwd));
+    const canonical = targets.find((path) => isCanonicalStatePath(path, ctx.cwd, executionCwd));
     if (canonical || looksLikeWorkflowStateMutation(command)) {
       return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused bash mutation${canonical ? ` '${canonical}'` : ""}` };
     }
-    const projectTarget = targets.find((path) => isProjectPath(path, ctx.cwd) && !isWorkStatePath(path, ctx.cwd));
+    const projectTarget = targets.find((path) => isProjectPath(path, ctx.cwd, executionCwd) && !isWorkStatePath(path, ctx.cwd, executionCwd));
     if (projectTarget && actor !== "worker") {
       return { block: true, reason: `orchestrator policy: source mutation via bash requires a trusted worker actor; got ${actor ?? "unknown"}` };
     }
@@ -131,7 +141,7 @@ export function orchestratorWriteGate(
   if (paths.length === 0) {
     return { block: true, reason: `orchestrator policy: ${actor ?? "unknown"} write/edit has no verifiable path` };
   }
-  const canonical = paths.find((path) => isCanonicalStatePath(path, ctx.cwd));
+  const canonical = paths.find((path) => isCanonicalStatePath(path, ctx.cwd, executionCwd));
   if (canonical) {
     return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused '${canonical}'` };
   }
@@ -140,13 +150,13 @@ export function orchestratorWriteGate(
     return { block: true, reason: "orchestrator policy: trusted actor identity is required for source writes" };
   }
   if (artifactsDir) {
-    const invalid = paths.find((path) => !isArtifactPath(path, ctx.cwd, artifactsDir));
+    const invalid = paths.find((path) => !isArtifactPath(path, ctx.cwd, artifactsDir, executionCwd));
     if (invalid) {
       return { block: true, reason: `orchestrator policy: trusted host may write only under the selected artifacts directory; refused '${invalid}'` };
     }
     return;
   }
-  const invalid = paths.find((path) => !isWorkStatePath(path, ctx.cwd));
+  const invalid = paths.find((path) => !isWorkStatePath(path, ctx.cwd, executionCwd));
   if (invalid) {
     return { block: true, reason: `orchestrator policy: ${actor} may write only under .work-state; refused '${invalid}'` };
   }
@@ -175,11 +185,11 @@ function simpleGitWords(command: string): string[] | undefined {
   return words;
 }
 
-function splitGitArgs(args: string[], options: ReadonlySet<string>): { before: string[]; after: string[] } | undefined {
+function splitGitArgs(args: string[], options: ReadonlySet<string>, allowLogCount = false): { before: string[]; after: string[] } | undefined {
   const separator = args.indexOf("--");
   const before = separator < 0 ? args : args.slice(0, separator);
   const after = separator < 0 ? [] : args.slice(separator + 1);
-  if (before.some((arg) => arg.startsWith("-") && !options.has(arg))) return undefined;
+  if (before.some((arg) => arg.startsWith("-") && !options.has(arg) && !(allowLogCount && /^-(?:[1-9][0-9]?|100)$/.test(arg)))) return undefined;
   if (before.some((arg) => !arg.startsWith("-") && !/^[A-Za-z0-9._/@:+~^-]+$/.test(arg))) return undefined;
   if (after.some((arg) => !/^[A-Za-z0-9._/@:+~^-]+$/.test(arg))) return undefined;
   return { before, after };
@@ -222,8 +232,14 @@ function isReadOnlyProofCommand(command: string, env: unknown, hasEnv: boolean):
     return parsed.before.includes("--no-ext-diff") && parsed.before.includes("--no-textconv");
   }
   if (subcommand === "log") {
-    const parsed = splitGitArgs(args, new Set(["-1", "--no-color", "--no-decorate", "--oneline", "--reverse"]));
+    const parsed = splitGitArgs(args, new Set(["--no-color", "--no-decorate", "--oneline", "--reverse"]), true);
     if (!parsed || parsed.before.filter((arg) => !arg.startsWith("-")).length > 1) return false;
+    let countSeen = false;
+    for (const arg of parsed.before) {
+      if (!arg.startsWith("-") || arg.startsWith("--")) continue;
+      if (countSeen) return false;
+      countSeen = true;
+    }
     return true;
   }
   return false;
@@ -310,11 +326,29 @@ function pathsFromPatch(patch: string): string[] {
 export function isRegisteredLifecycleDeviceWrite(event: ToolCallEvent): boolean {
   if (event.toolName !== "write") return false;
   const paths = pathsFromInput(event.input);
-  return paths.length > 0 && paths.every((path) => REGISTERED_LIFECYCLE_DEVICE_ROUTES.has(path));
+  return paths.length > 0 && paths.every((path) => Object.hasOwn(REGISTERED_LIFECYCLE_DEVICE_ROUTES, path));
 }
 
-function isWorkStatePath(path: string, cwd: string): boolean {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+function isTrustedHostServiceWrite(event: ToolCallEvent, ctx: ToolCallContext): boolean {
+  if (event.toolName !== "write" || !trustedActorOf(ctx)) return false;
+  const input = event.input;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  try {
+    if (Object.getPrototypeOf(input) !== Object.prototype) return false;
+    // Only the SDK's single-path write transport is a service request.
+    // Alias, patch, or mixed-target inputs must retain filesystem policy.
+    if ("file_path" in input || "paths" in input || "input" in input) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(input, "path");
+    if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") return false;
+    const path = descriptor.value;
+    return path === "xd://report_issue" || /^agent:\/\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path);
+  } catch {
+    return false;
+  }
+}
+
+function isWorkStatePath(path: string, cwd: string, executionCwd = cwd): boolean {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(executionCwd, path);
   const workState = resolve(cwd, ".work-state");
   const rel = relative(workState, absolute);
   if (rel !== "" && (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel))) return false;
@@ -330,8 +364,8 @@ function isWorkStatePath(path: string, cwd: string): boolean {
   }
 }
 
-function isArtifactPath(path: string, cwd: string, artifactsDir: string): boolean {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+function isArtifactPath(path: string, cwd: string, artifactsDir: string, executionCwd = cwd): boolean {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(executionCwd, path);
   const root = resolve(artifactsDir);
   const lexical = relative(root, absolute);
   if (lexical === "" || lexical.startsWith(`..${sep}`) || lexical === ".." || isAbsolute(lexical)) return false;
@@ -382,8 +416,8 @@ function isArtifactPath(path: string, cwd: string, artifactsDir: string): boolea
     return false;
   }
 }
-function isCanonicalStatePath(path: string, cwd: string): boolean {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+function isCanonicalStatePath(path: string, cwd: string, executionCwd = cwd): boolean {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(executionCwd, path);
   const canonical = (rel: string): boolean =>
     rel === ".active-feature"
     || rel === "team-state.json"
@@ -452,9 +486,9 @@ function bashMutationTargets(command: string): string[] {
   return targets;
 }
 
-function isProjectPath(path: string, cwd: string): boolean {
+function isProjectPath(path: string, cwd: string, executionCwd = cwd): boolean {
   const root = resolve(cwd);
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(executionCwd, path);
   const rel = relative(root, absolute);
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
@@ -547,6 +581,7 @@ export function workerWriteScopeGate(
 ): { block?: boolean; reason?: string } | void {
   const scope = ctx.writeScope;
   if (isRegisteredLifecycleDeviceWrite(event)) return;
+  if (isTrustedHostServiceWrite(event, ctx)) return;
   if (!scope?.enabled) return;
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
   if (trustedActorOf(ctx) !== "worker") return;

@@ -24,6 +24,7 @@ import type {
   RosterSelection,
   WorkflowContractStatus,
   WorkIdentity,
+  StageReceiptLedger,
 } from "../engine/types.js";
 import type { PauseKind, WorkflowName } from "../engine/types.js";
 import type { ModelClassification } from "../engine/run.js";
@@ -245,7 +246,81 @@ export interface CtoControlPlaneFields {
 
 
 
-/** Per-CTO-run persistent state under `.work-state/cto/<id>/state.json`. */
+/**
+ * Native CTO stage progress is the engine-owned bridge between a registered
+ * task admission and the immutable stage receipt ledger. It is deliberately
+ * separate from ordinary workflow state: a native wave can retain accepted
+ * receipts while this current-stage pointer advances.
+ */
+export type NativeStagePreflightTerminalSignal = "preflight:missing_prompt" | "preflight:invalid_arguments";
+
+export type NativeStageAssignmentStatus = "reserved" | "running" | "accepted" | "terminal";
+
+export interface NativeStageSlotDeclaration {
+  slot_id: string;
+  role: string;
+  agent: string;
+  occurrence: number;
+  facet?: string | null;
+}
+
+export interface NativeStageApproval {
+  approval_id: string;
+  stage_id: string;
+  iteration: number;
+  checkpoint: string;
+  decision: string;
+  phase: "before_dispatch" | "before_advance";
+  source: "human" | "policy-auto";
+  progress_revision: number;
+  receipt_digest: string;
+  at: string;
+}
+
+export interface NativeStageAssignment {
+  identity: WorkIdentity;
+  slot_id: string;
+  role: string;
+  agent: string;
+  status: NativeStageAssignmentStatus;
+  /** Engine-authored host preflight terminal proof; never model-supplied. */
+  terminal_signal?: NativeStagePreflightTerminalSignal;
+  reserved_at: string;
+  updated_at: string;
+}
+
+export interface NativeStageAdvanceRecord {
+  operation_id: string;
+  from_stage_id: string;
+  from_revision: number;
+  to_stage_id: string;
+  to_revision: number;
+  at: string;
+}
+
+export interface NativeStageProgress {
+  schema: 1;
+  run_id: string;
+  wave_id: string;
+  slice_id: string;
+  team_id: string;
+  workflow: WorkflowName;
+  stage_id: string;
+  stage_cursor: string;
+  profile_hash: string;
+  capability_id: string;
+  capability_epoch: string;
+  iteration: number;
+  declared_outputs: string[];
+  declared_slots: NativeStageSlotDeclaration[];
+  assignments: Record<string, NativeStageAssignment>;
+  status: "ready" | "running" | "accepted" | "complete";
+  revision: number;
+  approval?: NativeStageApproval;
+  advance_history?: NativeStageAdvanceRecord[];
+  updated_at: string;
+}
+
 export interface CtoState extends CtoControlPlaneFields {
   schema: 2;
   id: string;
@@ -255,9 +330,9 @@ export interface CtoState extends CtoControlPlaneFields {
    * LEGACY / engine-created autonomy flag. For task runs this is read-compat
    * only: new state mirrors `classification.autonomous` here so old readers
    * keep working, and the top-level flag NEVER overrides a present
-   * classification. Standby runs are the documented engine-created exception
-   * (no user task to classify): they carry `autonomous: true` and NO
-   * `classification` field.
+   * classification. The no-task standby bootstrap is the documented
+   * engine-created exception: it carries `autonomous: true` and no
+   * `classification` because there is no user task to classify.
    */
   autonomous: boolean;
   /**
@@ -265,10 +340,15 @@ export interface CtoState extends CtoControlPlaneFields {
    * task runs: `classification.autonomous` is the AUTHORITY for the run's
    * autonomy; the top-level `autonomous` field is mirrored (never
    * independent) when a classification is present. Absent on legacy runs and
-   * on engine-created standby runs (nothing to classify).
+   * on the engine-created no-task bootstrap (nothing to classify); a
+   * task-backed resident run retains its classification across closed waves.
    */
   classification?: ModelClassification;
   plan: TeamPlan;
+  /** Current engine-owned native stage progress, keyed by CTO team id. */
+  native_stage_progress?: Record<string, NativeStageProgress>;
+  /** Accepted native stage receipts, keyed by stable assignment dispatch id. */
+  stage_receipts?: Record<string, StageReceiptLedger>;
   teams: Array<{
     id: string;
     status: TeamRunStatus;
@@ -314,16 +394,18 @@ export interface CtoState extends CtoControlPlaneFields {
   /** Set when a mid-run task was folded into this run (br-k19 amend protocol). */
   amended_at?: string;
   /**
-   * Standby run marker (schema-2 optional). Set by the inbox bootstrap and
-   * the standby prompt; standby runs are adoptable cross-session so queued
-   * inbox tasks are never lost when a new session starts.
+   * Resident run marker (schema-2 optional). The registered `/cto` ingress
+   * sets this for both task-backed runs and the no-task inbox bootstrap.
+   * Resident runs are adoptable cross-session after a wave closes; explicit
+   * terminal state still releases their claim.
    */
   standby?: boolean;
   /**
-   * OMP session id that owns an interactive task run (schema-2 optional).
-   * Foreign sessions must not amend an owned run (fresh contract instead);
-   * standby runs have no owner. Absent on legacy runs — they remain
-   * amendable (status quo).
+   * OMP session id associated with the interactive task ingress (schema-2
+   * optional). It remains provenance for task-backed resident runs and for
+   * the no-task bootstrap; resident claim/binding rules, not a caller's
+   * session label, govern cross-session continuation. Absent on legacy runs —
+   * they remain amendable (status quo).
    */
   owner_session?: string;
   pause: {

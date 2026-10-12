@@ -184,31 +184,38 @@ ends at an explicit human approval gate.
 `lecture-research.json`):
 
 1. **URL-first intake** (orchestrator) — extract exactly one public video/playlist URL and the
-   non-empty research prompt. Record `lecture_intake` with acquisition-pending provenance. Do not
-   ask for a transcript or other source material; no network access or summarization yet.
-2. **Automatic acquisition** (orchestrator) — invoke the consumer-provided main-session
-   `lecture_acquire` tool and persist `lecture_acquisition`. The tool resolves bounded sources,
-   normalizes timestamped evidence, and preserves failures. Only `succeeded` or evidence-bearing
-   `partial` acquisition advances; failed/missing acquisition stops the workflow.
+   non-empty research prompt. Publish the declared `lecture_intake` value through
+   `workflow_submit_result({ "outputs": { ... } })`; do not ask for a transcript or other source
+   material, and do not perform network access or summarization.
+2. **Automatic acquisition** (main-session tool) — invoke the consumer-provided
+   `lecture_acquire` callback. The trusted callback publishes declared `lecture_acquisition` as
+   producer.kind `tool`; it resolves bounded sources, normalizes timestamped evidence, and
+   preserves failures. The tool has no worker terminal to wait for. Only `succeeded` or
+   evidence-bearing `partial` acquisition advances; failed/missing acquisition stops the workflow.
 3. **Lecture mapping** (consilium, bounded parallel roster) — consume only normalized
    `lecture_acquisition` evidence; **perform no network access, URL fetching, or provider calls**.
    Every URL-derived unit retains human-readable evidence and adds structured `evidence_refs`
-   (source, canonical location, quote, start/end timestamps). Produces `lecture_mapping`.
+   (source, canonical location, quote, start/end timestamps). Producers submit `lecture_mapping`
+   through the declared outputs-only contract.
 4. **Synthesis & dedupe** (single `analyst`) — merge overlapping claims across sources, record
    conflicts explicitly with the winning source and losing sources/claims, and produce deduplicated
-   candidate findings. Preserve partial-acquisition failures and gaps. Produces `lecture_candidates`.
+   candidate findings through the declared outputs-only contract. Preserve partial-acquisition
+   failures and gaps.
 5. **Repo fit & security review** (consilium, parallel, read-only) — `architect` checks candidate
    claims against the codebase with concrete repo evidence; `security-tester` reviews security and
-   IP/licensing risks. No fixes or edits. Produces `lecture_repo_fit`.
-6. **Approval** (orchestrator, explicit human checkpoint) — pause, record the verdict, and complete
-   on either explicit `approved` or `rejected`. No implementation, task creation, or code work
-   starts before approval; approval never launches implementation. Produces `lecture_decision`.
+   IP/licensing risks. No fixes or edits. Submit `lecture_repo_fit` through declared outputs.
+6. **Approval** (orchestrator, explicit human checkpoint) — pause at the profile checkpoint and
+   obtain a typed decision through the current approval surface. Ordinary workflows use
+   `workflow_checkpoint_ask`; native CTO slices use resident-root
+   `cto_checkpoint_ask({ "slice_id": "<sliceId>" })` followed by
+   `cto_stage_advance({ "slice_id": "<sliceId>" })`. No implementation, task creation, or code
+   work starts before approval; approval never launches implementation.
 
-**Artifacts.** Every stage writes typed artifacts under the selected run's `artifactsDir`
-(`.work-state/runs/<run-id>/artifacts/` for canonical runs) per `artifacts-schema.json`:
-URL intake, provider-neutral acquisition, evidence-grounded mapping, synthesis with
-conflicts, repo-fit/security findings, and the explicit decision. The profile never produces
-source code.
+**Artifacts.** Each stage's typed values are published through the outputs-only
+submission contract; the engine validates them and persists immutable output
+references under the selected run's artifact namespace (or renders deterministic
+document outputs). Producers do not write canonical workflow artifacts by path,
+copy manifests, or reconstruct receipts. The profile never produces source code.
 
 **Acquisition boundary.** Core cannot auto-acquire by itself. A consumer must register
 `lecture_acquire` (or route direct `core.run()` orchestration through `LectureAcquisitionPort`).
@@ -245,13 +252,45 @@ validates persisted state, profile hash and dispatch capability before any stage
    - **resolve roles → agents**: agent name from `.omp/team.config.json` `roles` (P6), falling back to built-in defaults and legacy `.claude/team.config.json`. Model capability is set by agent frontmatter and OMP policy — low-tier agents use `@smol` + `thinkingLevel: medium`, middle-tier use `@task` + `thinkingLevel: auto`, high-tier use `@slow` + `thinkingLevel: high`. Concrete models are configured via OMP `modelRoles` or `task.agentModelOverrides`, not in workflow config.
    - **checkpoint**: follow the declared typed checkpoint policy; interactive answers enter through `workflow_checkpoint_ask`. Routing/autonomy metadata never authorizes a checkpoint.
    - **gate**: do not mark the stage `done` until the gate condition holds.
-   - **write** the `produces` artifact to the selected run's `artifactsDir`.
+   - **submit** each producer's direct schema payload for its declared output id through
+     `workflow_submit_result({ "outputs": { "<artifact_id>": <payload> } })`. The host derives
+     producer, slot, and dispatch identity; core publishes immutable canonical references. Do
+     not write canonical artifacts by path.
    - **loop**: if the stage has a `loop`, repeat `back_to` until `until` or `max_iterations`.
    - **advance** the selected run's `stage_cursor` and mirror progress only through the configured run reader.
 
 The prose phase descriptions in `commands/team.md` remain as a **STAGE REFERENCE (fallback)** —
 the detailed prompt templates and review criteria live there. Profiles drive *which* stages
 run and *in what order*; the reference supplies the *how* for each stage type.
+
+### Полный hash профиля и fingerprint handoff
+
+Canonical state хранит полный SHA-256 профиля (64 hex):
+`workflow_begin.state.profile_hash`, `workflow_instructions.profile.hash`
+и `workflow_instructions.state.profileHash` показывают полное значение.
+`workflow_begin.handoff.profile_hash` намеренно содержит компактный
+fingerprint: первые 30 плюс последние 2 символа полного hash (32 hex).
+Корневой `profile_hash_note` в ответе begin явно поясняет это различие.
+
+Разная длина или прямое строковое неравенство этих двух представлений
+сами по себе не означают profile drift и не требуют recovery. В control
+calls копируется значение **актуального handoff дословно**, без вычисления
+fingerprint моделью, подстановки полного hash или изменения state.
+Пояснение не является authority: действительные несовпадения binding,
+profile, capability, cursor или loop iteration по-прежнему отклоняет движок.
+
+### Ответ штатного checkpoint-диалога
+
+OMP 18.4.9 включает `customInputImages` и `noteImages` в raw результат
+`askDialog` даже при обычном выборе без вложений. Checkpoint intake
+принимает эти два поля только отсутствующими, `undefined` или пустыми
+массивами. Непустые и malformed image metadata не дают approval;
+остальные неизвестные metadata также отклоняются.
+
+Решение выводится только из единственного policy-allowed selected option
+для точных question/id/options. Esc, timeout, custom input и stale binding
+не создают допустимый ответ. Proof, запись решения и advance остаются
+за штатными checkpoint tools; совместимость UI metadata не обходит их.
 
 ### Необязательные входы и required-input receipt
 
@@ -270,6 +309,51 @@ Accepted TCB boundary: already-loaded extensions are trusted host code and are n
 Binding worker не разрешает вложенную делегацию: worker не вызывает `Task` для redelegation. `team-lead` может действовать только в уже выданном том же CTO `run`/`slice`; copied marker, `hasUI`, raw `actor`, prompt/arguments или чужая session сами по себе полномочий не создают. `write_scope`, если включён consumer-ом, только сужает уже разрешённый доступ и никогда его не расширяет.
 
 Registry binding process-local. После перезапуска worker grants не восстанавливаются; durable `pending`/`transport_reconnect` и captured result origin позволяют точно reconcile прежний dispatch, но не являются полномочием на запись source и не синтезируют новый `Task` поверх pending.
+
+### Native CTO slices and supplemental DoD
+
+Resident `/cto` slices do not use ordinary workflow selectors. The resident
+main session commits the authenticated `CtoState` with `cto_state`, dispatches
+the configured team lead with the exact CTO slice marker, and that lead
+dispatches only its configured worker roster with inherited native authority.
+The lead/worker path preserves the resolved profile's stages, gates,
+checkpoints, typed artifacts, validation evidence, and DoD/approval obligations;
+it must not call ordinary `workflow_prepare`/`workflow_instructions`/
+`workflow_begin`/`workflow_advance` using a CTO slug. Native stage
+transition uses the registered `cto_stage_advance({ "slice_id": "<sliceId>" })`;
+the root tool derives current run/claim/profile/stage scope and rejects
+ordinary tokens or candidate-progress injection.
+
+Every producer publishes only its declared direct schema values through
+`workflow_submit_result({ "outputs": { ... } })`. The engine validates
+schemas/field errors, persists immutable output references, returns the receipt,
+and owns fan-in; no producer writes workflow JSON, canonical output files,
+manifests, paths, or authority fields by hand. A worker producer additionally
+requires its matching host terminal; orchestrator/tool/document producers have
+no worker terminal to wait for and use trusted result/callback or engine
+rendering. A receipt is not a worker terminal, readiness, DoD, fan-in, or
+approval. For a profile-required actual human checkpoint, the resident root
+calls `cto_checkpoint_ask({ "slice_id": "<sliceId>" })`, then
+`cto_stage_advance({ "slice_id": "<sliceId>" })`; eligible `policy_auto`
+continues through engine-evaluated `cto_stage_advance`. Do not hand-write
+approval/state evidence or use an ordinary selector/token.
+Per-team DoD is a supplemental ordinary artifact at the exact configured
+relative `teams[].dod_path`; the default file is
+`.work-state/artifacts/<team>/dod.json`, not canonical CTO state or a typed
+workflow output.
+
+### Служебные сообщения и диагностика
+
+Single-path `write` в точный `xd://report_issue` или корневой
+`agent://<recipient>` — служебная операция SDK, не файловая запись.
+Host/claim admission остаётся обязательным; SDK проверяет получателя,
+доставку сообщения и доступ к диагностическому device. Эти операции не
+дают прав на lifecycle, dispatch, сдачу outputs или изменение файлов.
+Файловый `write_scope` worker не ограничивает разрешённые служебные сообщения.
+Другие `xd://` routes не получают нового исключения. URI с subpath,
+query/fragment, смешанные файловые targets и `edit` не являются этим
+служебным транспортом; registered lifecycle devices сохраняют отдельный
+контракт авторизации.
 
 ### Защищённый artifact-proof Bash
 
@@ -293,12 +377,16 @@ Registry binding process-local. После перезапуска worker grants 
 Для non-inline encoding omitted `env` отклоняется; wrong/extra/malformed `env` отклоняется в обоих случаях.
 
 Allowlist содержит только read-only `status`, `log`, `diff`, `show` и ровно `branch --show-current`; `switch`, `checkout`, другие режимы `branch`, неподдержанные extra args, helper/wrapper, mutation и injection блокируются.
+Для `log` поддерживается не более одного положительного short count `-N`
+в диапазоне 1..100; например, `log -8 --oneline`. Нулевые, повторные,
+out-of-range counts и неподдержанные options отклоняются. Флаги
+`--no-ext-diff --no-textconv` к `log` добавлять не нужно.
 
 Примеры inline form с отсутствующим `env`:
 
 ```bash
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false status --short
-GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -1 --oneline
+GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false log -8 --oneline
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false branch --show-current
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false diff --no-ext-diff --no-textconv -- src/app.ts
 GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false show --no-ext-diff --no-textconv --stat HEAD
@@ -313,13 +401,29 @@ diagnose) and put `gate: dod_complete` on the `summary` stage. The DoD fixes acc
 *before* code, each with a verification method and (on close) proof. See the **DEFINITION OF
 DONE** section in `commands/team.md` for the policy and per-type minimums.
 
+В ordinary workflow последующее обновление общего `dod.json` поручается ровно
+одному designated writer стадии `qa_tests` или `manual_qa`: первому resolved
+slot, либо одному явно назначенному child этого slot. Остальные участники
+возвращают evidence и предложенные изменения, но не редактируют sidecar.
+Закрывать критерий можно только с фактическим criterion-specific evidence;
+неподтверждённые пункты остаются `pending`. Sidecar не добавляется в `produces`
+или `workflow_submit_result.outputs`; it remains supplemental DoD evidence only.
+
+Если downstream `summary` уже связан с незавершённым DoD, он не получает права
+переписать consumed input. После явного запроса пользователя выполняется
+same-run `rework` от ответственной QA-стадии: engine переоткрывает её и
+downstream, инвалидирует зависимые hashes/receipts, а свежие
+`workflow_instructions` → `workflow_begin` → `workflow_instructions`
+связывают новые inputs. Gate `dod_complete` при этом не ослабляется.
+
 Enforcement is two-layered and **never wedges the session**:
 - **Primary**: the `dod_complete` gate (interpreter) and `root_cause_documented` gate (BUG_FIX,
   before implementation).
-- **Backstop**: `hooks/dod-gate.sh` (Stop) reads the typed `dod` artifact from the selected run's
-  `artifactsDir`, not from a branch-derived or legacy path. It blocks (exit 2) **only at a
-  done-claim** — `pause.kind == "done"` or `stage_cursor == "summary"` — with unmet or
-  evidence-less items.
+- **Backstop**: `src/gates/dod-backstop.ts` replaces the legacy shell Stop hook and
+  reads the typed `dod` artifact from the selected run's `artifactsDir`, not a
+  branch-derived or legacy path. It reports a blocking decision **only at a
+  done-claim** — `pause.kind == "done"` or `stage_cursor == "summary"` — with unmet
+  or evidence-less items.
 
 Stop is always allowed (no DoD enforcement) when: `pause.kind` ∈
 `background_wait | user_checkpoint | needs_human | failed`; the workflow is

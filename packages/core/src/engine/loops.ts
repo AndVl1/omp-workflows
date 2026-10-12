@@ -21,17 +21,17 @@ export function loopStateFor(state: TeamState, stageId: string): LoopState | nul
 }
 
 /**
- * Re-entry budget: `reentries` counts loop-backs performed. A loop is
- * exhausted when the `until` expression still fails and re-entries have
- * already reached `max_iterations` (i.e. `max_iterations` re-entries are
- * allowed before escalation).
+ * Re-entry budget: `reentries` counts loop-backs performed and the active
+ * execution is `reentries + 1`. `max_iterations` is therefore the maximum
+ * number of real executions, including the first pass: a failed final
+ * iteration exhausts instead of creating an extra synthetic pass.
  */
 export function loopReentryDecision(
   loop: LoopState | null,
   maxIterations: number,
 ): { reentries: number; exhausted: boolean } {
   const reentries = loop?.reentries ?? 0;
-  return { reentries, exhausted: reentries >= maxIterations };
+  return { reentries, exhausted: reentries + 1 >= maxIterations };
 }
 
 /** The stage to re-enter, verified against the profile. */
@@ -72,6 +72,31 @@ export function loopIterationForStage(state: TeamState, profile: Profile, stageI
     return { ok: true, iteration: loop.reentries + 1 };
   }
   return { ok: true, iteration: 1 };
+}
+
+/**
+ * Stage ids that belong to the currently running loop window when execution
+ * resumes after a loop-back. Completed status is historical for these stages:
+ * the next real iteration must still walk them from `back_to` through the loop
+ * owner. Upstream stages and downstream stages remain subject to the normal
+ * completed-stage filter.
+ */
+export function loopReentryStageIds(profile: Profile, state: TeamState): Set<string> {
+  const loop = state.loop_state;
+  if (!loop || loop.status !== "running") return new Set();
+  const ownerIndex = profile.stages.findIndex((stage) => stage.id === loop.stage_id);
+  const backToIndex = profile.stages.findIndex((stage) => stage.id === loop.back_to);
+  const cursorIndex = profile.stages.findIndex((stage) => stage.id === state.stage_cursor);
+  if (
+    ownerIndex < 0
+    || backToIndex < 0
+    || cursorIndex < 0
+    || cursorIndex < Math.min(ownerIndex, backToIndex)
+    || cursorIndex > Math.max(ownerIndex, backToIndex)
+  ) return new Set();
+  return new Set(profile.stages
+    .slice(Math.min(ownerIndex, backToIndex), Math.max(ownerIndex, backToIndex) + 1)
+    .map((stage) => stage.id));
 }
 
 /** Fresh history entry for one loop-back. */

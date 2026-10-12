@@ -25,3 +25,6 @@ coverage
 
 # UX E2E run evidence (heavy: transcripts, screenshots) — keep local, reports go to git
 vibe-report/evidence/
+
+# Bulky historical acceptance evidence; compact disposition stays in OpenSpec.
+/openspec/changes/reliable-stage-execution/automatic-acceptance.json

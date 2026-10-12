@@ -74,7 +74,10 @@ function registerGate(
   }
   registerTeamWorkflow(pi as never, {
     roles: genericRoles,
-    ...(controller ? { getSessionController: () => controller } : {}),
+    ...(controller ? {
+      getSessionController: () => controller,
+      resolveTrustedToolCallActor: () => undefined,
+    } : {}),
   });
   return handlers[0]!;
 }

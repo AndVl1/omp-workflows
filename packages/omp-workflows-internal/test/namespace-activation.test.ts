@@ -118,6 +118,10 @@ function commandContext(cwd: string): unknown {
 	};
 }
 
+function admissionCode(reason: string | undefined): string | undefined {
+	return reason?.match(/\[workflow_admission:([a-z_]+)\]/)?.[1];
+}
+
 const ALL_CAPABILITIES: WorkflowCapability[] = ["workflow_registration", "workflow_tools", "config_writer"];
 
 function assertUnclaimed(cwd: string, capability: WorkflowCapability): void {
@@ -332,7 +336,31 @@ test("captured host admits ordinary no-run writes while preserving session and s
 			(result) => Boolean(result && typeof result === "object" && "block" in result && result.block === true),
 		);
 
+	const admissionCodeFor = (ctx: unknown, path: string): string | undefined => {
+		const result = hookResults(ctx, path).find(
+			(value) => value && typeof value === "object" && "block" in value && value.block === true,
+		);
+		if (!result || typeof result !== "object" || !("reason" in result) || typeof result.reason !== "string") return undefined;
+		return admissionCode(result.reason);
+	};
+
 	assert.equal(hasBlock(rawHostContext, join(root, "src", "app.ts")), false, "claim-free captured host bypasses only the outer actor preblock");
+	assert.equal(
+		admissionCodeFor({ ...rawHostContext, hasUI: false }, join(root, "src", "headless.ts")),
+		"host_profile_mismatch",
+	);
+	assert.equal(
+		admissionCodeFor({ ...rawHostContext, mode: "rpc" }, join(root, "src", "profile.ts")),
+		"host_profile_mismatch",
+	);
+	assert.equal(
+		admissionCodeFor({ ...rawHostContext, cwd: join(root, "other-worktree") }, join(root, "src", "worktree.ts")),
+		"worktree_mismatch",
+	);
+	assert.equal(
+		admissionCodeFor({ ...rawHostContext, actor: "worker" }, join(root, "src", "actor.ts")),
+		"untrusted_actor_context",
+	);
 
 	const controlPath = join(root, ".work-state", "run-control.json");
 	mkdirSync(join(root, ".work-state"), { recursive: true });
@@ -349,8 +377,16 @@ test("captured host admits ordinary no-run writes while preserving session and s
 		...emptyControl,
 		execution_claim: { run_id: "other-run", token: "foreign-token" },
 	}));
+	assert.equal(
+		admissionCodeFor(rawHostContext, join(root, "src", "claimed.ts")),
+		"no_run_claim_present",
+	);
 	assert.equal(hasBlock(rawHostContext, join(root, "src", "claimed.ts")), true, "a non-null execution claim denies no-run admission");
 	writeFileSync(controlPath, "{ malformed run control");
+	assert.equal(
+		admissionCodeFor(rawHostContext, join(root, "src", "corrupt.ts")),
+		"workflow_state_recovery_required",
+	);
 	assert.equal(hasBlock(rawHostContext, join(root, "src", "corrupt.ts")), true, "an unreadable canonical control denies no-run admission");
 	writeFileSync(controlPath, JSON.stringify(emptyControl));
 	assert.equal(readRunControl(root).execution_claim, null);
@@ -358,6 +394,10 @@ test("captured host admits ordinary no-run writes while preserving session and s
 		{ field: "session_id", context: { ...rawHostContext, session_id: "foreign-session" } },
 		{ field: "sessionId", context: { ...rawHostContext, sessionId: "foreign-session" } },
 	] as const) {
+		assert.equal(
+			admissionCodeFor(mismatch.context, join(root, "src", `${mismatch.field}-no-run.ts`)),
+			"session_identity_mismatch",
+		);
 		assert.equal(
 			hasBlock(mismatch.context, join(root, "src", `${mismatch.field}-no-run.ts`)),
 			true,
@@ -399,6 +439,10 @@ test("captured host admits ordinary no-run writes while preserving session and s
 		{ field: "sessionId", context: { ...rawHostContext, sessionId: "foreign-session" } },
 	] as const) {
 		assert.equal(
+			admissionCodeFor(mismatch.context, join(target.artifactsDir, `${mismatch.field}-proof.json`)),
+			"session_identity_mismatch",
+		);
+		assert.equal(
 			hasBlock(mismatch.context, join(target.artifactsDir, `${mismatch.field}-proof.json`)),
 			true,
 			`copied captured manager with mismatched ${mismatch.field} cannot use selected controller/proof admission`,
@@ -429,15 +473,27 @@ test("captured host admits ordinary no-run writes while preserving session and s
 	const foreignContext = {
 		sessionManager: { getCwd: () => root, getSessionId: () => "foreign-session" },
 	};
+	assert.equal(
+		admissionCodeFor(foreignContext, join(target.artifactsDir, "foreign.json")),
+		"session_identity_mismatch",
+	);
 	assert.equal(hasBlock(foreignContext, join(target.artifactsDir, "foreign.json")), true, "foreign session cannot borrow the captured host");
 	const mismatchedContext = {
 		sessionManager: { getCwd: () => plainRoot(), getSessionId: () => hostContext.session_id },
 	};
+	assert.equal(
+		admissionCodeFor(mismatchedContext, join(root, "src", "mismatched.ts")),
+		"session_identity_mismatch",
+	);
 	assert.equal(hasBlock(mismatchedContext, join(root, "src", "mismatched.ts")), true, "mismatched manager cwd remains fail-closed");
 	const contradictoryCwdContext = {
 		cwd: plainRoot(),
 		sessionManager: hostContext.sessionManager,
 	};
+	assert.equal(
+		admissionCodeFor(contradictoryCwdContext, join(root, "src", "contradictory-cwd.ts")),
+		"worktree_mismatch",
+	);
 	assert.equal(
 		hasBlock(contradictoryCwdContext, join(root, "src", "contradictory-cwd.ts")),
 		true,
@@ -449,5 +505,9 @@ test("captured host admits ordinary no-run writes while preserving session and s
 		mode: "print",
 		hasUI: false,
 	});
+	assert.equal(
+		admissionCodeFor(rawHostContext, join(target.artifactsDir, "headless.json")),
+		"headless_host_session",
+	);
 	assert.equal(hasBlock(rawHostContext, join(target.artifactsDir, "headless.json")), true, "headless transition revokes raw host admission");
 });

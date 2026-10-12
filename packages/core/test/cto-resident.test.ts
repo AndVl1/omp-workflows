@@ -27,6 +27,7 @@ import {
   setCtoPause,
   type TeamPlan,
 } from "@andvl1/omp-workflows-core";
+import { isCtoResidentWaiting, isCtoStandbyBootstrap } from "../src/cto/state.js";
 
 function samplePlan(id = "run-1"): TeamPlan {
   return {
@@ -55,6 +56,107 @@ test("cto-resident: isCtoResident mirrors the standby marker", () => {
   assert.equal(isCtoResident({ standby: true }), true);
   assert.equal(isCtoResident({ standby: false }), false);
   assert.equal(isCtoResident({}), false);
+});
+
+test("cto-resident: waiting predicate separates bootstrap, active task, closed wave, and recovery", () => {
+  const bootstrap = makeStandby("run-bootstrap");
+  assert.equal(isCtoStandbyBootstrap(bootstrap), true);
+  assert.equal(isCtoResidentWaiting(bootstrap), true);
+
+  const active = newCtoState({
+    id: "run-active",
+    task: "active task",
+    branch: "main",
+    autonomous: true,
+    standby: true,
+    plan: samplePlan("run-active"),
+  });
+  assert.equal(isCtoStandbyBootstrap(active), false);
+  assert.equal(isCtoResidentWaiting(active), false, "active task progress is not waiting");
+  const sentinelTask = newCtoState({
+    id: "run-sentinel-task",
+    task: "standby — awaiting inbox tasks",
+    branch: "main",
+    autonomous: false,
+    standby: true,
+    plan: { id: "run-sentinel-task", task: "standby — awaiting inbox tasks", teams: [], created_at: new Date().toISOString() },
+  });
+  assert.equal(isCtoStandbyBootstrap(sentinelTask), false, "a real task matching the bootstrap text is not bootstrap");
+  assert.equal(isCtoResidentWaiting(sentinelTask), false);
+
+  const closed = newCtoState({
+    id: "run-closed",
+    task: "closed task",
+    branch: "main",
+    autonomous: true,
+    standby: true,
+    plan: samplePlan("run-closed"),
+  });
+  appendWave(closed, { id: "wave-1", source: "inbox", source_id: "m1", task: "closed task" });
+  finishWave(closed, { id: "wave-1", status: "done" });
+  setTeamStatus(closed, "backend", "done");
+  setTeamStatus(closed, "frontend", "done");
+  setIntegration(closed, "done", "wave complete");
+  assert.equal(isCtoStandbyBootstrap(closed), false);
+  assert.equal(isCtoResidentWaiting(closed), true, "successful closed wave awaits a new task");
+
+  const retried = newCtoState({
+    id: "run-retried",
+    task: "retried task",
+    branch: "main",
+    autonomous: true,
+    standby: true,
+    plan: samplePlan("run-retried"),
+  });
+  appendWave(retried, { id: "wave-1", source: "inbox", source_id: "m1", task: "first attempt" });
+  finishWave(retried, { id: "wave-1", status: "failed" });
+  appendWave(retried, { id: "wave-2", source: "inbox", source_id: "m2", task: "retry" });
+  finishWave(retried, { id: "wave-2", status: "done" });
+  setTeamStatus(retried, "backend", "done");
+  setTeamStatus(retried, "frontend", "done");
+  setIntegration(retried, "done", "retry complete");
+  assert.equal(isCtoResidentWaiting(retried), true, "latest successful wave can wait despite earlier failed history");
+
+  const concurrent = newCtoState({
+    id: "run-concurrent",
+    task: "concurrent task",
+    branch: "main",
+    autonomous: true,
+    standby: true,
+    plan: samplePlan("run-concurrent"),
+  });
+  appendWave(concurrent, { id: "wave-1", source: "inbox", source_id: "m1", task: "still active" });
+  appendWave(concurrent, { id: "wave-2", source: "inbox", source_id: "m2", task: "finished sibling" });
+  finishWave(concurrent, { id: "wave-2", status: "done" });
+  setTeamStatus(concurrent, "backend", "done");
+  setTeamStatus(concurrent, "frontend", "done");
+  setIntegration(concurrent, "done", "sibling complete");
+  assert.equal(isCtoResidentWaiting(concurrent), false, "unfinished historical wave still requires recovery");
+
+  const failed = newCtoState({
+    id: "run-failed",
+    task: "failed task",
+    branch: "main",
+    autonomous: true,
+    standby: true,
+    plan: samplePlan("run-failed"),
+  });
+  appendWave(failed, { id: "wave-1", source: "inbox", source_id: "m1", task: "failed task" });
+  finishWave(failed, { id: "wave-1", status: "failed" });
+  setIntegration(failed, "failed", "recovery required");
+  setCtoPause(failed, "background_wait", "awaiting recovery");
+  assert.equal(isCtoResidentWaiting(failed), false, "failed/blocked work keeps recovery context");
+
+  const ended = newCtoState({
+    id: "run-ended",
+    task: "ended task",
+    branch: "main",
+    autonomous: true,
+    standby: true,
+    plan: samplePlan("run-ended"),
+  });
+  setCtoPause(ended, "done", "explicit END");
+  assert.equal(isCtoResidentWaiting(ended), false, "explicit END is not waiting");
 });
 
 test("cto-resident: newCtoState carries wave_history: [] and no active_wave_id/channel_profile", () => {

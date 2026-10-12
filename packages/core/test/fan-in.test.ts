@@ -16,125 +16,80 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { loadProfile, registerWorkflowProfiles, profileHash } from "../src/engine/profile.js";
-import { createCapability, authorizeDispatch as rawAuthorizeDispatch, completeDispatch as rawCompleteDispatch, reconcileTrustedTaskResult as rawReconcileTrustedTaskResult, advanceCursor as rawAdvanceCursor } from "../src/engine/durable.js";
+import { join } from "node:path";
+import { loadProfile, profileHash } from "../src/engine/profile.js";
+import { createCapability } from "../src/engine/durable.js";
 import {
   namespacedArtifactId,
   sanitizeSlot,
   missingSlotResults,
   mergeSlotValues,
   synthesizeArtifacts,
-  slotRecordsFor,
   DEFAULT_FAN_IN_POLICY,
   type FanInPolicy,
 } from "../src/engine/fan-in.js";
 
-import { resolveConfig } from "../src/engine/config.js";
-import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
-import { run } from "../src/engine/run.js";
-import type { Profile, TeamState } from "../src/engine/types.js";
+import type { TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
-import type { TaskCaller } from "../src/engine/stage.js";
-
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 const FAN_RUN_ID = "44444444-4444-4444-8444-444444444444";
-const SPEC_RUN_ID = "55555555-5555-4555-8555-555555555555";
-
-function runIdFor(root: string): string {
-  return readdirSync(join(root, ".work-state", "runs"))[0]!;
-}
-
-function authorizeDispatch(root: string, input: Parameters<typeof rawAuthorizeDispatch>[1]) {
-  return rawAuthorizeDispatch(root, { run_id: runIdFor(root), ...input });
-}
-function completeDispatch(root: string, input: Parameters<typeof rawCompleteDispatch>[1]) {
-  if (input.artifact_ids?.length) {
-    const statePath = join(root, ".work-state", "runs", runIdFor(root), "state.json");
-    const state = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    const artifacts = { ...(state.artifacts ?? {}) };
-    for (const id of input.artifact_ids) artifacts[id] = `artifacts/${id}.json`;
-    writeFileSync(statePath, JSON.stringify({ ...state, artifacts }) + "\n");
-  }
-  return rawCompleteDispatch(root, { run_id: runIdFor(root), ...input }, { runId: runIdFor(root) });
-}
-function reconcileTrustedTaskResult(root: string, input: Parameters<typeof rawReconcileTrustedTaskResult>[1]) {
-  return rawReconcileTrustedTaskResult(root, { run_id: runIdFor(root), ...input });
-}
-function advanceCursor(root: string, input: Parameters<typeof rawAdvanceCursor>[1]) {
-  return rawAdvanceCursor(root, { run_id: runIdFor(root), ...input }, { runId: runIdFor(root) });
-}
-
 function initGit(root: string, branch: string): void {
   execFileSync("git", ["-C", root, "init", "--quiet", "--initial-branch", branch], { stdio: "ignore" });
 }
-const COMPLETE_PRODUCT_SPEC = {
-  recommendation: "proceed",
-  value_proposition: "Deterministic PRDs give product owners a reviewable, tamper-evident document.",
-  opportunity: "No deterministic renderer from spec to document exists today.",
-  target_users: ["product owners", "platform leads"],
-  solution_direction: "Render the five source artifacts into deterministic Markdown with verifiable hashes.",
-  success_metrics: ["identical sources render byte-identical PRDs", "any post-write edit fails validation"],
-  guardrail_metrics: ["workflow stage latency unchanged"],
-  scope: ["deterministic renderer", "typed product_prd artifact", "profile documents stage"],
-  anti_scope: ["implementation planning", "architecture decisions"],
-  risks: ["template drift without hash re-verification"],
-  validation_plan: [],
-  evidence_trace: ["claim: deterministic rendering — status: verified — source: documents.test.ts"],
-  open_decisions: ["where the PRD file lives"],
-};
 
-function writeFixtureState(root: string, profileName: string, stageId: string): ReturnType<typeof createCapability> {
-  const profile = loadProfile(profileName);
+function writeFixtureState(root: string, stageId: string): ReturnType<typeof createCapability> {
+  const profile = loadProfile("full-feature");
   assert.ok(profile);
   const persistedHash = profileHash(profile);
-  const runId = profileName === "spec-preparation" ? SPEC_RUN_ID : FAN_RUN_ID;
-  const branch = profileName === "spec-preparation" ? "main" : "feat/fan";
+  const runId = FAN_RUN_ID;
+  const branch = "feat/fan";
   const issued = createCapability({
-    run_key: runId, branch, workflow: profile.name, profile_hash: persistedHash,
-    stage_cursor: stageId, kind: "consilium",
-    expected_roster: profileName === "spec-preparation"
-      ? [{ role: "analyst", agent: "analyst" }, { role: "tech-researcher", agent: "tech-researcher" }]
-      : [{ role: "analyst#1", agent: "analyst" }, { role: "tech-researcher", agent: "tech-researcher" }, { role: "analyst#2", agent: "analyst" }],
+    run_key: runId,
+    branch,
+    workflow: profile.name,
+    profile_hash: persistedHash,
+    stage_cursor: stageId,
+    kind: "consilium",
+    expected_roster: [
+      { role: "analyst#1", agent: "analyst" },
+      { role: "tech-researcher", agent: "tech-researcher" },
+      { role: "analyst#2", agent: "analyst" },
+    ],
   });
   const runDir = join(root, ".work-state", "runs", runId);
   mkdirSync(join(runDir, "artifacts"), { recursive: true });
   for (const id of profile.stages.find((candidate) => candidate.id === stageId)?.consumes ?? []) {
-    writeFileSync(join(runDir, "artifacts", `${id}.json`), JSON.stringify(id === "product_spec" ? COMPLETE_PRODUCT_SPEC : { task: "t", branch }) + "\n");
+    writeFileSync(join(runDir, "artifacts", `${id}.json`), JSON.stringify({ task: "t", branch }) + "\n");
   }
   writeFileSync(join(runDir, "state.json"), JSON.stringify({
-    schema: 2, run_id: runId, run_key: runId, lifecycle_status: "active", rework_generation: 0,
-    branch, title: "fan-in", classification: { type: profileName === "spec-preparation" ? "SPEC" : "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: profileName },
-    task: "fan-in", workflow_override: false, issue: null, required_inputs: {}, required_input_receipts: {},
+    schema: 2,
+    run_id: runId,
+    run_key: runId,
+    lifecycle_status: "active",
+    rework_generation: 0,
+    branch,
+    title: "fan-in",
+    classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: profile.name },
+    task: "fan-in",
+    workflow_override: false,
+    issue: null,
+    required_inputs: {},
+    required_input_receipts: {},
     stage_cursor: stageId,
     stages: profile.stages.map((s) => ({ id: s.id, status: s.id === stageId ? "in_progress" as const : "pending" as const })),
     artifacts: Object.fromEntries((profile.stages.find((candidate) => candidate.id === stageId)?.consumes ?? []).map((id) => [id, `artifacts/${id}.json`])),
     pause: { kind: "none", reason: "" },
     policy: { strict_orchestrator: true },
-    profile_hash: persistedHash, scope: NO_SCOPE, cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    dispatch_capability: issued.state, updated_at: new Date().toISOString(),
+    profile_hash: persistedHash,
+    scope: NO_SCOPE,
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    dispatch_capability: issued.state,
+    updated_at: new Date().toISOString(),
   }) + "\n");
   return issued;
-}
-
-const writeSpecFixtureState = (root: string) => writeFixtureState(root, "spec-preparation", "intake_repo_map");
-
-const trustedIntakeRoles = { analyst: "analyst", "tech-researcher": "tech-researcher" } as const;
-
-/** Publish a trusted live agent mapping covering the spec-preparation intake pool. */
-function publishMapping(root: string): void {
-  mkdirSync(join(root, ".omp"), { recursive: true });
-  writeFileSync(join(root, ".omp", "team.config.json"), JSON.stringify({ roles: trustedIntakeRoles }) + "\n");
-  const config = resolveConfig(root);
-  const mapping = buildAgentMapping({
-    roles: config.roles,
-    availableAgents: Object.values(trustedIntakeRoles),
-    extraRoles: config.scope_map.map((entry) => entry.dev_agent),
-    genericFallbackRoles: Object.keys(trustedIntakeRoles),
-  });
-  writeAgentMapping(root, mapping);
 }
 
 function artifactsDir(root: string): string {
@@ -146,55 +101,63 @@ function artifactsDir(root: string): string {
 function stateOf(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "runs", FAN_RUN_ID, "state.json"), "utf8")) as TeamState;
 }
-function specArtifactsDir(root: string): string {
-  const dir = join(root, ".work-state", "runs", SPEC_RUN_ID, "artifacts");
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
-function completeSlot(root: string, issued: ReturnType<typeof createCapability>, role: string, agent: string, artifactIds: string[]): void {
-  const auth = {
-    token: issued.dispatch_token,
-    capability_id: issued.capability_id,
-    run_key: issued.state.issued_for!.run_key,
-    branch: issued.state.issued_for!.branch,
-    workflow: issued.state.issued_for!.workflow,
-    profile_hash: issued.state.issued_for!.profile_hash,
-    stage_cursor: issued.state.issued_for!.stage_cursor,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    loop_iteration: issued.state.issued_for!.loop_iteration,
-    role,
-    slot_id: role,
-    agent,
-  };
-  const authorized = authorizeDispatch(root, auth);
-  assert.equal(authorized.ok, true, `authorize ${role}${authorized.ok ? "" : `: ${authorized.error}; expected=${JSON.stringify(issued.state.expected_roster)}`}`);
-  if (!authorized.ok || !authorized.record) throw new Error(`authorize failed: ${authorized.ok ? "missing record" : authorized.error}`);
-  const completed = completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: `${role} done`, artifact_ids: artifactIds });
-  assert.equal(completed.ok, true, `complete ${role}`);
-  if (!completed.ok) throw new Error(`complete failed: ${completed.error}`);
-}
-
-function authorizeSlot(root: string, issued: ReturnType<typeof createCapability>, role: string, agent: string, toolCallId: string): void {
-  const auth = {
-    token: issued.dispatch_token,
-    capability_id: issued.capability_id,
-    run_key: issued.state.issued_for!.run_key,
-    branch: issued.state.issued_for!.branch,
-    workflow: issued.state.issued_for!.workflow,
-    profile_hash: issued.state.issued_for!.profile_hash,
-    stage_cursor: issued.state.issued_for!.stage_cursor,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    loop_iteration: issued.state.issued_for!.loop_iteration,
-    role,
-    slot_id: role,
-    agent,
-    tool_call_id: toolCallId,
-  };
-  const authorized = authorizeDispatch(root, auth);
-  assert.equal(authorized.ok, true, `authorize ${role}${authorized.ok ? "" : `: ${authorized.error}; expected=${JSON.stringify(issued.state.expected_roster)}`}`);
-}
 
 const EXPLORATION = (summary: string, files: string[]) => ({ files_to_read: files.map((path) => ({ path, why: "x" })), summary });
+function publishCanonicalReceipt(
+  root: string,
+  issued: ReturnType<typeof createCapability>,
+  slot: string,
+  values: Record<string, unknown>,
+): void {
+  const state = stateOf(root);
+  const dir = artifactsDir(root);
+  mkdirSync(join(dir, "immutable"), { recursive: true });
+  const dispatchId = `dispatch-${slot.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+  const outputs = Object.entries(values).map(([artifactId, value]) => {
+    const bytes = Buffer.from(JSON.stringify(value), "utf8");
+    const immutableRef = `immutable/${dispatchId}-${artifactId}.json`;
+    writeFileSync(join(dir, immutableRef), bytes);
+    return {
+      artifact_id: artifactId,
+      immutable_ref: immutableRef,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+  });
+  const capability = issued.state.issued_for!;
+  const receiptId = `receipt-${dispatchId}`;
+  state.stage_receipts = {
+    ...(state.stage_receipts ?? {}),
+    [receiptId]: {
+      receipt_id: receiptId,
+      submission_id: `submission-${dispatchId}`,
+      digest: `digest-${dispatchId}`,
+      dispatch_id: dispatchId,
+      attempt: 1,
+      accepted_at: new Date().toISOString(),
+      work_identity: {
+        run_id: state.run_id!,
+        wave_id: "wave",
+        slice_id: "slice",
+        session_id: "session",
+        workflow: capability.workflow,
+        stage_id: capability.stage_cursor,
+        stage_cursor: capability.stage_cursor,
+        capability_id: capability.capability_id,
+        capability_epoch: capability.cursor_epoch,
+        loop_iteration: capability.loop_iteration,
+        slot_id: slot,
+        task_id: `task-${dispatchId}`,
+        dispatch_id: dispatchId,
+        attempt: 1,
+        worker_id: slot,
+      },
+      outputs,
+      evidence: [],
+    },
+  };
+  writeFileSync(join(root, ".work-state", "runs", FAN_RUN_ID, "state.json"), JSON.stringify(state) + "\n");
+}
+
 
 test("fan-in: slot namespace is deterministic and collision-free", () => {
   assert.equal(namespacedArtifactId("exploration", "analyst#1"), "exploration-analyst-1");
@@ -204,54 +167,24 @@ test("fan-in: slot namespace is deterministic and collision-free", () => {
   assert.equal(sanitizeSlot("devops"), "devops");
 });
 
-test("fan-in: shared-id completions are snapshotted per slot; later slots cannot clobber provenance", () => {
-  const root = mkdtempSync(join(tmpdir(), "fan-snapshot-"));
-  try {
-    initGit(root, "feat/fan");
-    const issued = writeFixtureState(root, "full-feature", "exploration");
-    const dir = artifactsDir(root);
-    // Both analysts declare the SHARED exploration id (legacy behavior). The
-    // engine must snapshot each slot's content before the next clobbers.
-    writeFileSync(join(dir, "exploration.json"), JSON.stringify(EXPLORATION("analyst one", ["a.ts"])));
-    completeSlot(root, issued, "analyst#1", "analyst", ["exploration"]);
-    writeFileSync(join(dir, "exploration.json"), JSON.stringify(EXPLORATION("analyst two", ["b.ts"])));
-    completeSlot(root, issued, "analyst#2", "analyst", ["exploration"]);
-    writeFileSync(join(dir, "exploration.json"), JSON.stringify(EXPLORATION("researcher", ["c.ts"])));
-    completeSlot(root, issued, "tech-researcher", "tech-researcher", ["exploration"]);
 
-    const records = slotRecordsFor(stateOf(root), "exploration");
-    assert.ok(records);
-    assert.equal(Object.keys(records!.slots["analyst#1"] ?? {}).length, 1);
-    assert.equal(records!.slots["analyst#1"]!["exploration"]!.path.endsWith("exploration-analyst-1.json"), true, "shared-id write is snapshotted into the slot namespace");
-    assert.equal(records!.slots["analyst#2"]!["exploration"]!.path.endsWith("exploration-analyst-2.json"), true);
-    const snap1 = JSON.parse(readFileSync(records!.slots["analyst#1"]!["exploration"]!.path, "utf8")) as { summary: string };
-    assert.equal(snap1.summary, "analyst one", "slot 1 keeps its own content despite the later clobber");
-    const snap2 = JSON.parse(readFileSync(records!.slots["analyst#2"]!["exploration"]!.path, "utf8")) as { summary: string };
-    assert.equal(snap2.summary, "analyst two");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("fan-in: deterministic synthesis merges slots in roster order, records provenance and resolved disagreements", () => {
+test("fan-in: deterministic synthesis merges canonical receipt outputs in roster order", () => {
   const root = mkdtempSync(join(tmpdir(), "fan-synth-"));
   try {
     initGit(root, "feat/fan");
-    const issued = writeFixtureState(root, "full-feature", "exploration");
+    const issued = writeFixtureState(root, "exploration");
     const dir = artifactsDir(root);
-    // Slot-scoped ids (the consilium prompt contract).
-    writeFileSync(join(dir, "exploration-analyst-1.json"), JSON.stringify(EXPLORATION("analyst one", ["a.ts"])));
-    writeFileSync(join(dir, "exploration-tech-researcher.json"), JSON.stringify(EXPLORATION("researcher", ["c.ts"])));
-    writeFileSync(join(dir, "exploration-analyst-2.json"), JSON.stringify(EXPLORATION("analyst two", ["b.ts"])));
-    writeFileSync(join(dir, "dod-analyst-1.json"), JSON.stringify({ items: [{ criterion: "c", verify_method: "v", status: "pending" }] }));
-    completeSlot(root, issued, "analyst#1", "analyst", ["exploration-analyst-1", "dod-analyst-1"]);
-    completeSlot(root, issued, "tech-researcher", "tech-researcher", ["exploration-tech-researcher"]);
-    completeSlot(root, issued, "analyst#2", "analyst", ["exploration-analyst-2"]);
+    publishCanonicalReceipt(root, issued, "analyst#1", {
+      exploration: EXPLORATION("analyst one", ["a.ts"]),
+      dod: { items: [{ criterion: "c", verify_method: "v", status: "pending" }] },
+    });
+    publishCanonicalReceipt(root, issued, "tech-researcher", {
+      exploration: EXPLORATION("researcher", ["c.ts"]),
+    });
+    publishCanonicalReceipt(root, issued, "analyst#2", {
+      exploration: EXPLORATION("analyst two", ["b.ts"]),
+    });
 
-    // `summary` is a schema-required scalar that the slots genuinely
-    // disagree on; the stage's documented resolution (first_slot) is the
-    // explicit policy that makes the shipped parallel-exploration contract
-    // advanceable without ever discarding the disagreement silently.
     const policy: FanInPolicy = {
       ...DEFAULT_FAN_IN_POLICY,
       resolutions: [
@@ -263,214 +196,28 @@ test("fan-in: deterministic synthesis merges slots in roster order, records prov
         },
       ],
     };
-    const state = stateOf(root);
-    const synthesized = synthesizeArtifacts(state, "exploration", dir, ["exploration", "dod"], ["analyst#1", "tech-researcher", "analyst#2"], policy);
+    const synthesized = synthesizeArtifacts(
+      stateOf(root),
+      "exploration",
+      dir,
+      ["exploration", "dod"],
+      ["analyst#1", "tech-researcher", "analyst#2"],
+      policy,
+    );
     assert.equal(synthesized.ok, true);
     if (!synthesized.ok) return;
     const shared = JSON.parse(readFileSync(join(dir, "exploration.json"), "utf8")) as { files_to_read: unknown[]; summary: string };
-    assert.equal(shared.files_to_read.length, 3, "arrays concatenate in roster order without dedupe loss");
-
-    assert.deepEqual(shared.files_to_read.map((f) => (f as { path: string }).path), ["a.ts", "c.ts", "b.ts"], "deterministic roster order");
-    assert.equal(shared.summary, "analyst one", "declared resolution resolves the required scalar first-slot-wins");
+    assert.deepEqual(shared.files_to_read.map((f) => (f as { path: string }).path), ["a.ts", "c.ts", "b.ts"]);
+    assert.equal(shared.summary, "analyst one");
     const provenance = synthesized.state.slot_artifacts!["exploration"]!.shared!;
     assert.deepEqual(provenance["exploration"]!.slots, ["analyst#1", "tech-researcher", "analyst#2"]);
-    assert.deepEqual(provenance["dod"]!.slots, ["analyst#1"], "synthesis provenance records the contributing slots");
-    const conflicts = provenance["exploration"]!.conflicts;
-    assert.ok(conflicts, "resolved disagreements are recorded, never discarded");
-    assert.equal(conflicts!.length, 2, "each losing slot is recorded");
-    assert.deepEqual(conflicts!.map((c) => c.field), ["summary", "summary"]);
-    assert.deepEqual(conflicts!.map((c) => c.strategy), ["first_slot", "first_slot"]);
-    assert.deepEqual(conflicts!.map((c) => c.winner_slot), ["analyst#1", "analyst#1"], "the first roster contributor wins deterministically");
-    assert.deepEqual(conflicts!.map((c) => c.losing_values.map((l) => l.slot)), [["tech-researcher"], ["analyst#2"]]);
-    assert.equal(conflicts![0]!.resolved_value, "analyst one");
-    assert.match(conflicts![0]!.rationale, /preserved per slot/);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("fan-in: advance recovers native completions after slots wrote declared files", () => {
-  const root = mkdtempSync(join(tmpdir(), "fan-native-recovery-"));
-  try {
-    initGit(root, "feat/fan");
-    const issued = writeFixtureState(root, "full-feature", "exploration");
-    const dir = artifactsDir(root);
-    writeFileSync(join(dir, "discovery.json"), JSON.stringify({ task: "t", branch: "feat/fan" }));
-
-    for (const [role, agent, toolCallId] of [
-      ["analyst#1", "analyst", "tool-analyst-1"],
-      ["tech-researcher", "tech-researcher", "tool-researcher"],
-      ["analyst#2", "analyst", "tool-analyst-2"],
-    ] as const) {
-      authorizeSlot(root, issued, role, agent, toolCallId);
-      const reconciled = reconcileTrustedTaskResult(root, {
-        tool_call_id: toolCallId,
-        outcome: "succeeded",
-        evidence: `${role} native result`,
-      });
-      assert.equal(reconciled.ok, true, `native reconciliation for ${role}`);
-    }
-
-    writeFileSync(join(dir, "exploration-analyst-1.json"), JSON.stringify(EXPLORATION("one", ["a.ts"])));
-    writeFileSync(join(dir, "exploration-tech-researcher.json"), JSON.stringify(EXPLORATION("two", ["b.ts"])));
-    writeFileSync(join(dir, "exploration-analyst-2.json"), JSON.stringify(EXPLORATION("three", ["c.ts"])));
-    writeFileSync(join(dir, "dod-analyst-1.json"), JSON.stringify({ items: [{ criterion: "c", verify_method: "v", status: "pending" }] }));
-
-    const advanced = advanceCursor(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: issued.state.issued_for!.run_key,
-      branch: issued.state.issued_for!.branch,
-      workflow: issued.state.issued_for!.workflow,
-      profile_hash: issued.state.issued_for!.profile_hash,
-      stage_cursor: issued.state.issued_for!.stage_cursor,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      loop_iteration: issued.state.issued_for!.loop_iteration,
-      evidence: "native consilium outputs reconciled",
-    });
-    assert.equal(advanced.ok, true, "native completion without ids is repaired from slot-scoped files");
-    assert.equal(existsSync(join(dir, "exploration.json")), true, "fan-in writes the shared produce after recovery");
-    const recovered = stateOf(root);
-    const slots = recovered.slot_artifacts!.exploration!.slots;
-    assert.deepEqual(Object.keys(slots["analyst#1"] ?? {}).sort(), ["dod-analyst-1", "exploration-analyst-1"]);
-    assert.deepEqual(Object.keys(slots["tech-researcher"] ?? {}), ["exploration-tech-researcher"]);
-    assert.deepEqual(Object.keys(slots["analyst#2"] ?? {}), ["exploration-analyst-2"]);
+    assert.deepEqual(provenance["dod"]!.slots, ["analyst#1"]);
+    assert.equal(provenance["exploration"]!.conflicts?.length, 2);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("spec-preparation: native consilium completion advances from slot-scoped outputs", () => {
-  const root = mkdtempSync(join(tmpdir(), "fan-spec-native-"));
-  try {
-    initGit(root, "main");
-    const issued = writeSpecFixtureState(root);
-    publishMapping(root);
-    const dir = specArtifactsDir(root);
-    for (const [role, agent, toolCallId] of [
-      ["analyst", "analyst", "tool-spec-analyst"],
-      ["tech-researcher", "tech-researcher", "tool-spec-researcher"],
-    ] as const) {
-      authorizeSlot(root, issued, role, agent, toolCallId);
-      const reconciled = reconcileTrustedTaskResult(root, {
-        tool_call_id: toolCallId,
-        outcome: "succeeded",
-        evidence: `${role} native result`,
-      });
-      assert.equal(reconciled.ok, true, `native reconciliation for ${role}`);
-    }
-    writeFileSync(join(dir, "spec_intake_repo_map-analyst.json"), JSON.stringify({ facts: [{ source: "analyst" }] }));
-    writeFileSync(join(dir, "spec_intake_repo_map-tech-researcher.json"), JSON.stringify({ facts: [{ source: "research" }] }));
-
-    const advanced = advanceCursor(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: issued.state.issued_for!.run_key,
-      branch: issued.state.issued_for!.branch,
-      workflow: issued.state.issued_for!.workflow,
-      profile_hash: issued.state.issued_for!.profile_hash,
-      stage_cursor: issued.state.issued_for!.stage_cursor,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      loop_iteration: issued.state.issued_for!.loop_iteration,
-      evidence: "spec intake complete",
-    });
-    assert.equal(advanced.ok, true, "spec-preparation intake transition succeeds");
-    assert.equal(advanced.ok && advanced.state.stage_cursor, "requirements_edge_cases");
-    assert.equal(existsSync(join(dir, "spec_intake_repo_map.json")), true, "shared spec intake artifact is synthesized");
-    assert.deepEqual(
-      Object.keys(advanced.ok ? advanced.state.slot_artifacts!.intake_repo_map!.slots : {}).sort(),
-      ["analyst", "tech-researcher"],
-    );
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-test("fan-in: native artifact ids can bind before a slot file becomes readable", () => {
-  const root = mkdtempSync(join(tmpdir(), "fan-native-delayed-"));
-  try {
-    initGit(root, "main");
-    const issued = writeSpecFixtureState(root);
-    publishMapping(root);
-    const dir = specArtifactsDir(root);
-    const sharedId = "spec_intake_repo_map";
-    const analystAuth = {
-      token: issued.dispatch_token,
-      capability_id: issued.capability_id,
-      run_key: issued.state.issued_for!.run_key,
-      branch: issued.state.issued_for!.branch,
-      workflow: issued.state.issued_for!.workflow,
-      profile_hash: issued.state.issued_for!.profile_hash,
-      stage_cursor: issued.state.issued_for!.stage_cursor,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      loop_iteration: issued.state.issued_for!.loop_iteration,
-      role: "analyst",
-      agent: "analyst",
-      tool_call_id: "tool-spec-delayed-analyst",
-    };
-    const analystDispatch = authorizeDispatch(root, analystAuth);
-    assert.equal(analystDispatch.ok, true);
-    assert.ok(analystDispatch.ok && analystDispatch.record);
-    const analystNative = reconcileTrustedTaskResult(root, {
-      tool_call_id: analystAuth.tool_call_id,
-      outcome: "succeeded",
-      evidence: "analyst native result",
-    });
-    assert.equal(analystNative.ok, true);
-
-    // The native completion is already durable, but the executor's artifact
-    // path currently contains a partial write and is not readable yet.
-    writeFileSync(join(dir, `${sharedId}.json`), "{");
-    const early = completeDispatch(root, {
-      ...analystAuth,
-      dispatch_id: analystDispatch.ok ? analystDispatch.record!.id : "",
-      outcome: "succeeded",
-      evidence: "analyst declared intake artifact",
-      artifact_ids: [sharedId],
-    });
-    assert.equal(early.ok, true, early.ok ? "" : early.error);
-    assert.equal(
-      early.ok ? early.record?.completion?.completed_by : undefined,
-      "synchronous_tool_result",
-      "a deferred binding remains marked as native until its snapshot exists",
-    );
-
-    const researcherAuth = {
-      ...analystAuth,
-      role: "tech-researcher",
-      agent: "tech-researcher",
-      tool_call_id: "tool-spec-delayed-researcher",
-    };
-    const researcherDispatch = authorizeDispatch(root, researcherAuth);
-    assert.equal(researcherDispatch.ok, true);
-    const researcherNative = reconcileTrustedTaskResult(root, {
-      tool_call_id: researcherAuth.tool_call_id,
-      outcome: "succeeded",
-      evidence: "researcher native result",
-    });
-    assert.equal(researcherNative.ok, true);
-
-    // Both files become readable before the advance boundary. Recovery must
-    // snapshot the already-bound analyst id and infer the still-empty slot.
-    writeFileSync(join(dir, `${sharedId}.json`), JSON.stringify({ facts: [{ source: "analyst" }] }));
-    writeFileSync(join(dir, `${sharedId}-tech-researcher.json`), JSON.stringify({ facts: [{ source: "research" }] }));
-    const advanced = advanceCursor(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: issued.state.issued_for!.run_key,
-      branch: issued.state.issued_for!.branch,
-      workflow: issued.state.issued_for!.workflow,
-      profile_hash: issued.state.issued_for!.profile_hash,
-      stage_cursor: issued.state.issued_for!.stage_cursor,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      loop_iteration: issued.state.issued_for!.loop_iteration,
-      evidence: "delayed native artifacts recovered",
-    });
-    assert.equal(advanced.ok, true, advanced.ok ? "" : advanced.error);
-    assert.equal(advanced.ok && advanced.state.stage_cursor, "requirements_edge_cases");
-    assert.equal(existsSync(join(dir, `${sharedId}-analyst.json`)), true, "the late analyst file is snapshotted by recovery");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 test("fan-in: merge dedupes identical array items and deep-merges objects", () => {
   const merged = mergeSlotValues(
@@ -487,24 +234,19 @@ test("fan-in: merge dedupes identical array items and deep-merges objects", () =
   }
 });
 
-test("fan-in: missing slot results and empty slots block; strict conflicts block with field diagnostics", () => {
+test("fan-in: missing canonical receipt results and empty slots block; strict conflicts block with field diagnostics", () => {
   const root = mkdtempSync(join(tmpdir(), "fan-block-"));
   try {
     initGit(root, "feat/fan");
-    const issued = writeFixtureState(root, "full-feature", "exploration");
-    const dir = artifactsDir(root);
-    // No slot recorded anything -> every produce is missing.
+    const issued = writeFixtureState(root, "exploration");
     const empty = missingSlotResults(stateOf(root), "exploration", ["analyst#1", "tech-researcher", "analyst#2"], ["exploration", "dod"]);
     assert.ok(empty.length > 0, "empty fan-in is detected as missing");
 
-    writeFileSync(join(dir, "exploration-analyst-1.json"), JSON.stringify(EXPLORATION("one", ["a.ts"])));
-    completeSlot(root, issued, "analyst#1", "analyst", ["exploration-analyst-1"]);
-    // Only one slot contributed -> other slots are empty -> blocked.
+    publishCanonicalReceipt(root, issued, "analyst#1", { exploration: EXPLORATION("one", ["a.ts"]) });
     const partial = missingSlotResults(stateOf(root), "exploration", ["analyst#1", "tech-researcher", "analyst#2"], ["exploration", "dod"]);
     assert.ok(partial.some((entry) => entry.slot === "tech-researcher"), "empty slot blocks");
     assert.ok(partial.some((entry) => entry.artifactId === "dod"), "produce with no contributor blocks");
 
-    // Strict conflict: required scalar `summary` disagrees between slots.
     const strict = mergeSlotValues(
       [EXPLORATION("one", ["a.ts"]), EXPLORATION("two", ["b.ts"])],
       ["files_to_read", "summary"],
@@ -514,8 +256,6 @@ test("fan-in: missing slot results and empty slots block; strict conflicts block
     assert.equal(strict.ok, false);
     if (!strict.ok) assert.match(strict.error, /required scalar field 'summary'.*no explicit resolution/s);
 
-    // Explicit opt-out of strict (setFanInPolicy): the same disagreement
-    // resolves deterministically and is recorded, never discarded.
     const lenient = mergeSlotValues(
       [EXPLORATION("one", ["a.ts"]), EXPLORATION("two", ["b.ts"])],
       ["files_to_read", "summary"],
@@ -590,138 +330,5 @@ test("fan-in: default policy is strict; an explicit resolution applies only to t
   if (!unsupported.ok) assert.match(unsupported.error, /strategy 'majority' is not supported/);
 });
 
-test("fan-in: missing slot results block advance end to end", () => {
-  const root = mkdtempSync(join(tmpdir(), "fan-advance-"));
-  try {
-    initGit(root, "feat/fan");
-    const issued = writeFixtureState(root, "full-feature", "exploration");
-    const dir = artifactsDir(root);
-    // discovery artifacts are consumed by exploration -> must exist.
-    writeFileSync(join(dir, "discovery.json"), JSON.stringify({ task: "t", branch: "feat/fan" }));
-    writeFileSync(join(dir, "exploration-analyst-1.json"), JSON.stringify(EXPLORATION("one", ["a.ts"])));
-    writeFileSync(join(dir, "exploration-tech-researcher.json"), JSON.stringify(EXPLORATION("two", ["b.ts"])));
-    writeFileSync(join(dir, "exploration-analyst-2.json"), JSON.stringify(EXPLORATION("three", ["c.ts"])));
-    completeSlot(root, issued, "analyst#1", "analyst", ["exploration-analyst-1"]);
-    completeSlot(root, issued, "tech-researcher", "tech-researcher", ["exploration-tech-researcher"]);
-    // analyst#2 completed with NO artifacts -> empty slot -> advance blocked.
-    completeSlot(root, issued, "analyst#2", "analyst", []);
-    const advanced = advanceCursor(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: issued.state.issued_for!.run_key,
-      branch: issued.state.issued_for!.branch,
-      workflow: issued.state.issued_for!.workflow,
-      profile_hash: issued.state.issued_for!.profile_hash,
-      stage_cursor: issued.state.issued_for!.stage_cursor,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      loop_iteration: issued.state.issued_for!.loop_iteration,
-      evidence: "exploration done",
-    });
-    assert.equal(advanced.ok, false, "empty slot blocks the handoff");
-    if (!advanced.ok) assert.match(advanced.error, /fan-in incomplete.*analyst#2/s);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
-test("fan-in: collision (same slot writing the same artifact twice with different content) blocks at completion", () => {
-  const root = mkdtempSync(join(tmpdir(), "fan-collision-"));
-  try {
-    initGit(root, "feat/fan");
-    const issued = writeFixtureState(root, "full-feature", "exploration");
-    const dir = artifactsDir(root);
-    writeFileSync(join(dir, "exploration.json"), JSON.stringify(EXPLORATION("one", ["a.ts"])));
-    completeSlot(root, issued, "analyst#1", "analyst", ["exploration"]);
-    // Re-complete the same dispatch with different content is a conflicting
-    // replay at the dispatch level; drive the collision via a second record:
-    // authorize the role again after a failed attempt is not possible in one
-    // capability, so assert the pure record-level invariant instead.
-    const records = slotRecordsFor(stateOf(root), "exploration");
-    const record = records!.slots["analyst#1"]!["exploration"]!;
-    const first = record.hash;
-    // Same content -> same hash (idempotent replay snapshot).
-    writeFileSync(join(dir, "exploration.json"), JSON.stringify(EXPLORATION("one", ["a.ts"])));
-    const auth = {
-      token: issued.dispatch_token,
-      capability_id: issued.capability_id,
-      run_key: issued.state.issued_for!.run_key,
-      branch: issued.state.issued_for!.branch,
-      workflow: issued.state.issued_for!.workflow,
-      profile_hash: issued.state.issued_for!.profile_hash,
-      stage_cursor: issued.state.issued_for!.stage_cursor,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      loop_iteration: issued.state.issued_for!.loop_iteration,
-      role: "analyst#1",
-      agent: "analyst",
-    };
-    const authorized = authorizeDispatch(root, auth);
-    assert.equal(authorized.ok, false, "role already dispatched (failed/cancelled required before re-dispatch)");
-    // The snapshot record is immutable per completion: changing the file
-    // after the fact cannot alter recorded provenance.
-    writeFileSync(join(dir, "exploration.json"), JSON.stringify(EXPLORATION("changed", ["z.ts"])));
-    assert.equal(slotRecordsFor(stateOf(root), "exploration")!.slots["analyst#1"]!["exploration"]!.hash, first, "provenance hash is immutable after recording");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
-test("fan-in: a zero-artifact slot never inherits foreign shared content as its namespaced provenance", async () => {
-  const root = mkdtempSync(join(tmpdir(), "fan-freerider-"));
-  // No slash in the branch so the derived feature slug equals the branch.
-  const branch = "fan-free-rider";
-  try {
-    initGit(root, branch);
-    const profile: Profile = {
-      name: "fan-free-rider",
-      title: "Free-rider regression",
-      description: "consilium slot returning no artifacts must not be credited with another slot's shared write",
-      match: { type: ["FEATURE"] },
-      stages: [
-        {
-          id: "exploration",
-          title: "Exploration",
-          type: "consilium",
-          roles: ["analyst", "tech-researcher"],
-          parallel: true,
-          produces: ["exploration"],
-        },
-        { id: "summary", title: "Summary", type: "orchestrator", consumes: ["exploration"] },
-      ],
-    };
-    registerWorkflowProfiles([profile]);
-    const taskTool: TaskCaller = {
-      async call() { return { id: "x", output: "ok", artifacts: {}, exitCode: 0 }; },
-      async batch() {
-        return [
-          { id: "exploration-analyst", output: "ok", artifacts: { exploration: EXPLORATION("analyst view", ["a.ts"]) }, exitCode: 0 },
-          // The second slot returns nothing. It must not inherit the shared
-          // exploration.json (written by the first slot) as its provenance.
-          { id: "exploration-tech-researcher", output: "ok", artifacts: {}, exitCode: 0 },
-        ];
-      },
-    };
-    const result = await run({
-      task: "free-rider fan-in",
-      cwd: root,
-      branch,
-      autonomous: false,
-      classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "fan-free-rider" },
-      taskTool,
-      execution: {
-        session_id: "fan-free-rider-session",
-        caller: "host",
-        process_id: process.pid,
-        worktree: root,
-        branch,
-        authority: "coordinator",
-      },
-    });
-    const exploration = result.outcomes.find((o) => o.stageId === "exploration");
-    assert.equal(exploration?.status, "failed", "a zero-artifact slot must fail the consilium stage");
-    const artifacts = join(dirname(result.statePath!), "artifacts");
-    assert.equal(existsSync(join(artifacts, "exploration-tech-researcher.json")), false, "the empty slot must not inherit the shared artifact as its namespaced provenance");
-    assert.equal(existsSync(join(artifacts, "exploration-analyst.json")), true, "the contributing slot keeps its own namespaced content");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});

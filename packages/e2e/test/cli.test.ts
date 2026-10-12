@@ -1,12 +1,14 @@
 /**
  * CLI tests: argv dispatch (--help / unknown subcommand) and arg
- * validation for bootstrap/start. No real npm link / git / omp runs.
+ * validation for bootstrap/start and scratch Git isolation. No npm link / omp runs.
  */
 
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 import { detachLogPath, main, parseBootstrapArgs, parseInputArgs, parseMaxTime, parseStartArgs, runInput, runStop, tailLogFile } from '../src/cli.js';
@@ -78,6 +80,40 @@ test('cli: bootstrap missing args exits 1 via main', async () => {
   const { code, err } = await runMain(['bootstrap']);
   assert.equal(code, 1);
   assert.ok(err.includes('missing <slug>'));
+});
+
+test('cli: isolated bootstrap ignores inherited Git selectors outside its scratch', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ux-e2e-bootstrap-isolation-'));
+  const canary = join(root, 'canary');
+  mkdirSync(canary);
+  const cliUrl = new URL('../src/cli.ts', import.meta.url).href;
+  const monorepo = fileURLToPath(new URL('../../../', import.meta.url));
+  const program = `
+    import { runBootstrap } from ${JSON.stringify(cliUrl)};
+    const root = ${JSON.stringify(root)};
+    runBootstrap({
+      slug: 'isolated', branch: 'probe/isolation', workdir: root,
+      monorepo: ${JSON.stringify(monorepo)}, omp: undefined, force: false,
+    }, { PATH: process.env.PATH, HOME: root, PI_CONFIG_DIR: '.omp' });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', program], {
+      env: {
+        PATH: process.env.PATH,
+        HOME: root,
+        TMPDIR: root,
+        GIT_DIR: join(canary, '.git'),
+        GIT_WORK_TREE: canary,
+      },
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(existsSync(join(canary, '.git')), false, 'parent Git target remains untouched');
+    assert.equal(readFileSync(join(root, 'omp-ux-e2e-isolated', '.git', 'HEAD'), 'utf8'), 'ref: refs/heads/probe/isolation\n');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('cli: start validates scratch-dir and options', () => {

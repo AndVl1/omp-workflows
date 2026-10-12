@@ -24,7 +24,6 @@ import {
   reopenFromFeedback,
 } from "@andvl1/omp-workflows-core";
 import { classificationToolGate } from "../src/gates/classification.js";
-import { createTaskCaller, runStage, type TaskToolLike } from "../src/engine/stage.js";
 
 const genericRoles = { worker: "worker" };
 const CANONICAL_RUN_ID = "66666666-6666-4666-8666-666666666666";
@@ -242,48 +241,6 @@ test("core: selected canonical run blocks task launches without zero-step classi
     rmSync(root, { recursive: true, force: true });
   }
 });
-test("core: workflow dispatch leaves model selection to OMP", async () => {
-  const calls: Array<{ agent: string; task: string; name?: string }> = [];
-  const state = {
-    schema: 1 as const,
-    branch: "feat/role-routing",
-    classification: { type: "FEATURE" as const, complexity: "QUICK" as const, confidence: "HIGH" as const, workflow: "lightweight" as const, autonomous: false },
-    task: "exercise role routing",
-    workflow_override: false,
-    issue: null,
-    stage_cursor: "implementation",
-    stages: [{ id: "implementation", status: "in_progress" as const }],
-    artifacts: {},
-    pause: { kind: "none" as const, reason: "" },
-    updated_at: new Date(0).toISOString(),
-  };
-  const outcome = await runStage(
-    { id: "implementation", title: "Implementation", type: "single", role: "backend-kotlin" },
-    {
-      cwd: process.cwd(),
-      state,
-      artifactsDir: `${process.cwd()}/.work-state/artifacts`,
-      flags: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
-      agent: (role) => role === "backend-kotlin" ? "developer-kotlin" : role,
-      task: {
-        call: async (opts) => {
-          calls.push(opts);
-          return { id: "result", output: "ok", artifacts: {}, exitCode: 0 };
-        },
-        batch: async () => [],
-      },
-      pause: async () => undefined,
-      log: () => undefined,
-      resolveDevAgent: () => "developer-kotlin",
-    },
-  );
-  assert.equal(outcome.status, "done");
-  assert.match(calls[0]?.task ?? "", /Workflow role: backend-kotlin/);
-  assert.equal(calls.length, 1);
-  assert.deepEqual(Object.keys(calls[0] ?? {}).sort(), ["agent", "name", "task"]);
-  assert.equal(calls[0]?.name, "implementation-backend-kotlin");
-  assert.equal(calls[0]?.agent, "developer-kotlin");
-});
 test("core: feedback reopens affected stage and preserves history", () => {
   const state = {
     schema: 1 as const,
@@ -384,53 +341,6 @@ test("fullstack: agent frontmatter uses OMP class role with standard fallback", 
   }
 });
 
-test("core: consilium preserves role variants without pinning models", async () => {
-  let dispatched: Array<{ name: string; agent: string; task: string }> = [];
-  const state = {
-    schema: 1 as const,
-    branch: "feat/role-routing",
-    classification: { type: "FEATURE" as const, complexity: "COMPLEX" as const, confidence: "HIGH" as const, workflow: "full-feature" as const, autonomous: false },
-    task: "compare architecture variants",
-    workflow_override: false,
-    issue: null,
-    stage_cursor: "architecture",
-    stages: [{ id: "architecture", status: "in_progress" as const }],
-    artifacts: {},
-    pause: { kind: "none" as const, reason: "" },
-    updated_at: new Date(0).toISOString(),
-  };
-  const roles = ["architect", "architect", "architect"];
-  const outcome = await runStage(
-    { id: "architecture", title: "Architecture", type: "consilium", roles },
-    {
-      cwd: process.cwd(),
-      state,
-      artifactsDir: `${process.cwd()}/.work-state/artifacts`,
-      flags: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null },
-      agent: () => "architect",
-      task: createTaskCaller({
-        async execute(_toolCallId, params) {
-          const tasks = params.tasks as Array<{ name: string; agent: string; task: string }>;
-          dispatched = tasks;
-          return {
-            output: {
-              results: tasks.map(() => ({ output: "ok", artifacts: {}, exitCode: 0 })),
-            },
-          };
-        },
-      } satisfies TaskToolLike),
-      pause: async () => undefined,
-      log: () => undefined,
-      resolveDevAgent: () => null,
-    },
-  );
-  assert.equal(outcome.status, "done");
-  assert.deepEqual(dispatched.map(({ name, agent }) => ({ name, agent })), ["architect#1", "architect#2", "architect#3"].map((slot) => ({ name: `architecture-${slot}`, agent: "architect" })));
-  for (const task of dispatched) {
-    assert.deepEqual(Object.keys(task).sort(), ["agent", "name", "task"]);
-    assert.match(task.task, new RegExp("Workflow role: architect"));
-  }
-});
 
 
 

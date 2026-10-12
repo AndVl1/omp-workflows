@@ -30,7 +30,9 @@ import {
   pendingEscalations,
   activeTeams,
   appendWave,
+  finishWave,
   setIntegration,
+  isCtoRunTerminal,
   setCtoPause,
   integrationDoD,
   ctoBackstop,
@@ -59,7 +61,7 @@ import {
   acquireExecutionClaim,
   LifecycleError,
 } from "../src/index.js";
-import { acquireCtoIngress } from "../src/cto/run.js";
+import { acquireCtoIngress, commitCtoStateForModel, readCtoStateForModel } from "../src/cto/run.js";
 import type { TrustedExecutionContext } from "../src/engine/types.js";
 
 function sampleDefs(): Record<string, TeamDef> {
@@ -220,6 +222,89 @@ test("cto-engine: runCto persists state and returns the plan", () => {
     const reloaded = readCtoState(res.plan.id, root);
     assert.ok(reloaded);
     assert.equal(reloaded?.task, "Add OAuth");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("cto-engine: registered task ingress keeps resident claim through wave close and explicit END", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-resident-task-ingress-"));
+  try {
+    const controller = createWorkflowSessionController({
+      cwd: root,
+      context: executionContext(root, "resident-task-owner"),
+    });
+    const ingress = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "resident task wave",
+      controller,
+    });
+    assert.equal(ingress.created, true);
+    assert.equal(ingress.state.standby, true, "task-backed registered ingress is resident");
+    assert.equal(readRunControl(root).execution_claim?.token, ingress.claim.claim.token);
+
+    const initial = readCtoStateForModel(controller, root, ingress.run_id);
+    const wave = initial.state;
+    wave.plan.teams.push({
+      team: "frontend",
+      scope: ["frontend"],
+      slice: "small frontend slice",
+      profile: "lightweight",
+      worktree: "same_branch",
+      depends_on: [],
+    });
+    wave.teams.push({ id: "frontend", status: "done", escalations: {} });
+    appendWave(wave, {
+      id: "wave-1",
+      source: "command",
+      source_id: "resident-task-wave-1",
+      task: "resident task wave",
+      slice_ids: ["frontend"],
+      now: "2026-09-29T01:00:00.000Z",
+    });
+    finishWave(wave, { id: "wave-1", status: "done", now: "2026-09-29T02:00:00.000Z" });
+    setIntegration(wave, "done", "wave 1 integrated");
+    const closed = commitCtoStateForModel({
+      controller,
+      cwd: root,
+      run_id: ingress.run_id,
+      expected_state_revision: initial.state_revision,
+      state: wave,
+    });
+    assert.equal(closed.transition, "state", "wave close is a resident state transition");
+    assert.equal(isCtoRunTerminal(closed.state), false, "completed resident wave is not terminal");
+    assert.equal(closed.state.active_wave_id, undefined);
+    assert.equal(closed.state.wave_history?.[0]?.status, "done");
+    assert.equal(readRunControl(root).execution_claim?.token, ingress.claim.claim.token, "wave close retains the exact claim");
+
+    const continuation = acquireCtoIngress({
+      cwd: root,
+      branch: "main",
+      task: "continue with the next slice",
+      run_id: ingress.run_id,
+      controller,
+    });
+    assert.equal(continuation.created, false);
+    assert.equal(continuation.state.wave_history?.length, 1, "same-run continuation does not repeat the completed wave");
+    assert.equal(continuation.state.wave_history?.[0]?.status, "done");
+    assert.equal(continuation.state.teams.find((team) => team.id === "frontend")?.status, "done", "completed work remains done");
+    assert.equal(readRunControl(root).execution_claim?.token, ingress.claim.claim.token, "continuation reuses the current private claim");
+
+    const beforeEnd = readCtoStateForModel(controller, root, ingress.run_id);
+    const terminal = beforeEnd.state;
+    terminal.pause = { kind: "done", reason: "user explicitly requested END" };
+    const ended = commitCtoStateForModel({
+      controller,
+      cwd: root,
+      run_id: ingress.run_id,
+      expected_state_revision: beforeEnd.state_revision,
+      state: terminal,
+    });
+    assert.equal(ended.transition, "terminal", "explicit END records a terminal transition");
+    assert.equal(ended.state.pause.kind, "done");
+    assert.equal(isCtoRunTerminal(ended.state), true);
+    assert.equal(readRunControl(root).execution_claim, null, "terminal transition releases the common claim");
+    assert.equal(controller.activeCtoClaim(), undefined, "terminal transition retires the private binding");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -939,6 +1024,54 @@ test("cto-core: canonicalizeState leaves a complete schema-2 state untouched", (
     assert.equal(canonical.schema, 2);
     const after = readFileSync(path, "utf8");
     assert.equal(after, before, "complete canonical state is not rewritten (updated_at not re-stamped)");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-core: canonicalizeState refuses a future schema without changing source bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-canon-future-"));
+  try {
+    const runId = "future-run";
+    const future = { ...schema1Fixture(), id: runId, schema: 3 };
+    const dir = join(root, ".work-state", "cto", runId);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "state.json");
+    writeFileSync(path, JSON.stringify(future, null, 2));
+    const before = readFileSync(path, "utf8");
+    assert.throws(() => canonicalizeState(runId, root), /unsupported CTO state schema 3/);
+    assert.equal(readFileSync(path, "utf8"), before, "unsupported schema remains byte-preserved");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cto-core: canonicalizeState refuses active legacy workers and newer ledgers", () => {
+  const root = mkdtempSync(join(tmpdir(), "cto-canon-busy-"));
+  try {
+    const runId = "busy-run";
+    const dir = join(root, ".work-state", "cto", runId);
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "state.json");
+    const active = {
+      ...schema1Fixture(),
+      id: runId,
+      teams: [{ id: "frontend", status: "in_progress", escalations: {} }],
+    };
+    writeFileSync(path, JSON.stringify(active, null, 2));
+    const before = readFileSync(path, "utf8");
+    assert.throws(() => canonicalizeState(runId, root), /quiescent workers/);
+    assert.equal(readFileSync(path, "utf8"), before, "active legacy state remains byte-preserved");
+
+    const ledgerRunId = "ledger-run";
+    const ledgerDir = join(root, ".work-state", "cto", ledgerRunId);
+    mkdirSync(ledgerDir, { recursive: true });
+    const ledgerPath = join(ledgerDir, "state.json");
+    const withLedger = { ...schema1Fixture(), id: ledgerRunId, native_stage_progress: {} };
+    writeFileSync(ledgerPath, JSON.stringify(withLedger, null, 2));
+    const ledgerBefore = readFileSync(ledgerPath, "utf8");
+    assert.throws(() => canonicalizeState(ledgerRunId, root), /newer native stage or recovery ledger/);
+    assert.equal(readFileSync(ledgerPath, "utf8"), ledgerBefore, "newer ledger remains byte-preserved");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

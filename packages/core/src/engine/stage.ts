@@ -23,18 +23,20 @@
 
 import { buildDispatchMarker, dispatchTaskId } from "../gates/dispatch.js";
 import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
-import { readFileSync } from "node:fs";
-import { persistReturnedArtifacts, readArtifact, readArtifactInput, writeArtifact } from "./artifacts.js";
-import { validateProducedArtifact } from "./artifact-contract.js";
-import { validateTypedDoD } from "../gates/dod-backstop.js";
+import { createHash, randomUUID } from "node:crypto";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { artifactSchemaForStage, validateProducedArtifact } from "./artifact-contract.js";
+import { readArtifact, readArtifactInput, writeArtifact } from "./artifacts.js";
+import { readRunState, runTarget } from "./run-store.js";
+import { loadProfile } from "./profile.js";
 import { resolveConfig } from "./config.js";
 import { type ScopeFlags } from "./scope.js";
 import { evaluatePredicate } from "./predicate.js";
-import { namespacedArtifactId, sanitizeSlot } from "./fan-in.js";
-import { PRD_SOURCE_ARTIFACT_IDS, validateProductPrdDocument, writeProductPrdDocument } from "./product-prd.js";
+import { sanitizeSlot } from "./fan-in.js";
+import { validateTypedDoD } from "../gates/dod-backstop.js";
 import { checkArtifact as validationCheckArtifact, validationGate } from "../gates/validation.js";
+import { PRD_SOURCE_ARTIFACT_IDS, PRODUCT_PRD_ARTIFACT_ID, prepareProductPrdDocument, validateProductPrdDocument, writeProductPrdDocument } from "./product-prd.js";
 import type {
   CapturedDispatchContext,
   DispatchSlot,
@@ -44,7 +46,132 @@ import type {
   RosterSelectionEntry,
   StageDef,
   TeamState,
+  TrustedExecutionContext,
+  StageReceiptLedger,
 } from "./types.js";
+import { deriveRendererStageHostBinding, submitStageResult } from "./reliable-stage.js";
+import type { StageResultReceipt, StageResultSubmissionOutcome, TrustedStagePublication } from "./reliable-stage.js";
+
+export interface DeclaredDocumentStageInput {
+  readonly cwd: string;
+  readonly runId: string;
+  readonly context: TrustedExecutionContext;
+}
+
+export type DeclaredDocumentStageResult =
+  | {
+      readonly ok: true;
+      readonly stage_id: string;
+      readonly document_path: string;
+      readonly html_document_path: string;
+      readonly receipt: StageResultReceipt;
+    }
+  | {
+      readonly ok: false;
+      readonly code: string;
+      readonly error: string;
+    };
+
+/**
+ * Execute the currently admitted deterministic document stage without
+ * walking downstream stages.  The renderer's output and document sidecars
+ * are committed by the ordinary receipt journal as one publication.
+ */
+export async function publishDeclaredDocumentStage(input: DeclaredDocumentStageInput): Promise<DeclaredDocumentStageResult> {
+  const state = readRunState(input.cwd, input.runId, input.context.branch);
+  const target = runTarget(input.cwd, input.runId);
+  if (!state || state.run_id !== input.runId) return { ok: false, code: "run_unavailable", error: "canonical run is unavailable" };
+  const workflow = state.classification?.workflow;
+  const profile = workflow ? loadProfile(workflow) : undefined;
+  const stage = profile?.stages.find((candidate) => candidate.id === state.stage_cursor);
+  if (!profile || !stage) return { ok: false, code: "stage_unavailable", error: "the current workflow stage is unavailable" };
+  if (stage.type !== "document" || stage.document?.format !== "markdown" || stage.document.renderer !== "product-prd" || !stage.produces || (Array.isArray(stage.produces) ? !stage.produces.includes(PRODUCT_PRD_ARTIFACT_ID) : stage.produces !== PRODUCT_PRD_ARTIFACT_ID)) {
+    return { ok: false, code: "renderer_not_declared", error: "the current stage is not the declared product PRD document renderer" };
+  }
+  const stageEntry = state.stages.find((candidate) => candidate.id === stage.id);
+  if (!stageEntry || stageEntry.status !== "in_progress") return { ok: false, code: "stage_not_admitted", error: "the current document stage has not been admitted" };
+  if (!state.dispatch_capability?.producer_assignment) return { ok: false, code: "producer_not_admitted", error: "the current document stage has no trusted producer assignment" };
+
+  const required = readRequiredStageInputs(stage, state, target.artifactsDir);
+  if (!required.ok) return { ok: false, code: "required_inputs_unavailable", error: required.error };
+  const byId = new Map(required.inputs.map((entry) => [entry.artifact_id, entry]));
+  const sourceArtifacts: Record<string, unknown> = {};
+  for (const id of PRD_SOURCE_ARTIFACT_IDS) {
+    const source = byId.get(id);
+    if (!source) return { ok: false, code: "required_inputs_unavailable", error: `required source artifact '${id}' is unavailable` };
+    try {
+      sourceArtifacts[id] = JSON.parse(source.content) as unknown;
+    } catch {
+      return { ok: false, code: "required_inputs_unavailable", error: `required source artifact '${id}' is not valid JSON` };
+    }
+  }
+  const preparedResult = prepareProductPrdDocument({
+    stateDir: dirname(target.artifactsDir),
+    artifactsDir: target.artifactsDir,
+    path: stage.document.path,
+    sourceArtifacts,
+  });
+  if (!preparedResult.ok) return { ok: false, code: "renderer_failed", error: preparedResult.error };
+  const prepared = preparedResult.prepared;
+  const contract = validateProducedArtifact(PRODUCT_PRD_ARTIFACT_ID, prepared.manifest);
+  if (!contract.ok) return { ok: false, code: "renderer_contract_invalid", error: contract.issues.map((issue) => `${issue.field}: ${issue.message}`).join("; ") };
+  const stagedEvidencePath = join(target.artifactsDir, `.product-prd-evidence-${randomUUID()}.md`);
+  const readSidecar = (path: string): string | null => {
+    if (!existsSync(path)) return null;
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("document sidecar target is not a regular file");
+    return readFileSync(path, "utf8");
+  };
+  try {
+    writeFileSync(stagedEvidencePath, prepared.markdown, { flag: "wx", mode: 0o600 });
+    const evidencePath = relative(target.artifactsDir, stagedEvidencePath).replaceAll("\\", "/");
+    const trustedPublication: TrustedStagePublication = {
+      evidence: [{ artifact_id: PRODUCT_PRD_ARTIFACT_ID, relative_path: evidencePath }],
+      publication: {
+        operation: "resume",
+        before: {
+          [prepared.documentPath]: readSidecar(prepared.documentPath),
+          [prepared.htmlDocumentPath]: readSidecar(prepared.htmlDocumentPath),
+        },
+        after: {
+          [prepared.documentPath]: prepared.markdown,
+          [prepared.htmlDocumentPath]: prepared.html,
+        },
+      },
+    };
+    const published = submitStageResult(
+      {
+        cwd: input.cwd,
+        runId: input.runId,
+        authority: "ordinary",
+        context: input.context,
+        bindingResolver: (_context, cwd, runId) => deriveRendererStageHostBinding({
+          cwd,
+          runId,
+          renderer: stage.document!.renderer,
+          hostSessionId: input.context.session_id,
+        }) ?? undefined,
+      },
+      { outputs: { [PRODUCT_PRD_ARTIFACT_ID]: prepared.manifest } },
+      trustedPublication,
+    );
+    if (!published.ok) return { ok: false, code: published.code, error: published.error };
+    const pair = validateProductPrdDocument({ stateDir: dirname(target.artifactsDir), artifactsDir: target.artifactsDir });
+    if (!pair.ok) return { ok: false, code: "document_publication_invalid", error: pair.issues.join("; ") };
+    return {
+      ok: true,
+      stage_id: stage.id,
+      document_path: prepared.documentPath,
+      html_document_path: prepared.htmlDocumentPath,
+      receipt: published.receipt,
+    };
+  } catch (error) {
+    return { ok: false, code: "renderer_publication_failed", error: String(error) };
+  } finally {
+    rmSync(stagedEvidencePath, { force: true });
+  }
+}
+
 
 
 /**
@@ -88,13 +215,15 @@ export interface StageContext {
   durable?: {
     /** Resolve and hash every canonical input before native dispatch. */
     readInputs?: (stageId: string) => { ok: true; inputs: Array<{ artifact_id: string; path: string; sha256: string; content: string }> } | { ok: false; error: string };
-    authorize: (role: string, agent: string) => { ok: true; dispatchId: string; captured?: CapturedDispatchContext } | { ok: false; error: string };
+    authorize: (role: string, agent: string, toolCallId?: string) => { ok: true; dispatchId: string; captured?: CapturedDispatchContext } | { ok: false; error: string };
     complete: (dispatchId: string, output: string, outcome: "succeeded" | "failed", artifactIds?: string[]) => { ok: true } | { ok: false; error: string };
     pending?: (dispatchId: string, reason?: "provider_running" | "awaiting_result" | "transport_reconnect", providerRef?: string) => { ok: true } | { ok: false; error: string };
+    /** Publish deterministic engine outputs through the trusted receipt path. */
+    publish?: (outputs: Record<string, unknown>, trustedPublication?: TrustedStagePublication) => StageResultSubmissionOutcome;
     advance: (evidence: string) => { ok: true; handoff?: { capability_id: string; dispatch_token: string; advance_token: string; cursor_epoch: string } } | { ok: false; error: string };
   };
 }
-/**
+/** 
  * Minimum shape we depend on from the real OMP `TaskTool`. `TaskTool` is
  * exported from `@oh-my-pi/pi-coding-agent/task` but the surface is
  * intentionally not pulled into the engine module — the adapter is built at
@@ -103,7 +232,7 @@ export interface StageContext {
  */
 export interface OrchestratorResult {
   output?: string;
-  artifacts?: Record<string, unknown>;
+  outputs?: Record<string, unknown>;
 }
 
 export interface TaskToolLike {
@@ -118,6 +247,12 @@ export interface TaskToolLike {
     details?: unknown;
   }>;
 }
+
+/** Host-generated identity for one physical TaskTool invocation. */
+export interface TaskInvocationOptions {
+  readonly toolCallId?: string;
+}
+
 
 /**
  * Spawn interface the engine actually consumes. Implemented by the OMP
@@ -134,7 +269,8 @@ export interface TaskCaller {
 		task: string;
 		name?: string;
 		effort?: "lo" | "med" | "hi";
-	}): Promise<TaskResult>;
+	}, options?: TaskInvocationOptions): Promise<TaskResult>;
+
 
   /**
    * Spawn N subagents in parallel. Wire shape: `{ context, tasks[] }`. Each
@@ -148,7 +284,7 @@ export interface TaskCaller {
       task: string;
       effort?: "lo" | "med" | "hi";
     }>;
-  }): Promise<TaskResult[]>;
+  }, options?: TaskInvocationOptions): Promise<TaskResult[]>;
 }
 export interface TaskResult {
   /** Provider result identity. Positional-only batch rows are rejected. */
@@ -159,7 +295,6 @@ export interface TaskResult {
   capability_id?: string;
   capability_epoch?: string;
   output: string;
-  artifacts: Record<string, string>;
   exitCode: number;
   error?: string;
   pending?: boolean;
@@ -178,9 +313,9 @@ interface SingleSpawnPayload {
   capability_id?: string;
   capability_epoch?: string;
   output?: string;
-  artifacts?: Record<string, string>;
   exitCode?: number;
   error?: string;
+  pending?: boolean;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -237,15 +372,12 @@ function readSingleSpawn(raw: unknown): SingleSpawnPayload {
   const output = typeof raw.output === "string" ? raw.output : undefined;
   const exitCode = typeof raw.exitCode === "number" ? raw.exitCode : undefined;
   const error = typeof raw.error === "string" ? raw.error : undefined;
-  let artifacts: Record<string, string> | undefined;
-  if (isObject(raw.artifacts) && Object.values(raw.artifacts).every((v) => typeof v === "string")) {
-    artifacts = Object.fromEntries(Object.entries(raw.artifacts)) as Record<string, string>;
-  }
-  return { id, slot_id, task_id, dispatch_id, capability_id, capability_epoch, output, artifacts, exitCode, error };
+  const pending = raw.pending === true;
+  return { id, slot_id, task_id, dispatch_id, capability_id, capability_epoch, output, exitCode, error, pending };
 }
 
 function extractPayload(raw: unknown, newId: () => string): TaskResult {
-  const value = isObject(raw) && "output" in raw && !("id" in raw || "exitCode" in raw || "artifacts" in raw || "error" in raw || "slot_id" in raw || "task_id" in raw)
+  const value = isObject(raw) && "output" in raw && !("id" in raw || "exitCode" in raw || "error" in raw || "pending" in raw || "slot_id" in raw || "task_id" in raw)
     ? raw.output
     : raw;
   if (isObject(value)) {
@@ -258,15 +390,14 @@ function extractPayload(raw: unknown, newId: () => string): TaskResult {
       ...(r.capability_id ? { capability_id: r.capability_id } : {}),
       ...(r.capability_epoch ? { capability_epoch: r.capability_epoch } : {}),
       output: r.output ?? JSON.stringify(value),
-      artifacts: r.artifacts ?? {},
       exitCode: r.exitCode ?? 0,
       error: r.error,
+      ...(r.pending ? { pending: true } : {}),
     };
   }
   return {
     id: newId(),
     output: typeof value === "string" ? value : "",
-    artifacts: {},
     exitCode: 0,
   };
 }
@@ -320,17 +451,18 @@ export function createTaskCaller(tool: TaskToolLike): TaskCaller {
 	const newId = (): string => `task-${Date.now().toString(36)}-${(nextId++).toString(36)}`;
 
 	return {
-		async call(args) {
+		async call(args, options) {
 			const params: Record<string, unknown> = {
 				agent: args.agent,
 				task: args.task,
 			};
 			if (args.name) params.name = args.name;
 			if (args.effort) params.effort = args.effort;
-			const result = await tool.execute(newId(), params);
+			const toolCallId = options?.toolCallId ?? newId();
+			const result = await tool.execute(toolCallId, params);
 			return extractResult(result, newId);
 		},
-		async batch(args) {
+		async batch(args, options) {
 			const params: Record<string, unknown> = {
 				context: args.context,
 				tasks: args.tasks.map((t) => {
@@ -340,13 +472,22 @@ export function createTaskCaller(tool: TaskToolLike): TaskCaller {
 					return item;
 				}),
 			};
-			const result = await tool.execute(newId(), params);
+			const toolCallId = options?.toolCallId ?? newId();
+			const result = await tool.execute(toolCallId, params);
 			const results = taskResultRows(result);
 			if (results.length > 0) {
 				const normalized = results.map((r) => extractPayload(r, newId));
 				return stampPositionalBatchIdentity(args.tasks, normalized);
 			}
-			if (taskIsPending(result)) return [];
+			if (taskIsPending(result)) {
+				return args.tasks.map((task) => ({
+					id: task.name ?? newId(),
+					output: "",
+					exitCode: 1,
+					error: "task remains asynchronous",
+					pending: true,
+				}));
+			}
 			return [];
 		},
 	};
@@ -442,7 +583,26 @@ async function runOrchestrator(
         artifactsDir: ctx.artifactsDir,
         state: ctx.state,
       });
-      if (result?.artifacts) persistReturnedArtifacts(ctx.artifactsDir, result.artifacts);
+      const outputs = result?.outputs ?? {};
+      if (produces.length > 0 || Object.keys(outputs).length > 0) {
+        if (!ctx.durable?.publish) {
+          return {
+            stageId: stage.id,
+            status: "failed",
+            note: "orchestrator outputs require the durable workflow_submit_result publication path",
+            artifacts: produces,
+          };
+        }
+        const published = ctx.durable.publish(outputs);
+        if (!published.ok) {
+          return {
+            stageId: stage.id,
+            status: "failed",
+            note: `orchestrator output publication failed: ${published.error}`,
+            artifacts: produces,
+          };
+        }
+      }
       return validateProduced(stage, ctx, produces, result?.output?.trim() || "orchestrator stage completed");
     } catch (error) {
       return { stageId: stage.id, status: "failed", note: `orchestrator stage failed: ${String(error)}`, artifacts: produces };
@@ -580,24 +740,56 @@ export function readOptionalStageInputs(stage: StageDef, state: TeamState, artif
   }
   return { ok: true, inputs, absent };
 }
-function persistTaskArtifacts(ctx: StageContext, result: TaskResult): { ids: string[]; error?: string } {
-  try {
-    return { ids: persistReturnedArtifacts(ctx.artifactsDir, result.artifacts ?? {}) };
-  } catch (error) {
-    return { ids: [], error: String(error) };
+const WORK_RECEIPT_IDENTITY_FIELDS = [
+  "run_id",
+  "wave_id",
+  "slice_id",
+  "session_id",
+  "workflow",
+  "stage_id",
+  "stage_cursor",
+  "capability_id",
+  "capability_epoch",
+  "loop_iteration",
+  "slot_id",
+  "task_id",
+  "dispatch_id",
+  "attempt",
+  "worker_id",
+] as const;
+
+type AcceptedWorkerReceipt =
+  | { ok: true; artifactIds: string[] }
+  | { ok: false; error: string };
+
+function acceptedWorkerReceipt(ctx: StageContext, dispatchId: string): AcceptedWorkerReceipt {
+  const runId = ctx.state.run_id ?? ctx.state.run_key;
+  if (!runId) return { ok: false, error: "canonical run identity is unavailable" };
+  const state = readRunState(ctx.cwd, runId, ctx.state.branch);
+  const receipt: StageReceiptLedger | undefined = state?.stage_receipts?.[dispatchId];
+  const dispatch = state?.dispatch_capability?.dispatches?.find((candidate) => candidate.id === dispatchId);
+  const dispatchIdentity = dispatch && "work_identity" in dispatch ? dispatch.work_identity : undefined;
+  if (!receipt || !dispatchIdentity) {
+    return {
+      ok: false,
+      error: `worker task completed without an accepted workflow_submit_result receipt for dispatch '${dispatchId}'`,
+    };
   }
-}
-function failAuthorizedDispatches(
-  ctx: StageContext,
-  authorized: Array<{ ok: true; dispatchId: string } | { ok: false; error: string }>,
-  evidence: string,
-): void {
-  if (!ctx.durable) return;
-  for (const entry of authorized) {
-    if (!entry.ok) continue;
-    const completed = ctx.durable.complete(entry.dispatchId, evidence, "failed");
-    if (!completed.ok) ctx.log(`  durable cleanup failed for ${entry.dispatchId}: ${completed.error}`);
+  const receiptIdentity = receipt.work_identity;
+  const receiptRecord = receiptIdentity as unknown as Record<string, unknown>;
+  const dispatchRecord = dispatchIdentity as unknown as Record<string, unknown>;
+  if (
+    receipt.dispatch_id !== dispatchId
+    || receiptIdentity.dispatch_id !== dispatchId
+    || WORK_RECEIPT_IDENTITY_FIELDS.some((field) => receiptRecord[field] !== dispatchRecord[field])
+    || !Array.isArray(receipt.outputs)
+  ) {
+    return {
+      ok: false,
+      error: `worker task produced a stale or foreign workflow_submit_result receipt for dispatch '${dispatchId}'`,
+    };
   }
+  return { ok: true, artifactIds: receipt.outputs.map((output) => output.artifact_id) };
 }
 
 function taskEvidence(result: TaskResult, outcome: "succeeded" | "failed"): string {
@@ -618,7 +810,7 @@ interface QaDoDOwnership {
   orchestratorOwner: boolean;
   standaloneOrchestrator: boolean;
 }
-
+const QA_DOD_OWNER_STAGE_IDS: Record<string, true> = { qa_tests: true, manual_qa: true };
 
 const QA_DOD_ITEM_CONTRACT = [
   "Root value is an object with an `items` array.",
@@ -642,7 +834,12 @@ function readQaDoDSnapshot(ctx: StageContext): QaDoDSnapshot {
   return { path, raw: input.content };
 }
 
-function renderQaDoDContract(snapshot: QaDoDSnapshot, ownership: QaDoDOwnership): string {
+function renderQaDoDContract(
+  snapshot: QaDoDSnapshot,
+  ownership: QaDoDOwnership,
+  stageId: string,
+  declaredOutputIds: readonly string[],
+): string {
   const current = snapshot.raw === null
     ? `DoD content is unavailable. Reason: ${snapshot.reason ?? "unknown read failure"}. Do not fabricate criteria or close items.`
     : [
@@ -652,6 +849,9 @@ function renderQaDoDContract(snapshot: QaDoDSnapshot, ownership: QaDoDOwnership)
       "```",
       snapshot.reason ? `Typed-item validation note: ${snapshot.reason}` : "The current JSON satisfies validateTypedDoD.",
     ].join("\n");
+  const declaredOutputs = declaredOutputIds.length > 0
+    ? declaredOutputIds.map((id) => `\`${id}\``).join(", ")
+    : "(none declared)";
   const ownershipRule = ownership.orchestrator
     ? ownership.orchestratorOwner
       ? ownership.standaloneOrchestrator
@@ -666,12 +866,16 @@ function renderQaDoDContract(snapshot: QaDoDSnapshot, ownership: QaDoDOwnership)
       ? "Do not edit dod.json directly; designate exactly one child writer in stable child order and keep every other child read-only."
       : "Do not edit dod.json directly; this non-owner orchestration slot must designate no child writer, and it plus all children remain read-only."
     : ownership.writable
-      ? "Write and verify the declared qa_tests artifact and the shared DoD sidecar when available."
+      ? declaredOutputIds.length > 0
+        ? `Write and verify the current stage's declared QA output${declaredOutputIds.length === 1 ? "" : "s"} (${declaredOutputs}) and the shared DoD sidecar when available.`
+        : "This stage declares no QA output files; write and verify the shared DoD sidecar when available."
       : "Do not write the shared DoD sidecar; return evidence and proposed updates to the designated writer.";
   return [
-    "## Shared DoD sidecar contract (qa_tests)",
+    "## Shared DoD sidecar contract",
+    `Current QA-owner stage: \`${stageId}\``,
+    `Declared QA output IDs: ${declaredOutputs}`,
     `Canonical expected shared sidecar path: ${snapshot.path}`,
-    "The DoD is shared mutable authored state, not a declared QA output or required-input receipt, and MUST NOT be added to workflow_complete artifact_ids.",
+    "The DoD is shared mutable authored state, not a declared QA output or required-input receipt. Submit only declared artifact outputs through workflow_submit_result; do not add the DoD sidecar to its outputs.",
     "### Source-backed typed DoD item contract",
     QA_DOD_ITEM_CONTRACT,
     ownershipRule,
@@ -713,14 +917,17 @@ async function runSingle(
     return validateProduced(stage, ctx, produces, "reused succeeded dispatch");
   }
   const task = buildStagePrompt(stage, ctx, slot.slot, false, optionalInputContents, resolvedSlots);
+  const toolCallId = `task-${randomUUID()}`;
   ctx.log(`  single: ${agent} (slot=${slot.slot}, role=${slot.role})`);
-  const authorized = ctx.durable?.authorize(slot.slot, agent);
+  const authorized = ctx.durable?.authorize(slot.slot, agent, toolCallId);
   if (authorized && !authorized.ok) return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${authorized.error}`, artifacts: produces };
   let result: TaskResult;
   try {
-    result = await ctx.task.call({ agent, task, name: `${stage.id}-${slot.slot}` });
+    result = await ctx.task.call({ agent, task, name: `${stage.id}-${slot.slot}` }, { toolCallId });
   } catch (error) {
-    if (authorized?.ok) failAuthorizedDispatches(ctx, [authorized], `task call failed: ${String(error)}`);
+    // A thrown/unknown transport result is deliberately non-terminal. The
+    // registered host must reconnect or settle it; this layer cannot safely
+    // synthesize a failure or authorize a replacement writer.
     return { stageId: stage.id, status: "failed", note: `${agent} task call failed: ${String(error)}`, artifacts: produces };
   }
   if (result.pending) {
@@ -730,15 +937,29 @@ async function runSingle(
     }
     return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} remains active`, artifacts: produces };
   }
-  const persisted = persistTaskArtifacts(ctx, result);
-  const outcome = result.exitCode === 0 && !persisted.error ? "succeeded" : "failed";
-  if (authorized) {
-    const completed = ctx.durable!.complete(authorized.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
+  const outcome = result.exitCode === 0 ? "succeeded" : "failed";
+  const receipt = outcome === "succeeded" && authorized?.ok
+    ? acceptedWorkerReceipt(ctx, authorized.dispatchId)
+    : undefined;
+  if (authorized?.ok) {
+    const completed = ctx.durable!.complete(
+      authorized.dispatchId,
+      taskEvidence(result, outcome),
+      outcome,
+      receipt?.ok ? receipt.artifactIds : [],
+    );
     if (!completed.ok) return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
   }
-  if (persisted.error) return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
-  if (result.exitCode !== 0) return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
-  return validateProduced(stage, ctx, produces, `${agent} returned exit 0`);
+  if (outcome !== "succeeded") {
+    return { stageId: stage.id, status: "failed", note: result.error ?? `${agent} returned exit ${result.exitCode}`, artifacts: produces };
+  }
+  if (!authorized?.ok) {
+    return { stageId: stage.id, status: "failed", note: "worker producer requires durable workflow_submit_result admission", artifacts: produces };
+  }
+  if (!receipt?.ok) {
+    return { stageId: stage.id, status: "failed", note: receipt?.error ?? "worker producer did not return an accepted workflow_submit_result receipt", artifacts: produces };
+  }
+  return validateProduced(stage, ctx, produces, `${agent} returned exit 0 with an accepted workflow_submit_result receipt`);
 }
 async function runProductPrdRender(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
   const contract = stage.document;
@@ -759,14 +980,67 @@ async function runProductPrdRender(stage: StageDef, ctx: StageContext, produces:
     }
     sourceArtifacts[id] = artifact;
   }
-  const written = writeProductPrdDocument({
+  const preparedResult = prepareProductPrdDocument({
     stateDir: dirname(ctx.artifactsDir),
     artifactsDir: ctx.artifactsDir,
     path: contract.path,
     sourceArtifacts,
   });
-  if (!written.ok) {
-    return { stageId: stage.id, status: "failed", note: `product_prd render failed: ${written.error}`, artifacts: produces };
+  if (!preparedResult.ok) {
+    return { stageId: stage.id, status: "failed", note: `product_prd render failed: ${preparedResult.error}`, artifacts: produces };
+  }
+  const prepared = preparedResult.prepared;
+  const artifactValidation = validateProducedArtifact(PRODUCT_PRD_ARTIFACT_ID, prepared.manifest);
+  if (!artifactValidation.ok) {
+    return { stageId: stage.id, status: "failed", note: `product_prd render contract failed: ${artifactValidation.issues.map((issue) => `${issue.field}: ${issue.message}`).join("; ")}`, artifacts: produces };
+  }
+  if (ctx.durable) {
+    if (!ctx.durable.publish) {
+      return { stageId: stage.id, status: "failed", note: "deterministic renderer has no trusted publication callback", artifacts: produces };
+    }
+    const stagedEvidencePath = join(ctx.artifactsDir, `.product-prd-evidence-${randomUUID()}.md`);
+    try {
+      const readSidecar = (path: string): string | null => {
+        if (!existsSync(path)) return null;
+        const stat = lstatSync(path);
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("deterministic renderer sidecar target is not a regular file");
+        return readFileSync(path, "utf8");
+      };
+      writeFileSync(stagedEvidencePath, prepared.markdown, { flag: "wx", mode: 0o600 });
+      const evidencePath = relative(ctx.artifactsDir, stagedEvidencePath).replaceAll("\\", "/");
+      const trustedPublication: TrustedStagePublication = {
+        evidence: [{ artifact_id: PRODUCT_PRD_ARTIFACT_ID, relative_path: evidencePath }],
+        publication: {
+          operation: "resume",
+          before: {
+            [prepared.documentPath]: readSidecar(prepared.documentPath),
+            [prepared.htmlDocumentPath]: readSidecar(prepared.htmlDocumentPath),
+          },
+          after: {
+            [prepared.documentPath]: prepared.markdown,
+            [prepared.htmlDocumentPath]: prepared.html,
+          },
+        },
+      };
+      const published = ctx.durable.publish({ [PRODUCT_PRD_ARTIFACT_ID]: prepared.manifest }, trustedPublication);
+      if (!published.ok) {
+        return { stageId: stage.id, status: "failed", note: `deterministic renderer publication failed: ${published.error}`, artifacts: produces };
+      }
+    } catch (error) {
+      return { stageId: stage.id, status: "failed", note: `deterministic renderer publication failed: ${String(error)}`, artifacts: produces };
+    } finally {
+      rmSync(stagedEvidencePath, { force: true });
+    }
+  } else {
+    const written = writeProductPrdDocument({
+      stateDir: dirname(ctx.artifactsDir),
+      artifactsDir: ctx.artifactsDir,
+      path: contract.path,
+      sourceArtifacts,
+    });
+    if (!written.ok) {
+      return { stageId: stage.id, status: "failed", note: `product_prd render failed: ${written.error}`, artifacts: produces };
+    }
   }
   // Fail closed on the freshly persisted pair: re-verify the exact manifest
   // shape, hash agreement, on-disk document bytes and source staleness
@@ -775,8 +1049,8 @@ async function runProductPrdRender(stage: StageDef, ctx: StageContext, produces:
   if (!pair.ok) {
     return { stageId: stage.id, status: "failed", note: `product_prd pair validation failed: ${pair.issues.join("; ")}`, artifacts: produces };
   }
-  ctx.log(`  product_prd: deterministic render -> ${written.documentPath}`);
-  return validateProduced(stage, ctx, produces, `deterministic product PRD rendered to ${written.documentPath}`);
+  ctx.log(`  product_prd: deterministic render -> ${prepared.documentPath}`);
+  return validateProduced(stage, ctx, produces, `deterministic product PRD rendered to ${prepared.documentPath}`);
 }
 function pairConsiliumResults(roster: DispatchSlot[], tasks: Array<{ name?: string }>, results: TaskResult[]): { ok: true; paired: Array<{ slot: DispatchSlot; result: TaskResult }> } | { ok: false; error: string } {
   const bySlot = new Map<string, TaskResult>();
@@ -810,31 +1084,36 @@ async function runConsilium(
   const roster = resolvedRoster.filter((slot) => !hasCompletedDispatchForSlot(ctx.state, stage.id, slot));
   if (roster.length === 0) return validateProduced(stage, ctx, produces, "reused succeeded dispatches");
   const multiSlot = roster.length > 1;
-  ctx.log(`  consilium: ${roster.map((slot) => slot.slot).join(", ")}${multiSlot ? " (slot-scoped artifacts)" : ""}`);
+  ctx.log(`  consilium: ${roster.map((slot) => slot.slot).join(", ")}${multiSlot ? " (slot-scoped receipts)" : ""}`);
   const inputRead = ctx.durable?.readInputs?.(stage.id);
+  if (inputRead && !inputRead.ok) return { stageId: stage.id, status: "failed", note: inputRead.error, artifacts: produces };
   const tasks = roster.map((slot) => ({ name: `${stage.id}-${slot.slot}`, agent: ctx.agent(slot.role), task: buildStagePrompt(stage, ctx, slot.slot, multiSlot, optionalInputContents, resolvedRoster) }));
-  const authorized = ctx.durable ? roster.map((slot, i) => ctx.durable!.authorize(slot.slot, tasks[i]!.agent)) : [];
+  const toolCallId = `task-${randomUUID()}`;
+  const authorized = ctx.durable ? roster.map((slot, i) => ctx.durable!.authorize(slot.slot, tasks[i]!.agent, toolCallId)) : [];
   const denied = authorized.find((a) => !a.ok);
   if (denied && !denied.ok) {
-    failAuthorizedDispatches(ctx, authorized, `dispatch authorization failed: ${denied.error}`);
     return { stageId: stage.id, status: "failed", note: `dispatch authorization failed: ${denied.error}`, artifacts: produces };
   }
   let results: TaskResult[];
   try {
-    results = await ctx.task.batch({ context: `Parallel agents for stage "${stage.id}" (${stage.title}). Each of you gathers its own context.`, tasks });
+    results = await ctx.task.batch(
+      { context: `Parallel agents for stage "${stage.id}" (${stage.title}). Each of you gathers its own context.`, tasks },
+      { toolCallId },
+    );
   } catch (error) {
-    failAuthorizedDispatches(ctx, authorized, `task batch failed: ${String(error)}`);
+    // A thrown/unknown transport result is deliberately non-terminal. The
+    // registered host must reconnect or settle these dispatches.
     return { stageId: stage.id, status: "failed", note: `task batch failed: ${String(error)}`, artifacts: produces };
   }
   if (results.length !== tasks.length) {
-    failAuthorizedDispatches(ctx, authorized, `task batch returned ${results.length}/${tasks.length} results`);
     return { stageId: stage.id, status: "failed", note: `task batch returned ${results.length}/${tasks.length} results`, artifacts: produces };
   }
   const paired = pairConsiliumResults(roster, tasks, results);
   if (!paired.ok) {
-    failAuthorizedDispatches(ctx, authorized, paired.error);
     return { stageId: stage.id, status: "failed", note: paired.error, artifacts: produces };
   }
+  const failed: Array<{ slot: DispatchSlot; result: TaskResult }> = [];
+  const missingReceipts: string[] = [];
   for (const { slot, result } of paired.paired) {
     const auth = authorized[roster.findIndex((candidate) => candidate.slot === slot.slot)];
     if (result.pending) {
@@ -842,68 +1121,43 @@ async function runConsilium(
         const pending = ctx.durable.pending(auth.dispatchId, "provider_running", result.id);
         if (!pending.ok) return { stageId: stage.id, status: "failed", note: `dispatch pending transition failed: ${pending.error}`, artifacts: produces };
       }
+      failed.push({ slot, result });
       continue;
     }
+    const outcome = result.exitCode === 0 ? "succeeded" : "failed";
+    const receipt = outcome === "succeeded" && auth?.ok
+      ? acceptedWorkerReceipt(ctx, auth.dispatchId)
+      : undefined;
     if (auth?.ok) {
-      const persisted = multiSlot
-        ? persistConsiliumSlotArtifacts(ctx, slot.slot, result, produces)
-        : persistTaskArtifacts(ctx, result);
-      const outcome = result.exitCode === 0 && !persisted.error ? "succeeded" : "failed";
-      const completed = ctx.durable!.complete(auth.dispatchId, taskEvidence(result, outcome), outcome, persisted.ids);
+      const completed = ctx.durable!.complete(
+        auth.dispatchId,
+        taskEvidence(result, outcome),
+        outcome,
+        receipt?.ok ? receipt.artifactIds : [],
+      );
       if (!completed.ok) {
-        failAuthorizedDispatches(ctx, authorized.slice(roster.findIndex((candidate) => candidate.slot === slot.slot) + 1), `dispatch completion failed: ${completed.error}`);
         return { stageId: stage.id, status: "failed", note: `dispatch completion failed: ${completed.error}`, artifacts: produces };
       }
-      if (persisted.error) {
-        failAuthorizedDispatches(ctx, authorized.slice(roster.findIndex((candidate) => candidate.slot === slot.slot) + 1), persisted.error);
-        return { stageId: stage.id, status: "failed", note: persisted.error, artifacts: produces };
-      }
+    }
+    if (outcome !== "succeeded") {
+      failed.push({ slot, result });
+    } else if (!auth?.ok) {
+      missingReceipts.push(`${slot.slot}: worker producer requires durable workflow_submit_result admission`);
+    } else if (!receipt?.ok) {
+      missingReceipts.push(`${slot.slot}: ${receipt?.error ?? "accepted workflow_submit_result receipt is missing"}`);
     }
   }
-  const failed = paired.paired.filter(({ result }) => result.exitCode !== 0 || result.pending);
-  if (failed.length > 0) return { stageId: stage.id, status: "failed", note: `${failed.length}/${tasks.length} failed or pending`, artifacts: produces };
-  return validateProduced(stage, ctx, produces, `${tasks.length} agents in parallel`, multiSlot ? roster : undefined);
+  if (failed.length > 0) {
+    return { stageId: stage.id, status: "failed", note: `${failed.length}/${tasks.length} failed or pending`, artifacts: produces };
+  }
+  if (missingReceipts.length > 0) {
+    return { stageId: stage.id, status: "failed", note: missingReceipts.join("; "), artifacts: produces };
+  }
+  return multiSlot
+    ? validateProducedMultiSlot(stage, ctx, produces, `${tasks.length} agents in parallel with accepted workflow_submit_result receipts`, roster)
+    : validateProduced(stage, ctx, produces, `${tasks.length} agents in parallel with an accepted workflow_submit_result receipt`);
 }
 
-/**
- * Persist a consilium slot's returned artifacts and guarantee the
- * slot-scoped namespaced files (`<id>-<slot>.json`) exist for every declared
- * produce. When the slot returned the shared id, a namespaced copy is made
- * from its own just-written content, so later slots can never clobber this
- * slot's provenance. The namespaced ids are declared on the durable
- * completion so advance-time synthesis can read them deterministically.
- */
-function persistConsiliumSlotArtifacts(
-  ctx: StageContext,
-  slot: string,
-  result: TaskResult,
-  produces: string[],
-): { ids: string[]; error?: string } {
-  const persisted = persistTaskArtifacts(ctx, result);
-  if (persisted.error) return persisted;
-  const ids = [...persisted.ids];
-  for (const produce of produces) {
-    const namespaced = namespacedArtifactId(produce, slot);
-    if (ids.includes(namespaced)) continue;
-    // Only snapshot a produce this slot EXPLICITLY returned under the shared
-    // id: at this moment the shared file is the slot's own just-written
-    // content. A slot that returned no artifact for a produce must never
-    // inherit another slot's (or a prior iteration's) shared file as its
-    // namespaced provenance — that would count a free-rider slot as a
-    // contributor and record incorrect fan-in provenance.
-    if (!ids.includes(produce)) continue;
-    const shared = readArtifact(ctx.artifactsDir, produce);
-    if (shared !== null) {
-      try {
-        writeArtifact(ctx.artifactsDir, namespaced, shared);
-      } catch (error) {
-        return { ids, error: String(error) };
-      }
-      ids.push(namespaced);
-    }
-  }
-  return { ids };
-}
 
 async function runBash(stage: StageDef, ctx: StageContext, produces: string[]): Promise<StageOutcome> {
   // The stage's task field may describe a command; user-driven stages use
@@ -972,11 +1226,9 @@ function validateProduced(
 }
 
 /**
- * Multi-slot consilium produced validation: every declared produce must have
- * at least one slot-scoped result and every slot must have contributed at
- * least one artifact. The shared artifacts are synthesized deterministically
- * by advance-time fan-in, so this stage-level check verifies the per-slot
- * provenance files exist.
+ * Multi-slot consilium produced validation. Worker output is admitted only by
+ * the canonical receipt ledger; advance-time fan-in materializes shared
+ * artifacts after this stage returns.
  */
 function validateProducedMultiSlot(
   stage: StageDef,
@@ -985,32 +1237,35 @@ function validateProducedMultiSlot(
   successNote: string,
   slots: DispatchSlot[],
 ): StageOutcome {
-  // No declared produces => nothing to fan in; the shared-id check does not
-  // apply (there are no shared artifacts for this stage).
   if (produces.length === 0) {
     return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
   }
-  const contributing = new Set<string>();
-  for (const id of produces) {
-    const contributors = slots.filter((slot) => readArtifact(ctx.artifactsDir, namespacedArtifactId(id, slot.slot)) !== null);
-    if (contributors.length === 0) {
-      return {
-        stageId: stage.id,
-        status: "failed",
-        note: `produced artifact "${id}" has no per-slot results (<id>-<slot>.json) at ${ctx.artifactsDir} — every consilium slot must write its slot-scoped artifact for each declared produce.`,
-        artifacts: produces,
-      };
-    }
-    for (const contributor of contributors) contributing.add(contributor.slot);
+  const runId = ctx.state.run_id ?? ctx.state.run_key;
+  const state = runId ? readRunState(ctx.cwd, runId, ctx.state.branch) : null;
+  const succeeded = new Set(
+    (state?.dispatch_capability?.dispatches ?? [])
+      .filter((dispatch) => dispatch.status === "succeeded")
+      .map((dispatch) => dispatch.id),
+  );
+  const receipts = Object.values(state?.stage_receipts ?? {}).filter((receipt) =>
+    succeeded.has(receipt.dispatch_id)
+    && receipt.work_identity.stage_id === stage.id
+    && slots.some((slot) => slot.slot === receipt.work_identity.slot_id || slot.slot_id === receipt.work_identity.slot_id)
+    && receipt.outputs.some((output) => produces.includes(output.artifact_id)),
+  );
+  if (receipts.length === 0) {
+    return { stageId: stage.id, status: "failed", note: "canonical workflow_submit_result receipts contain no declared consilium outputs", artifacts: produces };
   }
-  const emptySlots = slots.filter((slot) => !contributing.has(slot.slot));
+  for (const id of produces) {
+    if (!receipts.some((receipt) => receipt.outputs.some((output) => output.artifact_id === id))) {
+      return { stageId: stage.id, status: "failed", note: `canonical workflow_submit_result receipts contain no contribution for declared output "${id}"`, artifacts: produces };
+    }
+  }
+  const emptySlots = slots.filter((slot) =>
+    !receipts.some((receipt) => receipt.work_identity.slot_id === (slot.slot_id ?? slot.slot)),
+  );
   if (emptySlots.length > 0) {
-    return {
-      stageId: stage.id,
-      status: "failed",
-      note: `consilium slots produced no artifacts: ${emptySlots.map((slot) => slot.slot).join(", ")}`,
-      artifacts: produces,
-    };
+    return { stageId: stage.id, status: "failed", note: `consilium slots produced no accepted workflow_submit_result outputs: ${emptySlots.map((slot) => slot.slot).join(", ")}`, artifacts: produces };
   }
   return { stageId: stage.id, status: "done", note: successNote, artifacts: produces };
 }
@@ -1041,9 +1296,21 @@ ${input.content}
     ? `\n\n## Optional context (present inputs only; never satisfies required inputs)\n${optionalReads.join("\n\n")}`
     : "";
   const rawProduces = Array.isArray(stage.produces) ? stage.produces : stage.produces ? [stage.produces] : [];
-  const produces = slotScoped
-    ? rawProduces.map((id) => `${id}-${sanitizeSlot(role)}.json`).join(", ")
-    : rawProduces.join(", ") || "(none)";
+  const produces = rawProduces.join(", ") || "(none)";
+  const producerContracts = rawProduces.map((id) => {
+    const schema = artifactSchemaForStage(stage.id, id);
+    const schemaBlock = schema
+      ? `Schema for the submitted value (apply this directly; do not add an artifact-id key):
+\`\`\`json
+${JSON.stringify(schema, null, 2)}
+\`\`\``
+      : "No schema is declared for this artifact id; still submit one direct JSON value and do not add an envelope.";
+    return [
+      `- Output key: \`${id}\``,
+      "  Submit the value itself under this key; do NOT wrap it in an artifact-id, payload, artifact, markdown, or other envelope.",
+      `  ${schemaBlock.replace(/\n/g, "\n  ")}`,
+    ].join("\n");
+  }).join("\n\n");
   const resolvedSlots = resolvedSlotRoster ?? (stage.type === "single" || stage.type === "consilium"
     ? resolveStageDispatchSlots(stage, ctx)
     : []);
@@ -1053,8 +1320,19 @@ ${input.content}
   const roleHint = orchestratorRole
     ? "You are a DISPATCHER and INTEGRATOR, not a coder. Spawn subagents for any code work, read their artifacts, decide whether to proceed. Do NOT edit code yourself — if a subagent's output is wrong, re-spawn with a sharper task; do not patch their artifact. Trust their validation evidence; do not second-guess build/test output by re-running it."
     : "You are an EXECUTOR, not a router. Gather your own context. Do not delegate to other agents unless you spawn them yourself. If your stage produces code, you MUST run the project's build + tests + linter yourself and include the verbatim output in the artifact's `validation_evidence` field, with `validation_run: true`. The engine will reject the handoff otherwise. Do not invent escape hatches like 'orchestrator owns validation' — that contract does not exist.";
+  const registeredWorker = stage.type === "single" || stage.type === "consilium";
+  const submissionContract = registeredWorker
+    ? [
+      "After completing the work, publish through the registered `workflow_submit_result` tool. For large, nested, or multiline results with an authorized programmatic writer you MUST use outputs_path, not bulky inline JSON. Inline `{ \"outputs\": { \"declared_id\": <direct JSON value> } }` remains available for small/simple results and read-only producers without a writer; keep their output concise and schema-complete. Supply exactly one delivery variant.",
+      "Programmatically serialize the exact envelope `{ outputs }` with JSON.stringify inside your producer workspace. Allocate a fresh producer-occurrence filename, never a shared literal stage-output.json: when JS eval is exposed, `const path = 'stage-output-' + crypto.randomUUID() + '.json'; await Bun.write(path, JSON.stringify({ outputs }));` Then submit `{ outputs_path: path }` using that exact generated path. Never assemble JSON text by hand. Paths must be workspace-relative; absolute paths, traversal and symlinks are rejected. After an inline JSON parse error, switch to file delivery when a writer is authorized; otherwise repair and simplify only the inline payload without dropping required fields. Do not redo research or bypass permissions.",
+      "If you have authorized general Bash instead of eval, run a Node script in your producer workspace that builds the completed outputs object and calls `writeFileSync(path, JSON.stringify({ outputs }), { flag: 'wx' })` from `node:fs`, where `path = 'stage-output-' + randomUUID() + '.json'` uses `node:crypto`. Print that path and submit it. This is delivery-only temporary data, not source or canonical state. An ast-index-only Bash allowlist does NOT authorize Node.",
+      "Submit only declared output keys and direct values matching their schemas. Do not include run, workspace, stage, dispatch, token, identity, receipt, or completion fields in either envelope.",
+      "Publication is complete only when the tool confirms acceptance with a receipt. On refusal, repair only the file/payload or publication call using the returned error, and submit again; do not repeat completed research. Do not write canonical artifact files or treat a delivery file, textual task output, exit 0, or fallback publication as a receipt. The accepted receipt is separate from SDK task termination.",
+      slotScoped ? "This is one consilium slot: submit only your own values; the engine performs receipt-based fan-in." : "",
+    ].filter(Boolean).join(" ")
+    : "The orchestrator host must return declared values in `outputs` so the engine can publish them through the durable workflow_submit_result path; do not write canonical artifact files.";
   let qaDoDContract = "";
-  if (stage.id === "qa_tests") {
+  if (QA_DOD_OWNER_STAGE_IDS[stage.id] === true) {
     const ownerSlot = resolvedSlots[0]?.slot ?? role;
     const standaloneOrchestrator = orchestratorRole && resolvedSlots.length === 0;
     const ownership: QaDoDOwnership = {
@@ -1066,7 +1344,7 @@ ${input.content}
       standaloneOrchestrator,
     };
     const snapshot = readQaDoDSnapshot(ctx);
-    qaDoDContract = `\n\n${renderQaDoDContract(snapshot, ownership)}`;
+    qaDoDContract = `\n\n${renderQaDoDContract(snapshot, ownership, stage.id, rawProduces)}`;
   }
   const capability = ctx.state.dispatch_capability;
   const markerCapabilityId = capability?.capability_id;
@@ -1101,8 +1379,11 @@ ${stage.prompt ?? "Follow the stage title and produce the declared artifact from
 
 ${qaDoDContract}
 
+### Registered producer contract
+${producerContracts || "This stage declares no producer outputs."}
+
 ### Your job
-Execute this stage. Write your typed artifact to ${ctx.artifactsDir}/${slotScoped ? "<id>-<slot>.json" : "<id>.json"} matching the engine's schema (the engine reads only JSON, not prose).${slotScoped ? " This is a parallel consilium slot: write ONLY your own slot-scoped files (other slots write theirs). The engine deterministically synthesizes the shared artifacts at advance." : ""}
+Execute this stage. ${submissionContract}
 
 Produces: ${produces}${readsBlock}${optionalReadsBlock}
 

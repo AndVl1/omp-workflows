@@ -16,6 +16,7 @@ import { beginCapability as rawBeginCapability } from "../src/engine/durable.js"
 import { resolveWorkflowContract, WorkflowContractError } from "../src/engine/workflow-contract.js";
 import { registerWorkflowProfiles } from "../src/engine/profile.js";
 import type { Profile, TaskType, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
+import { createCoreFixture, createInterpreterTaskCaller, details, submission, type Harness } from "./reliable-stage-execution-fixture.js";
 import type { TaskCaller, TaskResult } from "../src/engine/stage.js";
 
 
@@ -71,11 +72,7 @@ function trustedContext(root: string, branch = BRANCH, sessionId = "run-lifecycl
 }
 
 function taskResult(id: string, stage: string): TaskResult {
-  const artifacts: Record<string, string> = {};
-  if (stage === "reopened" || stage === "downstream") {
-    artifacts[stage] = JSON.stringify({ stage, result: "new" });
-  }
-  return { id, output: `${stage} completed`, artifacts, exitCode: 0 };
+  return { id, output: `${stage} completed`, exitCode: 0 };
 }
 
 function taskTool(
@@ -99,6 +96,43 @@ function taskTool(
       return stages.map((stage, index) => taskResult(`batch-${index}`, stage));
     },
   };
+}
+
+function createInterpreterHarness(root: string, sessionId: string): Harness {
+  return createCoreFixture({
+    route: "ordinary",
+    root,
+    branch: BRANCH,
+    sessionId,
+    workflowProfiles: [profile],
+    roles: { worker: "worker" },
+    scopeMap: [{ glob: ["**/*"], scope: "default", dev_agent: "worker" }],
+  });
+}
+
+function interpreterTaskTool(
+  harness: Harness,
+  calls: string[],
+  requests: Array<{ agent: string; task: string }> = [],
+  onCall?: (stage: string) => void,
+): TaskCaller {
+  return createInterpreterTaskCaller(harness, async (worker, request) => {
+    const stage = request.task.match(/## Stage: ([^\s]+)/)?.[1] ?? "unknown";
+    calls.push(stage);
+    requests.push({ agent: request.agent, task: request.task });
+    onCall?.(stage);
+    const submitted = await harness.tools.get("workflow_submit_result")!.execute(
+      `${worker.toolCallId}-submit`,
+      submission({ [stage]: { stage, result: "new" } }),
+      undefined,
+      undefined,
+      worker.childContext,
+    );
+    const submittedDetails = details(submitted.details);
+    assert.equal(submittedDetails.ok, true, JSON.stringify(submittedDetails));
+    assert.ok(submittedDetails.receipt && typeof submittedDetails.receipt === "object", "registered worker output must return its receipt");
+    return { id: `${worker.toolCallId}-result`, output: `${stage} completed`, exitCode: 0 };
+  });
 }
 
 function prepareNew(root: string, task = "Original task", sessionId = "run-lifecycle-session") {
@@ -259,6 +293,50 @@ test("run rejects an omitted trusted execution context before canonical mutation
   }
 });
 
+test("run rejects a controller bound to another workspace before canonical writes or task dispatch", async () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-run-controller-bound-root-"));
+  const foreignRoot = mkdtempSync(join(tmpdir(), "omp-run-controller-bound-foreign-"));
+  try {
+    initGit(root, BRANCH);
+    initGit(foreignRoot, BRANCH);
+    const foreignController = createWorkflowSessionController({
+      cwd: foreignRoot,
+      context: trustedContext(foreignRoot, BRANCH, "foreign-controller-session"),
+    });
+    const beforeRoot = {
+      control: readRunControl(root),
+      runs: listRuns(root, { branch: BRANCH }),
+    };
+    const beforeForeign = {
+      control: readRunControl(foreignRoot),
+      runs: listRuns(foreignRoot, { branch: BRANCH }),
+    };
+    const calls: string[] = [];
+
+    await assert.rejects(
+      run({
+        task: "mismatched controller must not mutate either workspace",
+        cwd: root,
+        branch: BRANCH,
+        autonomous: false,
+        classification: CLASSIFICATION,
+        taskTool: taskTool(calls),
+        mode: "new",
+        request_id: "mismatched-controller",
+        execution: trustedContext(root, BRANCH, "root-execution-session"),
+        sessionController: foreignController,
+      }),
+      (error: unknown) => error instanceof LifecycleError && error.code === "lifecycle_request_conflict",
+    );
+    assert.deepEqual(calls, [], "mismatched controller must reject before task.call or batch");
+    assert.deepEqual({ control: readRunControl(root), runs: listRuns(root, { branch: BRANCH }) }, beforeRoot);
+    assert.deepEqual({ control: readRunControl(foreignRoot), runs: listRuns(foreignRoot, { branch: BRANCH }) }, beforeForeign);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(foreignRoot, { recursive: true, force: true });
+  }
+});
+
 test("run resume rejects a selected run from the wrong branch before task calls", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-run-resume-context-"));
   try {
@@ -291,10 +369,13 @@ test("run resume rejects a selected run from the wrong branch before task calls"
 
 test("run resume preserves canonical classification, upstream inputs, and completed stage identity", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-run-resume-canonical-"));
+  initGit(root);
+  const harness = createInterpreterHarness(root, "resume-session");
   try {
-    initGit(root);
-    publishLifecycleMapping(root);
-    const seeded = prepareNew(root, "Original task", "resume-session");
+    const execution = harness.controller.context();
+    const prepared = harness.controller.prepare({ mode: "new", task: "Original task", classification: CLASSIFICATION });
+    const seeded = { context: execution, controller: harness.controller, prepared, runId: prepared.state.run_id! };
+    assert.ok(seeded.runId);
     seedResumableState(root, seeded.runId);
     const calls: string[] = [];
     const requests: Array<{ agent: string; task: string }> = [];
@@ -305,11 +386,12 @@ test("run resume preserves canonical classification, upstream inputs, and comple
       branch: BRANCH,
       autonomous: true,
       classification: { type: "BUG_FIX", complexity: "COMPLEX", confidence: "LOW", autonomous: true, workflow: "debug-cycle" },
-      taskTool: taskTool(calls, requests),
+      taskTool: interpreterTaskTool(harness, calls, requests),
       mode: "resume",
       run_id: seeded.runId,
       request_id: "resume-canonical",
-      execution: seeded.context,
+      execution,
+      sessionController: harness.controller,
     });
 
     assert.deepEqual(result.classification, CLASSIFICATION, "resume must use persisted classification over new input");
@@ -347,16 +429,20 @@ test("run resume preserves canonical classification, upstream inputs, and comple
     assert.equal(state.lifecycle_status, "complete");
     assert.doesNotMatch(readFileSync(result.statePath!, "utf8"), /"(?:dispatch_token|advance_token)"\s*:/, "handoff secrets are not persisted");
   } finally {
+    await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("run rework snapshots the previous result and reruns only the affected stage and downstream work", async () => {
   const root = mkdtempSync(join(tmpdir(), "omp-run-rework-canonical-"));
+  initGit(root);
+  const harness = createInterpreterHarness(root, "rework-session");
   try {
-    initGit(root);
-    publishLifecycleMapping(root);
-    const seeded = prepareNew(root, "Original task", "rework-session");
+    const execution = harness.controller.context();
+    const prepared = harness.controller.prepare({ mode: "new", task: "Original task", classification: CLASSIFICATION });
+    const seeded = { context: execution, controller: harness.controller, prepared, runId: prepared.state.run_id! };
+    assert.ok(seeded.runId);
     seedCompletedState(root, seeded.runId);
     const preRunState = JSON.parse(readFileSync(runTarget(root, seeded.runId).statePath!, "utf8")) as TeamState;
     assert.equal(preRunState.run_id, seeded.runId);
@@ -392,13 +478,14 @@ test("run rework snapshots the previous result and reruns only the affected stag
       branch: BRANCH,
       autonomous: true,
       classification: { type: "BUG_FIX", complexity: "COMPLEX", confidence: "LOW", autonomous: true, workflow: "debug-cycle" },
-      taskTool: taskTool(calls, requests, captureFirstTaskCall),
+      taskTool: interpreterTaskTool(harness, calls, requests, captureFirstTaskCall),
       mode: "rework",
       run_id: seeded.runId,
       request_id: "rework-canonical",
       feedback: "Fix the reopened implementation result",
       affected_stage: "reopened",
-      execution: seeded.context,
+      execution,
+      sessionController: harness.controller,
     });
 
     assert.deepEqual(result.classification, CLASSIFICATION, "rework keeps the canonical classification");
@@ -442,6 +529,7 @@ test("run rework snapshots the previous result and reruns only the affected stag
     assert.ok(manifest.artifact_sha256?.["upstream.json"], "revision manifest preserves upstream evidence");
     assert.ok(manifest.artifact_sha256?.["reopened.json"], "revision manifest preserves the old affected result");
   } finally {
+    await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -592,6 +680,157 @@ test("QA rework invalidates only downstream DoD evidence and rebinds a fresh sum
     assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "dod")?.sha256, refreshedDodHash);
     assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "implementation")?.sha256, implementationHash);
     assert.equal(afterBeginInstructions.stage.input_read_receipt?.inputs.find((input) => input.artifact_id === "review")?.sha256, reviewHash);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("manual_qa rework invalidates shared DoD evidence and rebinds summary while preserving upstream inputs", () => {
+  const root = mkdtempSync(join(tmpdir(), "omp-run-rework-manual-qa-dod-"));
+  try {
+    initGit(root);
+    const workflow = "manual-qa-rework-dod-evidence";
+    const manualQaProfile: Profile = {
+      name: workflow,
+      title: "Manual QA DoD rework",
+      description: "Manual QA shared DoD re-entry regression",
+      match: { type: ["FEATURE"] },
+      stages: [
+        { id: "implementation", title: "Implementation", type: "orchestrator", produces: "implementation" },
+        { id: "manual_qa", title: "Manual QA", type: "single", role: "manual-qa", consumes: ["implementation"], produces: "manual_qa" },
+        { id: "summary", title: "Summary", type: "orchestrator", consumes: ["implementation", "manual_qa", "dod"], produces: "summary" },
+      ],
+    };
+    registerWorkflowProfiles([manualQaProfile]);
+    const execution = trustedContext(root, BRANCH, "manual-qa-rework-session");
+    const created = prepareWorkflowState({
+      task: "Manual QA DoD rework evidence",
+      cwd: root,
+      branch: BRANCH,
+      autonomous: false,
+      classification: { ...CLASSIFICATION, workflow },
+      files: [],
+      issue: null,
+      mode: "new",
+      request_id: "manual-qa-rework-new",
+      execution,
+    });
+    const runId = created.state.run_id!;
+    const target = runTarget(root, runId);
+    const artifactsDir = target.artifactsDir!;
+    mkdirSync(artifactsDir, { recursive: true });
+    const implementation = JSON.stringify({ files_touched: ["src/example.ts"], build_status: "pass" });
+    const manualQa = JSON.stringify({ verdict: "PASS", evidence: ["manual QA v1"] });
+    const dod = JSON.stringify({
+      items: [{
+        id: "criterion-1",
+        criterion: "Shared DoD evidence is current",
+        verify_method: "Manual QA mutation",
+        status: "pending",
+        evidence: "",
+      }],
+    });
+    const implementationHash = createHash("sha256").update(implementation, "utf8").digest("hex");
+    const manualQaHash = createHash("sha256").update(manualQa, "utf8").digest("hex");
+    const dodHash = createHash("sha256").update(dod, "utf8").digest("hex");
+    writeFileSync(join(artifactsDir, "implementation.json"), implementation);
+    writeFileSync(join(artifactsDir, "manual_qa.json"), manualQa);
+    writeFileSync(join(artifactsDir, "dod.json"), dod);
+    writeFileSync(join(artifactsDir, "summary.json"), JSON.stringify({ source: "summary-v1" }));
+    const input = (artifact_id: string, path: string, sha256: string) => ({ artifact_id, path, sha256 });
+    const implementationInput = input("implementation", "implementation.json", implementationHash);
+    const manualQaInput = input("manual_qa", "manual_qa.json", manualQaHash);
+    const dodInput = input("dod", "dod.json", dodHash);
+    const manualQaInputs = [implementationInput];
+    const summaryInputs = [implementationInput, manualQaInput, dodInput];
+    updateCanonicalRun(root, runId, (state) => ({
+      ...state,
+      stage_cursor: "summary",
+      stages: manualQaProfile.stages.map((stage) => ({ id: stage.id, status: "done" as const })),
+      lifecycle_status: "complete",
+      pause: { kind: "done", reason: "" },
+      artifacts: {
+        implementation: "artifacts/implementation.json",
+        manual_qa: "artifacts/manual_qa.json",
+        dod: "artifacts/dod.json",
+        summary: "artifacts/summary.json",
+      },
+      required_inputs: {
+        implementation: [],
+        manual_qa: manualQaInputs,
+        summary: summaryInputs,
+      },
+      required_input_receipts: {
+        summary: {
+          stage_id: "summary",
+          capability_id: "old-capability",
+          cursor_epoch: "old-epoch",
+          rework_generation: 0,
+          read_at: "2026-09-20T00:00:00.000Z",
+          inputs: summaryInputs,
+        },
+      },
+    }));
+
+    const reopened = prepareWorkflowState({
+      task: "ignored for explicit rework",
+      cwd: root,
+      branch: BRANCH,
+      autonomous: true,
+      classification: { ...CLASSIFICATION, workflow },
+      mode: "rework",
+      run_id: runId,
+      request_id: "manual-qa-rework",
+      feedback: "Manual QA must refresh shared DoD evidence",
+      affected_stage: "manual_qa",
+      execution,
+    });
+    assert.equal(reopened.state.run_id, runId, "manual_qa rework must continue the same canonical run");
+    assert.equal(reopened.state.rework_generation, 1);
+    assert.equal(reopened.state.stages.find((stage) => stage.id === "implementation")?.status, "done");
+    assert.equal(reopened.state.stages.find((stage) => stage.id === "manual_qa")?.status, "pending");
+    assert.equal(reopened.state.stages.find((stage) => stage.id === "summary")?.status, "pending");
+    assert.equal(reopened.state.required_inputs?.manual_qa?.find((entry) => entry.artifact_id === "implementation")?.sha256, implementationHash);
+    assert.equal(reopened.state.required_inputs?.summary?.find((entry) => entry.artifact_id === "implementation")?.sha256, implementationHash);
+    assert.equal(reopened.state.required_inputs?.summary?.find((entry) => entry.artifact_id === "manual_qa")?.sha256, undefined);
+    assert.equal(reopened.state.required_inputs?.summary?.find((entry) => entry.artifact_id === "dod")?.sha256, undefined);
+    assert.equal(reopened.state.required_inputs?.summary?.find((entry) => entry.artifact_id === "manual_qa")?.path, "manual_qa.json");
+    assert.equal(reopened.state.required_input_receipts?.summary, undefined);
+    assert.equal(reopened.state.artifacts?.dod, "artifacts/dod.json", "shared DoD path remains declared for the refreshed sidecar");
+    assert.equal(readFileSync(join(artifactsDir, "implementation.json"), "utf8"), implementation, "unaffected upstream content remains intact");
+
+    const refreshedManualQa = JSON.stringify({ verdict: "PASS", evidence: ["manual QA v2"] });
+    const refreshedManualQaHash = createHash("sha256").update(refreshedManualQa, "utf8").digest("hex");
+    const refreshedDod = JSON.stringify({
+      items: [{
+        id: "criterion-1",
+        criterion: "Shared DoD evidence is current",
+        verify_method: "Manual QA mutation",
+        status: "met",
+        evidence: "Manual QA refreshed the criterion",
+      }],
+    });
+    const refreshedDodHash = createHash("sha256").update(refreshedDod, "utf8").digest("hex");
+    writeFileSync(join(artifactsDir, "manual_qa.json"), refreshedManualQa);
+    writeFileSync(join(artifactsDir, "dod.json"), refreshedDod);
+    updateCanonicalRun(root, runId, (state) => ({
+      ...state,
+      stage_cursor: "summary",
+      stages: manualQaProfile.stages.map((stage) => ({ id: stage.id, status: stage.id === "summary" ? "pending" as const : "done" as const })),
+    }));
+
+    const instructions = resolveWorkflowContract(root, { runId, branch: BRANCH });
+    assert.equal(instructions.stage.id, "summary");
+    assert.equal(instructions.stage.required_input_contents.find((entry) => entry.artifact_id === "implementation")?.sha256, implementationHash);
+    assert.equal(instructions.stage.required_input_contents.find((entry) => entry.artifact_id === "manual_qa")?.sha256, refreshedManualQaHash);
+    assert.equal(instructions.stage.required_input_contents.find((entry) => entry.artifact_id === "dod")?.sha256, refreshedDodHash);
+    const began = rawBeginCapability(root, undefined, { runId });
+    assert.equal(began.ok, true, began.ok ? "summary begin reads refreshed manual QA and DoD" : began.error);
+    if (!began.ok) return;
+    const afterBegin = resolveWorkflowContract(root, { runId, branch: BRANCH });
+    assert.equal(afterBegin.stage.input_read_receipt?.inputs.find((entry) => entry.artifact_id === "implementation")?.sha256, implementationHash);
+    assert.equal(afterBegin.stage.input_read_receipt?.inputs.find((entry) => entry.artifact_id === "manual_qa")?.sha256, refreshedManualQaHash);
+    assert.equal(afterBegin.stage.input_read_receipt?.inputs.find((entry) => entry.artifact_id === "dod")?.sha256, refreshedDodHash);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

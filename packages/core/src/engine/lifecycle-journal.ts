@@ -7,15 +7,18 @@ import {
   renameSync,
   unlinkSync,
   writeFileSync,
+  rmSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { assertLifecyclePath, lifecycleFileDigest, type LifecycleFileReference } from "./lifecycle-files.js";
 
 const WORK_STATE = ".work-state";
 const TRANSACTIONS_DIR = "lifecycle-transactions";
 const SAFE_SEGMENT = /^[A-Za-z0-9._-]+$/;
 
 export type LifecycleTransactionStatus = "prepared" | "committing" | "committed" | "rolled_back";
-export type LifecycleFileContent = string | { encoding: "base64"; data: string } | null;
+export type LifecycleInlineContent = string | { encoding: "base64"; data: string } | null;
+export type LifecycleFileContent = LifecycleInlineContent | LifecycleFileReference;
 
 /**
  * A transaction record stores complete prepared bytes, not merely a status.
@@ -58,6 +61,7 @@ function recordPath(cwd: string, transactionId: string): string {
 }
 
 function atomicWriteRaw(path: string, content: string): void {
+  assertLifecyclePath(path);
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${randomUUID()}.tmp`;
   try {
@@ -70,6 +74,7 @@ function atomicWriteRaw(path: string, content: string): void {
 }
 
 function atomicWriteBytes(path: string, bytes: Buffer): void {
+  assertLifecyclePath(path);
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${randomUUID()}.tmp`;
   try { writeFileSync(temp, bytes); renameSync(temp, path); }
@@ -82,6 +87,7 @@ function atomicWrite(path: string, value: unknown): void {
 
 function digest(value: LifecycleFileContent): string | null {
   if (value === null) return null;
+  if (typeof value !== "string" && value.encoding === "file") return value.sha256;
   const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value.data, "base64");
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -106,7 +112,7 @@ function absolutePath(cwd: string, key: string): string {
 function normalizeFiles(cwd: string, files: Record<string, LifecycleFileContent>): Record<string, LifecycleFileContent> {
   if (!files || typeof files !== "object" || Array.isArray(files)) throw new LifecycleRecoveryError("lifecycle transaction file map is malformed");
   return Object.fromEntries(Object.entries(files).map(([path, content]) => {
-    if (content !== null && typeof content !== "string" && !(typeof content === "object" && content.encoding === "base64" && typeof content.data === "string")) throw new LifecycleRecoveryError(`lifecycle transaction content for '${path}' is malformed`);
+    if (content !== null && typeof content !== "string" && !(typeof content === "object" && ((content.encoding === "base64" && typeof content.data === "string") || (content.encoding === "file" && typeof content.path === "string" && /^[a-f0-9]{64}$/.test(content.sha256) && Number.isSafeInteger(content.size) && content.size >= 0)))) throw new LifecycleRecoveryError(`lifecycle transaction content for '${path}' is malformed`);
     return [keyFor(cwd, path), content];
   }));
 }
@@ -141,6 +147,14 @@ function parseRecord(cwd: string, transactionId: string): LifecycleTransactionRe
   }
   const before = normalizeFiles(cwd, value.before as Record<string, string | null>);
   const after = normalizeFiles(cwd, value.after as Record<string, string | null>);
+  for (const image of [before, after]) for (const content of Object.values(image)) {
+    if (content && typeof content !== "string" && content.encoding === "file") {
+      const prefix = `${WORK_STATE}/${TRANSACTIONS_DIR}/${transactionId}/blobs/`;
+      if (!content.path.startsWith(prefix) || !SAFE_SEGMENT.test(content.path.slice(prefix.length))) throw new LifecycleRecoveryError("invalid lifecycle blob reference", transactionId);
+      const actual = lifecycleFileDigest(absolutePath(cwd, content.path));
+      if (actual.sha256 !== content.sha256 || actual.size !== content.size) throw new LifecycleRecoveryError("lifecycle blob integrity mismatch", transactionId);
+    }
+  }
   const beforeManifest = manifest(before);
   const afterManifest = manifest(after);
   if (!manifestsEqual(beforeManifest, value.before_manifest) || !manifestsEqual(afterManifest, value.after_manifest)) {
@@ -178,16 +192,24 @@ function readFileValue(path: string): LifecycleFileContent {
 function fileContentEqual(left: LifecycleFileContent, right: LifecycleFileContent): boolean {
   if (left === null || right === null) return left === right;
   if (typeof left === "string" || typeof right === "string") return left === right;
+  if (left.encoding === "file" || right.encoding === "file") return digest(left) === digest(right);
   return left.encoding === right.encoding && left.data === right.data;
 }
 
 function currentMatches(cwd: string, files: Record<string, LifecycleFileContent>): boolean {
-  return Object.entries(files).every(([key, expected]) => fileContentEqual(readFileValue(absolutePath(cwd, key)), expected));
+  return Object.entries(files).every(([key, expected]) => {
+    if (expected && typeof expected !== "string" && expected.encoding === "file") {
+      try { const actual = lifecycleFileDigest(absolutePath(cwd, key)); return actual.sha256 === expected.sha256 && actual.size === expected.size; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+    }
+    return fileContentEqual(readFileValue(absolutePath(cwd, key)), expected);
+  });
 }
 
 function applyFiles(cwd: string, files: Record<string, LifecycleFileContent>): void {
   for (const [key, content] of Object.entries(files)) {
     const path = absolutePath(cwd, key);
+    assertLifecyclePath(path);
     if (content === null) {
       try { unlinkSync(path); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -195,7 +217,15 @@ function applyFiles(cwd: string, files: Record<string, LifecycleFileContent>): v
       continue;
     }
     if (typeof content === "string") atomicWriteRaw(path, content);
-    else atomicWriteBytes(path, Buffer.from(content.data, "base64"));
+    else if (content.encoding === "file") {
+      mkdirSync(dirname(path), { recursive: true });
+      const temp = `${path}.${randomUUID()}.tmp`;
+      try {
+        const actual = lifecycleFileDigest(absolutePath(cwd, content.path), temp);
+        if (actual.sha256 !== content.sha256 || actual.size !== content.size) throw new LifecycleRecoveryError("lifecycle blob integrity mismatch");
+        renameSync(temp, path);
+      } finally { try { unlinkSync(temp); } catch { /* already renamed */ } }
+    } else atomicWriteBytes(path, Buffer.from(content.data, "base64"));
   }
 }
 
@@ -212,8 +242,26 @@ export function beginLifecycleTransaction(input: {
   after?: Record<string, LifecycleFileContent>;
 }): LifecycleTransactionRecord {
   const transaction_id = randomUUID();
-  const before = normalizeFiles(input.cwd, input.before ?? {});
-  const after = normalizeFiles(input.cwd, input.after ?? {});
+  const stagingRoot = resolve(input.cwd, WORK_STATE, "lifecycle-staging", transaction_id);
+  const finalRoot = join(transactionRoot(input.cwd), transaction_id);
+  const stage = (files: Record<string, LifecycleFileContent>): Record<string, LifecycleFileContent> => {
+    const normalized = normalizeFiles(input.cwd, files);
+    const blobs = join(stagingRoot, "blobs");
+    for (const [key, content] of Object.entries(normalized)) {
+      if (!content || typeof content === "string" || content.encoding !== "file") continue;
+      assertLifecyclePath(blobs);
+      mkdirSync(blobs, { recursive: true });
+      const destination = join(blobs, randomUUID());
+      const actual = lifecycleFileDigest(absolutePath(input.cwd, content.path), destination);
+      if (actual.sha256 !== content.sha256 || actual.size !== content.size) throw new LifecycleRecoveryError("snapshot source changed during preparation", transaction_id);
+      normalized[key] = { encoding: "file", path: keyFor(input.cwd, join(finalRoot, "blobs", destination.slice(destination.lastIndexOf("/") + 1))), ...actual };
+    }
+    return normalized;
+  };
+  let before: Record<string, LifecycleFileContent>;
+  let after: Record<string, LifecycleFileContent>;
+  try { before = stage(input.before ?? {}); after = stage(input.after ?? {}); }
+  catch (error) { rmSync(stagingRoot, { recursive: true, force: true }); throw error; }
   const now = new Date().toISOString();
   const record: LifecycleTransactionRecord = {
     transaction_id,
@@ -227,7 +275,13 @@ export function beginLifecycleTransaction(input: {
     after_manifest: manifest(after),
     commit_marker: null,
   };
-  atomicWrite(recordPath(input.cwd, transaction_id), record);
+  try {
+    assertLifecyclePath(stagingRoot);
+    assertLifecyclePath(finalRoot);
+    atomicWrite(join(stagingRoot, "transaction.json"), record);
+    mkdirSync(transactionRoot(input.cwd), { recursive: true });
+    renameSync(stagingRoot, finalRoot);
+  } catch (error) { rmSync(stagingRoot, { recursive: true, force: true }); throw error; }
   return record;
 }
 

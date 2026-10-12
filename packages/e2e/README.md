@@ -135,11 +135,150 @@ manually edit or delete those files. A live pass is **not** implied by scenario
 loading or package tests: run these commands after core/fullstack/internal
 integration and attach the resulting transcript/report paths.
 
+## Reliable-stage: закреплённые H1/H2/H3
+
+План `scenarios/reliable-stage-host-smoke.json` использует OMP **18.0.6**
+и собранные candidate core/fullstack packages. Live cases запускаются только
+после зелёных D/P; `validate` проверяет план, но не означает H PASS:
+
+```bash
+npm run host-smoke -w @andvl1/omp-workflows-e2e -- validate
+npm run host-smoke -w @andvl1/omp-workflows-e2e -- prepare \
+  --root <owned-root> --core <core.tgz> --fullstack <fullstack.tgz> \
+  --model openai-codex/gpt-5.5
+```
+Подготовка передаёт один allowlisted environment установке, bootstrap и baseline
+commit собственных scratch repos. Родительские `INIT_CWD`, `OMP_PROJECT_DIR`,
+`npm_config_*`, `GIT_DIR` и `GIT_WORK_TREE` не выбирают каталоги записи:
+пути HOME/cache/config и postinstall target принадлежат `<owned-root>`.
+Проверяйте изоляцию с selectors, направленными только в собственный canary,
+не в пользовательский repo.
+
+
+Для запуска используйте binary из `runtime-manifest.json`, приватный
+`HOME=<owned-root>/home` и `PI_CODING_AGENT_DIR=<owned-root>/agent-data`.
+`PI_CONFIG_DIR` — имя каталога относительно HOME, а не абсолютный путь:
+при запуске оставьте `.omp`, чтобы обнаруживались bootstrap project plugins.
+Не наследуйте `OMP_PROFILE`/`PI_PROFILE` или пользовательские plugins.
+`prepare` требует конкретный `--model <provider/model>` и создаёт приватный
+host config `<owned-root>/home/.omp/agent/config.yml`: `default`, все встроенные
+роли установленного SDK и aliases из фактически обнаруженных candidate agents
+получают одну выбранную модель. Это включает `team-lead` и `cto`, которых нет
+в полной таксономии `defaultFullstackModelRoles`; список не копируется вручную.
+`<owned-root>/agent-data/config.yml` — symlink на тот же файл, чтобы root harness
+и SDK children читали один источник. Пользовательские config/auth stores не
+изменяются; обычный `ux-e2e start` сохраняет прежнее наследование профиля/config.
+
+До `PREPARED` выполняется config-only проверка каждого scratch через установленный
+SDK: `Settings.loadReadOnly` и настоящий model resolver должны разрешить каждую
+роль и обнаруженного агента в выбранную модель. Проверка не создаёт SDK sessions,
+не открывает auth DB, не вызывает модель и не расходует H-попытки.
+`runtime-manifest.json` (`reliable-stage-host-smoke/runtime/v3`) фиксирует модель,
+путь config и обнаруженные роли/agent count. Старые подготовленные roots и
+evidence не перезаписываются. Конфигурационный PASS не означает H PASS:
+при live-запуске всё ещё проверяйте фактически выбранные модели в host evidence.
+
+На macOS дополнительно проверьте native PTY **до** H-попыток. У `node-pty` 1.1.0
+Darwin prebuild может содержать `pty.node` без соседнего `spawn-helper`, хотя
+install завершается успешно. Симптом — `posix_spawn failed` и `pid: null`,
+а не ошибка выбора модели. Исправляйте только dependency в принадлежащем QA
+snapshot, против той же версии Node, которой запускается E2E CLI:
+
+```bash
+npm_config_build_from_source=true \
+npm_config_nodedir=<matching-cached-node-headers-dir> \
+npm rebuild node-pty
+```
+
+Cached headers позволяют выполнить source rebuild offline. Затем нужен actual
+PTY smoke с pinned wrapper `--version`, а не проверка наличия файлов.
+Не заменяйте эту диагностику переключением модели или Node без rebuild.
+Warning о missing `modelRoles` для quoted JSON-as-YAML key сам по себе не
+доказывает отсутствие роли: authoritative здесь config-only SDK validation
+и фактически выбранная модель в SDK session evidence.
+
+Исходное хранилище credentials читается только read-only. Для Codex допустим
+официальный static `api_key` в отдельном приватном SDK store, содержащий
+неизменённый действующий access token: request adapter получает account identity
+из самого JWT. OAuth rows/refresh tokens не копируются; истечение или 401
+останавливает попытку без refresh fallback. Перед каждой 15-минутной попыткой
+проверяется достаточный срок действия. Credentials не передаются в argv,
+scratch, transcripts или evidence; приватный auth store удаляется после smoke.
+
+Исторический бюджет составлял исходную попытку и один диагностированный повтор
+на case; обе прежние попытки сохранены в evidence. После него отдельно проведены
+два разрешённых tranche: по одной попытке H1/H2/H3 в каждом, затем отдельный
+H3-only tranche для actual Hub proof. Во всех — максимум 900 секунд включая
+startup и H3 restore, без automatic retry. Все бюджеты израсходованы `1/1`;
+следующий запуск или retry требует нового явного разрешения.
+Slash-команды вводятся через настоящий PTY по плану,
+не через `--scenario`/`--task`. H3 восстанавливает pending checkpoint без
+повторной реализации. Дополнительное наблюдение SDK cold revive использует
+только настоящий persisted worker этого case: `ensurePersistedRoster` и
+`AgentLifecycleManager.ensureLive` в новом host восстанавливают parked session,
+не прежний executor, workflow grant или authoritative running status.
+Новый prompt/task для доказательства revive не подставляется.
+В закреплённом SDK 18.0.6 исходники Agent Hub задают default `Alt+A`
+(`app.agents.hub`) либо `Ctrl+S` (`app.session.observe`); учитывайте overrides.
+Для live-доказательства откройте именно Hub overlay, выберите строку исходного
+parked worker, нажмите `r` и сохраните видимую строку и результат. Вызов `hub`
+как model tool или обычный workflow resume этого доказательства не заменяет.
+Поддержка в исходниках не считается runtime PASS и не доказывает `unsupported`.
+У каждого case один deadline, начиная **до** startup; H3 restore получает
+оставшееся время, не новый `15m`. Native `workflow_checkpoint_ask` может показать
+selection dialog без `[ask_user]` transcript marker: проверяйте pending call,
+current UI и matching result. Перед H3 restore исходный checkpoint не отвечается.
+Hub row/`r`/result фиксируются **до** `/do-work --resume` и current approval.
+Restore той же accepted child session может породить новый lifecycle started;
+это само по себе не replay. Проверяйте отсутствие нового implementation
+dispatch/assignment/submission и изменение accepted output hashes.
+H3 terminal host action — intentional close собственного restored SDK host
+после current approval и одного advance, не полный workflow complete/release.
+Declared downstream review/QA не считается implementation replay. Full terminal/
+release и новый ordinary tool обязательны для H1/H2, по actual event window.
+
+Диагностика timed browser cleanup относится к отдельному эпику e2e harness,
+а не к дополнительному product gate `reliable-stage-execution`. Если проверяется
+именно bounded cleanup harness, не подменяйте его proof успешным
+`agent-browser close`: в CLI 0.17 manager close ожидается, но ошибки подавляются;
+daemon/socket exit отложен на 100ms после ответа. Immediate `session list` может
+ещё содержать имя — это не proof browser liveness. Для этой диагностики сохраняйте
+actual owned browser PID/named-registry absence с timestamp до immutable deadline.
+Поздняя подтверждённая очистка — eventual, не ретроспективный PASS timed proof.
+Отсутствие такого timestamp не отменяет подтверждённые H-события и фактически
+выполненный общий owned cleanup исходной спеки; исходные NOT_VERIFIED сохраняются.
+
+Останавливайте только собственные sessions через существующий `stop`;
+`host-smoke cleanup --root <owned-root>` сохраняет evidence.
+
+## Приёмка host admission
+
+Сценарий [`host-admission.json`](scenarios/host-admission.json) и
+операторский [`host-admission-task.md`](scenarios/host-admission-task.md)
+покрывают обычные `bash`/`write`/`edit`, selected workflow, native worker,
+terminal/restart, CTO, неполную регистрацию bundle, диагностику отказов,
+границы host-контекста, recovery повреждённого run и internal activation.
+
+Это **ручной checklist, не prompt модели**: стартуйте независимые scratch
+sessions без `--scenario` и `--task`. Перед первым заданием подтвердите
+фактическую Luna-модель host/worker и единственного владельца workflow.
+Отрицательные fault fixtures разрешены только в disposable scratch;
+их результаты не заменяют проверки настоящего foreign host context.
+Совпадения `expect` — подсказки наблюдения, не автоматический PASS.
+Отчёт обязан отдельно перечислять PASS/FAIL/BLOCKED для A1–A9,
+runtime evidence и cleanup. Недоступное внешнее Android-окружение
+нельзя объявлять проверенным по результатам локального fullstack.
+
+Первый live-прогон описан в
+[отчёте PR #72](../../vibe-report/host-admission-pr72-manual-qa-2026-09-29.md):
+5 PASS, 2 FAIL, 2 BLOCKED. Наличие сценария не означает зелёную приёмку;
+открытые workflow/CTO и shutdown-проблемы перечислены в отчёте.
+
 ## Subcommands
 
 | Command | Purpose |
 |---|---|
-| `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire the plugin via `npm link` (NOT `file:` — the unpublished peer would fail with ETARGET), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
+| `bootstrap <slug> <branch>` | Create `<workdir>/omp-ux-e2e-<slug>` (default `/tmp`), `git init`, wire core/fullstack with scratch-local symlinks (no global npm/plugin mutation), write `.omp/ux-e2e-overlay.json`, copy `.omp/team.config.json`, materialize custom-TS commands. `--force` re-creates. |
 | `start <scratch-dir>` | `startTestSession()` + print the terminal URL. Foreground mode prints live `[ask_user]` hints and exits when omp exits; `--detach` runs the session in a **detached child that survives the parent** — the child writes its stdout/stderr directly into `<scratch>/.work-state/ux-e2e/detach.log` via an inherited file descriptor (no pipe between parent and child, so the child cannot crash with EPIPE when the parent exits). The parent tails the last 8 KiB on the 15 s startup timeout so failures are not swallowed. `--scenario`, `--task`, `--surface web\|text`, `--cols/--rows/--port`, `--max-time`, `--idle-ms`. `--force` allows relaunch over a live session. Honours the optional user-supplied overlay at `<scratch>/.omp/ux-e2e-overlay.user.json` (see [User-supplied overlay](#user-supplied-overlay)). |
 | `stop <scratch-dir>` | SIGTERM → SIGKILL the recorded process tree (see session.json `pid`). |
 | `transcript <scratch-dir>` | Render transcript.jsonl as text; `--tail N`, `--follow`. |

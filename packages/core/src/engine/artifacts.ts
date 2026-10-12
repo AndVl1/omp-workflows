@@ -10,7 +10,7 @@
 
 import { constants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { lifecycleTransactionStatus } from "./lifecycle-journal.js";
 import { recordArtifactWritten } from "../observability/hooks.js";
 
@@ -38,6 +38,10 @@ export type ArtifactInputRead =
   | { status: "absent"; path: string }
   | { status: "invalid"; path: string; error: string }
   | { status: "present"; path: string; content: string; value: unknown };
+export type ArtifactFileRead =
+  | { status: "absent"; path: string }
+  | { status: "invalid"; path: string; error: string }
+  | { status: "present"; path: string; bytes: Buffer };
 const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const O_NONBLOCK = constants.O_NONBLOCK ?? 0;
 const O_DIRECTORY = constants.O_DIRECTORY ?? 0;
@@ -191,14 +195,18 @@ function artifactContainmentRejection(root: string, path: string, realRoot: stri
 
 
 /**
- * Read one declared input while preserving the distinction between a truly
- * absent target and a present-but-invalid target.  Optional inputs use this
- * boundary so a symlink, non-file, containment failure, permission error, or
- * malformed JSON cannot be mistaken for absence.
+ * Read one file below the artifact root through a pinned descriptor. The
+ * opened inode, pathname, containing directory and realpath containment are
+ * checked before and after the read; callers receive the exact bytes from the
+ * descriptor that passed those checks.
  */
-export function readArtifactInput(artifactsDir: string, id: string): ArtifactInputRead {
-  const relativePath = `${id}.json`;
-  if (!isSafeArtifactId(id)) return { status: "invalid", path: relativePath, error: `unsafe artifact id: ${id}` };
+export function readArtifactFileSafe(artifactsDir: string, relativePath: string): ArtifactFileRead {
+  if (
+    !relativePath
+    || isAbsolute(relativePath)
+    || relativePath.includes("\\")
+    || relativePath.split("/").some((part) => part === "" || part === "." || part === "..")
+  ) return { status: "invalid", path: relativePath, error: "unsafe artifact path" };
   const lexicalRoot = resolve(artifactsDir);
   const directory = openArtifactsDirectory(lexicalRoot);
   if (directory.status === "absent") return { status: "absent", path: relativePath };
@@ -259,17 +267,15 @@ export function readArtifactInput(artifactsDir: string, id: string): ArtifactInp
       return { status: "invalid", path: relativePath, error: `artifact target changed while it was being read: ${(error as Error).message}` };
     }
     if (named.isSymbolicLink()) return { status: "invalid", path: relativePath, error: "artifact target is a symlink" };
-    if (!sameFileIdentity(named, opened)) {
-      return { status: "invalid", path: relativePath, error: "artifact target changed while it was being read" };
-    }
+    if (!sameFileIdentity(named, opened)) return { status: "invalid", path: relativePath, error: "artifact target changed while it was being read" };
     const containment = artifactContainmentRejection(root, path, realRoot);
     if (containment) return { status: "invalid", path: relativePath, error: containment };
     const beforeReadDirectory = pinnedDirectoryRejection(root, directoryFd, openedDirectory);
     if (beforeReadDirectory) return { status: "invalid", path: relativePath, error: beforeReadDirectory };
 
-    let content: string;
+    let bytes: Buffer;
     try {
-      content = readFileSync(fd, "utf8");
+      bytes = readFileSync(fd);
     } catch (error) {
       return { status: "invalid", path: relativePath, error: `artifact target is unreadable: ${(error as Error).message}` };
     }
@@ -279,7 +285,7 @@ export function readArtifactInput(artifactsDir: string, id: string): ArtifactInp
     } catch (error) {
       return { status: "invalid", path: relativePath, error: `artifact target is unreadable: ${(error as Error).message}` };
     }
-    if (!sameFileIdentity(after, opened) || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+    if (!sameFileIdentity(after, opened) || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || bytes.length !== opened.size) {
       return { status: "invalid", path: relativePath, error: "artifact target changed while it was being read" };
     }
     try {
@@ -287,21 +293,12 @@ export function readArtifactInput(artifactsDir: string, id: string): ArtifactInp
     } catch (error) {
       return { status: "invalid", path: relativePath, error: `artifact target changed while it was being read: ${(error as Error).message}` };
     }
-    if (named.isSymbolicLink() || !sameFileIdentity(named, opened)) {
-      return { status: "invalid", path: relativePath, error: "artifact target changed while it was being read" };
-    }
+    if (named.isSymbolicLink() || !sameFileIdentity(named, opened)) return { status: "invalid", path: relativePath, error: "artifact target changed while it was being read" };
     const postReadContainment = artifactContainmentRejection(root, path, realRoot);
     if (postReadContainment) return { status: "invalid", path: relativePath, error: postReadContainment };
-
-    let value: unknown;
-    try {
-      value = JSON.parse(content) as unknown;
-    } catch (error) {
-      return { status: "invalid", path: relativePath, error: `artifact is not valid JSON: ${(error as Error).message}` };
-    }
-    const postParseDirectory = pinnedDirectoryRejection(root, directoryFd, openedDirectory);
-    if (postParseDirectory) return { status: "invalid", path: relativePath, error: postParseDirectory };
-    return { status: "present", path: relativePath, content, value };
+    const postReadDirectory = pinnedDirectoryRejection(root, directoryFd, openedDirectory);
+    if (postReadDirectory) return { status: "invalid", path: relativePath, error: postReadDirectory };
+    return { status: "present", path: relativePath, bytes };
   } finally {
     if (fd !== null) {
       try {
@@ -318,27 +315,25 @@ export function readArtifactInput(artifactsDir: string, id: string): ArtifactInp
   }
 }
 
-function parseReturnedArtifact(id: string, value: unknown): unknown {
-  if (typeof value !== "string") return value;
+/**
+ * Read one declared JSON input through the shared descriptor boundary while
+ * preserving the distinction between absent and present-but-invalid targets.
+ */
+export function readArtifactInput(artifactsDir: string, id: string): ArtifactInputRead {
+  const relativePath = `${id}.json`;
+  if (!isSafeArtifactId(id)) return { status: "invalid", path: relativePath, error: `unsafe artifact id: ${id}` };
+  const raw = readArtifactFileSafe(artifactsDir, relativePath);
+  if (raw.status !== "present") return raw;
+  const content = raw.bytes.toString("utf8");
+  let value: unknown;
   try {
-    return JSON.parse(value) as unknown;
-  } catch {
-    throw new Error(`artifact "${id}" is not valid JSON`);
+    value = JSON.parse(content) as unknown;
+  } catch (error) {
+    return { status: "invalid", path: relativePath, error: `artifact is not valid JSON: ${(error as Error).message}` };
   }
+  return { status: "present", path: relativePath, content, value };
 }
 
-export function persistReturnedArtifacts(
-  artifactsDir: string,
-  artifacts: Record<string, unknown>,
-): string[] {
-  const ids: string[] = [];
-  for (const [id, value] of Object.entries(artifacts)) {
-    assertArtifactId(id);
-    writeArtifact(artifactsDir, id, parseReturnedArtifact(id, value));
-    ids.push(id);
-  }
-  return ids;
-}
 export type ArtifactId =
   | "discovery"
   | "feature_spec"

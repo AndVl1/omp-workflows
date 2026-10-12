@@ -111,9 +111,12 @@
    - **HIGH** (confidence 80-89): Should fix
    - **MEDIUM** (confidence 70-79): Consider fixing
 
-3. **Emit the normalized verdict** — write the `review` artifact to
-   `.work-state/artifacts/review.json` (schema `review` in `artifacts-schema.json`). The
-   verdict is **derived mechanically from findings, never eyeballed**:
+3. **Emit the normalized verdict** — submit the direct `review` schema payload under the
+   declared artifact id with
+   `workflow_submit_result({ "outputs": { "review": <payload> } })`. The host derives
+   producer, slot, and dispatch identity; core publishes immutable canonical references. Do not
+   write canonical artifacts by path. The verdict is **derived mechanically from findings, never
+   eyeballed**:
 
    | condition | verdict |
    |-----------|---------|

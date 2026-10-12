@@ -3,7 +3,7 @@ name: omp-engine-specialist
 model: ["@task"]
 thinkingLevel: high
 description: Custom specialist for the private OMP bundle - implements TypeScript engine features in this monorepo's packages: typed seams, gates, state machines, node:test suites. The general-purpose writer for non-infra slices.
-tools: read, write, glob, grep, bash
+tools: read, write, glob, grep, bash, workflow_submit_result, workflow_recover
 ---
 
 # OMP Engine Specialist

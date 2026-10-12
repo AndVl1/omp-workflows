@@ -22,12 +22,13 @@ import {
   registerCtoTerminalTransitionHook,
   type CtoTerminalTransitionProof,
 } from "./state.js";
+import { evaluateNativeStageReadiness } from "./native-stage.js";
 import { LifecycleError, assertTrustedExecutionContext } from "../engine/run-lifecycle.js";
 import {
   beginLifecycleTransaction,
   commitLifecycleTransaction,
   lifecycleTransactionStatus,
-  type LifecycleFileContent,
+  type LifecycleInlineContent as LifecycleFileContent,
 } from "../engine/lifecycle-journal.js";
 import { withWorkspaceReadNoRecovery, withWorkspaceTransaction } from "../engine/state.js";
 import type { ModelClassification } from "../engine/run.js";
@@ -291,6 +292,24 @@ function ctoStateRevision(raw: string): string {
   return createHash("sha256").update(raw, "utf8").digest("hex");
 }
 
+const MODEL_IMMUTABLE_CTO_FIELDS = ["native_stage_progress", "stage_receipts", "stage_recovery"] as const;
+
+function canonicalModelValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((entry) => canonicalModelValue(entry));
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonicalModelValue(entry)]));
+}
+
+function assertModelCannotMutateEngineOwnedCtoFields(current: CtoState, candidate: CtoState, runId: string): void {
+  const currentRecord = current as unknown as Record<string, unknown>;
+  const candidateRecord = candidate as unknown as Record<string, unknown>;
+  for (const field of MODEL_IMMUTABLE_CTO_FIELDS) {
+    if (JSON.stringify(canonicalModelValue(currentRecord[field])) !== JSON.stringify(canonicalModelValue(candidateRecord[field]))) {
+      throw new LifecycleError("run_state_invalid", `cto_state candidate attempted to mutate engine-owned field '${field}'`, { run_id: runId });
+    }
+  }
+}
+
 function captureCtoModelAuthority(
   controller: WorkflowSessionController,
   cwd: string,
@@ -443,6 +462,7 @@ export function commitCtoStateForModel(input: {
       );
     }
     const current = currentParsed.state;
+    assertModelCannotMutateEngineOwnedCtoFields(current, candidate, input.run_id);
     if (current.branch !== authority.context.branch || candidate.branch !== current.branch) {
       throw new LifecycleError("run_context_mismatch", `CTO run '${input.run_id}' branch does not match the authenticated coordinator`, { run_id: input.run_id, branch: current.branch });
     }
@@ -450,6 +470,15 @@ export function commitCtoStateForModel(input: {
       throw new LifecycleError("run_state_invalid", "cto_state candidate attempted to change engine-owned run identity", { run_id: input.run_id });
     }
     const terminal = isCtoRunTerminal(candidate);
+    if (terminal && candidate.pause.kind !== "done" && current.native_stage_progress) {
+      for (const [teamId, progress] of Object.entries(current.native_stage_progress)) {
+        if (progress.status === "complete") continue;
+        const readiness = evaluateNativeStageReadiness(input.cwd, input.run_id, teamId);
+        if (!readiness.ok || !readiness.ready) {
+          throw new LifecycleError("run_busy", `native stage '${progress.stage_id}' for team '${teamId}' is not ready for terminal CTO commit`, { run_id: input.run_id });
+        }
+      }
+    }
     if (terminal && (
       claim.worker_ids.length > 0
       || hasOutstandingCtoWork(current) && !terminalBarrierSettlement(current, candidate)
@@ -1075,15 +1104,18 @@ export function acquireCtoIngress(options: CtoIngressOptions): CtoIngressResult 
       throw new LifecycleError("run_selection_required", `active legacy CTO run '${legacyActive[0]}' requires an explicit --run selector`, { run_id: legacyActive[0], next_action: "use /cto --run <exact-cto-id>" });
     }
     runId = ctoRunId(options.task || "standby");
-    const standby = options.task.trim().length === 0;
-    const plan: TeamPlan = { id: runId, task: standby ? "standby — awaiting inbox tasks" : options.task, teams: [], created_at: new Date().toISOString() };
+    const noTask = options.task.trim().length === 0;
+    const plan: TeamPlan = { id: runId, task: noTask ? "standby — awaiting inbox tasks" : options.task, teams: [], created_at: new Date().toISOString() };
     state = newCtoState({
       id: runId,
       task: plan.task,
       branch: options.branch,
-      autonomous: standby,
+      autonomous: noTask,
       plan,
-      ...(standby ? { standby: true } : {}),
+      // Every newly created registered /cto ingress is a resident
+      // coordinator. A task-backed run may start wave 1 immediately; after
+      // that wave closes the same run remains claimable until explicit END.
+      standby: true,
       owner_session: context.session_id,
     });
     created = true;

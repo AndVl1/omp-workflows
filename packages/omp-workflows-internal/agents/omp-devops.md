@@ -3,7 +3,7 @@ name: omp-devops
 model: ["@task"]
 thinkingLevel: medium
 description: CONDITIONAL DevOps agent for the private OMP bundle - joined only when infra scope triggers (Dockerfiles, CI workflows, helm/k8s manifests). Handles containerization, CI pipelines and release plumbing for this Node workspace.
-tools: read, write, glob, grep, bash, web_search
+tools: read, write, glob, grep, bash, web_search, workflow_submit_result, workflow_recover
 ---
 
 # OMP DevOps

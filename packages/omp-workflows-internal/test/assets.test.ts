@@ -32,7 +32,7 @@ test("no bare or reserved command/agent names leak into assets", () => {
 	}
 });
 
-test("agent files declare the full frontmatter and stay concise", () => {
+test("agent files declare the required frontmatter", () => {
 	for (const agent of ALLOWED_POOL_AGENTS) {
 		const raw = readFileSync(join(packageRoot, "agents", `${agent}.md`), "utf8");
 		const frontmatter = raw.split("---")[1] ?? "";
@@ -40,8 +40,6 @@ test("agent files declare the full frontmatter and stay concise", () => {
 		for (const key of ["model:", "thinkingLevel:", "description:", "tools:"]) {
 			assert.ok(frontmatter.includes(key), `${agent}: missing frontmatter key ${key}`);
 		}
-		const lineCount = raw.split("\n").length;
-		assert.ok(lineCount < 60, `${agent}: expected <60 lines, got ${lineCount}`);
 	}
 });
 

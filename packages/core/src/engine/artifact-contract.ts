@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import { readArtifact, readArtifactInput } from "./artifacts.js";
 import { validateLectureAcquisitionArtifact } from "../lecture/acquisition.js";
+import { validationContractForStage } from "../gates/validation.js";
 import type { Profile, StageDef, TeamState } from "./types.js";
 
 export interface JsonSchemaDef {
@@ -94,6 +95,34 @@ export function loadArtifactSchemas(): Record<string, JsonSchemaDef> {
 /** Schema definition for an artifact id, or null when unconstrained. */
 export function artifactSchemaFor(id: string): JsonSchemaDef | null {
   return loadArtifactSchemas()[id] ?? null;
+}
+
+/**
+ * Return the exact producer schema exposed by `workflow_instructions`.
+ *
+ * Code-bearing stages add the gate-owned readiness fields to the declared
+ * artifact schema. Keeping this projection beside the executable artifact
+ * contract lets native producer prompts and workflow consumers share one
+ * flat-file schema without importing the workflow-contract module.
+ */
+export function artifactSchemaForStage(stageId: string, id: string): JsonSchemaDef | null {
+  const base = artifactSchemaFor(id);
+  const validation = validationContractForStage(stageId);
+  if (!validation || id !== stageId) return base;
+
+  const validationProperties: Record<string, JsonSchemaDef> = {
+    ready: { enum: [...validation.properties.ready.enum] },
+    validation_run: { enum: [...validation.properties.validation_run.enum] },
+    validation_evidence: {
+      type: validation.properties.validation_evidence.type,
+      description: validation.properties.validation_evidence.description,
+    },
+  };
+  return {
+    ...(base ?? { type: "object" }),
+    required: [...new Set([...(base?.required ?? []), ...validation.required])],
+    properties: { ...(base?.properties ?? {}), ...validationProperties },
+  };
 }
 
 /** Required top-level fields of a schema-defined artifact (null when unconstrained). */

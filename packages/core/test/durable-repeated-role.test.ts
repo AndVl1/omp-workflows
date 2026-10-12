@@ -36,8 +36,120 @@ import type { TeamState } from "../src/engine/types.js";
 import { registerWorkflowTools } from "../src/index.js";
 import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 import { z as zod } from "zod";
+import {
+  admitOrdinaryBatchWorkers,
+  admitOrdinaryWorker,
+  createCoreFixture,
+  details,
+  submission,
+  terminalOrdinaryBatchWorkers,
+  terminalWorker,
+  type Harness,
+  type Handoff,
+} from "./reliable-stage-execution-fixture.js";
 const NO_SCOPE: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: null };
 const RUN_ID = "99999999-9999-4999-8999-999999999999";
+function publicAuth(handoff: Handoff): {
+  token: string;
+  capability_id: string;
+  run_key: string;
+  branch: string;
+  workflow: string;
+  profile_hash: string;
+  stage_cursor: string;
+  cursor_epoch: string;
+  loop_iteration: number;
+} {
+  return {
+    token: handoff.advance_token,
+    capability_id: handoff.capability_id,
+    run_key: handoff.run_key,
+    branch: handoff.branch,
+    workflow: handoff.workflow,
+    profile_hash: handoff.profile_hash,
+    stage_cursor: handoff.stage_cursor,
+    cursor_epoch: handoff.cursor_epoch,
+    loop_iteration: handoff.loop_iteration,
+  };
+}
+async function prepareRegistered(harness: Harness, profile?: Profile): Promise<void> {
+  const prepared = harness.controller.prepare({ mode: "resume", run_id: RUN_ID });
+  assert.equal(prepared.state.run_id, RUN_ID, `${profile?.name ?? "registered"} resume must select the fixture run`);
+  assert.equal(harness.controller.activeClaimRunId(), RUN_ID, "registered fixture must hold the active execution claim");
+}
+async function beginRegistered(harness: Harness, selection?: unknown): Promise<Handoff> {
+  const tool = harness.tools.get("workflow_begin");
+  assert.ok(tool, "registered workflow_begin must be available");
+  const result = details((await tool.execute(
+    "durable-repeated-role-begin",
+    selection === undefined ? {} : { selection },
+    undefined,
+    undefined,
+    harness.context,
+  )).details);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const handoff = result.handoff;
+  assert.ok(handoff && typeof handoff === "object" && !Array.isArray(handoff), JSON.stringify(result));
+  return handoff as Handoff;
+}
+async function submitRegistered(harness: Harness, context: unknown, id: string, outputs: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const tool = harness.tools.get("workflow_submit_result");
+  assert.ok(tool, "registered workflow_submit_result must be available");
+  return details((await tool.execute(id, submission(outputs), undefined, undefined, context)).details);
+}
+async function advanceRegistered(harness: Harness, handoff: Handoff, evidence: string): Promise<Record<string, unknown>> {
+  const tool = harness.tools.get("workflow_advance");
+  assert.ok(tool, "registered workflow_advance must be available");
+  return details((await tool.execute(
+    "durable-repeated-role-advance",
+    { ...publicAuth(handoff), evidence },
+    undefined,
+    undefined,
+    harness.context,
+  )).details);
+}
+async function humanCheckpoint(harness: Harness, handoff: Handoff, checkpoint: string, checkpointKind: string): Promise<Record<string, unknown>> {
+  const askTool = harness.tools.get("workflow_checkpoint_ask");
+  assert.ok(askTool, "registered workflow_checkpoint_ask must be available");
+  const asked = details((await askTool.execute(
+    "durable-repeated-role-checkpoint-ask",
+    {
+      token: handoff.advance_token,
+      capability_id: handoff.capability_id,
+      run_key: handoff.run_key,
+      branch: handoff.branch,
+      workflow: handoff.workflow,
+      stage_cursor: handoff.stage_cursor,
+      cursor_epoch: handoff.cursor_epoch,
+      checkpoint,
+      checkpoint_id: checkpoint,
+      checkpoint_kind: checkpointKind,
+      loop_iteration: handoff.loop_iteration,
+    },
+    undefined,
+    undefined,
+    harness.context,
+  )).details);
+  assert.equal(asked.ok, true, JSON.stringify(asked));
+  const checkpointTool = harness.tools.get("workflow_checkpoint");
+  assert.ok(checkpointTool, "registered workflow_checkpoint must be available");
+  return details((await checkpointTool.execute(
+    "durable-repeated-role-checkpoint-record",
+    {
+      ...publicAuth(handoff),
+      checkpoint,
+      checkpoint_id: checkpoint,
+      checkpoint_kind: checkpointKind,
+      authorization: "human",
+      actor_provenance: asked.actor_provenance,
+      decision: asked.decision,
+      rationale: "registered human checkpoint fixture",
+    },
+    undefined,
+    undefined,
+    harness.context,
+  )).details);
+}
 function beginCapability(root: string, selection?: Parameters<typeof rawBeginCapability>[1], options?: Parameters<typeof rawBeginCapability>[2]) {
   return rawBeginCapability(root, selection, { runId: RUN_ID, ...options });
 }
@@ -304,490 +416,95 @@ test("br-eu6: full-feature exploration issues a valid consilium capability; mark
   }
 });
 
-test("br-eu6: both analyst slots authorize and complete independently; orchestrator-to-consilium advance defers roster-policy arming until workflow_begin", () => {
-  const root = mkdtempSync(join(tmpdir(), "br-eu6-advance-"));
-  try {
-    initGit(root, "feat/repeat");
-    const profile = loadProfile("full-feature");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
-    const issued = createCapability({
-      run_key: RUN_ID, branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "discovery", kind: "none", expected_roster: [],
-    });
-    writeCanonicalFixture(root, {
-      schema: 1,
-      branch: "feat/repeat",
-      run_key: RUN_ID,
-      classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
-      task: "orchestrator to consilium",
-      workflow_override: false,
-      issue: null,
-      stage_cursor: "discovery",
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" ? "in_progress" as const : "pending" as const })),
-      artifacts: {},
-      pause: { kind: "none" as const, reason: "" },
-      policy: { strict_orchestrator: true },
-      profile_hash: persistedProfileHash,
-      scope: NO_SCOPE,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      dispatch_capability: issued.state,
-      updated_at: new Date().toISOString(),
-    });
-    publishMapping(root);
-    const trusted = trustedCheckpoint(root, "discovery", "confirm_understanding", "proceed", "escalation");
-    const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    // Schema-valid discovery artifacts (task/branch required; feature_spec
-    // requires goal/scope/acceptance_criteria).
-    writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "repeat", branch: "feat/repeat", constraints: [] }));
-    writeFileSync(join(artifactsDir, "feature_spec.json"), JSON.stringify({ goal: "goal", scope: [], acceptance_criteria: ["criterion"] }));
 
-    const discoveryStage = profile.stages.find((stage) => stage.id === "discovery");
-    assert.ok(discoveryStage?.checkpoint === "confirm_understanding");
-    const discoveryPolicy = profile.checkpoint_policy;
-    assert.ok(discoveryPolicy);
-    const discoveryRule = discoveryPolicy.rules.confirm_understanding;
-    assert.ok(discoveryRule);
-    const checkpoint = recordCheckpointDecision(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "discovery", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      checkpoint: "confirm_understanding",
-      checkpoint_id: "confirm_understanding",
-      checkpoint_kind: discoveryRule.kind,
-      authorization: "human",
-      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
-      policy_hash: checkpointPolicyHash(discoveryPolicy),
-      decision: "proceed",
-      rationale: "fixture",
-    });
-    assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
-
-    const advanced = advanceCursor(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "discovery", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      evidence: "discovery completed",
-    });
-    assert.equal(advanced.ok, true);
-    if (!advanced.ok) return;
-    assert.equal(advanced.state.stage_cursor, "exploration");
-    // Roster-policy stages are never roster-resolved or armed by advance:
-    // the cursor parks on a pending stage with no capability and no frozen
-    // selection until the explicit workflow_begin freezes the roster.
-    assert.equal(advanced.handoff, undefined, "advance into a roster-policy stage issues no dispatch handoff");
-    assert.equal(advanced.state.dispatch_capability, undefined, "the deferred-roster advance deletes the completed prior capability: strict state<->capability coherence forbids carrying a stale stage/epoch binding");
-    assert.equal(advanced.state.stages.find((s) => s.id === "exploration")?.status, "pending", "the roster-policy stage stays semantically unselected");
-    assert.equal(advanced.state.roster_selection, undefined, "no default roster is frozen before begin");
-    const staleDispatch = authorizeDispatch(root, {
-      token: issued.dispatch_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/repeat", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "exploration", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      role: "analyst", agent: "analyst",
-    });
-    assert.equal(staleDispatch.ok, false, "dispatch before workflow_begin fails closed");
-
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, true, begun.ok ? "default begin accepted" : begun.error);
-    if (!begun.ok || !begun.handoff) return;
-    assert.equal(begun.handoff.kind, "consilium");
-    assert.deepEqual(begun.handoff.expected_roster, [
-      { role: "analyst", agent: "analyst" },
-      { role: "tech-researcher", agent: "tech-researcher" },
-    ], "deterministic default: minimum analyst slot plus one distinct risk-trigger role");
-
-    const auth = {
-      token: begun.handoff.dispatch_token,
-      capability_id: begun.handoff.capability_id,
-      run_key: begun.handoff.run_key,
-      branch: begun.handoff.branch,
-      workflow: begun.handoff.workflow,
-      profile_hash: begun.handoff.profile_hash,
-      stage_cursor: begun.handoff.stage_cursor,
-      cursor_epoch: begun.handoff.cursor_epoch,
-      loop_iteration: begun.handoff.loop_iteration,
-    };
-    const a1 = authorizeDispatch(root, { ...auth, role: "analyst", agent: "analyst" });
-    const tr = authorizeDispatch(root, { ...auth, role: "tech-researcher", agent: "tech-researcher" });
-    assert.equal(a1.ok, true);
-    assert.equal(tr.ok, true);
-    if (!a1.ok || !tr.ok || !a1.record || !tr.record) return;
-    assert.notEqual(a1.record.id, tr.record.id, "each slot gets its own dispatch record");
-    assert.notEqual(a1.record.role, tr.record.role);
-    assert.equal(a1.record.agent, "analyst");
-    assert.equal(tr.record.agent, "tech-researcher");
-
-    const complete = (record: { id: string }, role: string, agent: string, artifactIds: string[] = []) =>
-      completeDispatch(root, { ...auth, role, agent, dispatch_id: record.id, outcome: "succeeded", evidence: `${role} completed`, artifact_ids: artifactIds });
-    // Multi-slot consilium fan-in: every slot writes slot-scoped artifacts
-    // (<produce>-<slot>.json); the shared ids are synthesized deterministically
-    // at advance. The analyst slot also contributes the dod.
-    writeFileSync(join(artifactsDir, "exploration-analyst.json"), JSON.stringify({ files_to_read: [{ path: "a.ts", why: "x" }], summary: "analyst one" }));
-    writeFileSync(join(artifactsDir, "exploration-tech-researcher.json"), JSON.stringify({ files_to_read: [{ path: "b.ts", why: "y" }], summary: "researcher" }));
-    writeFileSync(join(artifactsDir, "dod-analyst.json"), JSON.stringify({ items: [{ criterion: "c", verify_method: "v", status: "pending" }] }));
-    assert.equal(complete(a1.record, "analyst", "analyst", ["exploration-analyst", "dod-analyst"]).ok, true);
-    assert.equal(complete(tr.record, "tech-researcher", "tech-researcher", ["exploration-tech-researcher"]).ok, true);
-
-    const advanced2 = advanceCursor(root, { ...auth, token: begun.handoff.advance_token, evidence: "exploration completed" });
-    if (!advanced2.ok) return;
-    assert.equal(advanced2.state.stage_cursor, "clarify");
-    // Deterministic synthesis wrote the shared artifacts for downstream consumers.
-    const sharedExploration = JSON.parse(readFileSync(join(artifactsDir, "exploration.json"), "utf8")) as { files_to_read: unknown[]; summary: string };
-    assert.equal(sharedExploration.files_to_read.length, 2, "synthesis concatenates per-slot arrays in roster order");
-    assert.equal(sharedExploration.summary, "analyst one", "scalar disagreements resolve deterministically first-slot-wins");
-    assert.ok(advanced2.state.slot_artifacts?.["exploration"]?.shared?.["exploration"], "synthesis provenance is recorded");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("br-eu6: single-to-single advance arms the next stage; required inputs are read before dispatch", () => {
+test("br-eu6: single-to-single advance arms the next stage; required inputs are read before dispatch", async () => {
   const root = mkdtempSync(join(tmpdir(), "br-eu6-single-"));
+  initGit(root, "feat/single");
+  const profile = loadProfile("lightweight");
+  assert.ok(profile);
+  const persistedProfileHash = profileHash(profile);
+  const issued = createCapability({
+    run_key: RUN_ID, branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
+    stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
+  });
+  writeCanonicalFixture(root, {
+    schema: 1,
+    branch: "feat/single",
+    run_key: RUN_ID,
+    classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+    task: "single to single",
+    workflow_override: false,
+    issue: null,
+    stage_cursor: "implementation",
+    stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" ? "done" as const : stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
+    artifacts: {},
+    pause: { kind: "none" as const, reason: "" },
+    policy: { strict_orchestrator: true },
+    profile_hash: persistedProfileHash,
+    scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    dispatch_capability: issued.state,
+    updated_at: new Date().toISOString(),
+  });
+  const harness = createCoreFixture({
+    root,
+    branch: "feat/single",
+    workflowProfiles: [profile],
+    roles: {
+      "${scope.dev_agent}": "developer-kotlin",
+      "developer-kotlin": "developer-kotlin",
+      "code-reviewer": "code-reviewer",
+    },
+  });
   try {
-    initGit(root, "feat/single");
-    const profile = loadProfile("lightweight");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
-    const issued = createCapability({
-      run_key: RUN_ID, branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", kind: "single", expected_roster: [{ role: "${scope.dev_agent}", agent: "developer-kotlin" }],
+    await prepareRegistered(harness, profile);
+    const handoff = await beginRegistered(harness);
+    assert.equal(handoff.kind, "single");
+    assert.deepEqual(handoff.expected_roster, [{ role: "developer-kotlin", agent: "developer-kotlin" }]);
+    const worker = await admitOrdinaryWorker(harness, handoff, "single-to-single");
+    const submitted = await submitRegistered(harness, worker.childContext, "single-to-single-submit", {
+      implementation: { ready: true, validation_run: true, validation_evidence: "focused single-to-single regression", files_touched: ["src/index.ts"] },
     });
-    writeCanonicalFixture(root, {
-      schema: 1,
-      branch: "feat/single",
-      run_key: RUN_ID,
-      classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
-      task: "single to single",
-      workflow_override: false,
-      issue: null,
-      stage_cursor: "implementation",
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
-      artifacts: {},
-      pause: { kind: "none" as const, reason: "" },
-      policy: { strict_orchestrator: true },
-      profile_hash: persistedProfileHash,
-      scope: { scope: ["backend-kotlin"], has_security: false, has_infra: false, has_ui: false, has_runtime: true, dev_agent: "developer-kotlin" },
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      dispatch_capability: issued.state,
-      updated_at: new Date().toISOString(),
-    });
-    const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    // Schema-valid implementation artifact (files_touched is required by the
-    // artifact contract; the validation gate additionally requires the
-    // validation block).
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "focused single-to-single regression", files_touched: ["src/index.ts"] }));
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
+    await terminalWorker(harness, worker);
 
-    const auth = {
-      token: issued.dispatch_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      role: "${scope.dev_agent}", agent: "developer-kotlin",
-    };
-    const authorized = authorizeDispatch(root, auth);
-    assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed" }).ok, true);
-
-    // lightweight implementation declares a checkpoint; record it durably
-    // before the advance is allowed.
     const implementationStage = profile.stages.find((stage) => stage.id === "implementation");
     assert.ok(implementationStage?.checkpoint === "approve_implementation");
     const implementationPolicy = profile.checkpoint_policy;
     assert.ok(implementationPolicy);
     const implementationRule = implementationPolicy.rules.approve_implementation;
     assert.ok(implementationRule);
-    const trusted = trustedCheckpoint(root, "implementation", "approve_implementation", "proceed");
-    const checkpoint = recordCheckpointDecision(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/single", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      checkpoint: "approve_implementation",
-      checkpoint_id: "approve_implementation",
-      checkpoint_kind: implementationRule.kind,
-      authorization: "human",
-      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
-      policy_hash: checkpointPolicyHash(implementationPolicy),
-      decision: "proceed",
-      rationale: "fixture",
-    });
-    assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
+    const checkpoint = await humanCheckpoint(harness, handoff, "approve_implementation", implementationRule.kind);
+    assert.equal(checkpoint.ok, true, JSON.stringify(checkpoint));
 
-    const advanced = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "implementation completed" });
-    assert.equal(advanced.ok, true);
-    if (!advanced.ok) return;
-    assert.equal(advanced.state.stage_cursor, "code_review");
-    assert.equal(advanced.state.dispatch_capability?.status, "ready");
-    assert.equal(advanced.state.dispatch_capability?.kind, "single");
-    assert.deepEqual(advanced.state.dispatch_capability?.expected_roster, [{ role: "code-reviewer", agent: "code-reviewer" }]);
-    assert.equal(advanced.state.stages.find((s) => s.id === "code_review")?.status, "in_progress", "single-to-single lands on an executable in_progress stage");
+    const advanced = await advanceRegistered(harness, handoff, "implementation completed");
+    assert.equal(advanced.ok, true, JSON.stringify(advanced));
+    const advancedState = readCanonicalState(root).state;
+    assert.ok(advancedState);
+    assert.equal(advancedState.stage_cursor, "code_review");
+    assert.equal(advancedState.dispatch_capability?.status, "ready");
+    assert.equal(advancedState.dispatch_capability?.kind, "single");
+    assert.deepEqual(advancedState.dispatch_capability?.expected_roster, [{ role: "code-reviewer", agent: "code-reviewer" }]);
+    assert.equal(advancedState.stages.find((s) => s.id === "code_review")?.status, "in_progress", "single-to-single lands on an executable in_progress stage");
 
     const codeReview = profile.stages.find((stage) => stage.id === "code_review");
     assert.ok(codeReview);
-    const marker = buildDispatchMarker(RUN_ID, codeReview, ["code-reviewer"], "code-reviewer", advanced.state.cursor_epoch);
+    const marker = buildDispatchMarker(RUN_ID, codeReview, ["code-reviewer"], "code-reviewer", advancedState.cursor_epoch!);
     const blockedBeforeRead = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: marker } }, { cwd: root });
     assert.equal(blockedBeforeRead?.reason, "dispatch gate: recovery_required: required inputs must be read and hash-receipted before dispatch");
 
     // Public workflow_begin reads code_review's declared implementation input,
     // hashes the exact artifact bytes, and persists the capability-bound receipt.
-    const begun = beginCapability(root);
-    assert.equal(begun.ok, true, begun.ok ? "workflow_begin read and hash-receipted code-review inputs" : begun.error);
-    if (!begun.ok) return;
-    const gate = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: marker } }, { cwd: root });
+    const begun = await beginRegistered(harness);
+    assert.deepEqual(begun.expected_roster, [{ role: "code-reviewer", agent: "code-reviewer" }]);
+    const gate = dispatchGate({ toolName: "task", input: { agent: "code-reviewer", role: "code-reviewer", task: begun.dispatch_markers[0]!.marker } }, { cwd: root });
     assert.equal(gate, undefined, "required-input read receipt makes the armed next stage executable");
   } finally {
+    await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("br-eu6: reopening a stage clears stale downstream slot bindings and starts with a fresh empty capability", () => {
-  const root = mkdtempSync(join(tmpdir(), "br-eu6-reopen-"));
-  const branch = "feat/reopen";
-  try {
-    initGit(root, branch);
-    const profile = loadProfile("full-feature");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
-    const issued = createCapability({
-      run_key: branch,
-      branch,
-      workflow: "full-feature",
-      profile_hash: persistedProfileHash,
-      stage_cursor: "exploration",
-      kind: "consilium",
-      expected_roster: [
-        { role: "analyst#1", agent: "analyst" },
-        { role: "tech-researcher", agent: "tech-researcher" },
-        { role: "analyst#2", agent: "analyst" },
-      ],
-    });
-    const initialState: TeamState = {
-      schema: 1,
-      branch,
-      run_key: branch,
-      classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
-      task: "reopen stale bindings",
-      workflow_override: false,
-      issue: null,
-      stage_cursor: "exploration",
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" ? "done" as const : stage.id === "exploration" ? "in_progress" as const : "pending" as const })),
-      artifacts: { discovery: "artifacts/discovery.json", feature_spec: "artifacts/feature_spec.json" },
-      pause: { kind: "none", reason: "" },
-      policy: { strict_orchestrator: true },
-      profile_hash: persistedProfileHash,
-      scope: NO_SCOPE,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      dispatch_capability: issued.state,
-      updated_at: new Date().toISOString(),
-    };
-    writeCanonicalFixture(root, initialState);
-    publishMapping(root);
-    const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "reopen stale bindings", branch }));
-    const upstreamPath = join(artifactsDir, "discovery-upstream.json");
-    writeFileSync(upstreamPath, "upstream");
-    const upstreamSecondPath = join(artifactsDir, "discovery-upstream-second.json");
-    writeFileSync(upstreamSecondPath, "upstream-second");
-    const outsideDir = join(root, "outside");
-    mkdirSync(outsideDir, { recursive: true });
-    const outsidePath = join(outsideDir, "must-survive.json");
-    writeFileSync(outsidePath, "outside");
-
-    const oldArtifacts = [
-      { role: "analyst#1", agent: "analyst", id: "exploration-analyst-1" },
-      { role: "tech-researcher", agent: "tech-researcher", id: "exploration-tech-researcher" },
-      { role: "analyst#2", agent: "analyst", id: "exploration-analyst-2" },
-    ];
-    for (const item of oldArtifacts) {
-      writeFileSync(join(artifactsDir, item.id + ".json"), JSON.stringify({ files_to_read: [{ path: "old.ts" }], summary: "old" }));
-    }
-    const oldAuth = {
-      token: issued.dispatch_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID,
-      branch,
-      workflow: "full-feature",
-      profile_hash: persistedProfileHash,
-      stage_cursor: "exploration",
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      loop_iteration: issued.state.issued_for!.loop_iteration,
-    };
-    const oldRecords: Array<{ role: string; agent: string; id: string }> = [];
-    for (const item of oldArtifacts) {
-      const authorized = authorizeDispatch(root, { ...oldAuth, role: item.role, agent: item.agent });
-      assert.equal(authorized.ok, true, authorized.ok ? "" : `authorize ${item.role}: ${authorized.error}`);
-      if (!authorized.ok || !authorized.record) return;
-      const completed = completeDispatch(root, {
-        ...oldAuth,
-        role: item.role,
-        agent: item.agent,
-        dispatch_id: authorized.record.id,
-        outcome: "succeeded",
-        evidence: "old completion",
-        artifact_ids: [item.id],
-      });
-      assert.equal(completed.ok, true, completed.ok ? "" : `complete ${item.role}: ${completed.error}`);
-      oldRecords.push({ role: item.role, agent: item.agent, id: authorized.record.id });
-    }
-
-    const staleState = JSON.parse(readFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), "utf8")) as TeamState;
-    staleState.slot_artifacts = {
-      ...staleState.slot_artifacts,
-      discovery: {
-        slots: {
-          "analyst#1": { discovery: { path: upstreamPath, hash: "upstream-1" } },
-          "analyst#2": { discovery: { path: upstreamSecondPath, hash: "upstream-2" } },
-        },
-      },
-      architecture: { slots: { "architect#2": { architecture: { path: join(artifactsDir, "architecture-architect-2.json"), hash: "downstream" } } } },
-    };
-    const oldExplorationSlots = staleState.slot_artifacts.exploration?.slots["analyst#1"];
-    if (!oldExplorationSlots) return;
-    oldExplorationSlots.outside = { path: outsidePath, hash: "outside" };
-    const downstreamPath = join(artifactsDir, "architecture-architect-2.json");
-    writeFileSync(downstreamPath, "downstream");
-    writeCanonicalFixture(root, staleState);
-
-    const execution = {
-      session_id: "reopen-session",
-      caller: "host",
-      process_id: process.pid,
-      worktree: root,
-      branch,
-      authority: "coordinator",
-    } as const;
-    const reopened = prepareWorkflowState({
-      task: "reopen stale bindings",
-      cwd: root,
-      branch,
-      autonomous: false,
-      classification: staleState.classification,
-      files: [],
-      mode: "rework",
-      run_id: RUN_ID,
-      feedback: "reopen exploration after stale downstream evidence",
-      affected_stage: "exploration",
-      execution,
-    });
-    assert.equal(reopened.state.stage_cursor, "exploration", "rework reopens the requested stage");
-
-    const begun = beginCapability(root, THREE_SLOT_SELECTION);
-    assert.equal(begun.ok, true, begun.ok ? "" : `reopen begin failed: ${begun.error}`);
-    if (!begun.ok || !begun.handoff) return;
-    assert.equal(reopened.state.artifacts?.discovery, initialState.artifacts?.discovery, "upstream discovery artifact binding survives the rework");
-    assert.equal(reopened.state.artifacts?.feature_spec, initialState.artifacts?.feature_spec, "upstream feature spec artifact binding survives the rework");
-    for (const item of oldArtifacts) {
-      assert.equal(Object.prototype.hasOwnProperty.call(reopened.state.artifacts ?? {}, item.id), false, `affected artifact binding is invalidated: ${item.id}`);
-    }
-    assert.deepEqual(begun.state.dispatch_capability?.dispatches, [], "reopened capability never reuses old dispatch records");
-    assert.equal(begun.state.slot_artifacts?.exploration, undefined, "reopened slot bindings are cleared");
-    assert.equal(begun.state.slot_artifacts?.architecture, undefined, "downstream slot bindings are cleared");
-    assert.ok(begun.state.slot_artifacts?.discovery?.slots["analyst#1"], "first upstream repeated-role occurrence remains bound");
-    assert.equal(begun.state.slot_artifacts?.discovery?.slots["analyst#2"]?.discovery.path, upstreamSecondPath, "second upstream repeated-role occurrence remains distinct");
-    assert.equal(existsSync(upstreamPath), true, "first upstream slot artifact file remains");
-    assert.equal(existsSync(upstreamSecondPath), true, "second upstream slot artifact file remains");
-    assert.equal(existsSync(outsidePath), true, "out-of-tree stale path is never removed");
-    for (const item of oldArtifacts) assert.equal(existsSync(join(artifactsDir, item.id + ".json")), false, "stale slot file is removed: " + item.id);
-    assert.equal(existsSync(downstreamPath), false, "downstream stale slot file is removed");
-
-    const replay = completeDispatch(root, {
-      ...oldAuth,
-      dispatch_id: oldRecords[0]!.id,
-      role: oldRecords[0]!.role,
-      agent: oldRecords[0]!.agent,
-      outcome: "succeeded",
-      evidence: "stale replay",
-      artifact_ids: [],
-    });
-    assert.equal(replay.ok, false, "the old capability cannot authorize a fresh completion");
-
-    const fresh = begun.handoff;
-    const freshAuth = {
-      token: fresh.dispatch_token,
-      capability_id: fresh.capability_id,
-      run_key: fresh.run_key,
-      branch: fresh.branch,
-      workflow: fresh.workflow,
-      profile_hash: fresh.profile_hash,
-      stage_cursor: fresh.stage_cursor,
-      cursor_epoch: fresh.cursor_epoch,
-      loop_iteration: fresh.loop_iteration,
-    };
-    writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "reopen stale bindings", branch }));
-    const first = oldArtifacts[0]!;
-    const firstAuth = authorizeDispatch(root, { ...freshAuth, role: first.role, agent: first.agent });
-    assert.equal(firstAuth.ok, true);
-    if (!firstAuth.ok || !firstAuth.record) return;
-    const beforeMissingOldFile = readCanonicalState(root).state;
-    assert.ok(beforeMissingOldFile, "state remains available before missing artifact rejection");
-    const upstreamBytesBefore = {
-      first: readFileSync(upstreamPath),
-      second: readFileSync(upstreamSecondPath),
-    };
-    const missingOldFile = completeDispatch(root, {
-      ...freshAuth,
-      role: first.role,
-      agent: first.agent,
-      dispatch_id: firstAuth.record.id,
-      outcome: "succeeded",
-      evidence: "stale file replay",
-      artifact_ids: [first.id],
-    });
-    assert.equal(missingOldFile.ok, false, "a removed old file cannot authorize fresh completion");
-    if (missingOldFile.ok) return;
-    const afterMissingOldFile = readCanonicalState(root).state;
-    assert.ok(afterMissingOldFile, "state remains available after missing artifact rejection");
-    assert.equal(afterMissingOldFile.stage_cursor, beforeMissingOldFile.stage_cursor, "missing artifact cannot advance the cursor");
-    assert.equal(afterMissingOldFile.cursor_epoch, beforeMissingOldFile.cursor_epoch, "missing artifact cannot rotate the cursor epoch");
-    assert.deepEqual(afterMissingOldFile.stages, beforeMissingOldFile.stages, "missing artifact cannot advance stage statuses");
-    assert.deepEqual(afterMissingOldFile.dispatch_capability, beforeMissingOldFile.dispatch_capability, "missing artifact leaves the dispatch capability unchanged");
-    assert.deepEqual(afterMissingOldFile.slot_artifacts?.exploration, beforeMissingOldFile.slot_artifacts?.exploration, "affected exploration bindings stay unchanged");
-    assert.deepEqual(afterMissingOldFile.slot_artifacts?.architecture, beforeMissingOldFile.slot_artifacts?.architecture, "downstream bindings stay unchanged");
-    assert.deepEqual(afterMissingOldFile.slot_artifacts?.discovery?.slots, beforeMissingOldFile.slot_artifacts?.discovery?.slots, "upstream repeated-role bindings stay unchanged");
-    assert.equal(afterMissingOldFile.slot_artifacts?.discovery?.slots["analyst#1"]?.discovery?.path, upstreamPath, "analyst#1 upstream binding remains distinct");
-    assert.equal(afterMissingOldFile.slot_artifacts?.discovery?.slots["analyst#2"]?.discovery?.path, upstreamSecondPath, "analyst#2 upstream binding remains distinct");
-    assert.deepEqual(readFileSync(upstreamPath), upstreamBytesBefore.first, "analyst#1 upstream bytes remain unchanged");
-    assert.deepEqual(readFileSync(upstreamSecondPath), upstreamBytesBefore.second, "analyst#2 upstream bytes remain unchanged");
-
-    for (const item of oldArtifacts) {
-      writeFileSync(join(artifactsDir, item.id + ".json"), JSON.stringify({ files_to_read: [{ path: "fresh.ts" }], summary: "fresh " + item.role }));
-      const dodId = item.id.replace("exploration-", "dod-");
-      writeFileSync(join(artifactsDir, dodId + ".json"), JSON.stringify({ items: [{ criterion: "fresh", verify_method: "focused regression", status: "pending" }] }));
-    }
-    const freshRecords = [{ role: first.role, agent: first.agent, id: firstAuth.record.id }, ...oldArtifacts.slice(1).map((item) => {
-      const authorized = authorizeDispatch(root, { ...freshAuth, role: item.role, agent: item.agent });
-      assert.equal(authorized.ok, true);
-      if (!authorized.ok || !authorized.record) throw new Error("fresh dispatch authorization failed");
-      return { role: item.role, agent: item.agent, id: authorized.record.id };
-    })];
-    for (const item of freshRecords) {
-      const explorationId = "exploration-" + item.role.replace(/[^A-Za-z0-9._-]/g, "-");
-      const dodId = "dod-" + item.role.replace(/[^A-Za-z0-9._-]/g, "-");
-      const completed = completeDispatch(root, {
-        ...freshAuth,
-        role: item.role,
-        agent: item.agent,
-        dispatch_id: item.id,
-        outcome: "succeeded",
-        evidence: "fresh completion",
-        artifact_ids: [explorationId, dodId],
-      });
-      assert.equal(completed.ok, true);
-    }
-    const advanced = advanceCursor(root, { ...freshAuth, token: fresh.advance_token, evidence: "fresh exploration completed" });
-    assert.equal(advanced.ok, true, "fresh downstream artifacts complete after stale bindings are cleared");
-    if (advanced.ok) assert.equal(advanced.state.stage_cursor, "clarify");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
 
 const ARCHITECT_PAIR_SELECTION = {
   occurrences: [
@@ -815,106 +532,92 @@ function freshMapping(roles: Record<string, string>, availableAgents: string[]):
   return buildAgentMapping({ roles, availableAgents, extraRoles: [], genericFallbackRoles: Object.keys(roles) });
 }
 
-test("wave-004: advance into architecture stays semantically unselected; workflow_begin selects multiple architects", () => {
+test("wave-004: advance into architecture stays semantically unselected; workflow_begin selects multiple architects", async () => {
   const root = mkdtempSync(join(tmpdir(), "wave004-arch-"));
+  initGit(root, "feat/arch");
+  const profile = loadProfile("full-feature");
+  assert.ok(profile);
+  const persistedProfileHash = profileHash(profile);
+  const issued = createCapability({
+    run_key: RUN_ID, branch: "feat/arch", workflow: "full-feature", profile_hash: persistedProfileHash,
+    stage_cursor: "clarify", kind: "none", expected_roster: [],
+  });
+  writeCanonicalFixture(root, {
+    schema: 1,
+    branch: "feat/arch",
+    run_key: RUN_ID,
+    classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
+    task: "multi-architect selection regression",
+    workflow_override: false,
+    issue: null,
+    stage_cursor: "clarify",
+    stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" || stage.id === "exploration" ? "done" as const : stage.id === "clarify" ? "in_progress" as const : "pending" as const })),
+    artifacts: {},
+    pause: { kind: "none" as const, reason: "" },
+    policy: { strict_orchestrator: true },
+    profile_hash: persistedProfileHash,
+    scope: NO_SCOPE,
+    cursor_epoch: issued.state.issued_for!.cursor_epoch,
+    dispatch_capability: issued.state,
+    updated_at: new Date().toISOString(),
+  });
+  const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
+  mkdirSync(artifactsDir, { recursive: true });
+  writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "arch", branch: "feat/arch", constraints: [] }));
+  writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: [{ path: "a.ts", why: "x" }], summary: "explored" }));
+  writeFileSync(join(artifactsDir, "clarifications.json"), JSON.stringify({ questions: [], answers: ["proceed"] }));
+  const harness = createCoreFixture({ root, branch: "feat/arch", workflowProfiles: [profile], roles: poolRoles });
+  publishMapping(root);
   try {
-    initGit(root, "feat/arch");
-    const profile = loadProfile("full-feature");
-    assert.ok(profile);
-    const persistedProfileHash = profileHash(profile);
-    const issued = createCapability({
-      run_key: RUN_ID, branch: "feat/arch", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "clarify", kind: "none", expected_roster: [],
+    await prepareRegistered(harness, profile);
+    const clarify = await beginRegistered(harness);
+    const submitted = await submitRegistered(harness, harness.context, "wave004-clarify-submit", {
+      clarifications: { questions: [], answers: ["proceed"] },
     });
-    writeCanonicalFixture(root, {
-      schema: 1,
-      branch: "feat/arch",
-      run_key: RUN_ID,
-      classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: "full-feature" },
-      task: "multi-architect selection regression",
-      workflow_override: false,
-      issue: null,
-      stage_cursor: "clarify",
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" || stage.id === "exploration" ? "done" as const : stage.id === "clarify" ? "in_progress" as const : "pending" as const })),
-      artifacts: {},
-      pause: { kind: "none" as const, reason: "" },
-      policy: { strict_orchestrator: true },
-      profile_hash: persistedProfileHash,
-      scope: NO_SCOPE,
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      dispatch_capability: issued.state,
-      updated_at: new Date().toISOString(),
-    });
-    publishMapping(root);
-    const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "arch", branch: "feat/arch", constraints: [] }));
-    writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: [{ path: "a.ts", why: "x" }], summary: "explored" }));
-    writeFileSync(join(artifactsDir, "clarifications.json"), JSON.stringify({ questions: [], answers: ["proceed"] }));
-
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
     const clarifyStage = profile.stages.find((stage) => stage.id === "clarify");
     assert.ok(clarifyStage?.checkpoint === "user_answers");
     const policy = profile.checkpoint_policy;
     assert.ok(policy);
     const rule = policy.rules.user_answers;
     assert.ok(rule);
-    const trusted = trustedCheckpoint(root, "clarify", "user_answers", "proceed");
-    const checkpoint = recordCheckpointDecision(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/arch", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      checkpoint: "user_answers",
-      checkpoint_id: "user_answers",
-      checkpoint_kind: rule.kind,
-      authorization: "human",
-      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
-      policy_hash: checkpointPolicyHash(policy),
-      decision: "proceed",
-      rationale: "fixture",
-    });
-    assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
+    const checkpoint = await humanCheckpoint(harness, clarify, "user_answers", rule.kind);
+    assert.equal(checkpoint.ok, true, JSON.stringify(checkpoint));
 
-    const advanced = advanceCursor(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/arch", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      evidence: "clarify completed",
-    });
-    assert.equal(advanced.ok, true, advanced.ok ? "clarify-to-architecture advance ok" : advanced.error);
-    if (!advanced.ok) return;
-    assert.equal(advanced.state.stage_cursor, "architecture");
-    assert.equal(advanced.handoff, undefined, "no handoff and no default roster before the explicit begin");
-    assert.equal(advanced.state.dispatch_capability, undefined, "the deferred-roster advance leaves no capability behind: begin issues the deferred stage's own capability");
-    assert.equal(advanced.state.stages.find((s) => s.id === "architecture")?.status, "pending", "architecture is not armed by advance");
-    assert.equal(advanced.state.roster_selection, undefined, "no default architect roster is frozen before begin");
+    const advanced = await advanceRegistered(harness, clarify, "clarify completed");
+    assert.equal(advanced.ok, true, JSON.stringify(advanced));
+    const advancedState = readCanonicalState(root).state;
+    assert.ok(advancedState);
+    assert.equal(advancedState.stage_cursor, "architecture");
+    assert.equal(advancedState.dispatch_capability, undefined, "the deferred-roster advance leaves no capability behind: begin issues the deferred stage's own capability");
+    assert.equal(advancedState.stages.find((s) => s.id === "architecture")?.status, "pending", "architecture is not armed by advance");
+    assert.equal(advancedState.roster_selection, undefined, "no default architect roster is frozen before begin");
 
-    const begun = beginCapability(root, ARCHITECT_PAIR_SELECTION);
-    assert.equal(begun.ok, true, begun.ok ? "multi-architect begin accepted" : begun.error);
-    if (!begun.ok || !begun.handoff) return;
-    assert.equal(begun.handoff.kind, "consilium");
-    assert.deepEqual(begun.handoff.expected_roster, [
+    const begun = await beginRegistered(harness, ARCHITECT_PAIR_SELECTION);
+    assert.equal(begun.kind, "consilium");
+    assert.deepEqual(begun.expected_roster, [
       { role: "architect#1", agent: "architect" },
       { role: "architect#2", agent: "architect" },
     ], "both architect occurrences resolve to numbered executable slots");
-    assert.equal(begun.state.roster_selection?.selected.length, 2, "the semantic selection is frozen with both occurrences");
-    const auth = {
-      token: begun.handoff.dispatch_token,
-      capability_id: begun.handoff.capability_id,
-      run_key: begun.handoff.run_key,
-      branch: begun.handoff.branch,
-      workflow: begun.handoff.workflow,
-      profile_hash: begun.handoff.profile_hash,
-      stage_cursor: begun.handoff.stage_cursor,
-      cursor_epoch: begun.handoff.cursor_epoch,
-      loop_iteration: begun.handoff.loop_iteration,
-    };
-    const slot1 = authorizeDispatch(root, { ...auth, role: "architect#1", agent: "architect" });
-    const slot2 = authorizeDispatch(root, { ...auth, role: "architect#2", agent: "architect" });
-    assert.equal(slot1.ok, true, slot1.ok ? "architect#1 executable" : slot1.error);
-    assert.equal(slot2.ok, true, slot2.ok ? "architect#2 executable" : slot2.error);
+    const afterBegin = readCanonicalState(root).state;
+    assert.equal(afterBegin?.roster_selection?.selected.length, 2, "the semantic selection is frozen with both occurrences");
+    const workers = await admitOrdinaryBatchWorkers(harness, begun, "wave004-architect");
+    assert.equal(workers.length, 2);
+    for (const [index, worker] of workers.entries()) {
+      const slot = begun.expected_roster[index]!;
+      const result = await submitRegistered(harness, worker.childContext, `wave004-architect-submit-${index}`, {
+        architecture: {
+          options: [{ id: `option-${index + 1}`, summary: `Architecture option ${index + 1}` }],
+          chosen: `option-${index + 1}`,
+          rationale: "registered producer fixture",
+        },
+      });
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal(slot.agent, "architect");
+    }
+    await terminalOrdinaryBatchWorkers(harness, workers);
   } finally {
+    await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -991,8 +694,9 @@ test("wave-004: trusted mapping handoff wins over a tampered persisted mapping; 
   }
 });
 
-test("wave-004: non-roster advance arming consumes the trusted mapping override", () => {
+test("wave-004: non-roster advance arming consumes the trusted mapping override", async () => {
   const root = mkdtempSync(join(tmpdir(), "wave004-advance-mapping-"));
+  let harness: Harness | undefined;
   try {
     initGit(root, "feat/trusted-advance");
     const profile = loadProfile("lightweight");
@@ -1011,7 +715,7 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
       workflow_override: false,
       issue: null,
       stage_cursor: "implementation",
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
+      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" ? "done" as const : stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
       artifacts: {},
       pause: { kind: "none" as const, reason: "" },
       policy: { strict_orchestrator: true },
@@ -1021,55 +725,53 @@ test("wave-004: non-roster advance arming consumes the trusted mapping override"
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
     });
-    publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "omp-attacker" }, ["developer-kotlin", "omp-attacker"]);
-    const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "trusted advance override regression", files_touched: ["src/index.ts"] }));
+    mkdirSync(join(root, ".work-state", "runs", RUN_ID, "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "runs", RUN_ID, "artifacts", "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "trusted advance override regression", files_touched: ["src/index.ts"] }));
 
-    const auth = {
-      token: issued.dispatch_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/trusted-advance", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      role: "${scope.dev_agent}", agent: "developer-kotlin",
-    };
-    const authorized = authorizeDispatch(root, auth);
-    assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed" }).ok, true);
+    harness = createCoreFixture({
+      root,
+      branch: "feat/trusted-advance",
+      workflowProfiles: [profile],
+      roles: { "${scope.dev_agent}": "developer-kotlin", "developer-kotlin": "developer-kotlin", "code-reviewer": "omp-attacker" },
+    });
+    publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "omp-attacker" }, ["developer-kotlin", "omp-attacker"]);
+    await prepareRegistered(harness, profile);
+    const handoff = await beginRegistered(harness);
+    assert.deepEqual(handoff.expected_roster, [{ role: "developer-kotlin", agent: "developer-kotlin" }]);
+    const worker = await admitOrdinaryWorker(harness, handoff, "trusted-advance");
+    const submitted = await submitRegistered(harness, worker.childContext, "durable-repeated-role-trusted-submit", {
+      implementation: {
+        ready: true,
+        validation_run: true,
+        validation_evidence: "trusted advance override regression",
+        files_touched: ["src/index.ts"],
+      },
+    });
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
+    await terminalWorker(harness, worker);
     const implementationStage = profile.stages.find((stage) => stage.id === "implementation");
     assert.ok(implementationStage?.checkpoint === "approve_implementation");
     const policy = profile.checkpoint_policy;
     assert.ok(policy);
     const rule = policy.rules.approve_implementation;
     assert.ok(rule);
-    const trusted = trustedCheckpoint(root, "implementation", "approve_implementation", "proceed");
-    const checkpoint = recordCheckpointDecision(root, {
-      ...auth,
-      token: issued.advance_token,
-      checkpoint: "approve_implementation",
-      checkpoint_id: "approve_implementation",
-      checkpoint_kind: rule.kind,
-      authorization: "human",
-      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
-      policy_hash: checkpointPolicyHash(policy),
-      decision: "proceed",
-      rationale: "fixture",
-    });
-    assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint recorded" : checkpoint.error);
+    const checkpoint = await humanCheckpoint(harness, handoff, "approve_implementation", rule.kind);
+    assert.equal(checkpoint.ok, true, JSON.stringify(checkpoint));
 
-    const malformedAdvance = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, { trustedMapping: { schema: 99 } as unknown as AgentMappingState });
+    const auth = publicAuth(handoff);
+    const malformedAdvance = advanceCursor(root, { ...auth, evidence: "stage completed" }, { trustedMapping: { schema: 99 } as unknown as AgentMappingState });
     assert.equal(malformedAdvance.ok, false, "a malformed trusted handoff fails the advance closed");
     if (!malformedAdvance.ok) assert.match(malformedAdvance.error, /trusted agent mapping handoff is malformed/);
-    const nullAdvance = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, { trustedMapping: null as unknown as AgentMappingState });
+    const nullAdvance = advanceCursor(root, { ...auth, evidence: "stage completed" }, { trustedMapping: null as unknown as AgentMappingState });
     assert.equal(nullAdvance.ok, false, "a runtime-null advance handoff fails closed instead of selecting the persisted mapping");
     if (!nullAdvance.ok) assert.match(nullAdvance.error, /trusted agent mapping handoff is malformed/);
-    const advanced = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, { trustedMapping: freshMapping({ "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "code-reviewer" }, ["developer-kotlin", "code-reviewer"]) });
+    const advanced = advanceCursor(root, { ...auth, evidence: "stage completed" }, { trustedMapping: freshMapping({ "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "code-reviewer" }, ["developer-kotlin", "code-reviewer"]) });
     assert.equal(advanced.ok, true, advanced.ok ? "trusted advance ok" : advanced.error);
     if (!advanced.ok) return;
     assert.equal(advanced.state.stage_cursor, "code_review");
     assert.deepEqual(advanced.state.dispatch_capability?.expected_roster, [{ role: "code-reviewer", agent: "code-reviewer" }], "the trusted mapping names the code-reviewer slot, never the tampered file's agent");
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1098,13 +800,12 @@ const LOOP_ROSTER_PROFILE: Profile = {
   ],
 };
 
-test("wave-004: loop re-entry into a roster-policy target defers the roster; explicit begin reselects", () => {
+test("wave-004: loop re-entry into a roster-policy target defers the roster; explicit begin reselects", async () => {
   const root = mkdtempSync(join(tmpdir(), "wave004-loop-roster-"));
+  let harness: Harness | undefined;
   try {
     initGit(root, "feat/loop-roster");
-    registerWorkflowProfiles([LOOP_ROSTER_PROFILE]);
-    const profile = loadProfile("loop-roster-regression");
-    assert.ok(profile);
+    const profile = LOOP_ROSTER_PROFILE;
     const persistedProfileHash = profileHash(profile);
     writeCanonicalFixture(root, {
       schema: 1,
@@ -1124,84 +825,64 @@ test("wave-004: loop re-entry into a roster-policy target defers the roster; exp
       cursor_epoch: "fixture-epoch-0",
       updated_at: new Date().toISOString(),
     });
+    mkdirSync(join(root, ".work-state", "runs", RUN_ID, "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "runs", RUN_ID, "artifacts", "design.json"), JSON.stringify({ chosen: "option-1" }));
+
+    harness = createCoreFixture({
+      root,
+      branch: "feat/loop-roster",
+      workflowProfiles: [profile],
+      roles: { architect: "architect", reviewer: "reviewer" },
+    });
     publishMapping(root);
-    const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, "design.json"), JSON.stringify({ chosen: "option-1" }));
+    await prepareRegistered(harness, profile);
+    const begun = await beginRegistered(harness, { occurrences: [{ role: "architect", reason: "option one" }] });
+    assert.deepEqual(begun.expected_roster, [{ role: "architect", agent: "architect" }]);
+    const designWorker = await admitOrdinaryWorker(harness, begun, "loop-design");
+    const designSubmitted = await submitRegistered(harness, designWorker.childContext, "durable-repeated-role-design-submit", {
+      design: { chosen: "option-1" },
+    });
+    assert.equal(designSubmitted.ok, true, JSON.stringify(designSubmitted));
+    await terminalWorker(harness, designWorker);
 
-    const begun = beginCapability(root, { occurrences: [{ role: "architect", reason: "option one" }] });
-    assert.equal(begun.ok, true, begun.ok ? "first-iteration begin accepted" : begun.error);
-    if (!begun.ok || !begun.handoff) return;
-    const designAuth = {
-      token: begun.handoff.dispatch_token,
-      capability_id: begun.handoff.capability_id,
-      run_key: begun.handoff.run_key,
-      branch: begun.handoff.branch,
-      workflow: begun.handoff.workflow,
-      profile_hash: begun.handoff.profile_hash,
-      stage_cursor: begun.handoff.stage_cursor,
-      cursor_epoch: begun.handoff.cursor_epoch,
-      loop_iteration: begun.handoff.loop_iteration,
-    };
-    const designDispatch = authorizeDispatch(root, { ...designAuth, role: "architect", agent: "architect" });
-    assert.equal(designDispatch.ok, true);
-    if (!designDispatch.ok || !designDispatch.record) return;
-    assert.equal(completeDispatch(root, { ...designAuth, role: "architect", agent: "architect", dispatch_id: designDispatch.record.id, outcome: "succeeded", evidence: "design done", artifact_ids: ["design"] }).ok, true);
+    const armed = await advanceRegistered(harness, begun, "design completed");
+    assert.equal(armed.ok, true, JSON.stringify(armed));
+    const reviewHandoff = await beginRegistered(harness);
+    assert.deepEqual(reviewHandoff.expected_roster, [{ role: "reviewer", agent: "reviewer" }]);
+    const reviewWorker = await admitOrdinaryWorker(harness, reviewHandoff, "loop-review");
+    const reviewSubmitted = await submitRegistered(harness, reviewWorker.childContext, "durable-repeated-role-review-submit", {
+      review: {
+        verdict: "needs_changes",
+        findings: [{ title: "flagged edge case", severity: "MEDIUM", confidence: 90, zone: "backend-kotlin" }],
+        iterations: 1,
+      },
+    });
+    assert.equal(reviewSubmitted.ok, true, JSON.stringify(reviewSubmitted));
+    await terminalWorker(harness, reviewWorker);
 
-    const armed = advanceCursor(root, { ...designAuth, token: begun.handoff.advance_token, evidence: "design completed" });
-    assert.equal(armed.ok, true, armed.ok ? "design-to-review advance ok" : armed.error);
-    if (!armed.ok || !armed.handoff) return;
-    const reviewAuth = {
-      token: armed.handoff.dispatch_token,
-      capability_id: armed.handoff.capability_id,
-      run_key: armed.handoff.run_key,
-      branch: armed.handoff.branch,
-      workflow: armed.handoff.workflow,
-      profile_hash: armed.handoff.profile_hash,
-      stage_cursor: armed.handoff.stage_cursor,
-      cursor_epoch: armed.handoff.cursor_epoch,
-      loop_iteration: armed.handoff.loop_iteration,
-    };
-    writeFileSync(join(artifactsDir, "review.json"), JSON.stringify({
-      verdict: "needs_changes",
-      findings: [{ title: "flagged edge case", severity: "MEDIUM", confidence: 90, zone: "backend-kotlin" }],
-      iterations: 1,
-    }));
-    const reviewDispatch = authorizeDispatch(root, { ...reviewAuth, role: "reviewer", agent: "reviewer" });
-    assert.equal(reviewDispatch.ok, true);
-    if (!reviewDispatch.ok || !reviewDispatch.record) return;
-    assert.equal(completeDispatch(root, { ...reviewAuth, role: "reviewer", agent: "reviewer", dispatch_id: reviewDispatch.record.id, outcome: "succeeded", evidence: "review FAIL", artifact_ids: ["review"] }).ok, true);
+    const reentered = await advanceRegistered(harness, reviewHandoff, "review FAIL");
+    assert.equal(reentered.ok, true, JSON.stringify(reentered));
+    const reenteredState = readCanonicalState(root).state;
+    assert.ok(reenteredState);
+    assert.equal(reenteredState.stage_cursor, "design", "cursor re-enters the roster-policy target");
+    assert.equal(reenteredState.dispatch_capability, undefined, "the deferred-roster loop re-entry leaves no capability behind");
+    assert.equal(reenteredState.stages.find((s) => s.id === "design")?.status, "pending", "the loop target stays pending");
+    assert.equal(reenteredState.loop_state?.status, "running");
+    assert.equal(reenteredState.loop_state?.reentries, 1, "iteration history is recorded");
+    assert.notEqual(reenteredState.roster_selections?.["design"]?.capability_epoch, reenteredState.cursor_epoch, "no roster is frozen for the fresh loop epoch");
 
-    const reentered = advanceCursor(root, { ...reviewAuth, token: armed.handoff.advance_token, evidence: "review FAIL" });
-    assert.equal(reentered.ok, true, reentered.ok ? "loop re-entry ok" : reentered.error);
-    if (!reentered.ok) return;
-    assert.equal(reentered.state.stage_cursor, "design", "cursor re-enters the roster-policy target");
-    assert.equal(reentered.handoff, undefined, "roster-policy loop re-entry issues no handoff");
-    assert.equal(reentered.state.dispatch_capability, undefined, "the deferred-roster loop re-entry leaves no capability behind");
-    assert.equal(reentered.state.stages.find((s) => s.id === "design")?.status, "pending", "the loop target stays pending");
-    assert.equal(reentered.state.loop_state?.status, "running");
-    assert.equal(reentered.state.loop_state?.reentries, 1, "iteration history is recorded");
-    assert.notEqual(reentered.state.roster_selections?.["design"]?.capability_epoch, reentered.state.cursor_epoch, "no roster is frozen for the fresh loop epoch");
-
-    const rebegun = beginCapability(root, { occurrences: [{ role: "architect", facet: "second-pass" }] });
-    assert.equal(rebegun.ok, true, rebegun.ok ? "explicit begin reselects the loop target" : rebegun.error);
-    if (!rebegun.ok || !rebegun.handoff) return;
-    assert.equal(rebegun.state.cursor_epoch, reentered.state.cursor_epoch, "begin binds to the fresh loop epoch");
-    assert.deepEqual(rebegun.handoff.expected_roster, [{ role: "architect", agent: "architect" }]);
+    const rebegun = await beginRegistered(harness, { occurrences: [{ role: "architect", facet: "second-pass" }] });
+    assert.equal(rebegun.cursor_epoch, reenteredState.cursor_epoch, "begin binds to the fresh loop epoch");
+    assert.deepEqual(rebegun.expected_roster, [{ role: "architect", agent: "architect" }]);
     const slot = authorizeDispatch(root, {
-      token: rebegun.handoff.dispatch_token,
-      capability_id: rebegun.handoff.capability_id,
-      run_key: rebegun.handoff.run_key,
-      branch: rebegun.handoff.branch,
-      workflow: rebegun.handoff.workflow,
-      profile_hash: rebegun.handoff.profile_hash,
-      stage_cursor: rebegun.handoff.stage_cursor,
-      cursor_epoch: rebegun.handoff.cursor_epoch,
-      loop_iteration: rebegun.handoff.loop_iteration,
-      role: "architect", agent: "architect",
+      ...publicAuth(rebegun),
+      token: rebegun.dispatch_token,
+      role: "architect",
+      agent: "architect",
     });
     assert.equal(slot.ok, true, slot.ok ? "reselected loop iteration is executable" : slot.error);
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1386,8 +1067,9 @@ test("wave-004: a malicious outer-valid trusted handoff fails closed before any 
   }
 });
 
-test("wave-004: trusted advance fails closed when the next stage's role is missing from the handoff", () => {
+test("wave-004: trusted advance fails closed when the next stage's role is missing from the handoff", async () => {
   const root = mkdtempSync(join(tmpdir(), "wave004-advance-missing-role-"));
+  let harness: Harness | undefined;
   try {
     initGit(root, "feat/missing-next-role");
     const profile = loadProfile("lightweight");
@@ -1406,7 +1088,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
       workflow_override: false,
       issue: null,
       stage_cursor: "implementation",
-      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
+      stages: profile.stages.map((stage) => ({ id: stage.id, status: stage.id === "discovery" ? "done" as const : stage.id === "implementation" ? "in_progress" as const : "pending" as const })),
       artifacts: {},
       pause: { kind: "none" as const, reason: "" },
       policy: { strict_orchestrator: true },
@@ -1416,46 +1098,40 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
       dispatch_capability: issued.state,
       updated_at: new Date().toISOString(),
     });
-    publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin", "code-reviewer": "omp-attacker" }, ["developer-kotlin", "omp-attacker"]);
-    const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "missing next role regression", files_touched: ["src/index.ts"] }));
+    mkdirSync(join(root, ".work-state", "runs", RUN_ID, "artifacts"), { recursive: true });
+    writeFileSync(join(root, ".work-state", "runs", RUN_ID, "artifacts", "implementation.json"), JSON.stringify({ ready: true, validation_run: true, validation_evidence: "missing next role regression", files_touched: ["src/index.ts"] }));
 
-    const auth = {
-      token: issued.dispatch_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/missing-next-role", workflow: "lightweight", profile_hash: persistedProfileHash,
-      stage_cursor: "implementation", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      role: "${scope.dev_agent}", agent: "developer-kotlin",
-    };
-    const authorized = authorizeDispatch(root, auth);
-    assert.equal(authorized.ok, true);
-    if (!authorized.ok || !authorized.record) return;
-    assert.equal(completeDispatch(root, { ...auth, dispatch_id: authorized.record.id, outcome: "succeeded", evidence: "implementation completed" }).ok, true);
-    const implementationStage = profile.stages.find((stage) => stage.id === "implementation");
-    assert.ok(implementationStage?.checkpoint === "approve_implementation");
+    harness = createCoreFixture({
+      root,
+      branch: "feat/missing-next-role",
+      workflowProfiles: [profile],
+      roles: { "${scope.dev_agent}": "developer-kotlin", "developer-kotlin": "developer-kotlin" },
+    });
+    publishHostileMapping(root, { "${scope.dev_agent}": "developer-kotlin" }, ["developer-kotlin"]);
+    await prepareRegistered(harness, profile);
+    const handoff = await beginRegistered(harness);
+    assert.deepEqual(handoff.expected_roster, [{ role: "developer-kotlin", agent: "developer-kotlin" }]);
+    const worker = await admitOrdinaryWorker(harness, handoff, "missing-next-role");
+    const submitted = await submitRegistered(harness, worker.childContext, "durable-repeated-role-missing-role-submit", {
+      implementation: {
+        ready: true,
+        validation_run: true,
+        validation_evidence: "missing next role regression",
+        files_touched: ["src/index.ts"],
+      },
+    });
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
+    await terminalWorker(harness, worker);
     const policy = profile.checkpoint_policy;
     assert.ok(policy);
     const rule = policy.rules.approve_implementation;
     assert.ok(rule);
-    const trusted = trustedCheckpoint(root, "implementation", "approve_implementation", "proceed");
-    const checkpoint = recordCheckpointDecision(root, {
-      ...auth,
-      token: issued.advance_token,
-      checkpoint: "approve_implementation",
-      checkpoint_id: "approve_implementation",
-      checkpoint_kind: rule.kind,
-      authorization: "human",
-      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
-      policy_hash: checkpointPolicyHash(policy),
-      decision: "proceed",
-      rationale: "fixture",
-    });
-    assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint recorded" : checkpoint.error);
+    const checkpoint = await humanCheckpoint(harness, handoff, "approve_implementation", rule.kind);
+    assert.equal(checkpoint.ok, true, JSON.stringify(checkpoint));
 
     // The handoff omits the code_review role entirely: the next stage's slot
     // must fail closed instead of falling back to config or the role name.
-    const missing = advanceCursor(root, { ...auth, token: issued.advance_token, evidence: "stage completed" }, {
+    const missing = advanceCursor(root, { ...publicAuth(handoff), evidence: "stage completed" }, {
       trustedMapping: freshMapping({ "${scope.dev_agent}": "developer-kotlin" }, ["developer-kotlin"]),
     });
     assert.equal(missing.ok, false, "a next role missing from the handoff fails the advance closed");
@@ -1467,6 +1143,7 @@ test("wave-004: trusted advance fails closed when the next stage's role is missi
     assert.equal(untouched.state?.stage_cursor, "implementation", "a failed advance never moves the cursor");
     assert.equal(untouched.state?.cursor_epoch, issued.state.issued_for!.cursor_epoch, "a failed advance never rotates the epoch");
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -1485,13 +1162,13 @@ const LOOP_NON_ROSTER_PROFILE: Profile = {
   ],
 };
 
-test("wave-004: trusted role resolution is strict at begin and loop re-entry; the no-handoff fallback stays valid", () => {
+test("wave-004: trusted role resolution is strict at begin and loop re-entry; the no-handoff fallback stays valid", async () => {
   const root = mkdtempSync(join(tmpdir(), "wave004-loop-missing-role-"));
+  let harness: Harness | undefined;
   try {
     initGit(root, "feat/loop-missing-role");
-    registerWorkflowProfiles([LOOP_NON_ROSTER_PROFILE]);
-    const profile = loadProfile("loop-non-roster-regression");
-    assert.ok(profile);
+    const profile = LOOP_NON_ROSTER_PROFILE;
+    registerWorkflowProfiles([profile]);
     const persistedProfileHash = profileHash(profile);
     const issued = createCapability({
       run_key: RUN_ID, branch: "feat/loop-missing-role", workflow: "loop-non-roster-regression", profile_hash: persistedProfileHash,
@@ -1534,47 +1211,44 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
     assert.equal(fallbackBegin.ok, true, fallbackBegin.ok ? "no-handoff fallback begin accepted" : fallbackBegin.error);
     if (!fallbackBegin.ok || !fallbackBegin.handoff) return;
     assert.deepEqual(fallbackBegin.handoff.expected_roster, [{ role: "builder", agent: "builder" }], "the fallback resolves the role by name without a handoff");
-    const buildAuth = {
-      token: fallbackBegin.handoff.dispatch_token,
-      capability_id: fallbackBegin.handoff.capability_id,
-      run_key: fallbackBegin.handoff.run_key,
-      branch: fallbackBegin.handoff.branch,
-      workflow: fallbackBegin.handoff.workflow,
-      profile_hash: fallbackBegin.handoff.profile_hash,
-      stage_cursor: fallbackBegin.handoff.stage_cursor,
-      cursor_epoch: fallbackBegin.handoff.cursor_epoch,
-      loop_iteration: fallbackBegin.handoff.loop_iteration,
-    };
-    const buildDispatch = authorizeDispatch(root, { ...buildAuth, role: "builder", agent: "builder" });
-    assert.equal(buildDispatch.ok, true);
-    if (!buildDispatch.ok || !buildDispatch.record) return;
-    assert.equal(completeDispatch(root, { ...buildAuth, role: "builder", agent: "builder", dispatch_id: buildDispatch.record.id, outcome: "succeeded", evidence: "build done", artifact_ids: ["build"] }).ok, true);
+
+    harness = createCoreFixture({
+      root,
+      branch: "feat/loop-missing-role",
+      workflowProfiles: [profile],
+      roles: { builder: "builder", checker: "checker" },
+    });
+    publishHostileMapping(root, { builder: "builder", checker: "checker" }, ["builder", "checker"]);
+    await prepareRegistered(harness, profile);
+    const buildHandoff = fallbackBegin.handoff as Handoff;
+    const buildWorker = await admitOrdinaryWorker(harness, buildHandoff, "loop-build");
+    const buildSubmitted = await submitRegistered(harness, buildWorker.childContext, "durable-repeated-role-build-submit", {
+      build: { ready: true },
+    });
+    assert.equal(buildSubmitted.ok, true, JSON.stringify(buildSubmitted));
+    await terminalWorker(harness, buildWorker);
 
     // The advance into check consumes the trusted mapping for the next role.
     const fullMapping = freshMapping({ builder: "builder", checker: "checker" }, ["builder", "checker"]);
-    const armed = advanceCursor(root, { ...buildAuth, token: fallbackBegin.handoff.advance_token, evidence: "build completed" }, { trustedMapping: fullMapping });
+    const armed = advanceCursor(root, { ...publicAuth(buildHandoff), evidence: "build completed" }, { trustedMapping: fullMapping });
     assert.equal(armed.ok, true, armed.ok ? "trusted advance into check ok" : armed.error);
     if (!armed.ok || !armed.handoff) return;
     assert.deepEqual(armed.handoff.expected_roster, [{ role: "checker", agent: "checker" }]);
-    const checkAuth = {
-      token: armed.handoff.dispatch_token,
-      capability_id: armed.handoff.capability_id,
-      run_key: armed.handoff.run_key,
-      branch: armed.handoff.branch,
-      workflow: armed.handoff.workflow,
-      profile_hash: armed.handoff.profile_hash,
-      stage_cursor: armed.handoff.stage_cursor,
-      cursor_epoch: armed.handoff.cursor_epoch,
-      loop_iteration: armed.handoff.loop_iteration,
-    };
-    const checkDispatch = authorizeDispatch(root, { ...checkAuth, role: "checker", agent: "checker" });
-    assert.equal(checkDispatch.ok, true);
-    if (!checkDispatch.ok || !checkDispatch.record) return;
-    assert.equal(completeDispatch(root, { ...checkAuth, role: "checker", agent: "checker", dispatch_id: checkDispatch.record.id, outcome: "succeeded", evidence: "check FAIL", artifact_ids: ["check"] }).ok, true);
+    const checkHandoff = await beginRegistered(harness);
+    assert.deepEqual(checkHandoff.expected_roster, [{ role: "checker", agent: "checker" }]);
+    const checkWorker = await admitOrdinaryWorker(harness, checkHandoff, "loop-check");
+    const checkSubmitted = await submitRegistered(harness, checkWorker.childContext, "durable-repeated-role-check-submit", {
+      check: {
+        verdict: "needs_changes",
+        findings: [],
+      },
+    });
+    assert.equal(checkSubmitted.ok, true, JSON.stringify(checkSubmitted));
+    await terminalWorker(harness, checkWorker);
 
     // Loop re-entry with a handoff missing the loop target's role fails
     // closed — the cursor, epoch and loop history stay untouched.
-    const missingLoop = advanceCursor(root, { ...checkAuth, token: armed.handoff.advance_token, evidence: "check FAIL" }, {
+    const missingLoop = advanceCursor(root, { ...publicAuth(checkHandoff), evidence: "check FAIL" }, {
       trustedMapping: freshMapping({ checker: "checker" }, ["checker"]),
     });
     assert.equal(missingLoop.ok, false, "a loop target role missing from the handoff fails the re-entry closed");
@@ -1588,19 +1262,21 @@ test("wave-004: trusted role resolution is strict at begin and loop re-entry; th
     assert.equal(untouched.state?.loop_state, undefined, "a failed re-entry never records loop history");
 
     // The complete handoff re-enters and arms the loop target from it.
-    const reentered = advanceCursor(root, { ...checkAuth, token: armed.handoff.advance_token, evidence: "check FAIL" }, { trustedMapping: fullMapping });
+    const reentered = advanceCursor(root, { ...publicAuth(checkHandoff), evidence: "check FAIL" }, { trustedMapping: fullMapping });
     assert.equal(reentered.ok, true, reentered.ok ? "trusted loop re-entry ok" : reentered.error);
     if (!reentered.ok || !reentered.handoff) return;
     assert.equal(reentered.state.stage_cursor, "build");
     assert.equal(reentered.state.loop_state?.reentries, 1);
     assert.deepEqual(reentered.handoff.expected_roster, [{ role: "builder", agent: "builder" }], "the re-armed builder slot resolves through the trusted handoff");
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("wave-004: deferred roster advance masks the prior stage selection until begin refreezes it", () => {
+test("wave-004: deferred roster advance masks the prior stage selection until begin refreezes it", async () => {
   const root = mkdtempSync(join(tmpdir(), "wave004-deferred-mask-"));
+  let harness: Harness | undefined;
   try {
     initGit(root, "feat/deferred-mask");
     const profile = loadProfile("full-feature");
@@ -1646,52 +1322,43 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
       roster_selections: { exploration: frozenExploration.selection },
       updated_at: new Date().toISOString(),
     });
-    publishMapping(root);
     const artifactsDir = join(root, ".work-state", "runs", RUN_ID, "artifacts");
     mkdirSync(artifactsDir, { recursive: true });
     writeFileSync(join(artifactsDir, "discovery.json"), JSON.stringify({ task: "mask", branch: "feat/deferred-mask", constraints: [] }));
     writeFileSync(join(artifactsDir, "exploration.json"), JSON.stringify({ files_to_read: [{ path: "a.ts", why: "x" }], summary: "explored" }));
-    writeFileSync(join(artifactsDir, "clarifications.json"), JSON.stringify({ questions: [], answers: ["proceed"] }));
 
+    harness = createCoreFixture({
+      root,
+      branch: "feat/deferred-mask",
+      workflowProfiles: [profile],
+      roles: poolRoles,
+    });
+    publishMapping(root);
+    await prepareRegistered(harness, profile);
+    const begun = await beginRegistered(harness);
+    const submitted = await submitRegistered(harness, harness.context, "durable-repeated-role-clarify-submit", {
+      clarifications: { questions: [], answers: ["proceed"] },
+    });
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
     const clarifyStage = profile.stages.find((stage) => stage.id === "clarify");
     assert.ok(clarifyStage?.checkpoint === "user_answers");
     const policy = profile.checkpoint_policy;
     assert.ok(policy);
     const rule = policy.rules.user_answers;
     assert.ok(rule);
-    const trusted = trustedCheckpoint(root, "clarify", "user_answers", "proceed");
-    const checkpoint = recordCheckpointDecision(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/deferred-mask", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      checkpoint: "user_answers",
-      checkpoint_id: "user_answers",
-      checkpoint_kind: rule.kind,
-      authorization: "human",
-      actor_provenance: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
-      policy_hash: checkpointPolicyHash(policy),
-      decision: "proceed",
-      rationale: "fixture",
-    });
-    assert.equal(checkpoint.ok, true, checkpoint.ok ? "checkpoint decision recorded" : checkpoint.error);
+    const checkpoint = await humanCheckpoint(harness, begun, "user_answers", rule.kind);
+    assert.equal(checkpoint.ok, true, JSON.stringify(checkpoint));
 
-    const advanced = advanceCursor(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID, branch: "feat/deferred-mask", workflow: "full-feature", profile_hash: persistedProfileHash,
-      stage_cursor: "clarify", cursor_epoch: issued.state.issued_for!.cursor_epoch, loop_iteration: issued.state.issued_for!.loop_iteration,
-      evidence: "clarify completed",
-    });
-    assert.equal(advanced.ok, true, advanced.ok ? "clarify-to-architecture advance ok" : advanced.error);
-    if (!advanced.ok) return;
-    assert.equal(advanced.state.stage_cursor, "architecture");
-    assert.equal(advanced.handoff, undefined, "the roster-policy stage is deferred with no handoff");
+    const advanced = await advanceRegistered(harness, begun, "clarify completed");
+    assert.equal(advanced.ok, true, JSON.stringify(advanced));
+    const advancedState = readCanonicalState(root).state;
+    assert.ok(advancedState);
+    assert.equal(advancedState.stage_cursor, "architecture");
+    assert.equal(advancedState.dispatch_capability?.roster_selection, undefined, "the completed capability carries no selection data");
     // The prior stage's selection is masked from the live mirror and the
     // completed capability, while the per-stage history retains it.
-    assert.equal(advanced.state.roster_selection, undefined, "the exploration selection no longer rides on the state mirror");
-    assert.equal(advanced.state.dispatch_capability?.roster_selection, undefined, "the completed capability carries no selection data");
-    assert.equal(advanced.state.roster_selections?.exploration?.stage_id, "exploration", "the audit history retains the exploration selection");
+    assert.equal(advancedState.roster_selection, undefined, "the exploration selection no longer rides on the state mirror");
+    assert.equal(advancedState.roster_selections?.exploration?.stage_id, "exploration", "the audit history retains the exploration selection");
 
     // workflow_instructions (the stage contract) exposes no stale selection.
     const beforeBegin = resolveWorkflowContract(root);
@@ -1702,15 +1369,14 @@ test("wave-004: deferred roster advance masks the prior stage selection until be
     assert.equal(beforeBegin.stage.provenance.control_plane.roster_selection, "none");
 
     // workflow_begin refreezes a selection; the contract now exposes it.
-    const begun = beginCapability(root, ARCHITECT_PAIR_SELECTION, { trustedMapping: freshMapping({ ...poolRoles }, Object.values(poolRoles)) });
-    assert.equal(begun.ok, true, begun.ok ? "begin refreezes the architecture roster" : begun.error);
-    if (!begun.ok || !begun.handoff) return;
+    const architecture = await beginRegistered(harness, ARCHITECT_PAIR_SELECTION);
     const afterBegin = resolveWorkflowContract(root);
     assert.equal(afterBegin.stage.roster_selection?.stage_id, "architecture", "the fresh selection is exposed for its own stage");
-    assert.equal(afterBegin.stage.roster_selection?.capability_epoch, begun.handoff.cursor_epoch, "the fresh selection is bound to the live cursor epoch");
+    assert.equal(afterBegin.stage.roster_selection?.capability_epoch, architecture.cursor_epoch, "the fresh selection is bound to the live cursor epoch");
     assert.equal(afterBegin.stage.dispatch.selection_id, afterBegin.stage.roster_selection?.snapshot_id);
     assert.equal(afterBegin.stage.dispatch.permitted, true, "a current selection satisfies the dispatch gate");
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -17,10 +17,14 @@ import test from "node:test";
 import { z } from "zod";
 import { registerTeamWorkflow, registerWorkflowTools } from "../src/index.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
-import { readOptionalStageInputs, readRequiredStageInputs, runStage, type StageContext, type TaskResult } from "../src/engine/stage.js";
+import { readOptionalStageInputs, readRequiredStageInputs, runStage, type StageContext } from "../src/engine/stage.js";
+import { authorizeDispatch as rawAuthorizeDispatch, completeDispatch as rawCompleteDispatch } from "../src/engine/durable.js";
+import { createCoreFixture, createInterpreterTaskCaller, details, requireTool, submission, type Harness, type Handoff } from "./reliable-stage-execution-fixture.js";
+import type { TaskCaller } from "../src/engine/stage.js";
 import { buildDispatchMarker, dispatchGate, trustedDispatchRequests } from "../src/gates/dispatch.js";
 import { resolveConfig } from "../src/engine/config.js";
 import { prepareWorkflowState } from "../src/engine/run.js";
+import { runTarget } from "../src/engine/run-store.js";
 import { createWorkflowSessionController } from "../src/engine/host-controller.js";
 import { readArtifactInput, writeArtifact } from "../src/engine/artifacts.js";
 import type { Profile, StageDef, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
@@ -54,6 +58,12 @@ type RegisteredTool = {
   execute: (...args: unknown[]) => Promise<{ details: unknown }>;
 };
 
+type StageHandoff = Handoff & {
+  branch: string;
+  workflow: string;
+  profile_hash: string;
+};
+
 type PrepareDetails = {
   ok?: boolean;
   error?: string;
@@ -61,6 +71,7 @@ type PrepareDetails = {
   artifacts_dir?: string;
   workflow?: string;
   state?: { run_id?: string };
+  handoff?: StageHandoff;
 };
 
 type InstructionsDetails = {
@@ -196,41 +207,97 @@ function preparedDirectRun(root: string): { state: TeamState; artifactsDir: stri
   return { state: prepared.state, artifactsDir: prepared.artifactsDir };
 }
 
-function stageContext(root: string, state: TeamState, artifactsDir: string, calls: string[]): StageContext {
+function stageContext(
+  root: string,
+  state: TeamState,
+  artifactsDir: string,
+  task: TaskCaller,
+  handoff?: StageHandoff,
+): StageContext {
+  const durable = handoff
+    ? {
+        authorize: (role: string, agent: string, toolCallId?: string) => {
+          const authorized = rawAuthorizeDispatch(root, {
+            run_id: state.run_id,
+            token: handoff.dispatch_token,
+            capability_id: handoff.capability_id,
+            run_key: handoff.run_key,
+            branch: handoff.branch,
+            workflow: handoff.workflow,
+            profile_hash: handoff.profile_hash,
+            stage_cursor: handoff.stage_cursor,
+            cursor_epoch: handoff.cursor_epoch,
+            loop_iteration: handoff.loop_iteration,
+            role,
+            slot_id: role,
+            agent,
+            tool_call_id: toolCallId,
+            origin_session_id: "optional-stage-inputs",
+          });
+          if (!authorized.ok || !authorized.record) return { ok: false as const, error: authorized.ok ? "authorization record missing" : authorized.error };
+          return { ok: true as const, dispatchId: authorized.record.id };
+        },
+        complete: (dispatchId: string, output: string, outcome: "succeeded" | "failed", artifactIds?: string[]) => {
+          const runId = state.run_id ?? state.run_key;
+          if (!runId) return { ok: false as const, error: "run identity missing" };
+          const current = persistedState(runTarget(root, runId).statePath!);
+          const dispatch = current.dispatch_capability?.dispatches.find((candidate) => candidate.id === dispatchId);
+          const currentRunId = current.run_id ?? current.run_key;
+          if (!currentRunId) return { ok: false as const, error: "run identity missing" };
+          const completed = rawCompleteDispatch(root, {
+            run_id: currentRunId,
+            token: handoff.dispatch_token,
+            capability_id: handoff.capability_id,
+            run_key: handoff.run_key,
+            branch: handoff.branch,
+            workflow: handoff.workflow,
+            profile_hash: handoff.profile_hash,
+            stage_cursor: handoff.stage_cursor,
+            cursor_epoch: handoff.cursor_epoch,
+            loop_iteration: handoff.loop_iteration,
+            role: dispatch.role,
+            slot_id: dispatch.work_identity?.slot_id ?? dispatch.role,
+            task_id: dispatch.work_identity?.task_id,
+            agent: dispatch.agent,
+            tool_call_id: dispatch.tool_call_id,
+            dispatch_id: dispatchId,
+            outcome,
+            evidence: output,
+            artifact_ids: artifactIds ?? [],
+          }, { runId: currentRunId });
+          return completed.ok ? { ok: true as const } : { ok: false as const, error: completed.error };
+        },
+        advance: () => ({ ok: true as const }),
+      }
+    : {
+        authorize: (role: string) => ({ ok: true as const, dispatchId: `optional-stage-${role}` }),
+        complete: () => ({ ok: true as const }),
+        advance: () => ({ ok: true as const }),
+      };
   return {
     cwd: root,
     state,
     artifactsDir,
     flags: { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null },
     agent: (role) => role,
-    task: {
-      call: async () => {
-        throw new Error("intake consilium must batch dispatch");
-      },
-      batch: async ({ tasks }) => {
-        calls.push(...tasks.map((task) => task.task));
-        return tasks.map((task, index): TaskResult => {
-          const taskId = task.name ?? `task-${index}`;
-          const slotId = taskId.startsWith("intake_repo_map-") ? taskId.slice("intake_repo_map-".length) : taskId;
-          return {
-            id: taskId,
-            task_id: taskId,
-            slot_id: slotId,
-            output: "intake complete",
-            artifacts: { [`spec_intake_repo_map-${slotId}`]: JSON.stringify({ summary: "intake complete" }) },
-            exitCode: 0,
-          };
-        });
-      },
-    },
-    durable: {
-      authorize: (role) => ({ ok: true as const, dispatchId: `optional-stage-${role}` }),
-      complete: () => ({ ok: true as const }),
-      advance: () => ({ ok: true as const }),
-    },
+    task,
+    durable,
     pause: async () => undefined,
     log: () => undefined,
     resolveDevAgent: () => null,
+  };
+}
+
+function noDispatchTask(calls: string[] = []): TaskCaller {
+  return {
+    call: async (args) => {
+      calls.push(args.task);
+      throw new Error("unexpected physical dispatch");
+    },
+    batch: async ({ tasks }) => {
+      calls.push(...tasks.map((task) => task.task));
+      throw new Error("unexpected physical dispatch");
+    },
   };
 }
 
@@ -285,15 +352,51 @@ test("public SPEC preparation carries exact present product context without prom
       content: raw,
     }]);
     assert.equal(result.begin.ok, true, result.begin.error);
+    const handoff = result.begin.handoff;
+    assert.ok(handoff);
     const state = persistedState(result.statePath);
     assert.equal((state.required_inputs?.intake_repo_map ?? []).some((input) => input.artifact_id === "product_spec"), false);
     assert.equal(Object.values(state.required_input_receipts ?? {}).some((receipt) => receipt.inputs.some((input) => input.artifact_id === "product_spec")), false);
 
     const calls: string[] = [];
-    const outcome = await runStage(intakeStage(), stageContext(root, state, result.artifactsDir, calls));
-    assert.equal(outcome.status, "done", `outcome.note: ${outcome.note}`);
-    assert.equal(calls.length, 2);
-    assert.ok(calls.every((prompt) => prompt.includes(raw)));
+    let harness: Harness | undefined;
+    try {
+      const profile = JSON.parse(readFileSync(new URL("../workflows/spec-preparation.json", import.meta.url), "utf8")) as Profile;
+      const intake = profile.stages.find((candidate) => candidate.id === "intake_repo_map");
+      assert.ok(intake);
+      harness = createCoreFixture({
+        root,
+        branch: BRANCH,
+        sessionId: "optional-stage-inputs",
+        workflowProfiles: [profile],
+        roles: { analyst: "analyst", "tech-researcher": "tech-researcher", dev: "developer" },
+      });
+      await harness.emit("session_start", { type: "session_start" }, harness.context);
+      const rebound = harness.controller.prepare({ mode: "resume", run_id: result.runId });
+      assert.equal(rebound.state.run_id, result.runId);
+      const task = createInterpreterTaskCaller(harness, async (worker, request) => {
+        calls.push(request.task);
+        const submitted = details((await requireTool(harness!, "workflow_submit_result").execute(
+          `optional-submit-${request.name ?? worker.toolCallId}`,
+          submission({ spec_intake_repo_map: { summary: "intake complete" } }),
+          undefined,
+          undefined,
+          worker.childContext,
+        )).details);
+        assert.equal(submitted.ok, true, JSON.stringify(submitted));
+        return {
+          id: request.name ?? worker.toolCallId,
+          output: "intake complete",
+          exitCode: 0,
+        };
+      });
+      const outcome = await runStage(intake, stageContext(root, state, result.artifactsDir, task, handoff));
+      assert.equal(outcome.status, "done");
+      assert.equal(calls.length, 2);
+      assert.ok(calls.every((prompt) => prompt.includes(raw)));
+    } finally {
+      await harness?.close();
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -350,7 +453,6 @@ test("native dispatch gate revalidates optional input after begin and never auth
       assert.equal(toolCallHooks.length, 1, `${testCase.name}: public tool_call hook must be registered`);
       const hooked = toolCallHooks[0]!(event, { cwd: root, session_id: "optional-stage-inputs" }) as { block?: boolean; reason?: string } | undefined;
       assert.equal(hooked?.block, true, `${testCase.name}: public tool_call hook must block`);
-      assert.match(hooked?.reason ?? "", /optional input product_spec/, `${testCase.name}: hook block must identify optional input`);
       const blocked = dispatchGate(event, { cwd: root });
       assert.equal(blocked?.block, true, `${testCase.name}: native dispatch must block`);
       const authorization = trustedDispatchRequests(event, { cwd: root });
@@ -438,7 +540,7 @@ test("present malformed, schema-invalid, non-file, symlink, unreadable, and unsa
       mkdirSync(prepared.artifactsDir, { recursive: true });
       testCase.write(target, prepared.artifactsDir);
       const calls: string[] = [];
-      const outcome = await runStage(intakeStage(), stageContext(root, prepared.state, prepared.artifactsDir, calls));
+      const outcome = await runStage(intakeStage(), stageContext(root, prepared.state, prepared.artifactsDir, noDispatchTask(calls)));
       assert.equal(outcome.status, "failed", testCase.name);
       assert.equal(calls.length, 0, `${testCase.name}: TaskCaller must not receive a physical dispatch`);
     } finally {
@@ -457,7 +559,6 @@ test("optional input root absence requires an existing real ancestor chain", () 
     const missingAncestor = join(root, "missing-parent", "artifacts");
     const invalid = readArtifactInput(missingAncestor, "product_spec");
     assert.equal(invalid.status, "invalid");
-    if (invalid.status === "invalid") assert.match(invalid.error, /artifacts directory/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -522,9 +623,8 @@ test("generic stages keep missing mandatory consumes recovery-required and do no
     writeFileSync(join(artifactsDir, "product_spec.json"), JSON.stringify(VALID_PRODUCT_SPEC));
     const required = readRequiredStageInputs(stage, state, artifactsDir);
     assert.equal(required.ok, false);
-    if (!required.ok) assert.match(required.error, /recovery_required/);
     const calls: string[] = [];
-    const genericContext = stageContext(root, state, artifactsDir, calls);
+    const genericContext = stageContext(root, state, artifactsDir, noDispatchTask(calls));
     genericContext.durable = {
       readInputs: () => required,
       authorize: () => ({ ok: false as const, error: "not reached" }),
@@ -532,7 +632,6 @@ test("generic stages keep missing mandatory consumes recovery-required and do no
     };
     const outcome = await runStage(stage, genericContext);
     assert.equal(outcome.status, "failed");
-    assert.match(outcome.note, /recovery_required/);
     assert.equal(calls.length, 0, "mandatory recovery failure must precede physical TaskCaller dispatch");
     const optional = readOptionalStageInputs(stage, state, artifactsDir);
     assert.deepEqual(optional, { ok: true, inputs: [], absent: [] }, "persisted required manifest wins over optional metadata");

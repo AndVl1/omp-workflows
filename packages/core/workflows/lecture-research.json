@@ -15,6 +15,7 @@
       "id": "acquisition",
       "title": "Automatic Lecture Acquisition",
       "type": "orchestrator",
+      "producer": { "kind": "tool", "tool_name": "lecture_acquire" },
       "consumes": ["lecture_intake"],
       "prompt": "Automatic acquisition boundary: invoke the consumer-provided main-session `lecture_acquire` tool using the current lecture_intake URL and prompt. The tool must parse and bound one video/playlist source set, normalize timestamped provider evidence, persist `lecture_acquisition`, and retain every source/provider failure. Do not ask the user for a transcript, captions, recording, notes, or media file; acquisition is automatic and must not require manual source material. Do not claim core itself fetches URLs; provider/API credentials and rights setup are installation concerns. A partial result may continue only with at least one valid evidence segment; a failed or missing acquisition artifact stops the workflow. Do not start implementation, repo edits, or task creation.",
       "produces": "lecture_acquisition",

@@ -12,49 +12,126 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   checkArtifact,
   validationGate,
 } from "../src/gates/validation.js";
-import { runStage, type TaskCaller, type StageContext } from "../src/engine/stage.js";
-import type { StageDef, TeamState } from "../src/engine/types.js";
+import { run, type RunResult } from "../src/engine/run.js";
+import type { OrchestratorResult, TaskResult } from "../src/engine/stage.js";
+import type { Profile, StageDef, TeamState } from "../src/engine/types.js";
+import { registerWorkflowProfiles } from "../src/engine/profile.js";
+import {
+  BRANCH,
+  createInterpreterTaskCaller,
+  details,
+  ordinaryHarness,
+  RELIABLE_PROFILE,
+  requireTool,
+  submission,
+  type Harness,
+  type InterpreterTaskRequest,
+  type WorkerFixture,
+} from "./reliable-stage-execution-fixture.js";
+
+type OrchestrateArgs = {
+  stage: StageDef;
+  prompt: string;
+  cwd: string;
+  artifactsDir: string;
+  state: TeamState;
+};
+type InterpreterOrchestrate = (harness: Harness, args: OrchestrateArgs) => Promise<OrchestratorResult | void> | OrchestratorResult | void;
 
 function withTempDir(): { cwd: string; cleanup: () => void } {
   const cwd = mkdtempSync(join(tmpdir(), "omp-val-"));
   return { cwd, cleanup: () => rmSync(cwd, { recursive: true, force: true }) };
 }
 
-function makeState(): TeamState {
+let profileSequence = 0;
+
+function stageProfile(stage: StageDef): Profile {
   return {
-    schema: 1,
-    branch: "main",
-    classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", workflow: "lightweight", autonomous: false },
-    task: "synthetic",
-    workflow_override: false,
-    issue: null,
-    stage_cursor: "implementation",
-    stages: [{ id: "implementation", status: "pending" }],
-    artifacts: {},
-    pause: { kind: "none", reason: "" },
-    updated_at: new Date().toISOString(),
+    name: `validation-gate-${stage.id}-${profileSequence++}`,
+    title: RELIABLE_PROFILE.title,
+    description: RELIABLE_PROFILE.description,
+    match: RELIABLE_PROFILE.match,
+    stages: [stage],
   };
 }
 
-function makeStageCtx(artifactsDir: string, task: TaskCaller): StageContext {
-  return {
-    cwd: "/tmp",
-    state: makeState(),
-    artifactsDir,
-    flags: { dev_agent: "developer-go" },
-    agent: () => "developer-go",
-    task,
-    pause: async () => undefined,
-    log: () => undefined,
-    resolveDevAgent: () => "developer-go",
-  };
+async function runRegisteredStage(
+  stage: StageDef,
+  execute: (harness: Harness, worker: WorkerFixture, request: InterpreterTaskRequest) => Promise<TaskResult>,
+  orchestrate?: InterpreterOrchestrate,
+): Promise<{ harness: Harness; result: RunResult }> {
+  const profile = stageProfile(stage);
+  registerWorkflowProfiles([profile]);
+  const harness = ordinaryHarness({ workflowProfiles: [profile] });
+  try {
+    const classification = {
+      type: "FEATURE" as const,
+      complexity: "QUICK" as const,
+      confidence: "HIGH" as const,
+      autonomous: false,
+      workflow: profile.name,
+    };
+    const prepared = harness.controller.prepare({
+      mode: "new",
+      task: "validation gate fixture",
+      classification,
+      files: [],
+      issue: null,
+      request_id: `validation-gate-${profileSequence}`,
+    });
+    const runId = prepared.state.run_id;
+    assert.ok(runId, "registered workflow preparation must persist a run identity");
+    const taskTool = createInterpreterTaskCaller(harness, (worker, request) => execute(harness, worker, request));
+    const execution = harness.controller.context();
+    const result = await run({
+      cwd: harness.root,
+      branch: BRANCH,
+      task: "validation gate fixture",
+      autonomous: false,
+      classification,
+      files: [],
+      issue: null,
+      mode: "resume",
+      run_id: runId,
+      request_id: `validation-gate-resume-${profileSequence}`,
+      execution,
+      sessionController: harness.controller,
+      taskTool,
+      ...(orchestrate ? { orchestrate: (args: OrchestrateArgs) => orchestrate(harness, args) } : {}),
+    });
+    return { harness, result };
+  } catch (error) {
+    await harness.close();
+    throw error;
+  }
 }
+
+
+async function submitWorkerOutput(
+  harness: Harness,
+  worker: WorkerFixture,
+  callId: string,
+  outputs: Record<string, unknown>,
+): Promise<TaskResult> {
+  const result = await requireTool(harness, "workflow_submit_result").execute(
+    callId,
+    submission(outputs),
+    undefined,
+    undefined,
+    worker.childContext,
+  );
+  const submitted = details(result.details);
+  assert.equal(submitted.ok, true, JSON.stringify(submitted));
+  assert.ok(submitted.receipt && typeof submitted.receipt === "object", "accepted worker output must return its receipt");
+  return { id: `${worker.toolCallId}-result`, output: "worker submitted", exitCode: 0 };
+}
+
 
 test("validationGate: PASS when implementation artifact has validation_run=true and non-empty evidence", () => {
   const result = checkArtifact("implementation", {
@@ -172,203 +249,168 @@ test("validationGate: file-based — malformed JSON is reported", () => {
     cleanup();
   }
 });
-
-
-
-test("runStage: runSingle with implementation stage and unvalidated artifact returns failed", async () => {
-  const { cwd, cleanup } = withTempDir();
-  try {
-    const artifactsDir = join(cwd, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    // The stub agent returns ready:true but no validation_run.
-    const stubTask: TaskCaller = {
-      async call() {
-        return { id: "t1", output: "ok", artifacts: {}, exitCode: 0 };
-      },
-      async batch() {
-        return [];
-      },
-    };
-    // Simulate the agent having written an unvalidated artifact.
-    writeFileSync(
-      join(artifactsDir, "implementation.json"),
-      JSON.stringify({
+test("run: implementation stage with unvalidated registered artifact returns failed", async () => {
+  const stage: StageDef = {
+    id: "implementation",
+    title: "Implementation",
+    type: "single",
+    role: "dev",
+    produces: "implementation",
+  };
+  const registered = await runRegisteredStage(stage, async (harness, worker) => submitWorkerOutput(
+    harness,
+    worker,
+    "validation-unvalidated-submit",
+    {
+      implementation: {
+        files_touched: ["packages/core/src/engine/stage.ts"],
         ready: "true",
         validation_run: "false",
         validation_note: "Per assignment, orchestrator owns validation",
-      }),
-    );
-    const stage: StageDef = {
-      id: "implementation",
-      title: "Implementation",
-      type: "single",
-      role: "go",
-      produces: "implementation",
-    };
-    const ctx = makeStageCtx(artifactsDir, stubTask);
-    const outcome = await runStage(stage, ctx);
-    assert.equal(outcome.status, "failed");
-    assert.match(outcome.note, /validation_run: true/);
+      },
+    },
+  ));
+  try {
+    assert.equal(registered.result.outcomes[0]?.status, "failed");
+    assert.match(registered.result.outcomes[0]?.note ?? "", /validation_run: true/);
   } finally {
-    cleanup();
+    await registered.harness.close();
   }
 });
 
-test("runStage: runSingle with validated implementation artifact returns done", async () => {
-  const { cwd, cleanup } = withTempDir();
-  try {
-    const artifactsDir = join(cwd, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(
-      join(artifactsDir, "implementation.json"),
-      JSON.stringify({
+test("run: implementation stage with validated registered artifact returns done", async () => {
+  const stage: StageDef = {
+    id: "implementation",
+    title: "Implementation",
+    type: "single",
+    role: "dev",
+    produces: "implementation",
+  };
+  const registered = await runRegisteredStage(stage, async (harness, worker) => submitWorkerOutput(
+    harness,
+    worker,
+    "validation-valid-submit",
+    {
+      implementation: {
+        files_touched: ["packages/core/src/engine/stage.ts"],
         ready: "true",
         validation_run: "true",
         validation_evidence: "go build ./...: PASS\ngo test ./...: PASS",
-      }),
-    );
-    const stubTask: TaskCaller = {
-      async call() {
-        return { id: "t1", output: "ok", artifacts: {}, exitCode: 0 };
       },
-      async batch() {
-        return [];
-      },
-    };
-    const stage: StageDef = {
-      id: "implementation",
-      title: "Implementation",
-      type: "single",
-      role: "go",
-      produces: "implementation",
-    };
-    const ctx = makeStageCtx(artifactsDir, stubTask);
-    const outcome = await runStage(stage, ctx);
-    assert.equal(outcome.status, "done");
+    },
+  ));
+  try {
+    assert.equal(registered.result.outcomes[0]?.status, "done");
   } finally {
-    cleanup();
+    await registered.harness.close();
   }
 });
 
-test("runStage: non-validation-required stage (discovery) passes regardless of artifact", async () => {
-  const { cwd, cleanup } = withTempDir();
+test("run: non-validation-required stage (discovery) passes after registered output submission", async () => {
+  const stage: StageDef = {
+    id: "discovery",
+    title: "Discovery",
+    type: "single",
+    role: "dev",
+    produces: "discovery",
+  };
+  const registered = await runRegisteredStage(stage, async (harness, worker) => submitWorkerOutput(
+    harness,
+    worker,
+    "validation-discovery-submit",
+    { discovery: { task: "synthetic", branch: BRANCH } },
+  ));
   try {
-    const artifactsDir = join(cwd, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(
-      join(artifactsDir, "discovery.json"),
-      JSON.stringify({ anything: "no validation here" }),
-    );
-    const stubTask: TaskCaller = {
-      async call() {
-        return { id: "t1", output: "ok", artifacts: {}, exitCode: 0 };
-      },
-      async batch() {
-        return [];
-      },
-    };
-    const stage: StageDef = {
-      id: "discovery",
-      title: "Discovery",
-      type: "single",
-      role: "analyst",
-      produces: "discovery",
-    };
-    const ctx = makeStageCtx(artifactsDir, stubTask);
-    const outcome = await runStage(stage, ctx);
-    assert.equal(outcome.status, "done");
+    assert.equal(registered.result.outcomes[0]?.status, "done");
   } finally {
-    cleanup();
+    await registered.harness.close();
   }
 });
 
-test("runStage: implementation stage where the subagent never wrote the artifact returns failed with explicit reason", async () => {
-  const { cwd, cleanup } = withTempDir();
+test("run: implementation stage without a registered result receipt returns failed", async () => {
+  const stage: StageDef = {
+    id: "implementation",
+    title: "Implementation",
+    type: "single",
+    role: "dev",
+    produces: "implementation",
+  };
+  const registered = await runRegisteredStage(stage, async (_harness, worker) => ({
+    id: `${worker.toolCallId}-result`,
+    output: "worker completed without a registered output",
+    exitCode: 0,
+  }));
   try {
-    const artifactsDir = join(cwd, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    // No artifact at all
-    const stubTask: TaskCaller = {
-      async call() {
-        return { id: "t1", output: "ok", artifacts: {}, exitCode: 0 };
-      },
-      async batch() {
-        return [];
-      },
-    };
-    const stage: StageDef = {
-      id: "implementation",
-      title: "Implementation",
-      type: "single",
-      role: "go",
-      produces: "implementation",
-    };
-    const ctx = makeStageCtx(artifactsDir, stubTask);
-    const outcome = await runStage(stage, ctx);
-    assert.equal(outcome.status, "failed");
-    assert.match(outcome.note, /not found/);
+    assert.equal(registered.result.outcomes[0]?.status, "failed");
+    assert.match(registered.result.outcomes[0]?.note ?? "", /accepted workflow_submit_result receipt/);
   } finally {
-    cleanup();
+    await registered.harness.close();
   }
 });
 
-test("runStage: orchestrator with declared artifact fails when output is missing", async () => {
-  const { cwd, cleanup } = withTempDir();
+test("run: orchestrator with declared artifact fails when output is missing", async () => {
+  const stage: StageDef = { id: "planning", title: "Planning", type: "orchestrator", produces: "team_plan" };
+  const registered = await runRegisteredStage(stage, async (_harness, worker) => ({
+    id: `${worker.toolCallId}-result`,
+    output: "",
+    exitCode: 0,
+  }));
   try {
-    const artifactsDir = join(cwd, "artifacts");
-    mkdirSync(artifactsDir, { recursive: true });
-    const ctx = makeStageCtx(artifactsDir, {
-      async call() { return { id: "unused", output: "", artifacts: {}, exitCode: 0 }; },
-      async batch() { return []; },
-    });
-    const outcome = await runStage({ id: "planning", title: "Planning", type: "orchestrator", produces: "team_plan" }, ctx);
-    assert.equal(outcome.status, "failed");
-    assert.match(outcome.note, /orchestrate callback is configured/);
+    assert.equal(registered.result.outcomes[0]?.status, "failed");
+    assert.match(registered.result.outcomes[0]?.note ?? "", /orchestrate callback is configured/);
   } finally {
-    cleanup();
+    await registered.harness.close();
   }
 });
 
-test("runStage: inline orchestrator with no outputs remains done", async () => {
-  const { cwd, cleanup } = withTempDir();
+test("run: inline orchestrator with no outputs remains done", async () => {
+  const stage: StageDef = { id: "summary", title: "Summary", type: "orchestrator" };
+  const registered = await runRegisteredStage(stage, async (_harness, worker) => ({
+    id: `${worker.toolCallId}-result`,
+    output: "",
+    exitCode: 0,
+  }));
   try {
-    const ctx = makeStageCtx(join(cwd, "artifacts"), {
-      async call() { return { id: "unused", output: "", artifacts: {}, exitCode: 0 }; },
-      async batch() { return []; },
-    });
-    const outcome = await runStage({ id: "summary", title: "Summary", type: "orchestrator" }, ctx);
-    assert.equal(outcome.status, "done");
+    assert.equal(registered.result.outcomes[0]?.status, "done");
   } finally {
-    cleanup();
+    await registered.harness.close();
   }
 });
 
-test("runStage: orchestrator persists callback artifacts before validating outputs", async () => {
-  const { cwd, cleanup } = withTempDir();
-  try {
-    const artifactsDir = join(cwd, "artifacts");
-    const ctx = makeStageCtx(artifactsDir, {
-      async call() { return { id: "unused", output: "", artifacts: {}, exitCode: 0 }; },
-      async batch() { return []; },
-    });
-    ctx.orchestrate = async () => ({
+test("run: orchestrator publishes callback outputs before validating them", async () => {
+  const stage: StageDef = {
+    id: "planning",
+    title: "Planning",
+    type: "orchestrator",
+    produces: "team_plan",
+  };
+  const registered = await runRegisteredStage(
+    stage,
+    async (_harness, worker) => ({
+      id: `${worker.toolCallId}-result`,
+      output: "",
+      exitCode: 0,
+    }),
+    async () => ({
       output: "plan ready",
-      artifacts: { team_plan: { decision: "parallel", contributors: 2 } },
-    });
-
-    const outcome = await runStage({
-      id: "planning",
-      title: "Planning",
-      type: "orchestrator",
-      produces: "team_plan",
-    }, ctx);
-
-    assert.equal(outcome.status, "done");
-    assert.deepEqual(JSON.parse(readFileSync(join(artifactsDir, "team_plan.json"), "utf8")), {
-      decision: "parallel",
-      contributors: 2,
-    });
+      outputs: {
+        team_plan: {
+          teams: [{ team: "team-a", slice: "slice-a", profile: "lightweight" }],
+        },
+      },
+    }),
+  );
+  try {
+    assert.equal(registered.result.outcomes[0]?.status, "done");
+    assert.ok(registered.result.statePath);
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(dirname(registered.result.statePath!), "artifacts", "team_plan.json"), "utf8")),
+      { teams: [{ team: "team-a", slice: "slice-a", profile: "lightweight" }] },
+    );
   } finally {
-    cleanup();
+    await registered.harness.close();
   }
 });
+
+
+

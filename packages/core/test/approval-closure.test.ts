@@ -63,6 +63,7 @@ import { resolveConfig } from "../src/engine/config.js";
 import { buildAgentMapping, writeAgentMapping } from "../src/engine/agent-mapping.js";
 import type { CheckpointPolicy, TeamState, TypedCheckpointDecision, WorkIdentity, TrustedExecutionContext } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
+import { createCoreFixture, details, submission, type Harness } from "./reliable-stage-execution-fixture.js";
 
 const RUN_ID = "33333333-3333-4333-8333-333333333333";
 
@@ -481,7 +482,7 @@ test("closure: run observes a checkpoint decision committed while advance waits 
         workflow: checkpointRaceProfile.name,
       },
       taskTool: {
-        call: async () => ({ id: "unused", output: "unused", artifacts: {}, exitCode: 0 }),
+        call: async () => ({ id: "unused", output: "unused", exitCode: 0 }),
       },
       orchestrate: async () => {
         const selectedRunId = readRunControl(root).execution_claim?.run_id;
@@ -545,7 +546,7 @@ test("closure: run observes a checkpoint decision committed while advance waits 
         const deadline = Date.now() + 5_000;
         while (!existsSync(childEntered) && Date.now() < deadline) Atomics.wait(waitCell, 0, 0, 10);
         assert.ok(existsSync(childEntered), "concurrent decision writer holds the state lock before orchestrator completion");
-        return { id: "approve", output: "orchestrator completed", artifacts: {}, exitCode: 0 };
+        return { output: "orchestrator completed" };
       },
     });
     await decisionChildExit;
@@ -825,9 +826,10 @@ function publishMapping(root: string): void {
   writeAgentMapping(root, mapping);
 }
 
-test("closure: a deferred roster stage keeps no capability after the cursor move and workflow_begin arms it", () => {
+test("closure: a deferred roster stage keeps no capability after the cursor move and workflow_begin arms it", async () => {
   const root = mkdtempSync(join(tmpdir(), "closure-deferred-"));
   const statePath = statePathFor(root);
+  let harness: Harness | undefined;
   try {
     initGit(root);
     const profile = loadProfile("full-feature");
@@ -876,69 +878,140 @@ test("closure: a deferred roster stage keeps no capability after the cursor move
       },
     });
 
-    // Resolve the checkpoint so the advance reaches the cursor move.
-    const persistedState = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
-    const trusted = recordTrustedCheckpointAnswer(persistedState, {
-      answer_id: "closure/deferred/user_answers",
-      channel: "terminal",
-      reference: "terminal-answer/closure/deferred/user_answers",
-      stage_id: "clarify",
-      checkpoint_id: "user_answers",
-      decision: "proceed",
-    });
-    writeCanonicalState(root, trusted.state);
-    const policy = profile.checkpoint_policy!;
-    const recorded = updateStateAtomically(root, (snapshot) => {
-      assert.ok(snapshot.state);
-      return { op: "commit", state: {
-        ...snapshot.state,
-        typed_checkpoint_decisions: [{
-          run_id: RUN_ID,
-          stage_id: "clarify",
-          checkpoint_id: "user_answers",
-          checkpoint_kind: policy.rules.user_answers!.kind,
-          decision: "proceed",
-          authorization: "human",
-          actor: { kind: "user", ref: trusted.answer.reference, proof: trusted.proof },
-          capability_id: issued.capability_id,
-          capability_epoch: issued.state.issued_for!.cursor_epoch,
-          loop_iteration: 1,
-          policy_hash: checkpointPolicyHash(policy),
-          rationale: "closure deferred",
-          decided_at: new Date().toISOString(),
-        }],
-      } as TeamState };
-    });
-    assert.equal(recorded.ok, true, recorded.ok ? "checkpoint decision persisted" : recorded.error);
-
-    publishMapping(root);
-    const advanced = advanceCursor(root, {
-      token: issued.advance_token,
-      capability_id: issued.capability_id,
-      run_key: RUN_ID,
+    harness = createCoreFixture({
+      root,
       branch: "main",
-      workflow: "full-feature",
-      profile_hash: persistedHash,
-      stage_cursor: "clarify",
-      cursor_epoch: issued.state.issued_for!.cursor_epoch,
-      loop_iteration: issued.state.issued_for!.loop_iteration,
-      evidence: "clarify done",
+      workflowProfiles: [profile],
+      roles: poolRoles,
     });
-    assert.equal(advanced.ok, true, advanced.ok ? "advance into the roster stage" : advanced.error);
-    if (!advanced.ok) return;
-    assert.equal(advanced.state.stage_cursor, "architecture");
+    publishMapping(root);
+    const prepared = harness.controller.prepare({ mode: "resume", run_id: RUN_ID });
+    assert.equal(prepared.state.run_id, RUN_ID);
+    assert.equal(harness.controller.activeClaimRunId(), RUN_ID);
+
+    const beginTool = harness.tools.get("workflow_begin");
+    assert.ok(beginTool);
+    const beginDetails = details((await beginTool.execute("closure-deferred-begin", {}, undefined, undefined, harness.context)).details);
+    assert.equal(beginDetails.ok, true, JSON.stringify(beginDetails));
+    const handoff = beginDetails.handoff as {
+      advance_token: string;
+      capability_id: string;
+      run_key: string;
+      branch: string;
+      workflow: string;
+      profile_hash: string;
+      stage_cursor: string;
+      cursor_epoch: string;
+      loop_iteration: number;
+    };
+    assert.equal(handoff.stage_cursor, "clarify");
+
+    const submitTool = harness.tools.get("workflow_submit_result");
+    assert.ok(submitTool);
+    const submitted = details((await submitTool.execute(
+      "closure-deferred-submit",
+      submission({ clarifications: { questions: [], answers: ["proceed"] } }),
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
+    assert.equal(submitted.ok, true, JSON.stringify(submitted));
+
+    const policy = profile.checkpoint_policy;
+    assert.ok(policy);
+    const rule = policy.rules.user_answers;
+    assert.ok(rule);
+    const askTool = harness.tools.get("workflow_checkpoint_ask");
+    assert.ok(askTool);
+    const asked = details((await askTool.execute(
+      "closure-deferred-checkpoint-ask",
+      {
+        token: handoff.advance_token,
+        capability_id: handoff.capability_id,
+        run_key: handoff.run_key,
+        branch: handoff.branch,
+        workflow: handoff.workflow,
+        stage_cursor: handoff.stage_cursor,
+        cursor_epoch: handoff.cursor_epoch,
+        checkpoint: "user_answers",
+        checkpoint_id: "user_answers",
+        checkpoint_kind: rule.kind,
+        loop_iteration: handoff.loop_iteration,
+      },
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
+    assert.equal(asked.ok, true, JSON.stringify(asked));
+    const checkpointTool = harness.tools.get("workflow_checkpoint");
+    assert.ok(checkpointTool);
+    const checkpoint = details((await checkpointTool.execute(
+      "closure-deferred-checkpoint-record",
+      {
+        token: handoff.advance_token,
+        capability_id: handoff.capability_id,
+        run_key: handoff.run_key,
+        branch: handoff.branch,
+        workflow: handoff.workflow,
+        profile_hash: handoff.profile_hash,
+        stage_cursor: handoff.stage_cursor,
+        cursor_epoch: handoff.cursor_epoch,
+        loop_iteration: handoff.loop_iteration,
+        checkpoint: "user_answers",
+        checkpoint_id: "user_answers",
+        checkpoint_kind: rule.kind,
+        authorization: "human",
+        actor_provenance: asked.actor_provenance,
+        decision: asked.decision,
+        rationale: "registered human checkpoint fixture",
+      },
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
+    assert.equal(checkpoint.ok, true, JSON.stringify(checkpoint));
+
+    const advanceTool = harness.tools.get("workflow_advance");
+    assert.ok(advanceTool);
+    const advanced = details((await advanceTool.execute(
+      "closure-deferred-advance",
+      {
+        token: handoff.advance_token,
+        capability_id: handoff.capability_id,
+        run_key: handoff.run_key,
+        branch: handoff.branch,
+        workflow: handoff.workflow,
+        profile_hash: handoff.profile_hash,
+        stage_cursor: handoff.stage_cursor,
+        cursor_epoch: handoff.cursor_epoch,
+        loop_iteration: handoff.loop_iteration,
+        evidence: "clarify done",
+      },
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
+    assert.equal(advanced.ok, true, JSON.stringify(advanced));
+    const advancedState = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
+    assert.equal(advancedState.stage_cursor, "architecture");
     // The completed prior-stage capability is DELETED, never carried with a
     // stale stage/epoch binding: workflow_begin must be able to arm the
     // deferred stage.
-    assert.equal(advanced.state.dispatch_capability, undefined, "no stale capability is left behind");
+    assert.equal(advancedState.dispatch_capability, undefined, "no stale capability is left behind");
 
-    const begun = beginCapability(root, ARCHITECT_SELECTION);
-    assert.equal(begun.ok, true, begun.ok ? "workflow_begin arms the deferred stage" : begun.error);
-    if (!begun.ok) return;
+    const architectureBegin = details((await beginTool.execute(
+      "closure-deferred-architecture-begin",
+      { selection: ARCHITECT_SELECTION },
+      undefined,
+      undefined,
+      harness.context,
+    )).details);
+    assert.equal(architectureBegin.ok, true, JSON.stringify(architectureBegin));
     const after = JSON.parse(readFileSync(statePath, "utf8")) as TeamState;
     assert.equal(after.dispatch_capability?.issued_for?.stage_cursor, "architecture");
     assert.equal(after.dispatch_capability?.issued_for?.cursor_epoch, after.cursor_epoch, "the armed capability binds the live cursor epoch");
   } finally {
+    if (harness) await harness.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

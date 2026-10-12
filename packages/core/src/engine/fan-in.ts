@@ -1,10 +1,10 @@
 /**
  * Consilium fan-in: per-slot artifact provenance and deterministic synthesis.
  *
- * Every consilium dispatch slot owns a stable namespaced artifact id
- * (`<produce>-<slot>.json`, slot sanitized: `analyst#1` -> `analyst-1`) so
- * shared produce ids can never clobber each other. `advanceCursor` requires
- * all expected results before handoff:
+ * Every consilium dispatch slot contributes immutable receipt outputs under
+ * its canonical `(stage, loop iteration, slot)` identity. Shared produce ids
+ * are synthesized only after receipt identity and bytes are verified.
+ * `advanceCursor` requires all expected results before handoff:
  *
  *   - missing: a declared produce with no slot contribution, or a slot that
  *     recorded no artifact at all -> blocks with a diagnostic;
@@ -26,20 +26,11 @@
  * contributing slots are recorded as synthesis provenance.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { writeArtifact } from "./artifacts.js";
+import { createHash } from "node:crypto";
+import { readArtifactFileSafe, writeArtifact } from "./artifacts.js";
 import { requiredFieldsOf } from "./artifact-contract.js";
 import type { FanInConflictRecord, SlotArtifactRecord, StageFanInResolution, StageSlotRecords, TeamState } from "./types.js";
 
-/** Read a namespaced snapshot file (JSON) by absolute path; undefined when absent/unreadable. */
-function readSnapshot(path: string): unknown {
-  try {
-    if (!existsSync(path)) return undefined;
-    return JSON.parse(readFileSync(path, "utf8")) as unknown;
-  } catch {
-    return undefined;
-  }
-}
 
 export interface FanInPolicy {
   /** Require per-slot provenance and deterministic synthesis for multi-slot consilium stages. */
@@ -100,14 +91,72 @@ export function isNamespacedArtifactId(id: string, slot: string): boolean {
   return id.endsWith(suffix) && namespacedArtifactId(id.slice(0, -suffix.length), slot) === id;
 }
 
-export function slotRecordsFor(state: TeamState, stageId: string): StageSlotRecords | null {
-  return state.slot_artifacts?.[stageId] ?? null;
+
+/**
+ * Build fan-in records exclusively from accepted immutable stage receipts.
+ * `slot_artifacts` is deliberately not consulted: it is a derived legacy
+ * projection and cannot establish producer, iteration, or immutable-file
+ * authority.
+ */
+function canonicalSlotRecords(
+  state: TeamState,
+  stageId: string,
+  produces: string[],
+): { records: StageSlotRecords; error?: string } {
+  const records: StageSlotRecords = { slots: {} };
+  const expectedCapability = state.dispatch_capability?.issued_for;
+  const activeDispatches = state.dispatch_capability?.dispatches ?? [];
+  const successfulDispatches = new Map<string, number>();
+  for (const dispatch of activeDispatches) {
+    if (dispatch.status !== "succeeded") continue;
+    successfulDispatches.set(dispatch.id, dispatch.attempt);
+  }
+  const restrictToCurrentDispatches = successfulDispatches.size > 0;
+  const receipts = Object.values(state.stage_receipts ?? {}).filter((receipt) => {
+    const identity = receipt.work_identity;
+    if (identity.stage_id !== stageId) return false;
+    if (restrictToCurrentDispatches) {
+      const attempt = successfulDispatches.get(identity.dispatch_id);
+      if (attempt === undefined || attempt !== identity.attempt) return false;
+    }
+    if (expectedCapability?.stage_cursor === stageId) {
+      if (identity.stage_cursor !== expectedCapability.stage_cursor) return false;
+      if (
+        expectedCapability.loop_iteration !== undefined
+        && identity.loop_iteration !== expectedCapability.loop_iteration
+      ) return false;
+    }
+    return true;
+  });
+  if (receipts.length === 0) {
+    return { records, error: `canonical stage receipts are missing for stage '${stageId}'` };
+  }
+  const collisions: string[] = [];
+  for (const receipt of receipts) {
+    const slot = receipt.work_identity.slot_id;
+    const slotRecords = (records.slots[slot] ??= {});
+    for (const output of receipt.outputs) {
+      if (!produces.includes(output.artifact_id)) continue;
+      const previous = slotRecords[output.artifact_id];
+      if (previous && (previous.hash !== output.sha256 || previous.path !== output.immutable_ref)) {
+        collisions.push(`${slot}/${output.artifact_id}`);
+        continue;
+      }
+      slotRecords[output.artifact_id] = {
+        path: output.immutable_ref,
+        hash: output.sha256,
+      };
+    }
+  }
+  if (collisions.length > 0) {
+    return { records, error: `consilium fan-in has conflicting canonical receipts for ${collisions.join(", ")}` };
+  }
+  return { records };
 }
 
 /**
- * Resolve a slot's contribution to a declared produce: the record may be
- * keyed by the shared id (slot wrote `<id>.json`) or by the slot-scoped id
- * (`<id>-<slot>.json`, per the consilium prompt contract).
+ * Resolve a slot's contribution from the canonical receipt projection. The
+ * projection retains the receipt's immutable reference and byte hash.
  */
 export function slotArtifactRecord(
   records: StageSlotRecords,
@@ -119,8 +168,8 @@ export function slotArtifactRecord(
 
 /**
  * Missing-result check at advance: every declared produce must have at least
- * one slot contribution and every expected slot must have recorded at least
- * one artifact. Returns the missing list (empty = complete).
+ * one canonical receipt contribution and every expected slot must have
+ * recorded at least one artifact. Returns the missing list (empty = complete).
  */
 export function missingSlotResults(
   state: TeamState,
@@ -128,8 +177,9 @@ export function missingSlotResults(
   expectedSlots: string[],
   produces: string[],
 ): Array<{ slot: string; artifactId: string }> {
-  const records = slotRecordsFor(state, stageId);
-  if (!records) {
+  const canonical = canonicalSlotRecords(state, stageId, produces);
+  const records = canonical.records;
+  if (canonical.error) {
     return produces.map((artifactId) => ({ slot: "<any>", artifactId }));
   }
   const missing: Array<{ slot: string; artifactId: string }> = [];
@@ -316,15 +366,16 @@ export function synthesizeArtifacts(
   if (!policy.enabled || expectedSlots.length <= 1) {
     return { ok: true, state, shared: {} };
   }
+  const canonical = canonicalSlotRecords(state, stageId, produces);
+  if (canonical.error) return { ok: false, error: canonical.error, state };
   const missing = missingSlotResults(state, stageId, expectedSlots, produces);
   if (missing.length > 0) {
     const detail = missing.map((entry) =>
-      entry.slot === "<any>" ? `artifact '${entry.artifactId}' has no slot results` : `slot '${entry.slot}' recorded no artifact results`,
+      entry.slot === "<any>" ? `artifact '${entry.artifactId}' has no canonical receipt` : `slot '${entry.slot}' recorded no canonical artifact receipt`,
     ).join("; ");
-    return { ok: false, error: `consilium fan-in incomplete: ${detail}` };
+    return { ok: false, error: `consilium fan-in incomplete: ${detail}`, state };
   }
-  const records = slotRecordsFor(state, stageId);
-  if (!records) return { ok: false, error: "consilium fan-in records are missing" };
+  const records = canonical.records;
   const shared: NonNullable<StageSlotRecords["shared"]> = {};
   const now = new Date().toISOString();
   const resolutions = policy.resolutions ?? [];
@@ -333,9 +384,18 @@ export function synthesizeArtifacts(
     const entries: MergeEntry[] = [];
     for (const slot of contributors) {
       const record = slotArtifactRecord(records, slot, artifactId)!;
-      const value = readSnapshot(record.path);
-      if (value === undefined) {
-        return { ok: false, error: `consilium fan-in: namespaced snapshot missing for artifact '${artifactId}' (slot '${slot}')` };
+      const raw = readArtifactFileSafe(artifactsDir, record.path);
+      if (raw.status !== "present") {
+        return { ok: false, error: `consilium fan-in: canonical immutable artifact '${artifactId}' for slot '${slot}' is unavailable`, state };
+      }
+      if (createHash("sha256").update(raw.bytes).digest("hex") !== record.hash) {
+        return { ok: false, error: `consilium fan-in: canonical immutable artifact '${artifactId}' for slot '${slot}' failed hash verification`, state };
+      }
+      let value: unknown;
+      try {
+        value = JSON.parse(raw.bytes.toString("utf8")) as unknown;
+      } catch {
+        return { ok: false, error: `consilium fan-in: canonical immutable artifact '${artifactId}' for slot '${slot}' is not valid JSON`, state };
       }
       entries.push({ slot, value });
     }

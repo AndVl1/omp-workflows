@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
 	isRegisteredWorkflow,
@@ -16,6 +18,7 @@ import {
 
 import ompWorkflowsInternal, { ensureEngineActivation, resolveSessionCwd } from "../src/index.js";
 import { OMP_INTERNAL_BUNDLE_ID, OMP_INTERNAL_OWNER_KIND } from "../src/identity.js";
+import { ALLOWED_POOL_AGENTS, waitForInternalAgentMappings } from "../src/pool.js";
 
 // ── Fake host surface ────────────────────────────────────────────────────────
 
@@ -36,7 +39,7 @@ function permissiveZod(): { z: unknown } {
 	return { z };
 }
 
-function makePi(options: { tools?: boolean } = {}) {
+function makePi(options: { tools?: boolean; events?: object } = {}) {
 	const commands = new Map<string, RecordedCommand>();
 	const hooks = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const labels: string[] = [];
@@ -45,6 +48,7 @@ function makePi(options: { tools?: boolean } = {}) {
 	const sent: string[] = [];
 	const pi = {
 		...(options.tools ? { zod: permissiveZod() } : {}),
+		...(options.events ? { events: options.events } : {}),
 		registerCommand(name: string, commandOptions: { description?: string; handler: RecordedCommand["handler"] }) {
 			commands.set(name, { name, ...commandOptions });
 		},
@@ -77,6 +81,9 @@ function makePi(options: { tools?: boolean } = {}) {
 		},
 		fireSessionSwitch(event: unknown, ctx: unknown): void {
 			for (const handler of hooks.get("session_switch") ?? []) handler(event, ctx);
+		},
+		async fireSessionSwitchAsync(event: unknown, ctx: unknown): Promise<void> {
+			for (const handler of hooks.get("session_switch") ?? []) await handler(event, ctx);
 		},
 		fireBeforeAgentStart(event: unknown, ctx: unknown): unknown {
 			let result: unknown;
@@ -451,6 +458,156 @@ test("exact stop settles the host claim but retains command/controller binding u
 	);
 });
 
+test("internal turn stop preserves an explicit new intent for the next prepare", async () => {
+	resetWorkflowOwners();
+	const root = markedRoot();
+	const host = makePi({ tools: true });
+	ompWorkflowsInternal(host.pi as never);
+	initGit(root);
+	const owner = interactiveContext(root, "internal-command-intent-session");
+	host.fireSessionStart(owner);
+	const command = host.commands.get("omp-do-work");
+	assert.ok(command);
+	await command.handler("--new internal explicit lifecycle", owner);
+	const prompt = host.sent.at(-1);
+	assert.match(prompt ?? "", /Command intent token: `[0-9a-f-]{36}`/);
+	const token = /Command intent token: `([0-9a-f-]{36})`/.exec(prompt ?? "")?.[1];
+	assert.ok(token);
+	assert.equal(
+		host.fireBeforeAgentStart({ prompt, systemPrompt: ["base"] }, owner) !== undefined,
+		true,
+		"internal command provenance must be admitted before the classifier turn",
+	);
+	host.fireSessionStop(
+		{
+			type: "session_stop",
+			messages: [],
+			turn_id: 0,
+			session_id: owner.session_id,
+			session_file: owner.sessionManager.getSessionFile(),
+			stop_hook_active: false,
+			signal: new AbortController().signal,
+		},
+		owner,
+	);
+	const executePrepare = host.toolHandlers.get("workflow_prepare") as
+		| ((id: string, params: unknown, signal: unknown, update: unknown, ctx: unknown) => Promise<unknown>)
+		| undefined;
+	assert.equal(typeof executePrepare, "function");
+	const prepared = await executePrepare!(
+		"internal-command-intent-prepare",
+		{
+			mode: "new",
+			task: "internal explicit lifecycle after classifier boundary",
+			command_intent_id: token,
+			classification: {
+				type: "FEATURE",
+				complexity: "QUICK",
+				confidence: "HIGH",
+				autonomous: false,
+				workflow: "lightweight",
+			},
+		},
+		undefined,
+		undefined,
+		owner,
+	);
+	const details = (prepared as { details?: { ok?: boolean; error?: string } }).details;
+	assert.equal(details?.ok, true, details?.error ?? JSON.stringify(prepared));
+	host.fireSessionShutdown({ type: "session_shutdown" }, owner);
+});
+test("internal classifier stop preserves CTO supersession provenance", async () => {
+	resetWorkflowOwners();
+	const root = markedRoot();
+	const host = makePi({ tools: true });
+	ompWorkflowsInternal(host.pi as never);
+	initGit(root);
+	const owner = interactiveContext(root, "internal-cto-turn-stop-session");
+	host.fireSessionStart(owner);
+	const command = host.commands.get("omp-do-work");
+	const cto = host.commands.get("omp-cto");
+	assert.ok(command);
+	assert.ok(cto);
+	const stopEvent = {
+		type: "session_stop",
+		messages: [],
+		turn_id: 0,
+		session_id: owner.session_id,
+		session_file: owner.sessionManager.getSessionFile(),
+		stop_hook_active: false,
+		signal: new AbortController().signal,
+	};
+	const classification = {
+		type: "FEATURE" as const,
+		complexity: "QUICK" as const,
+		confidence: "HIGH" as const,
+		autonomous: false,
+		workflow: "lightweight",
+	};
+
+	await command.handler("--new internal predecessor for failed CTO", owner);
+	const failedPredecessorPrompt = host.sent.at(-1) ?? "";
+	const failedPredecessorToken = /Command intent token: `([0-9a-f-]{36})`/.exec(failedPredecessorPrompt)?.[1];
+	assert.ok(failedPredecessorToken);
+	assert.equal(host.fireBeforeAgentStart({ prompt: failedPredecessorPrompt, systemPrompt: ["base"] }, owner) !== undefined, true);
+	host.fireSessionStop(stopEvent, owner);
+	await assert.rejects(
+		cto.handler("--run missing-internal-cto failed acquisition", owner),
+		/CTO run 'missing-internal-cto' is missing/,
+	);
+	const executePrepare = host.toolHandlers.get("workflow_prepare") as
+		| ((id: string, params: unknown, signal: unknown, update: unknown, ctx: unknown) => Promise<unknown>)
+		| undefined;
+	assert.equal(typeof executePrepare, "function");
+	const recovered = await executePrepare!(
+		"internal-cto-failed-acquisition-prepare",
+		{
+			mode: "new",
+			task: "internal predecessor remains usable after failed CTO acquisition",
+			command_intent_id: failedPredecessorToken,
+			classification,
+		},
+		undefined,
+		undefined,
+		owner,
+	);
+	assert.equal((recovered as { details?: { ok?: boolean } }).details?.ok, true, JSON.stringify(recovered));
+	host.fireSessionStop(stopEvent, owner);
+
+	await command.handler("--new internal predecessor for CTO supersession", owner);
+	const supersededPrompt = host.sent.at(-1) ?? "";
+	const supersededToken = /Command intent token: `([0-9a-f-]{36})`/.exec(supersededPrompt)?.[1];
+	assert.ok(supersededToken);
+	assert.equal(host.fireBeforeAgentStart({ prompt: supersededPrompt, systemPrompt: ["base"] }, owner) !== undefined, true);
+	host.fireSessionStop(stopEvent, owner);
+	await cto.handler("internal successful CTO supersession", owner);
+	const outerPrompt = host.sent.at(-1) ?? "";
+	assert.match(outerPrompt, /internal successful CTO supersession/);
+	assert.equal(host.fireBeforeAgentStart({ prompt: outerPrompt, systemPrompt: ["base"] }, owner) !== undefined, true);
+	const rejected = await executePrepare!(
+		"internal-cto-supersession-rejected-prepare",
+		{
+			mode: "new",
+			task: "old CTO predecessor must be rejected",
+			command_intent_id: supersededToken,
+			classification,
+		},
+		undefined,
+		undefined,
+		owner,
+	);
+	const rejectedDetails = (rejected as { details?: { ok?: boolean; error?: string } }).details;
+	assert.equal(rejectedDetails?.ok, false, JSON.stringify(rejected));
+	assert.match(rejectedDetails?.error ?? "", /command intent token/);
+
+	await command.handler("--new internal future preparation after CTO supersession", owner);
+	const futurePrompt = host.sent.at(-1) ?? "";
+	const futureToken = /Command intent token: `([0-9a-f-]{36})`/.exec(futurePrompt)?.[1];
+	assert.ok(futureToken);
+	assert.equal(host.fireBeforeAgentStart({ prompt: futurePrompt, systemPrompt: ["base"] }, owner) !== undefined, true);
+	host.fireSessionShutdown({ type: "session_shutdown" }, owner);
+});
+
 test("same-identity headless start revokes internal authority and trusted start restores it", async () => {
 	resetWorkflowOwners();
 	const root = markedRoot();
@@ -577,6 +734,71 @@ test("raw authority requires an active claim, then returns after post-idle prepa
 	assert.equal(resumedDetails?.ok, true, JSON.stringify(resumed));
 	assert.equal(readRunControl(root).execution_claim?.run_id, runId, "post-prepare rebind restores the canonical claim");
 	assert.equal(artifactBlocked(owner), false, "post-prepare claim restores raw orchestrator authority");
+});
+
+test("tagged private aliases retain exact selected claim authority across headless UI transitions", async (t) => {
+	resetWorkflowOwners();
+	const replicaUrl = new URL("../src/index.ts", import.meta.url);
+	replicaUrl.searchParams.set("claim-registry-replica", "entry");
+	const replica = await import(replicaUrl.href) as { default: typeof ompWorkflowsInternal };
+	const discoverAgents = async () => ({
+		agents: ALLOWED_POOL_AGENTS.map((name) => ({
+			name,
+			source: "bundled" as const,
+			filePath: fileURLToPath(new URL(`../agents/${name}.md`, import.meta.url)),
+		})),
+	});
+	for (const initial of ["interactive", "headless"] as const) {
+		const root = markedRoot();
+		t.after(() => rmSync(root, { recursive: true, force: true }));
+		initGit(root);
+		mkdirSync(join(root, ".omp"), { recursive: true });
+		const events = new EventEmitter();
+		const first = makePi({ tools: true, events });
+		const alias = makePi({ tools: true, events });
+		const owner = interactiveContext(root, `tagged-${initial}`);
+		const headless = { ...owner, mode: "print", hasUI: false };
+		ompWorkflowsInternal(first.pi as never, { discoverAgents });
+		replica.default(alias.pi as never, { discoverAgents });
+		first.fireSessionStart(initial === "headless" ? headless : owner);
+		alias.fireSessionStart(headless);
+		first.fireSessionStart(owner);
+		alias.fireSessionStart(owner);
+		first.fireSessionStart(owner);
+		alias.fireSessionStart(owner);
+		const execute = (first.toolHandlers.get("workflow_prepare") ?? alias.toolHandlers.get("workflow_prepare")) as
+			(id: string, params: unknown, signal: unknown, update: unknown, ctx: unknown) => Promise<unknown>;
+		const prepared = await execute(`tagged-prepare-${initial}`, {
+			mode: "new",
+			task: "verify selected claim across private aliases",
+			classification: { type: "FEATURE", complexity: "QUICK", confidence: "HIGH", autonomous: false, workflow: "lightweight" },
+		}, undefined, undefined, owner);
+		const details = (prepared as { details: { ok: boolean; artifacts_dir: string; state: { run_id: string } } }).details;
+		assert.equal(details.ok, true, JSON.stringify(prepared));
+		mkdirSync(details.artifacts_dir, { recursive: true });
+		const event = { toolName: "write", input: { path: join(details.artifacts_dir, "proof.json"), content: "{}" } };
+		const blocked = (result: unknown) => Boolean(result && typeof result === "object" && "block" in result && result.block);
+		const decisions = await Promise.all([...first.fireToolCall(event, owner), ...alias.fireToolCall(event, owner)]);
+		assert.equal(decisions.some(blocked), false, JSON.stringify(decisions));
+		assert.equal(readRunControl(root).execution_claim?.run_id, details.state.run_id);
+		const copiedManager = { ...owner, sessionManager: { ...owner.sessionManager } };
+		first.fireSessionStart(copiedManager);
+		const foreign = makePi({ tools: true, events });
+		replica.default(foreign.pi as never, { discoverAgents });
+		foreign.fireSessionStart(copiedManager);
+		foreign.fireSessionStart(copiedManager);
+		const foreignDecisions = await Promise.all(foreign.fireToolCall(event, copiedManager));
+		assert.equal(foreignDecisions.some(blocked), true, "a copied manager cannot inherit the exact claim token");
+		const retained = await Promise.all([...first.fireToolCall(event, owner), ...alias.fireToolCall(event, owner)]);
+		assert.equal(retained.some(blocked), false);
+		const freshHeadless = makePi({ tools: true, events });
+		replica.default(freshHeadless.pi as never, { discoverAgents });
+		freshHeadless.fireSessionStart(headless);
+		const headlessCommand = freshHeadless.commands.get("omp-do-work");
+		await assert.rejects(() => Promise.resolve(headlessCommand!.handler("must not inherit UI authority", headless)), /trusted session identity is unavailable/);
+		await waitForInternalAgentMappings(root, discoverAgents);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
 });
 
 
@@ -971,7 +1193,7 @@ test("verified replacement isolates the old host while headless ingress preserve
 	const newSessionId = "entry-replacement-new";
 	const newSessionFile = hostSessionFile(root, newSessionId);
 	ownerSession.setSession(newSessionId, newSessionFile);
-	host.fireSessionSwitch(
+	await host.fireSessionSwitchAsync(
 		{ type: "session_switch", reason: "new", previousSessionFile: oldSessionFile },
 		owner,
 	);
@@ -995,7 +1217,7 @@ test("verified replacement isolates the old host while headless ingress preserve
 		{ mode: "new", task: "replacement host run", classification },
 		owner,
 	);
-	assert.equal(second.ok, true);
+	assert.equal(second.ok, true, JSON.stringify(second));
 	assert.equal(typeof second.run_id, "string");
 	const replacementRunId = second.run_id as string;
 	assert.notEqual(replacementRunId, oldRunId, "replacement prepare starts a fresh run");

@@ -50,6 +50,7 @@ import {
 	writeRuntimeConfig,
 	workflowOwnerFor,
 	type RegisterOptions,
+	type CtoClaimScope,
 	type TrustedExecutionContext,
 	type TrustedToolCallResolution,
 	type WorkflowCapability,
@@ -74,6 +75,7 @@ import {
 	defaultOmpInternalScopeUiClasses,
 	refreshInternalAgentMappings,
 	waitForInternalAgentMappings,
+	type InternalAgentDiscovery,
 } from "./pool.js";
 import { loadOmpWorkflowProfiles } from "./profiles.js";
 
@@ -110,13 +112,112 @@ interface InternalSessionBinding {
 	controller?: WorkflowSessionController;
 }
 
-/**
- * The bundle owns one trusted controller per host extension instance/session.
- * The mapping is deliberately process-local: it is only an adapter seam and
- * never a source of run authority. Core's canonical controller/read APIs own
- * run selection and lifecycle mutation.
- */
-const sessionBindings = new WeakMap<object, InternalSessionBinding>();
+interface InternalRuntimeSession {
+	binding?: InternalSessionBinding;
+	runtime?: object;
+	manager?: object;
+	hostActor?: boolean;
+}
+
+interface InternalHostRegistry {
+	version: 1;
+	sessions: WeakMap<object, InternalRuntimeSession>;
+	runtimes: WeakMap<object, WeakMap<object, InternalRuntimeSession>>;
+	workerRuntimes: WeakMap<object, WeakMap<object, InternalRuntimeSession>>;
+	activatedEngines: WeakSet<object>;
+}
+
+const INTERNAL_HOST_REGISTRY = Symbol.for("omp-workflows.internal-host-registry");
+
+function getInternalHostRegistry(): InternalHostRegistry {
+	const host = globalThis as unknown as Record<symbol, unknown>;
+	const existing = host[INTERNAL_HOST_REGISTRY];
+	if (existing !== undefined) {
+		const registry = existing as Partial<InternalHostRegistry> | null;
+		if (
+			!registry
+			|| registry.version !== 1
+			|| !(registry.sessions instanceof WeakMap)
+			|| !(registry.runtimes instanceof WeakMap)
+			|| !(registry.workerRuntimes instanceof WeakMap)
+			|| !(registry.activatedEngines instanceof WeakSet)
+		) throw new Error("[internal_host_registry:unsupported] Restart OMP with compatible private bundle modules.");
+		return registry as InternalHostRegistry;
+	}
+	const registry: InternalHostRegistry = {
+		version: 1,
+		sessions: new WeakMap(),
+		runtimes: new WeakMap(),
+		workerRuntimes: new WeakMap(),
+		activatedEngines: new WeakSet(),
+	};
+	Object.defineProperty(host, INTERNAL_HOST_REGISTRY, {
+		value: registry,
+		configurable: false,
+		enumerable: false,
+		writable: false,
+	});
+	return registry;
+}
+
+const internalHostRegistry = getInternalHostRegistry();
+
+function sessionScope(pi: object): InternalRuntimeSession {
+	let scope = internalHostRegistry.sessions.get(pi);
+	if (!scope) {
+		scope = {};
+		internalHostRegistry.sessions.set(pi, scope);
+	}
+	return scope;
+}
+
+// Cache-tagged aliases share one host session across UI/print transitions.
+// Explicit worker actors remain in a separate scope and never borrow it.
+function associateCapturedRuntime(pi: object, manager: object | undefined, hostActor: boolean): boolean {
+	const runtime = (pi as { events?: unknown }).events;
+	if (!manager || !runtime || typeof runtime !== "object") return true;
+	const current = internalHostRegistry.sessions.get(pi);
+	if (
+		current
+		&& (
+			(current.runtime !== undefined && current.runtime !== runtime)
+			|| (current.manager !== undefined && current.manager !== manager)
+			|| (current.hostActor !== undefined && current.hostActor !== hostActor)
+			|| (current.binding?.sessionManager !== undefined && current.binding.sessionManager !== manager)
+		)
+	) return false;
+	const runtimes = hostActor ? internalHostRegistry.runtimes : internalHostRegistry.workerRuntimes;
+	let sessions = runtimes.get(runtime);
+	if (!sessions) {
+		sessions = new WeakMap();
+		runtimes.set(runtime, sessions);
+	}
+	const shared = sessions.get(manager);
+	if (
+		shared && current && current !== shared
+		&& (current.binding || internalHostRegistry.activatedEngines.has(current))
+	) return false;
+	const scope = shared ?? current ?? sessionScope(pi);
+	scope.runtime = runtime;
+	scope.manager = manager;
+	scope.hostActor = hostActor;
+	sessions.set(manager, scope);
+	internalHostRegistry.sessions.set(pi, scope);
+	return true;
+}
+
+function getSessionBinding(pi: object): InternalSessionBinding | undefined {
+	return internalHostRegistry.sessions.get(pi)?.binding;
+}
+
+function setSessionBinding(pi: object, binding: InternalSessionBinding): void {
+	sessionScope(pi).binding = binding;
+}
+
+function clearSessionBinding(pi: object): void {
+	const scope = internalHostRegistry.sessions.get(pi);
+	if (scope) scope.binding = undefined;
+}
 
 function sessionIdFromContext(ctx: unknown): string | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
@@ -143,6 +244,14 @@ function sessionManagerFromContext(ctx: unknown): object | undefined {
 	return typeof value.getCwd === "function" && typeof value.getSessionId === "function"
 		? manager
 		: undefined;
+}
+
+function samePath(left: string, right: string): boolean {
+	try {
+		return resolve(left) === resolve(right);
+	} catch {
+		return false;
+	}
 }
 
 function sessionFileFromManager(manager: object | undefined): string | undefined {
@@ -317,7 +426,7 @@ function isVerifiedSessionSwitch(
 
 
 function switchSessionBinding(pi: object, event: unknown, ctx: unknown): void {
-	const prior = sessionBindings.get(pi);
+	const prior = getSessionBinding(pi);
 	if (!prior || !isVerifiedSessionSwitch(prior, event, ctx)) return;
 	const cwd = resolveSessionCwd(ctx);
 	if (!cwd || resolve(cwd) !== resolve(prior.cwd)) return;
@@ -459,6 +568,7 @@ function resetControllerForLifecycle(
 	binding: InternalSessionBinding,
 	receipt: string,
 	reason?: CtoSuspensionReason,
+	preserveCommandIntent = false,
 ): boolean {
 	const ctoClaim = hasActiveCtoClaim(binding);
 	if (reason && !suspendCtoBeforeReset(binding, reason)) return false;
@@ -468,7 +578,7 @@ function resetControllerForLifecycle(
 	// adapter binding.
 	if (ctoClaim) return true;
 	try {
-		binding.controller?.release(receipt);
+		binding.controller?.release(receipt, { preserveCommandIntent });
 		return true;
 	} catch {
 		console.warn(`[${COMMAND_NAME}]`, JSON.stringify({
@@ -490,22 +600,23 @@ function releaseSessionBinding(
 	receipt: string,
 	reason?: CtoSuspensionReason,
 ): boolean {
-	const prior = sessionBindings.get(pi);
+	const prior = getSessionBinding(pi);
 	if (!prior || !resetControllerForLifecycle(prior, receipt, reason)) return !prior;
-	sessionBindings.delete(pi);
+	clearSessionBinding(pi);
 	return true;
 }
 
 /**
  * Release the exact trusted interactive binding while retaining its profile,
- * controller and selected-run view. Core's canonical release semantics clear
- * only the private execution claim and pending command reservation. A resident
- * CTO claim is intentionally not released by an idle turn stop.
+ * controller and selected-run view. An idle turn stop releases only the
+ * ordinary execution claim and preserves a pending explicit command intent
+ * for the next user boundary. A resident CTO claim is intentionally not
+ * released by an idle turn stop.
  */
 function settleSessionBinding(pi: object, event: unknown, ctx: unknown): boolean {
-	const binding = sessionBindings.get(pi);
+	const binding = getSessionBinding(pi);
 	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
-	return resetControllerForLifecycle(binding, "host-session-stop");
+	return resetControllerForLifecycle(binding, "host-session-stop", undefined, true);
 }
 
 /**
@@ -519,10 +630,10 @@ function teardownSessionBinding(
 	receipt: string,
 	reason?: CtoSuspensionReason,
 ): boolean {
-	const binding = sessionBindings.get(pi);
+	const binding = getSessionBinding(pi);
 	if (!binding || !trustedInteractiveLifecycle(binding, event, ctx)) return false;
 	if (!resetControllerForLifecycle(binding, receipt, reason)) return false;
-	sessionBindings.delete(pi);
+	clearSessionBinding(pi);
 	return true;
 }
 
@@ -582,11 +693,12 @@ function refreshSessionBindingBranch(binding: InternalSessionBinding): WorkflowS
  */
 function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 	const interactive = trustedInteractiveSession(ctx);
-	const current = sessionBindings.get(pi);
 	const value = ctx as { mode?: unknown; hasUI?: unknown };
 	const incomingManager = sessionManagerFromContext(ctx);
 	const incomingIdentity = sessionIdentityFromValue(ctx);
-	if (!trustedHostActor(ctx)) return;
+	const hostActor = trustedHostActor(ctx);
+	if (!associateCapturedRuntime(pi, incomingManager, hostActor) || !hostActor) return;
+	const current = getSessionBinding(pi);
 	if (!interactive) {
 		if (
 			current
@@ -600,7 +712,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 			// Headless/worker ingress can revoke interactive authority, but it
 			// is not a trusted teardown and must not release either ordinary
 			// ownership or a resident CTO claim.
-			sessionBindings.set(pi, { ...current, interactive: false });
+			setSessionBinding(pi, { ...current, interactive: false });
 		}
 		return;
 	}
@@ -615,7 +727,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 		if (sameIdentity && !current.interactive) {
 			// Re-entry of the exact manager-backed host restores UI authority
 			// without replacing the resident controller or its CTO claim.
-			sessionBindings.set(pi, { ...current, interactive: true, mode });
+			setSessionBinding(pi, { ...current, interactive: true, mode });
 			return;
 		}
 		// A different identity must arrive through the authenticated
@@ -632,7 +744,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
 	}
 	const sessionId = incomingIdentity?.managerBacked === true ? incomingIdentity.sessionId : undefined;
 	const controller = sessionId ? buildTrustedController(cwd, sessionId) : undefined;
-	sessionBindings.set(pi, {
+	setSessionBinding(pi, {
 		cwd,
 		interactive,
 		mode,
@@ -651,7 +763,7 @@ function captureSessionBinding(pi: object, ctx: unknown, cwd: string): void {
  * later ingress context that exposes the host session manager's ID.
  */
 function sharedSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
-	const binding = sessionBindings.get(pi);
+	const binding = getSessionBinding(pi);
 	if (!binding || resolve(binding.cwd) !== resolve(cwd) || !binding.interactive) return undefined;
 	if (!matchesCapturedHostContext(binding, ctx, "command")) return undefined;
 	const identity = capturedManagerIdentity(binding, ctx, cwd);
@@ -673,65 +785,193 @@ function sharedSessionController(pi: object, ctx: unknown, cwd: string): Workflo
 	return controller;
 }
 
+type TrustedToolCallDenial = Extract<TrustedToolCallResolution, { readonly kind: "denied" }>;
+type TrustedToolCallDenialCode = TrustedToolCallDenial["code"];
+
+function deniedTrustedToolCall(code: TrustedToolCallDenialCode): TrustedToolCallResolution {
+	return { kind: "denied", code };
+}
+
+function internalRawHostContextDenial(
+	binding: InternalSessionBinding,
+	ctx: unknown,
+	cwd: string,
+): TrustedToolCallDenialCode | undefined {
+	if (!ctx || typeof ctx !== "object" || Array.isArray(ctx)) return "invalid_host_context";
+	if (!trustedHostActor(ctx)) return "untrusted_actor_context";
+	const manager = sessionManagerFromContext(ctx);
+	if (!manager) return "invalid_host_context";
+	if (binding.sessionManager !== undefined && manager !== binding.sessionManager) {
+		return "session_identity_mismatch";
+	}
+
+	const managerValue = manager as { getCwd: () => unknown; getSessionId: () => unknown };
+	const value = ctx as Record<string, unknown>;
+	const suppliedCwd = value.cwd;
+	if (suppliedCwd !== undefined && (typeof suppliedCwd !== "string" || suppliedCwd.length === 0)) {
+		return "invalid_host_context";
+	}
+	if (typeof suppliedCwd === "string" && !samePath(suppliedCwd, binding.cwd)) {
+		return "worktree_mismatch";
+	}
+	const suppliedSessionId = value.session_id;
+	const suppliedSessionIdAlias = value.sessionId;
+	for (const supplied of [suppliedSessionId, suppliedSessionIdAlias]) {
+		if (supplied !== undefined && (typeof supplied !== "string" || supplied.length === 0)) {
+			return "invalid_host_context";
+		}
+	}
+	if (
+		typeof suppliedSessionId === "string"
+		&& typeof suppliedSessionIdAlias === "string"
+		&& suppliedSessionId !== suppliedSessionIdAlias
+	) {
+		return "session_identity_mismatch";
+	}
+	const suppliedId = typeof suppliedSessionId === "string" ? suppliedSessionId : suppliedSessionIdAlias;
+	if (suppliedId !== undefined && suppliedId !== binding.sessionId) {
+		return "session_identity_mismatch";
+	}
+
+	let managerCwd: unknown;
+	let managerSessionId: unknown;
+	try {
+		managerCwd = managerValue.getCwd();
+		managerSessionId = managerValue.getSessionId();
+	} catch {
+		return "invalid_host_context";
+	}
+	if (typeof managerCwd !== "string" || managerCwd.length === 0) return "invalid_host_context";
+	if (typeof managerSessionId !== "string" || managerSessionId.length === 0) {
+		return "invalid_host_context";
+	}
+	if (!samePath(managerCwd, binding.cwd)) return "worktree_mismatch";
+	if (binding.sessionId !== undefined && managerSessionId !== binding.sessionId) {
+		return "session_identity_mismatch";
+	}
+	if (typeof cwd !== "string" || cwd.length === 0) return "invalid_host_context";
+	if (!samePath(cwd, binding.cwd)) return "worktree_mismatch";
+
+	const profile = ctx as { mode?: unknown; hasUI?: unknown };
+	if (profile.hasUI === false) return "host_profile_mismatch";
+	if (profile.mode !== undefined && profile.mode !== binding.mode) return "host_profile_mismatch";
+	if (profile.hasUI !== undefined && profile.hasUI !== true) return "host_profile_mismatch";
+	return undefined;
+}
+
 /**
  * Resolve the narrow orchestrator capability for raw tool calls from the
  * already-captured host binding. The manager identity is re-read on every
  * call; a raw context cannot replace identity, while an idle branch drift
  * may refresh the controller from the actual host branch.
  */
+function resolveInternalTrustedToolCallActorUnsafe(
+	pi: object,
+	ctx: unknown,
+	cwd: string,
+	runId: string | undefined,
+): TrustedToolCallResolution | undefined {
+	const binding = getSessionBinding(pi);
+	if (!binding) return deniedTrustedToolCall("host_session_not_captured");
+	const hostContextDenial = internalRawHostContextDenial(binding, ctx, cwd);
+	if (hostContextDenial) {
+		if (!binding.interactive && hostContextDenial === "host_profile_mismatch") {
+			return deniedTrustedToolCall("headless_host_session");
+		}
+		return deniedTrustedToolCall(hostContextDenial);
+	}
+	if (!binding.interactive) return deniedTrustedToolCall("headless_host_session");
+	if (!binding.sessionId || !binding.controller) {
+		return deniedTrustedToolCall("session_controller_unavailable");
+	}
+
+	try {
+		const controllerContext = binding.controller.context();
+		if (
+			controllerContext.session_id !== binding.sessionId
+			|| !samePath(controllerContext.worktree, binding.cwd)
+		) {
+			return deniedTrustedToolCall("controller_context_mismatch");
+		}
+	} catch {
+		return deniedTrustedToolCall("controller_resolution_failed");
+	}
+
+	let ctoClaim: CtoClaimScope | undefined;
+	try {
+		ctoClaim = binding.controller.activeCtoClaim();
+	} catch {
+		return deniedTrustedToolCall("controller_resolution_failed");
+	}
+	// CTO authority is the controller's exact current claim proof. It is
+	// intentionally resolved before ordinary selection/claim checks: a CTO
+	// run is not authorized by selectedRunId, owner_session, runTarget, or
+	// an ordinary run UUID.
+	if (ctoClaim !== undefined) {
+		if (
+			typeof ctoClaim.run_id !== "string"
+			|| ctoClaim.run_id.length === 0
+			|| typeof ctoClaim.ownership_epoch !== "string"
+			|| ctoClaim.ownership_epoch.length === 0
+		) {
+			return deniedTrustedToolCall("execution_claim_mismatch");
+		}
+		return {
+			kind: "authenticated-interactive-host-cto",
+			run_id: ctoClaim.run_id,
+			ownership_epoch: ctoClaim.ownership_epoch,
+		};
+	}
+
+	let selectedRunId: string | undefined;
+	let activeClaimRunId: string | undefined;
+	try {
+		selectedRunId = binding.controller.selectedRunId();
+		if (selectedRunId !== runId) return deniedTrustedToolCall("selected_run_mismatch");
+		activeClaimRunId = binding.controller.activeClaimRunId();
+	} catch {
+		return deniedTrustedToolCall("controller_resolution_failed");
+	}
+	if (runId === undefined) {
+		if (activeClaimRunId !== undefined) return deniedTrustedToolCall("execution_claim_mismatch");
+		return { kind: "authenticated-interactive-host-no-run" };
+	}
+	if (!runId || activeClaimRunId !== runId) {
+		return deniedTrustedToolCall("execution_claim_mismatch");
+	}
+
+	let artifactsDir: string | undefined;
+	try {
+		artifactsDir = runTarget(binding.cwd, runId).artifactsDir;
+	} catch {
+		return deniedTrustedToolCall("artifacts_scope_mismatch");
+	}
+	const expectedArtifactsDir = resolve(binding.cwd, ".work-state", "runs", runId, "artifacts");
+	if (
+		typeof artifactsDir !== "string"
+		|| artifactsDir.length === 0
+		|| resolve(artifactsDir) !== expectedArtifactsDir
+	) {
+		return deniedTrustedToolCall("artifacts_scope_mismatch");
+	}
+	return { actor: "orchestrator", artifactsDir };
+}
+
 function resolveInternalTrustedToolCallActor(
 	pi: object,
 	ctx: unknown,
 	cwd: string,
 	runId: string | undefined,
 ): TrustedToolCallResolution | undefined {
-	const binding = sessionBindings.get(pi);
-	if (!binding?.interactive || !binding.sessionId || !binding.controller) return undefined;
-	if (!matchesCapturedHostContext(binding, ctx, "raw")) return undefined;
-	const identity = capturedManagerIdentity(binding, ctx, cwd);
-	if (!identity || identity.sessionId !== binding.sessionId) return undefined;
 	try {
-		const controllerContext = binding.controller.context();
-		if (
-			controllerContext.session_id !== binding.sessionId
-			|| resolve(controllerContext.worktree) !== resolve(binding.cwd)
-		) return undefined;
-
-		// CTO authority is the controller's exact current claim proof. It is
-		// intentionally resolved before ordinary selection/claim checks: a CTO
-		// run is not authorized by selectedRunId, owner_session, runTarget, or
-		// an ordinary run UUID.
-		const ctoClaim = binding.controller.activeCtoClaim();
-		if (ctoClaim !== undefined) {
-			if (
-				typeof ctoClaim.run_id !== "string"
-				|| ctoClaim.run_id.length === 0
-				|| typeof ctoClaim.ownership_epoch !== "string"
-				|| ctoClaim.ownership_epoch.length === 0
-			) return undefined;
-			return {
-				kind: "authenticated-interactive-host-cto",
-				run_id: ctoClaim.run_id,
-				ownership_epoch: ctoClaim.ownership_epoch,
-			};
-		}
-
-		const selectedRunId = binding.controller.selectedRunId();
-		const activeClaimRunId = binding.controller.activeClaimRunId();
-		if (selectedRunId !== runId || activeClaimRunId !== runId) return undefined;
-		if (runId === undefined) return { kind: "authenticated-interactive-host-no-run" };
-		const artifactsDir = runTarget(binding.cwd, runId).artifactsDir;
-		const expectedArtifactsDir = resolve(binding.cwd, ".work-state", "runs", runId, "artifacts");
-		return resolve(artifactsDir) === expectedArtifactsDir
-			? { actor: "orchestrator", artifactsDir }
-			: undefined;
+		return resolveInternalTrustedToolCallActorUnsafe(pi, ctx, cwd, runId);
 	} catch {
-		return undefined;
+		return deniedTrustedToolCall("controller_resolution_failed");
 	}
 }
 function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSessionController | undefined {
 	if (!ctx || typeof ctx !== "object") return undefined;
-	const binding = sessionBindings.get(pi);
+	const binding = getSessionBinding(pi);
 	if (!binding?.interactive || !binding.controller) return undefined;
 	if (!matchesCapturedHostContext(binding, ctx, "raw")) return undefined;
 	const identity = capturedManagerIdentity(binding, ctx, cwd);
@@ -749,8 +989,6 @@ function rawSessionController(pi: object, ctx: unknown, cwd: string): WorkflowSe
 	}
 }
 
-/** Entry points already wired for a given pi instance (idempotent per host). */
-const activatedEngines = new WeakSet<object>();
 
 /**
  * Resolve the session project root for hooks, tools and the command handler.
@@ -794,6 +1032,15 @@ export function resolveGatedCommandCwd(ctx: unknown): string | undefined {
 	return detectWorkspaceMarkers(cwd).ok ? cwd : undefined;
 }
 
+export interface InternalRegistrationOptions {
+	/**
+	 * Optional host-owned discovery seam. Production defaults to the pinned
+	 * OMP task discovery import; deterministic hosts may provide the same
+	 * provenance-bearing inventory explicitly.
+	 */
+	readonly discoverAgents?: InternalAgentDiscovery;
+}
+
 export type ActivationOutcome =
 	| { ok: true }
 	| { ok: false; code: "activation_markers_missing"; missing: string[] }
@@ -814,7 +1061,7 @@ export type ActivationOutcome =
  *     role config on its very first session (never overwrites a custom one);
  *  5. engine registration and adapter wiring.
  */
-export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): ActivationOutcome {
+export function ensureEngineActivation(pi: ExtensionAPI, cwd: string, options: InternalRegistrationOptions = {}): ActivationOutcome {
 	const gate = detectWorkspaceMarkers(cwd);
 	if (!gate.ok) {
 		return { ok: false, code: gate.code, missing: gate.missing.map((marker) => marker.path) };
@@ -842,6 +1089,7 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 		scopeUiClasses: defaultOmpInternalScopeUiClasses,
 		flags: defaultOmpInternalFlags,
 		workflowProfiles: profiles,
+		readOnlyBashAgents: ["omp-analyst", "omp-tech-researcher"],
 		resolveCwd: resolveSessionCwd,
 		owner: privateOmpOwnerForCwd,
 		resolveTrustedToolCallActor: (ctx, sessionCwd, runId) =>
@@ -867,7 +1115,8 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 		};
 	}
 
-	if (activatedEngines.has(pi)) return { ok: true };
+	const activationScope = sessionScope(pi);
+	if (internalHostRegistry.activatedEngines.has(activationScope)) return { ok: true };
 
 	// Registration is the last step and the WeakSet mark lands only AFTER it
 	// succeeds (SEC-BUNDLE-001): a throw mid-registration must not leave the
@@ -881,18 +1130,18 @@ export function ensureEngineActivation(pi: ExtensionAPI, cwd: string): Activatio
 			// authorizes from this session's discovery — in memory, never from the
 			// persisted mapping file. A failed refresh rejects here, which blocks
 			// the begin (fail closed) instead of letting a stale roster stand in.
-			beforeBegin: (sessionCwd) => waitForInternalAgentMappings(sessionCwd),
+			beforeBegin: (sessionCwd) => waitForInternalAgentMappings(sessionCwd, options.discoverAgents),
 		});
 		adapter.register(pi);
 	} catch (error) {
-		activatedEngines.delete(pi);
+		internalHostRegistry.activatedEngines.delete(activationScope);
 		return {
 			ok: false,
 			code: "registration_failed",
 			error: String(error instanceof Error ? error.message : error),
 		};
 	}
-	activatedEngines.add(pi);
+	internalHostRegistry.activatedEngines.add(activationScope);
 	return { ok: true };
 }
 
@@ -957,7 +1206,7 @@ function buildValidateReport(cwd: string): string {
 }
 
 
-export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
+export default function ompWorkflowsInternal(pi: ExtensionAPI, options: InternalRegistrationOptions = {}): void {
 	// Diagnostic/command surface — registered unconditionally. This is NOT
 	// workflow-engine registration: it performs zero claims, zero tool
 	// registrations and zero config writes, and is the only channel through
@@ -975,7 +1224,7 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 				pi.sendUserMessage(buildValidateReport(cwd));
 				return;
 			}
-			const outcome = ensureEngineActivation(pi, cwd);
+			const outcome = ensureEngineActivation(pi, cwd, options);
 			if (!outcome.ok) {
 				pi.sendUserMessage(formatDiagnostic(outcome));
 				return;
@@ -1060,7 +1309,7 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 		// the default omp-* role config (write-if-absent), so the refresh
 		// kicked below resolves real roles on the very first session instead
 		// of failing closed on empty config until a second session_start.
-		const outcome = ensureEngineActivation(pi, cwd);
+		const outcome = ensureEngineActivation(pi, cwd, options);
 		if (!outcome.ok) {
 			// SEC-BUNDLE-003: no absolute paths in host logs — marker names and
 			// typed codes only.
@@ -1078,7 +1327,7 @@ export default function ompWorkflowsInternal(pi: ExtensionAPI): void {
 		// resolveConfig. Fire and forget — a rejected refresh fails closed
 		// without blocking activation.
 		if (detectWorkspaceMarkers(cwd).ok) {
-			void refreshInternalAgentMappings(cwd).catch((error: unknown) => {
+			void refreshInternalAgentMappings(cwd, options.discoverAgents).catch((error: unknown) => {
 				// SEC-BUNDLE-003: no absolute paths in host logs — typed code plus
 				// the typed error text (agent names) only.
 				console.warn(`[${COMMAND_NAME}]`, JSON.stringify({

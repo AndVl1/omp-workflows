@@ -4,6 +4,13 @@
 
 ### Added
 
+- `host-smoke prepare --model <provider/model>` создаёт изолированный config
+  с одной моделью для встроенных ролей OMP и aliases фактически установленных
+  candidate agents, включая `team-lead`. Root harness и SDK children используют
+  один файл через symlink; перед `PREPARED` выполняется config-only проверка
+  настоящим SDK resolver во всех scratch-проектах, без запуска H-сценариев.
+  Обычное наследование config/profile в `ux-e2e start` не изменено.
+
 - **User-supplied omp config overlay (`ux-e2e-overlay.user.json`)** —
   a new opt-in third `--config` overlay at `<scratch>/.omp/ux-e2e-overlay.user.json`,
   emitted by `buildOmpArgs` AFTER the host config and the regenerated ux-e2e

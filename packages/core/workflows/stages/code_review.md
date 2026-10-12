@@ -51,7 +51,11 @@ automated tests exercise the code that actually ships — not a pre-fix snapshot
    - **HIGH** (80-89): should fix
    - **MEDIUM** (70-79): consider
 
-3. **Emit the normalized verdict** — write `.work-state/artifacts/review.json` (schema `review`).
+3. **Emit the normalized verdict** — submit the direct `review` schema payload under the
+   declared artifact id with
+   `workflow_submit_result({ "outputs": { "review": <payload> } })`.
+   The host derives producer, slot, and dispatch identity; core publishes immutable canonical
+   references. Do not write canonical artifacts by path.
    The verdict is **derived mechanically from findings, never eyeballed**:
 
    | condition | verdict |

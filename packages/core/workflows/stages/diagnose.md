@@ -25,10 +25,12 @@ Agent (diagnostics):
 The gate enforces ONE explicit diagnosis contract, identical to
 `workflows/artifacts-schema.json` (both fields are schema-required):
 
-- Write `diagnosis.root_cause` to `.work-state/artifacts/diagnosis.json`: **what** the root
-  cause is.
-- Write `diagnosis.explanation` to the same artifact: **why** the proposed fix closes that
-  cause rather than masking the symptom.
+- Submit `diagnosis.root_cause` (**what** the root cause is) and
+  `diagnosis.explanation` (**why** the proposed fix closes that cause rather than masking the
+  symptom) as the direct `diagnosis` schema payload under the declared artifact id using
+  `workflow_submit_result({ "outputs": { "diagnosis": <payload> } })`. The host derives
+  producer, slot, and dispatch identity; core publishes immutable canonical references. Do not
+  write canonical artifacts by path.
 - Both must be non-empty; the gate rejects the advance with the exact offending field
   (`diagnosis.root_cause is empty` / `diagnosis.explanation is empty`).
 - Do at least **2 iterations** of repro/log evidence before proposing the fix.

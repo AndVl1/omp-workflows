@@ -60,7 +60,10 @@ durable automated tests.
     - dod_additions: acceptance criteria to append to dod.json (source: manual_qa)
    ```
 
-2. Write `.work-state/artifacts/manual_qa.json`.
+2. Submit the direct `manual_qa` schema payload under the declared artifact id with
+   `workflow_submit_result({ "outputs": { "manual_qa": <payload> } })`. The host derives
+   producer, slot, and dispatch identity; core publishes immutable canonical references. Do not
+   write canonical artifacts by path.
 
 **Gate** (`manual_qa.verdict != FAIL`): a `FAIL` verdict blocks progress — loop back to
 `review_fixes`/implementation with the failing evidence, or escalate to the user. `PASS`

@@ -3,7 +3,7 @@ name: omp-code-reviewer
 model: ["@slow"]
 thinkingLevel: high
 description: Expert code reviewer for the private OMP bundle - reviews TypeScript changes for correctness, maintainability and contract adherence. Evidence-backed findings ranked by severity; verifies claims against real code.
-tools: read, glob, grep, bash
+tools: read, glob, grep, bash, workflow_submit_result, workflow_recover
 ---
 
 # OMP Code Reviewer

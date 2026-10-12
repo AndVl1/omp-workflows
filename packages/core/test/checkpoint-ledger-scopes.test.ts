@@ -26,10 +26,10 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z as zod } from "zod";
 import {
   createCapability,
   authorizeDispatch as authorizeDispatchRaw,
-  completeDispatch as completeDispatchRaw,
   advanceCursor as advanceCursorRaw,
   beginCapability as beginCapabilityRaw,
   persistPendingDispatch as persistPendingDispatchRaw,
@@ -50,8 +50,10 @@ import {
 import { validateActiveCapabilityStateBinding } from "../src/engine/control-plane-contract.js";
 import { registerWorkflowProfiles, loadProfile, profileHash } from "../src/engine/profile.js";
 import { normalizePersistedState } from "../src/engine/state.js";
-import { runTarget } from "../src/engine/run-store.js";
-import type { CheckpointPolicy, Profile, TeamState } from "../src/engine/types.js";
+import { acquireExecutionClaim, persistCanonicalRun, readRunControl, runTarget } from "../src/engine/run-store.js";
+import { createWorkflowSessionController, type WorkflowSessionController } from "../src/engine/host-controller.js";
+import { buildDispatchMarker, registerTeamWorkflow, registerWorkflowTools } from "../src/index.js";
+import type { CheckpointPolicy, Profile, TeamState, TrustedExecutionContext } from "../src/engine/types.js";
 
 const RUN_ID = "22222222-2222-4222-8222-222222222222";
 
@@ -69,9 +71,6 @@ function persistPendingDispatch(root: string, input: Parameters<typeof persistPe
   return persistPendingDispatchRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input });
 }
 
-function completeDispatch(root: string, input: Parameters<typeof completeDispatchRaw>[1], options?: Parameters<typeof completeDispatchRaw>[2]) {
-  return completeDispatchRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input }, { runId: RUN_ID, ...(options ?? {}) });
-}
 
 function advanceCursor(root: string, input: DispatchAuth, options?: Parameters<typeof advanceCursorRaw>[2]) {
   return advanceCursorRaw(root, { run_id: RUN_ID, run_key: RUN_ID, ...input }, { runId: RUN_ID, ...(options ?? {}) });
@@ -158,8 +157,157 @@ function writeArtifacts(root: string, artifacts: Record<string, unknown>): void 
   writeCanonicalState(root, { ...state, artifacts: { ...(state.artifacts ?? {}), ...declarations } });
 }
 
+type LedgerFixture = {
+  host: Record<string, unknown>;
+  controller: WorkflowSessionController;
+  tools: Map<string, { name: string; execute: never }>;
+  emit: (name: string, event: unknown, ctx: unknown) => unknown[];
+};
+const ledgerFixtures = new Map<string, LedgerFixture>();
+const LEDGER_SESSION_ID = "ledger-host-session";
+
+function ensureLedgerFixture(root: string): LedgerFixture {
+  const existing = ledgerFixtures.get(root);
+  if (existing) return existing;
+  const context: TrustedExecutionContext = {
+    session_id: LEDGER_SESSION_ID,
+    caller: "host",
+    process_id: process.pid,
+    worktree: root,
+    branch: "main",
+    authority: "coordinator",
+  };
+  const controller = createWorkflowSessionController({ cwd: root, context });
+  const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+  const on = (name: string, handler: (event: unknown, ctx: unknown) => unknown): void => {
+    handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+  };
+  const hostFile = join(root, "ledger-host.jsonl");
+  const hostManager = {
+    getCwd: () => root,
+    getSessionId: () => LEDGER_SESSION_ID,
+    getSessionFile: () => hostFile,
+    getHeader: () => ({ id: LEDGER_SESSION_ID, cwd: root }),
+  };
+  const host: Record<string, unknown> = { ...context, cwd: root, mode: "tui", hasUI: true, sessionFile: hostFile, sessionManager: hostManager };
+  const tools = new Map<string, { name: string; execute: never }>();
+  const pi = {
+    on,
+    events: { on },
+    setLabel() {},
+    sendMessage() {},
+    zod: { z: zod },
+    registerTool: (tool: { name: string; execute: never }) => { tools.set(tool.name, tool); },
+  };
+  const options = {
+    cwd: root,
+    resolveCwd: (ctx: unknown) => (ctx && typeof ctx === "object" && "cwd" in ctx && typeof ctx.cwd === "string" ? ctx.cwd : undefined),
+    getSessionController: (ctx: unknown) => ctx === host ? controller : undefined,
+    resolveTrustedToolCallActor: (ctx: unknown, cwd: string, runId: string | undefined) => {
+      if (ctx !== host || !runId) return undefined;
+      return { actor: "orchestrator" as const, artifactsDir: runTarget(cwd, runId).artifactsDir };
+    },
+    observability: false,
+  };
+  registerTeamWorkflow(pi as never, options);
+  registerWorkflowTools(pi as never, {
+    isMainSession: () => true,
+    resolveCwd: options.resolveCwd,
+    getSessionController: options.getSessionController,
+  });
+  const fixture: LedgerFixture = {
+    host,
+    controller,
+    tools,
+    emit: (name, event, ctx) => (handlers.get(name) ?? []).map((handler) => handler(event, ctx)),
+  };
+  ledgerFixtures.set(root, fixture);
+  return fixture;
+}
+
+async function submitAndTerminal(
+  root: string,
+  dispatch: { id: string; role: string; agent: string; work_identity?: { capability_epoch: string; capability_id: string; task_id: string } },
+  artifactIds: string[],
+  artifacts: Record<string, unknown>,
+): Promise<void> {
+  const fixture = ensureLedgerFixture(root);
+  const state = readState(root);
+  const profile = loadProfile(state.classification!.workflow!);
+  const stage = profile?.stages.find((candidate) => candidate.id === state.stage_cursor);
+  assert.ok(stage, "ledger producer stage must be declared");
+  const toolCallId = `ledger-worker-${dispatch.id}`;
+  const marker = buildDispatchMarker(
+    RUN_ID,
+    stage,
+    [dispatch.role],
+    dispatch.role,
+    dispatch.work_identity?.capability_epoch ?? state.cursor_epoch,
+    dispatch.work_identity?.capability_id ?? state.dispatch_capability!.capability_id,
+    dispatch.role,
+    dispatch.work_identity?.task_id,
+  );
+  const input = { agent: dispatch.agent, task: marker };
+  const admitted = fixture.emit("tool_call", { toolName: "task", toolCallId, input }, fixture.host);
+  assert.equal(admitted.filter(Boolean).length, 0, JSON.stringify(admitted));
+  fixture.emit("tool_execution_start", { toolName: "task", toolCallId, args: input }, fixture.host);
+  const childFile = join(root, `${toolCallId}-worker.jsonl`);
+  const childSessionId = `${toolCallId}-worker`;
+  const childManager = {
+    getCwd: () => root,
+    getSessionId: () => childSessionId,
+    getSessionFile: () => childFile,
+    getHeader: () => ({ id: childSessionId, cwd: root, parentSession: String(fixture.host.sessionFile) }),
+  };
+  const childContext: Record<string, unknown> = { cwd: root, mode: "print", hasUI: false, session_id: childSessionId, sessionFile: childFile, sessionManager: childManager };
+  const lifecycleId = `${toolCallId}-lifecycle`;
+  fixture.emit("task:subagent:lifecycle", { id: lifecycleId, agent: dispatch.agent, status: "started", sessionFile: childFile, parentToolCallId: toolCallId, index: 0 }, fixture.host);
+  const submitTool = fixture.tools.get("workflow_submit_result");
+  assert.ok(submitTool, "workflow_submit_result must be registered");
+  const execute = submitTool.execute as unknown as (id: string, params: unknown, signal: undefined, update: undefined, ctx: unknown) => Promise<{ details: unknown }>;
+  const outputs = Object.fromEntries(artifactIds.map((id) => [id, artifacts[id]]));
+  const submitted = await execute(`${toolCallId}-submit`, { outputs }, undefined, undefined, childContext);
+  const details = submitted.details as { ok?: boolean };
+  assert.equal(details.ok, true, JSON.stringify(details));
+  assert.ok(readState(root).stage_receipts?.[dispatch.id], "accepted worker output must persist its receipt");
+  const terminal = fixture.emit("tool_result", {
+    toolName: "task",
+    toolCallId,
+    input,
+    details: { results: [{ index: 0, id: `${toolCallId}-result`, agent: dispatch.agent, agentSource: "project", task: marker, exitCode: 0, output: "worker completed", stderr: "", truncated: false, durationMs: 1, tokens: 1, requests: 1 }] },
+    content: [{ type: "text", text: "worker completed" }],
+    isError: false,
+  }, fixture.host);
+  await Promise.all(terminal.map(async (result) => await result));
+  const lifecycle = fixture.emit("task:subagent:lifecycle", { id: lifecycleId, agent: dispatch.agent, status: "completed", sessionFile: childFile, parentToolCallId: toolCallId, index: 0 }, fixture.host);
+  await Promise.all(lifecycle.map(async (result) => await result));
+}
+async function beginLedgerStage(root: string): Promise<{ handoff: CapabilityHandoff; issued: IssuedCapability }> {
+  const fixture = ensureLedgerFixture(root);
+  const beginTool = fixture.tools.get("workflow_begin");
+  assert.ok(beginTool, "workflow_begin must be registered");
+  const execute = beginTool.execute as unknown as (id: string, params: unknown, signal: undefined, update: undefined, ctx: unknown) => Promise<{ details: unknown }>;
+  const begun = await execute("ledger-stage-begin", {}, undefined, undefined, fixture.host);
+  const details = begun.details as { ok?: boolean; error?: string; handoff?: CapabilityHandoff };
+  assert.equal(details.ok, true, JSON.stringify(details));
+  assert.ok(details.handoff, "workflow_begin must return a fresh stage handoff");
+  const state = readState(root);
+  assert.ok(state.dispatch_capability, "workflow_begin must persist a fresh dispatch capability");
+  if (!details.handoff || !state.dispatch_capability) throw new Error(details.error ?? "workflow_begin returned no handoff");
+  return {
+    handoff: details.handoff,
+    issued: {
+      capability_id: details.handoff.capability_id,
+      dispatch_token: details.handoff.dispatch_token,
+      advance_token: details.handoff.advance_token,
+      state: state.dispatch_capability,
+    },
+  };
+}
+
+
 /** Arm a stage with a fresh capability and run its single dispatch to completion. */
-function runStage(root: string, profile: Profile, stageId: string, role: string, artifactIds: string[], artifacts: Record<string, unknown>, stageStatuses?: TeamState["stages"]): IssuedCapability {
+async function runStage(root: string, profile: Profile, stageId: string, role: string, artifactIds: string[], artifacts: Record<string, unknown>, stageStatuses?: TeamState["stages"]): Promise<IssuedCapability> {
   const issued = createCapability({
     run_key: RUN_ID,
     branch: "main",
@@ -176,7 +324,7 @@ function runStage(root: string, profile: Profile, stageId: string, role: string,
   } catch {
     // first stage setup: no state yet
   }
-  writeCanonicalState(root, {
+  const nextState: TeamState = {
     schema: 2,
     run_id: RUN_ID,
     run_key: RUN_ID,
@@ -186,7 +334,7 @@ function runStage(root: string, profile: Profile, stageId: string, role: string,
     workflow_override: false,
     issue: null,
     stage_cursor: stageId,
-    stages: stageStatuses ?? profile.stages.map((stage) => ({ id: stage.id, status: stage.id === stageId ? "in_progress" as const : "pending" as const })),
+    stages: stageStatuses ?? profile.stages.map((stage, index) => ({ id: stage.id, status: stage.id === stageId ? "in_progress" as const : index < profile.stages.findIndex((candidate) => candidate.id === stageId) ? "skipped" as const : "pending" as const })),
     artifacts: {},
     pause: { kind: "none", reason: "" },
     policy: { strict_orchestrator: true },
@@ -199,17 +347,36 @@ function runStage(root: string, profile: Profile, stageId: string, role: string,
     ...(previous.checkpoint_decisions ? { checkpoint_decisions: previous.checkpoint_decisions } : {}),
     ...(previous.trusted_checkpoint_answers ? { trusted_checkpoint_answers: previous.trusted_checkpoint_answers } : {}),
     ...(previous.checkpoint_policy ? { checkpoint_policy: previous.checkpoint_policy } : {}),
+    ...(previous.required_input_receipts ? { required_input_receipts: previous.required_input_receipts } : {}),
+    ...(previous.stage_receipts ? { stage_receipts: previous.stage_receipts } : {}),
+    ...(previous.advance_receipts ? { advance_receipts: previous.advance_receipts } : {}),
     ...(checkpointPolicy ? { checkpoint_policy: checkpointPolicy } : {}),
     updated_at: new Date().toISOString(),
-  });
-  writeArtifacts(root, artifacts);
-  const authorized = authorizeDispatch(root, dispatchAuthOf(issued, role));
+  };
+  const fixture = ensureLedgerFixture(root);
+  const controlBefore = readRunControl(root);
+  if (!controlBefore.runs[RUN_ID]) {
+    persistCanonicalRun(root, nextState, { context: fixture.controller.context() });
+  } else {
+    writeCanonicalState(root, nextState);
+  }
+  let control = readRunControl(root);
+  if (!control.execution_claim) {
+    const claimed = acquireExecutionClaim(root, { run_id: RUN_ID, context: fixture.controller.context() });
+    control = readRunControl(root);
+    assert.equal(control.execution_claim?.token, claimed.claim.token, "ledger fixture must reacquire the existing canonical run claim");
+  }
+  const claim = control.execution_claim;
+  assert.ok(claim, "ledger fixture must own a canonical execution claim");
+  if (fixture.controller.activeClaimRunId() !== RUN_ID) fixture.controller.bind(RUN_ID, claim.token);
+  const begun = await beginLedgerStage(root);
+  const armed = begun.issued;
+  writeArtifacts(root, Object.fromEntries(artifactIds.map((id) => [id, artifacts[id]])));
+  const authorized = authorizeDispatch(root, { ...dispatchAuthOf(armed, role), origin_session_id: LEDGER_SESSION_ID });
   assert.equal(authorized.ok, true, authorized.ok ? "authorized" : authorized.error);
-  if (!authorized.ok) throw new Error("authorize failed");
-  const completed = completeDispatch(root, { ...dispatchAuthOf(issued, role), dispatch_id: authorized.record!.id, outcome: "succeeded", evidence: "done", artifact_ids: artifactIds });
-  assert.equal(completed.ok, true, completed.ok ? "completed" : completed.error);
-  if (!completed.ok) throw new Error("complete failed");
-  return issued;
+  if (!authorized.ok || !authorized.record) throw new Error("authorize failed");
+  await submitAndTerminal(root, authorized.record, artifactIds, artifacts);
+  return armed;
 }
 
 function dispatchAuthOf(issued: IssuedCapability, role: string) {
@@ -225,6 +392,7 @@ function dispatchAuthOf(issued: IssuedCapability, role: string) {
     loop_iteration: issued.state.issued_for!.loop_iteration,
     role,
     agent: role,
+    origin_session_id: LEDGER_SESSION_ID,
   };
 }
 
@@ -256,19 +424,31 @@ function handoffAuths(handoff: CapabilityHandoff) {
   };
   return {
     advance: { ...base, token: handoff.advance_token },
-    dispatch: (role: string) => ({ ...base, token: handoff.dispatch_token, role, agent: role }),
+    dispatch: (role: string) => ({ ...base, token: handoff.dispatch_token, role, agent: role, origin_session_id: LEDGER_SESSION_ID }),
   };
 }
 
 /** Complete the currently armed stage's single dispatch using the handoff secrets. */
-function completeArmed(root: string, handoff: CapabilityHandoff, role: string, artifactIds: string[], artifacts: Record<string, unknown>): void {
-  writeArtifacts(root, artifacts);
+async function completeArmed(root: string, handoff: CapabilityHandoff, role: string, artifactIds: string[], artifacts: Record<string, unknown>): Promise<void> {
+  const fixture = ensureLedgerFixture(root);
+  let control = readRunControl(root);
+  if (!control.runs[RUN_ID]) {
+    persistCanonicalRun(root, readState(root), { context: fixture.controller.context() });
+    control = readRunControl(root);
+  } else if (!control.execution_claim) {
+    acquireExecutionClaim(root, { run_id: RUN_ID, context: fixture.controller.context() });
+    control = readRunControl(root);
+  }
+  const claim = control.execution_claim;
+  assert.ok(claim, "ledger fixture must own a canonical execution claim");
+  if (fixture.controller.activeClaimRunId() !== RUN_ID) fixture.controller.bind(RUN_ID, claim.token);
+  const begun = await beginLedgerStage(root);
+  Object.assign(handoff, begun.handoff);
+  writeArtifacts(root, Object.fromEntries(artifactIds.map((id) => [id, artifacts[id]])));
   const authorized = authorizeDispatch(root, handoffAuths(handoff).dispatch(role));
   assert.equal(authorized.ok, true, authorized.ok ? "armed dispatch authorized" : authorized.error);
-  if (!authorized.ok) throw new Error("armed authorize failed");
-  const completed = completeDispatch(root, { ...handoffAuths(handoff).dispatch(role), dispatch_id: authorized.record!.id, outcome: "succeeded", evidence: "done", artifact_ids: artifactIds });
-  assert.equal(completed.ok, true, completed.ok ? "armed dispatch completed" : completed.error);
-  if (!completed.ok) throw new Error("armed complete failed");
+  if (!authorized.ok || !authorized.record) throw new Error("armed authorize failed");
+  await submitAndTerminal(root, authorized.record, artifactIds, artifacts);
 }
 
 /** Record a human checkpoint decision bound to the CURRENT state scope. */
@@ -512,7 +692,7 @@ test("ledger: a consumed proof without a provable final decision is treated as s
   }
 });
 
-test("ledger: a prior loop iteration's approve_fix neither satisfies nor deadlocks the re-entered implementation", () => {
+test("ledger: a prior loop iteration's approve_fix neither satisfies nor deadlocks the re-entered implementation", async () => {
   const root = mkdtempSync(join(tmpdir(), "ledger-loop-"));
   try {
     initGit(root, "main");
@@ -521,17 +701,17 @@ test("ledger: a prior loop iteration's approve_fix neither satisfies nor deadloc
     registerWorkflowProfiles([profile]);
 
     // Iteration 1: diagnose -> implementation (records approve_fix) -> verify FAIL re-entry.
-    const diagnose1 = runStage(root, profile, "diagnose", "diagnostics", ["diagnosis"], { diagnosis: { root_cause: "c1", explanation: "e1" } });
+    const diagnose1 = await runStage(root, profile, "diagnose", "diagnostics", ["diagnosis"], { diagnosis: { root_cause: "c1", explanation: "e1" } });
     const toImpl1 = advanceCursor(root, { ...advanceAuthOf(diagnose1), evidence: "diagnosis done" });
     assert.equal(toImpl1.ok, true, toImpl1.ok ? "armed implementation iteration 1" : toImpl1.error);
     if (!toImpl1.ok || !toImpl1.handoff) return;
     assert.equal(toImpl1.handoff.loop_iteration, 1);
-    completeArmed(root, toImpl1.handoff, "dev", ["implementation"], { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e1" } });
+    await completeArmed(root, toImpl1.handoff, "dev", ["implementation"], { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e1" } });
     recordHumanDecision(root, toImpl1.handoff, "implementation", "approve_fix", "approve_fix", "iteration 1 answer");
     const toVerify1 = advanceCursor(root, { ...handoffAuths(toImpl1.handoff).advance, evidence: "fix 1 done" });
     assert.equal(toVerify1.ok, true, toVerify1.ok ? "armed verify" : toVerify1.error);
     if (!toVerify1.ok || !toVerify1.handoff) return;
-    completeArmed(root, toVerify1.handoff, "qa", ["debug"], { diagnosis: { root_cause: "c1", explanation: "e1" }, implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e1" }, debug: { verdict: "FAIL", iterations: 1 } });
+    await completeArmed(root, toVerify1.handoff, "qa", ["debug"], { diagnosis: { root_cause: "c1", explanation: "e1" }, implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e1" }, debug: { verdict: "FAIL", iterations: 1 } });
     const reentered = advanceCursor(root, { ...handoffAuths(toVerify1.handoff).advance, evidence: "FAIL" });
     assert.equal(reentered.ok, true, reentered.ok ? "re-entered diagnose" : reentered.error);
     if (!reentered.ok || !reentered.handoff) return;
@@ -542,14 +722,14 @@ test("ledger: a prior loop iteration's approve_fix neither satisfies nor deadloc
 
     // Iteration 2: diagnose -> implementation. The re-armed implementation
     // capability must carry loop_iteration 2 and a fresh epoch.
-    completeArmed(root, reentered.handoff, "diagnostics", ["diagnosis"], { diagnosis: { root_cause: "c2", explanation: "e2" } });
+    await completeArmed(root, reentered.handoff, "diagnostics", ["diagnosis"], { diagnosis: { root_cause: "c2", explanation: "e2" } });
     const toImpl2 = advanceCursor(root, { ...handoffAuths(reentered.handoff).advance, evidence: "diagnosis 2" });
     assert.equal(toImpl2.ok, true, toImpl2.ok ? "re-armed implementation" : toImpl2.error);
     if (!toImpl2.ok || !toImpl2.handoff) return;
     const afterRearm = readState(root);
     assert.equal(afterRearm.dispatch_capability!.issued_for!.loop_iteration, 2, "re-armed implementation carries iteration 2");
     assert.equal(afterRearm.dispatch_capability!.capability_id, toImpl2.handoff.capability_id);
-    completeArmed(root, toImpl2.handoff, "dev", ["implementation"], { implementation: { files_touched: ["y"], ready: true, validation_run: true, validation_evidence: "e2" } });
+    await completeArmed(root, toImpl2.handoff, "dev", ["implementation"], { implementation: { files_touched: ["y"], ready: true, validation_run: true, validation_evidence: "e2" } });
 
     // The iteration-1 approve_fix must NOT unblock iteration 2...
     const blocked = advanceCursor(root, { ...handoffAuths(toImpl2.handoff).advance, evidence: "fix 2" });
@@ -572,7 +752,7 @@ test("ledger: a prior loop iteration's approve_fix neither satisfies nor deadloc
   }
 });
 
-test("ledger: the current stage's declaration wins; a prior stage's decision and a stale policy_auto cannot cross over", () => {
+test("ledger: the current stage's declaration wins; a prior stage's decision and a stale policy_auto cannot cross over", async () => {
   const root = mkdtempSync(join(tmpdir(), "ledger-policy-"));
   try {
     initGit(root, "main");
@@ -603,7 +783,7 @@ test("ledger: the current stage's declaration wins; a prior stage's decision and
     };
     registerWorkflowProfiles([profile]);
 
-    const buildIssued = runStage(root, profile, "build", "dev", ["implementation"], { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e" } });
+    const buildIssued = await runStage(root, profile, "build", "dev", ["implementation"], { implementation: { files_touched: ["x"], ready: true, validation_run: true, validation_evidence: "e" } });
     recordDecisionFor(root, advanceAuthOf(buildIssued), "build", "approve_fix", "approve_fix", "build stage answer");
     const toShip = advanceCursor(root, { ...advanceAuthOf(buildIssued), evidence: "build done" });
     assert.equal(toShip.ok, true, toShip.ok ? "advanced to ship" : toShip.error);
@@ -613,7 +793,7 @@ test("ledger: the current stage's declaration wins; a prior stage's decision and
     // The stage-1 decision neither authorizes nor blocks stage 2: the ship
     // stage's checkpoint is UNRESOLVED in its own scope (its own policy hash
     // and capability epoch), not wrongly satisfied and not an error.
-    completeArmed(root, toShip.handoff, "dev", ["debug"], { debug: { verdict: "PASS", iterations: 1 } });
+    await completeArmed(root, toShip.handoff, "dev", ["debug"], { debug: { verdict: "PASS", iterations: 1 } });
     const blocked = advanceCursor(root, { ...handoffAuths(toShip.handoff).advance, evidence: "ship done" });
     assert.equal(blocked.ok, false, "stage 2 still requires its own decision");
     if (!blocked.ok) assert.match(blocked.error, /checkpoint 'approve_fix' for stage 'ship' is unresolved/);

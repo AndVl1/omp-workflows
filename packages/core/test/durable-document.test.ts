@@ -1,16 +1,8 @@
 /**
- * Executable `document` stage on the NATIVE durable path (/do-work):
- * advancing a `product_prd_document` stage renders the deterministic
- * Markdown PRD and the typed `product_prd` artifact IN-ENGINE, before the
- * transition commits — the advance boundary is the renderer, no dispatch is
- * expected (the stage arms a kind "none" capability with an empty roster).
- *
- * Coverage:
- *   - happy path: advance succeeds, the document and the typed artifact
- *     exist and validateProductPrdDocument passes, the stage is marked done
- *     and the next stage (product_approval) is armed;
- *   - fail closed: a missing source artifact blocks the advance with the
- *     source named — nothing is rendered, nothing is marked done.
+ * Registered document producer on the durable /do-work path:
+ * workflow_begin renders and accepts the PRD receipt; only that receipt
+ * authorizes advance. Missing declared sources fail closed without output
+ * publication or cursor movement.
  */
 
 import { test } from "node:test";
@@ -26,6 +18,23 @@ import { runTarget } from "../src/engine/run-store.js";
 import { validateProductPrdDocument } from "../src/engine/product-prd.js";
 import type { Profile, TeamState } from "../src/engine/types.js";
 import type { ScopeFlags } from "../src/engine/scope.js";
+import { createCoreFixture, details, type Harness, type Handoff } from "./reliable-stage-execution-fixture.js";
+
+async function resumeDocumentStage(root: string): Promise<Harness> {
+  const harness = createCoreFixture({
+    root, branch: "feat/product-discovery-workflow",
+    workflowProfiles: [loadProfile("product-discovery")!],
+  });
+  await harness.emit("session_start", { type: "session_start" }, harness.context);
+  harness.controller.prepare({ mode: "resume", run_id: RUN_ID });
+  return harness;
+}
+
+async function beginDocument(harness: Harness) {
+  return details((await harness.tools.get("workflow_begin")!.execute(
+    "document-begin", {}, undefined, undefined, harness.context,
+  )).details);
+}
 
 const FLAGS: ScopeFlags = { scope: [], has_security: false, has_infra: false, has_ui: false, has_runtime: false, dev_agent: null };
 const RUN_ID = "88888888-8888-4888-8888-888888888888";
@@ -108,12 +117,12 @@ function setupDocumentStage(preArtifacts: Record<string, unknown>): {
     run_id: RUN_ID,
     run_key: RUN_ID,
     branch,
-    classification: { type: "FEATURE", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: profile.name },
+    classification: { type: "PRODUCT_DISCOVERY", complexity: "COMPLEX", confidence: "HIGH", autonomous: false, workflow: profile.name },
     task: "Render the deterministic product PRD document",
     workflow_override: false,
     issue: null,
     stage_cursor: currentStageId,
-    stages: profile.stages.map((s) => ({ id: s.id, status: s.id === currentStageId ? "in_progress" as const : "pending" as const })),
+    stages: profile.stages.map((s, index) => ({ id: s.id, status: s.id === currentStageId ? "in_progress" as const : index < profile.stages.findIndex((stage) => stage.id === currentStageId) ? "skipped" as const : "pending" as const })),
     artifacts: {},
     pause: { kind: "none" as const, reason: "" },
     policy: { strict_orchestrator: true },
@@ -136,29 +145,32 @@ function readState(root: string): TeamState {
   return JSON.parse(readFileSync(join(root, ".work-state", "runs", RUN_ID, "state.json"), "utf8")) as TeamState;
 }
 
-function advanceAuth(issued: IssuedCapability) {
+function advanceAuth(handoff: Handoff) {
   return {
-    token: issued.advance_token,
-    capability_id: issued.capability_id,
-    run_key: issued.state.issued_for!.run_key,
-    branch: issued.state.issued_for!.branch,
-    workflow: issued.state.issued_for!.workflow,
-    profile_hash: issued.state.issued_for!.profile_hash,
-    stage_cursor: issued.state.issued_for!.stage_cursor,
-    cursor_epoch: issued.state.issued_for!.cursor_epoch,
-    loop_iteration: issued.state.issued_for!.loop_iteration,
+    token: handoff.advance_token,
+    capability_id: handoff.capability_id,
+    run_key: handoff.run_key,
+    branch: handoff.branch,
+    workflow: handoff.workflow,
+    profile_hash: handoff.profile_hash,
+    stage_cursor: handoff.stage_cursor,
+    cursor_epoch: handoff.cursor_epoch,
+    loop_iteration: handoff.loop_iteration,
   };
 }
 
-test("durable document advance: the engine renders doc + product_prd before the transition commits", () => {
-  const { issued, root, featureDir, artifactsDir } = setupDocumentStage(fiveSources());
+test("durable document producer: an accepted rendered PRD advances to product approval", async () => {
+  const { root, featureDir, artifactsDir } = setupDocumentStage(fiveSources());
+  let harness: Harness | undefined;
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "deterministic document render" }, { runId: RUN_ID });
-    assert.equal(advanced.ok, true, "advance succeeds for a fully-sourced document stage");
+    harness = await resumeDocumentStage(root);
+    const begun = await beginDocument(harness);
+    assert.equal(begun.ok, true, JSON.stringify(begun));
+    const advanced = advanceCursor(root, { ...advanceAuth(begun.handoff as Handoff), evidence: "accepted document render" }, { runId: RUN_ID });
+    assert.equal(advanced.ok, true, JSON.stringify(advanced));
     if (!advanced.ok) return;
 
-    // The engine created the document, its derived offline viewer and the
-    // typed artifact at the advance boundary.
+    // Document, viewer and manifest were accepted atomically by the renderer.
     assert.ok(existsSync(join(featureDir, "documents", "product-prd.md")), "the PRD document is rendered");
     assert.ok(existsSync(join(featureDir, "documents", "product-prd.html")), "the derived PRD HTML viewer is rendered");
     assert.ok(existsSync(join(artifactsDir, "product_prd.json")), "the typed product_prd artifact is written");
@@ -169,18 +181,21 @@ test("durable document advance: the engine renders doc + product_prd before the 
     assert.equal(advanced.state.stage_cursor, "product_approval");
     assert.equal(advanced.state.dispatch_capability?.issued_for?.stage_cursor, "product_approval");
   } finally {
+    await harness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("durable document advance: a missing source fails closed — nothing rendered, nothing transitioned", () => {
+test("durable document producer: a missing source publishes nothing and preserves the cursor", async () => {
   const sources = fiveSources();
   delete sources.product_evidence;
-  const { issued, root, featureDir, artifactsDir } = setupDocumentStage(sources);
+  const { root, featureDir, artifactsDir } = setupDocumentStage(sources);
+  let harness: Harness | undefined;
   try {
-    const advanced = advanceCursor(root, { ...advanceAuth(issued), evidence: "attempted document render" }, { runId: RUN_ID });
-    assert.equal(advanced.ok, false, "a missing source must block the advance");
-    if (!advanced.ok) assert.match(advanced.error, /product_evidence/);
+    harness = await resumeDocumentStage(root);
+    const begun = await beginDocument(harness);
+    assert.equal(begun.ok, false, "a missing source must block the registered renderer");
+    assert.match(String(begun.error), /product_evidence/);
 
     const state = readState(root);
     assert.equal(state.stages.find((s) => s.id === "product_prd_document")?.status, "in_progress", "stage is not done");
@@ -188,6 +203,7 @@ test("durable document advance: a missing source fails closed — nothing render
     assert.ok(!existsSync(join(artifactsDir, "product_prd.json")), "no artifact was written");
     assert.ok(!existsSync(join(featureDir, "documents")), "no document was rendered");
   } finally {
+    await harness?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

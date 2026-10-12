@@ -99,6 +99,16 @@ function validateStageArtifactLists(value: UnknownRecord, path: string, issues: 
   }
 }
 
+function validateStageProducer(value: unknown, stageType: unknown, path: string, issues: string[]): void {
+  if (!isRecord(value)) {
+    issue(issues, path, "must be an object");
+    return;
+  }
+  unknownKeys(value, ["kind", "tool_name"], path, issues);
+  if (value.kind !== "tool") issue(issues, `${path}.kind`, "must be tool");
+  requiredString(value, "tool_name", path, issues);
+  if (stageType !== "orchestrator") issue(issues, path, "tool producers require an orchestrator stage");
+}
 
 function enumValue(value: unknown, allowed: readonly string[], path: string, issues: string[]): boolean {
   if (typeof value !== "string" || !allowed.includes(value)) {
@@ -309,6 +319,7 @@ export function validateProfileControlPlane(profile: unknown): { ok: true } | { 
           stageIds.add(stage.id);
         }
         validateStageArtifactLists(stage, path, issues);
+        if (hasOwn(stage, "producer")) validateStageProducer(stage.producer, stage.type, `${path}.producer`, issues);
         if (hasOwn(stage, "completion_intent")) validateCompletionIntent(stage.completion_intent, `${path}.completion_intent`, issues);
         if (hasOwn(stage, "checkpoint_policy")) validateCheckpointPolicy(stage.checkpoint_policy, `${path}.checkpoint_policy`, issues);
         if (hasOwn(stage, "roster_policy")) validateRosterPolicy(stage.roster_policy, `${path}.roster_policy`, issues);
@@ -471,7 +482,10 @@ export function loadAllProfiles(): Profile[] {
       }
     }
   }
-  const unique = new Map(result.map((profile) => [profile.name, profile]));
+  const unique = new Map<string, Profile>();
+  for (const profile of result) {
+    if (!unique.has(profile.name)) unique.set(profile.name, profile);
+  }
   return [...unique.values()].sort((a, b) => {
     const ai = SELECTION_ORDER.indexOf(a.name);
     const bi = SELECTION_ORDER.indexOf(b.name);
