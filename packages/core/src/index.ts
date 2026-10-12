@@ -57,6 +57,7 @@ import { resolveRuntimeConfigPath, writeConfig } from "./runtime-config.js";
 import { readRunControlNoRecovery, knownDispatchOrigins, rememberDispatchOrigin, restoreDispatchOrigins, readSelectionSnapshot, retainSelectionSnapshot, readRunControl, readRunState, resolveRunSelection, listRuns, runStatePath, runTarget, reserveExecutionClaimWorkers, settleExecutionClaimWorkers, settleCtoExecutionClaimWorkersByToolCall, type DispatchOrigin } from "./engine/run-store.js";
 import type { Profile, RoleConfig, CheckpointRuleKind, CheckpointAnswerProof, TrustedExecutionContext, LifecycleSelector, CtoClaimScope, RunControl, WorkIdentity, StageReceiptLedger, CapturedDispatchContext } from "./engine/types.js";
 import { createNativeWorkerAuthority, NativeWorkerRouteError, type NativeWorkerAuthority, type NativeRootAuthorityRegistration, type NativeWorkerResolution } from "./native-worker-authority.js";
+import { createOrdinaryTaskAuthority } from "./ordinary-task-authority.js";
 import { commitNativeCtoStageResult } from "./cto/native-stage-execution.js";
 import { advanceNativeStageForCoordinator, findNativeAcceptedStageReceipt, preflightNativeStageCheckpoint, commitNativeStageCheckpoint, type NativeStageMutationResult } from "./cto/native-stage.js";
 import { readArtifactFileSafe } from "./engine/artifacts.js";
@@ -2408,6 +2409,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     },
   });
   nativeWorkerAuthorities.set(pi as unknown as object, nativeWorkerAuthority);
+  const ordinaryTaskAuthority = createOrdinaryTaskAuthority(pi.events, label);
   type LiveRootAuthorityRegistration = Pick<NativeRootAuthorityRegistration, "cwd" | "owner">;
   let liveRootAuthorityRegistration: LiveRootAuthorityRegistration | undefined;
   const unregisterLiveRootAuthority = (): void => {
@@ -2521,6 +2523,9 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   });
   stageResultCommitters.set(pi as unknown as object, (input) => commitNativeCtoStageResult(input));
   pi.on("session_start", (event: unknown, ctx: unknown) => {
+    ordinaryTaskAuthority.observeSessionStart(ctx);
+    const ordinaryCwd = resolveCwdForContext(ctx).cwd;
+    if (ordinaryCwd) ordinaryTaskAuthority.resolve(ctx, ordinaryCwd);
     if (!sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_start")) return;
     const verified = verifiedLifecycleHost(ctx);
     if (!verified) {
@@ -2546,6 +2551,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     scanNativeOwner(lifecycleBinding, ctx);
   });
   pi.on("session_switch", (event: unknown, ctx: unknown) => {
+    ordinaryTaskAuthority.observeSessionSwitch(ctx);
     const verified = verifiedLifecycleHost(ctx);
     const binding = lifecycleBinding;
     if (!verified || !sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_switch")) return;
@@ -2607,10 +2613,14 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   // session_shutdown is a type-only disposal event, not a session switch.
   // The host supplies no old-session id here; replacement uses session_switch.
   pi.on("session_shutdown", (event: unknown, ctx: unknown) => {
-    if (!sessionSwitchActorIsAdmissible(event, ctx) || !lifecycleEventIdentityIsAdmissible(event, ctx, "session_shutdown")) return;
+    const admissible = sessionSwitchActorIsAdmissible(event, ctx)
+      && lifecycleEventIdentityIsAdmissible(event, ctx, "session_shutdown");
     const verified = verifiedLifecycleHost(ctx);
     const binding = lifecycleBinding;
-    if (!verified || !binding || !sameLifecycleIdentity(binding.identity, verified.identity)) return;
+    const boundHostShutdown = admissible && verified && binding
+      && sameLifecycleIdentity(binding.identity, verified.identity);
+    if (!binding || boundHostShutdown) ordinaryTaskAuthority.observeSessionShutdown(ctx);
+    if (!boundHostShutdown) return;
     unregisterLiveRootAuthority();
     try {
       suspendCtoSession(binding.controller, "session-shutdown");
@@ -2626,9 +2636,11 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
   });
   pi.on("tool_execution_start", (event, ctx: unknown) => {
     nativeWorkerAuthority.observeToolExecutionStart(event, ctx);
+    ordinaryTaskAuthority.observeToolExecutionStart(event, ctx);
   });
   pi.on("tool_execution_end", (event, ctx: unknown) => {
     nativeWorkerAuthority.observeToolExecutionEnd(event, ctx);
+    ordinaryTaskAuthority.observeToolExecutionEnd(event, ctx);
   });
   pi.on("tool_call", (event: ToolCallEvent, ctx: unknown) => {
     const c: {
@@ -2726,6 +2738,9 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         nativeResolutionFailed = true;
       }
     }
+    const knownWorkflowChild = admissionCwd
+      ? nativeWorkerAuthority.hasWorkflowLineage(ctx)
+      : false;
     // Only an ordinary selected run or an ordinary native grant enters the
     // classification/monotonic namespace. CTO targets stay in cto_run_id.
     const trustedRunId = admissionResolutionFailed
@@ -2761,6 +2776,14 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         : actorResolverSignal === "invalid"
           ? "actor_resolver_invalid_result"
           : "actor_unresolved";
+    const ordinaryChild = admissionCwd && !admissionResolutionFailed
+      && actorResolverSignal !== "threw" && actorResolverSignal !== "invalid"
+      && !nativeResolutionFailed && !nativeActor && !knownWorkflowChild
+      ? ordinaryTaskAuthority.resolve(ctx, admissionCwd)
+      : "unknown";
+    const authenticatedOrdinaryChild = typeof ordinaryChild === "object";
+    const ordinaryDenialCode = typeof ordinaryChild === "string" && ordinaryChild !== "unknown"
+      ? ordinaryChild : undefined;
     const adaptedDenialCode = adaptedActor
       && "kind" in adaptedActor
       && adaptedActor.kind === "denied"
@@ -2898,6 +2921,11 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         }
       }
     }
+    // Denial-only lineage has precedence over legacy actorless idle capture.
+    if (!nativeActor && (knownWorkflowChild || ordinaryDenialCode)) {
+      authenticatedHostIdleBasicTools = false;
+      authenticatedInteractiveHostNoRun = false;
+    }
     const selectedNoRunConflict = selectedRunId !== undefined
       && adaptedActor
       && "kind" in adaptedActor
@@ -2987,12 +3015,18 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
     if (!admissionCwd && (event.toolName === "ask" || event.toolName === "task" || event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")) {
       runAdmission(cwdResolverFailed ? "cwd_resolution_failed" : "cwd_unavailable");
     }
+    if (!nativeActor && (nativeResolutionFailed || ordinaryDenialCode || knownWorkflowChild)
+      && (event.toolName === "task" || event.toolName === "bash"
+        || event.toolName === "edit" || (event.toolName === "write" && !lifecycleDeviceWrite))) {
+      runAdmission(ordinaryDenialCode ?? "native_authority_resolution_failed");
+    }
     if (
       !result
       && actorAuthorityConfigured
       && !trustedActor
       && !authenticatedInteractiveHostNoRun
       && !authenticatedHostIdleBasicTools
+      && !authenticatedOrdinaryChild
       && !lifecycleDeviceWrite
       && (event.toolName === "write" || event.toolName === "edit" || event.toolName === "bash")
     ) {
@@ -3023,6 +3057,7 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       && actorAuthorityConfigured
       && !nativeActor
       && !legacyCtoTaskAdmission
+      && !authenticatedOrdinaryChild
       && (
         !sharedController
         || (selectedRunId !== undefined && activeClaimRunId !== selectedRunId)
@@ -3057,6 +3092,13 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
       run(outboxEnforcementGate(event as unknown as Parameters<typeof outboxEnforcementGate>[0], gateContext));
       run(classificationToolGate(event as unknown as Parameters<typeof classificationToolGate>[0], gateContext));
       run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], writeGateContext ?? gateContext!));
+      if (authenticatedOrdinaryChild && ordinaryChild.cwd !== gateContext.cwd) {
+        run(orchestratorWriteGate(event as unknown as Parameters<typeof orchestratorWriteGate>[0], {
+          ...(writeGateContext ?? gateContext),
+          cwd: ordinaryChild.cwd,
+          executionCwd: gateContext.cwd,
+        }));
+      }
       run(workerWriteScopeGate(event as unknown as Parameters<typeof workerWriteScopeGate>[0], { ...(writeGateContext ?? gateContext!), writeScope: opts.writeScope }));
       run(ctoSliceTaskGate(normalizedTaskEvent as unknown as Parameters<typeof ctoSliceTaskGate>[0], gateContext));
       if (!ctoAuthorizedDispatch) run(dispatchGate(normalizedTaskEvent as unknown as Parameters<typeof dispatchGate>[0], { ...gateContext, controller: sharedController }));
@@ -3365,6 +3407,41 @@ export function registerTeamWorkflow(pi: ExtensionAPI, opts: RegisterOptions = {
         // Native authority is fail-closed; a malformed host context never
         // changes the already-allowed task decision or creates a grant.
       }
+    }
+    if (!result && event.toolName === "task" && admissionCwd
+      && !nativeActor && !knownWorkflowChild && !nativeResolutionFailed
+      && !nativeCtoTargeted && ctoMarkerIds.length === 0 && eventRunId === undefined
+      && (authenticatedOrdinaryChild || (authenticatedInteractiveHostNoRun && sharedController))) {
+      const rootController = sharedController;
+      const readRootCurrent: (() => true | AdmissionDiagnosticCode) | undefined = authenticatedOrdinaryChild ? undefined : () => {
+        let current: WorkflowSessionController | undefined;
+        try {
+          current = opts.getSessionController?.(ctx, admissionCwd);
+          if (!current || current !== rootController) return "session_identity_mismatch";
+          if (current.selectedRunId() !== undefined) return "selected_run_mismatch";
+          if (current.activeClaimRunId() !== undefined || current.activeCtoClaim() !== undefined) return "execution_claim_mismatch";
+        } catch (error) {
+          return error instanceof LifecycleError && (error.code === "recovery_required" || error.code === "run_state_invalid")
+            ? "workflow_state_recovery_required" : "session_controller_resolution_failed";
+        }
+        try {
+          const actor = opts.resolveTrustedToolCallActor?.(ctx, admissionCwd, undefined);
+          if (actor === undefined) return "actor_unresolved";
+          if (!isTrustedToolCallResolution(actor)) return "actor_resolver_invalid_result";
+          if ("kind" in actor && actor.kind === "denied") return actor.code;
+          if (!("kind" in actor) || actor.kind !== "authenticated-interactive-host-no-run") return "session_identity_mismatch";
+        } catch {
+          return "actor_resolver_failed";
+        }
+        try {
+          return readRunControlNoRecovery(admissionCwd).execution_claim === null ? true : "no_run_claim_present";
+        } catch (error) {
+          return error instanceof LifecycleError && (error.code === "recovery_required" || error.code === "run_state_invalid")
+            ? "workflow_state_recovery_required" : "run_control_unreadable";
+        }
+      };
+      const ordinaryAdmission = ordinaryTaskAuthority.admitTaskCall(ctx, event, readRootCurrent);
+      if (ordinaryAdmission !== true) runAdmission(ordinaryAdmission);
     }
     if (
       event.toolName === "task"

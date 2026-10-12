@@ -578,6 +578,13 @@ and safe report guidance. See the
 before upgrading a custom bundle; do not bypass admission by removing its
 controller or trusting raw `actor`/`hasUI` fields.
 
+Обычная делегация не требует `/do-work`: разрешённый `task` из подтверждённого
+интерактивного host без run/claim связывает реальную SDK-сессию child с отдельной
+внутренней lineage. Это позволяет обычные дочерние и вложенные `task`,
+`bash`/`write`/`edit`, не выдавая workflow/publication authority и не отключая
+safety, read-only или защиту canonical state. Bare headless idle-basic не создаёт
+такой корень; смена identity/claim, terminal и shutdown отзывают подтверждение.
+
 ## Observability
 
 When the engine is wired in via `registerTeamWorkflow`, it subscribes to seven OMP extension events

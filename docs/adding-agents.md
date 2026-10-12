@@ -230,6 +230,20 @@ controller, ослабить gates или добавить `actor: "orchestrator
 Проверяй их вместе с lifecycle capture и controller callbacks, а не копируй
 только финальный `return`.
 
+Обычные SDK task children не нужно объявлять interactive host или workflow worker.
+Core самостоятельно связывает принятый no-run `task`, execution args и точный
+SDK lifecycle slot с manager дочерней сессии. Root обязан проходить существующий
+host/controller контракт; bare idle-basic не может выдать эту lineage. Вложенная
+обычная делегация сохраняет подтверждение того же корня, но не получает claims
+или `workflow_*`/publication credentials. Отсутствующий `parentSession` в свежем
+SDK header допустим; при наличии он должен соответствовать захваченному родителю.
+
+Не подавляй ошибки resolver/controller ради ordinary task: authoritative ошибка
+остаётся отказом. Применимость workflow и положительная private task lineage —
+разные проверки. Safety, SDK spawn/read-only правила и canonical/source policy
+остаются включены; tool targets разрешаются относительно реального child cwd,
+даже когда дополнительно проверяется защищённый каталог корневого host.
+
 Активация — отдельная ответственность bundle. Если он предназначен только
 для определённых проектов, вне них не устанавливай активные workflow hooks.
 Возврат `undefined` из `resolveCwd` или actor resolver после регистрации

@@ -538,13 +538,13 @@ test("process acceptance: registered CTO journal faults retain A and protect for
       let fault;
       const injected = [];
       fs.renameSync = ((from, to) => {
-        originalRename(from, to);
         const destination = String(to);
         if (fault === "pre-marker" && destination.includes("/lifecycle-transactions/") && destination.endsWith("/transaction.json")) {
           fault = undefined;
           injected.push("pre-marker");
           throw new Error("cto terminal pre-marker fault");
         }
+        originalRename(from, to);
         if (fault === "post-state" && destination.includes("/.work-state/cto/") && destination.endsWith("/state.json")) {
           fault = undefined;
           injected.push("post-state");

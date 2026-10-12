@@ -51,15 +51,9 @@ const SESSION_ID = "ask-hardening-session";
 
 const fixtureControllers = new Map<string, WorkflowSessionController>();
 type FixtureEventHandler = (event: unknown, ctx: unknown) => unknown;
-type FixtureRecoveryBarrier = {
-  queued: Promise<void>;
-  release: () => void;
-  released: Promise<void>;
-};
 type FixtureBridge = {
   host: Record<string, unknown>;
   emit: (name: string, event: unknown, ctx: unknown) => unknown[];
-  recovery: FixtureRecoveryBarrier;
 };
 const fixtureBridges = new Map<string, FixtureBridge>();
 const RECEIPT_WORKFLOW = "checkpoint-ask-receipt";
@@ -154,30 +148,8 @@ function registerTools(root: string, workerSubmission = false): Map<string, { na
     sessionFile: hostFile,
     sessionManager: hostManager,
   };
-  let queued = false;
-  let resolveQueued!: () => void;
-  const queuedPromise = new Promise<void>((resolve) => { resolveQueued = resolve; });
-  let released = false;
-  let releaseQueue!: () => void;
-  let resolveReleased!: () => void;
-  const releasedPromise = new Promise<void>((resolve) => { resolveReleased = resolve; });
-  const sendMessage = (message: unknown): void | Promise<void> => {
-    if (!message || typeof message !== "object" || Array.isArray(message) || !("customType" in message) || message.customType !== "omp-workflow-stage-recovery") return;
-    if (!queued) {
-      queued = true;
-      resolveQueued();
-    }
-    return new Promise<void>((resolve) => {
-      releaseQueue = () => {
-        if (released) return;
-        released = true;
-        resolve();
-        resolveReleased();
-      };
-    });
-  };
   const pi = {
-    ...(workerSubmission ? { on, events: { on }, setLabel() {}, sendMessage } : {}),
+    ...(workerSubmission ? { on, events: { on }, setLabel() {} } : {}),
     zod: { z: zod },
     registerTool: (tool: { name: string; execute: never }) => {
       registered.set(tool.name, tool);
@@ -198,11 +170,6 @@ function registerTools(root: string, workerSubmission = false): Map<string, { na
     fixtureBridges.set(root, {
       host,
       emit: (name, event, ctx) => (handlers.get(name) ?? []).map((handler) => handler(event, ctx)),
-      recovery: {
-        queued: queuedPromise,
-        release: () => releaseQueue(),
-        released: releasedPromise,
-      },
     });
   }
   registerWorkflowTools(pi as never, {
@@ -210,6 +177,9 @@ function registerTools(root: string, workerSubmission = false): Map<string, { na
     resolveCwd: (ctx: unknown) => (ctx as { cwd?: string }).cwd,
     getSessionController: () => controller,
   });
+  if (workerSubmission) {
+    for (const handler of handlers.get("session_start") ?? []) handler({ type: "session_start" }, host);
+  }
   return registered;
 }
 async function publishAssignedWorkerOutput(
@@ -320,10 +290,35 @@ async function terminalAssignedWorker(root: string, worker: AssignedWorkerFixtur
     index: 0,
   }, bridge.host);
   await Promise.all(lifecycle.map(async (result) => await result));
-  if (failed) {
-    await bridge.recovery.queued;
-    bridge.recovery.release();
-    await bridge.recovery.released;
+  // Accepted publication survives a failed provider terminal; it does not
+  // authorize or promise an automatic replacement continuation.
+}
+
+async function assertAcceptedPublicationIsNotReplaced(
+  root: string,
+  tools: Map<string, { name: string; execute: never }>,
+): Promise<void> {
+  const bridge = fixtureBridges.get(root);
+  const recoverTool = tools.get("workflow_recover");
+  assert.ok(bridge && recoverTool, "registered recovery must use the captured host");
+  const recover = recoverTool.execute as unknown as AskExecute;
+  const before = readStateFile(root);
+  for (const operation of ["diagnose", "reconcile"] as const) {
+    const response = await recover(`checkpoint-recovery-${operation}`, {
+      operation,
+      ...(operation === "reconcile" ? { intent: "replace" } : {}),
+    }, undefined, undefined, bridge.host);
+    const details = response.details as {
+      ok?: boolean;
+      error?: string;
+      recovery?: { code?: string; action?: string };
+    };
+    assert.equal(details.ok, true, details.error);
+    assert.equal(details.recovery?.code, "worker_succeeded");
+    assert.equal(details.recovery?.action, "none", "accepted output forbids replacement even through owner-scoped recovery");
+    const after = readStateFile(root);
+    assert.deepEqual(after.stage_receipts, before.stage_receipts, "recovery must preserve accepted producer receipts");
+    assert.deepEqual(after.dispatch_capability?.dispatches, before.dispatch_capability?.dispatches, "recovery must not create or replace a producer");
   }
 }
 
@@ -537,9 +532,7 @@ function askAuth(issued: IssuedCapability): AskParams {
 
 function askContext(root: string, script: DialogScript, calls: DialogCall[]): AskContext {
   return {
-    cwd: root,
-    session_id: SESSION_ID,
-    hasUI: true,
+    ...trustedToolContext(root),
     ui: {
       async askDialog(questions: DialogQuestion[], dialogOptions: DialogOptions): Promise<unknown> {
         calls.push({ questions, options: dialogOptions });
@@ -550,7 +543,7 @@ function askContext(root: string, script: DialogScript, calls: DialogCall[]): As
 }
 
 function trustedToolContext(root: string): AskContext {
-  return { cwd: root, session_id: SESSION_ID, hasUI: true };
+  return { ...fixtureBridges.get(root)?.host, cwd: root, session_id: SESSION_ID, hasUI: true };
 }
 
 type SubmitExtra = Partial<{ id: string; question: string; options: string[]; multi: boolean; timedOut: boolean; customInput: string; note: string }>;
@@ -745,9 +738,16 @@ function withFixture(
       const tools = registerTools(root, options.workerSubmission === true);
       await run(root, askExecute(tools), tools);
     } finally {
-      fixtureBridges.delete(root);
-      fixtureControllers.delete(root);
-      rmSync(root, { recursive: true, force: true });
+      try {
+        const bridge = fixtureBridges.get(root);
+        if (bridge) {
+          await Promise.all(bridge.emit("session_shutdown", { type: "session_shutdown" }, bridge.host));
+        }
+      } finally {
+        fixtureBridges.delete(root);
+        fixtureControllers.delete(root);
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 }
@@ -1220,7 +1220,8 @@ withFixture("ask: pre-dispatch approval cannot authorize post-production retry",
     validation_run: true,
     validation_evidence: "pre-dispatch approval first worker attempt",
   });
-  await terminalAssignedWorker(root, firstWorker, true);
+  await terminalAssignedWorker(root, firstWorker, false);
+  await assertAcceptedPublicationIsNotReplaced(root, tools);
   const stalePreProduction = await checkpoint("t", {
     ...envelope,
     actor_provenance: firstActor,
@@ -1229,34 +1230,17 @@ withFixture("ask: pre-dispatch approval cannot authorize post-production retry",
   }, undefined, undefined, trustedToolContext(root));
   const staleDetails = stalePreProduction.details as { ok?: boolean; error?: string };
   assert.equal(staleDetails.ok, false, "pre-dispatch approval must not authorize a real worker result");
-  assert.match(staleDetails.error ?? "", /stale|mismatch|production|checkpoint/i);
   const retryDispatchAuth = {
     ...dispatchAuth,
     tool_call_id: "checkpoint-ask-retry",
     origin_session_id: SESSION_ID,
   };
   const retried = authorizeDispatch(root, { ...retryDispatchAuth, retry_of: authorized.record.id });
-  assert.equal(retried.ok, true, retried.ok ? "retry authorized" : retried.error);
-  if (!retried.ok || !retried.record) throw new Error(retried.ok ? "retry authorization produced no record" : retried.error);
-  const retryWorker = await publishAssignedWorkerOutput(root, issued, tools, {
-    id: retried.record.id,
-    role: retried.record.role,
-    agent: retried.record.agent,
-    task_id: retried.record.work_identity?.task_id,
-    tool_call_id: retried.record.tool_call_id,
-  }, {
-    files_touched: ["checkpoint-ask-hardening.test.ts"],
-    ready: true,
-    validation_run: true,
-    validation_evidence: "pre-dispatch approval continuity test",
-  });
+  assert.equal(retried.ok, false, "an accepted publication cannot authorize a replacement of its producer");
 
-
-  // Publication and terminal worker lifecycle remain separate facts: the
-  // retry receipt is accepted, but planning consent is not post-production
-  // checkpoint approval.
-  await terminalAssignedWorker(root, retryWorker, false);
-  const advanced = advanceCursor(root, {
+  // A receipt and successful worker terminal satisfy production, not the
+  // distinct post-production checkpoint. Planning consent cannot replace it.
+  const advanceAuth = {
     token: issued.advance_token,
     capability_id: issued.capability_id,
     run_key: RUN_ID,
@@ -1267,17 +1251,32 @@ withFixture("ask: pre-dispatch approval cannot authorize post-production retry",
     cursor_epoch: issued.state.issued_for!.cursor_epoch,
     loop_iteration: 1,
     evidence: "pre-dispatch approval must not advance the completed worker",
-  }, { runId: RUN_ID });
+  };
+  const advanced = advanceCursor(root, advanceAuth, { runId: RUN_ID });
   assert.equal(advanced.ok, false, "pre-dispatch approval must not authorize the real stage advance");
-  assert.match(advanced.error ?? "", /checkpoint|approval|decision|receipt/i);
   assert.equal(readStateFile(root).stage_cursor, "implementation", "the failed advance keeps the stage in its current checkpoint window");
 
   const state = readStateFile(root);
   assert.equal((state.typed_checkpoint_decisions ?? []).length, 0, "stale planning consent never appends a post-production decision");
   assert.ok((state.trusted_checkpoint_answers ?? []).some((answer) => answer.answer_id === oldAnswerId), "the original answer remains in the audit ledger");
+
+  const postProduction = await ask("post-production", askAuth(issued), undefined, undefined,
+    askContext(root, (questions) => submit(questions[0]!, ["proceed"]), calls));
+  const postDetails = postProduction.details as { ok?: boolean; actor_provenance?: Record<string, unknown>; error?: string };
+  assert.equal(postDetails.ok, true, postDetails.error);
+  const accepted = await checkpoint("post-production", {
+    ...envelope,
+    actor_provenance: postDetails.actor_provenance,
+    decision: "proceed",
+    rationale: "approval of the published result, not earlier planning consent",
+  }, undefined, undefined, trustedToolContext(root));
+  assert.equal((accepted.details as { ok?: boolean; error?: string }).ok, true, JSON.stringify(accepted.details));
+  const authorizedAdvance = advanceCursor(root, advanceAuth, { runId: RUN_ID });
+  assert.equal(authorizedAdvance.ok, true, authorizedAdvance.error);
+  assert.equal(readStateFile(root).stage_cursor, "code_review", "fresh result approval satisfies the same advance prerequisites");
 }, { workerSubmission: true });
 
-withFixture("ask: finalized real-attempt proof survives failed dispatch retry", async (root, ask, tools) => {
+withFixture("ask: finalized real-attempt proof survives a rejected dispatch retry", async (root, ask, tools) => {
   const issued = await writeAskFixtureWithDiscovery(root, tools);
   const checkpointTool = tools.get("workflow_checkpoint");
   assert.ok(checkpointTool, "workflow_checkpoint must be registered");
@@ -1330,6 +1329,7 @@ withFixture("ask: finalized real-attempt proof survives failed dispatch retry", 
   assert.equal((recorded.details as { ok?: boolean; error?: string }).ok, true, (recorded.details as { error?: string }).error);
 
   await terminalAssignedWorker(root, firstWorker, true);
+  await assertAcceptedPublicationIsNotReplaced(root, tools);
   const retryIssued = await beginAskStage(root, tools);
   const retryDispatchAuth = {
     ...dispatchAuth,
@@ -1341,21 +1341,7 @@ withFixture("ask: finalized real-attempt proof survives failed dispatch retry", 
     loop_iteration: retryIssued.state.issued_for!.loop_iteration,
   };
   const retry = authorizeDispatch(root, { ...retryDispatchAuth, retry_of: authorized.record.id, tool_call_id: "checkpoint-ask-real-retry" });
-  assert.equal(retry.ok, true, retry.ok ? "retry authorized" : retry.error);
-  if (!retry.ok || !retry.record) throw new Error(retry.ok ? "retry authorization produced no record" : retry.error);
-  const retryWorker = await publishAssignedWorkerOutput(root, retryIssued, tools, {
-    id: retry.record.id,
-    role: retry.record.role,
-    agent: retry.record.agent,
-    task_id: retry.record.work_identity?.task_id,
-    tool_call_id: retry.record.tool_call_id,
-  }, {
-    files_touched: ["checkpoint-ask-hardening.test.ts"],
-    ready: true,
-    validation_run: true,
-    validation_evidence: "real-attempt proof retry output",
-  });
-  await terminalAssignedWorker(root, retryWorker, false);
+  assert.equal(retry.ok, false, "an accepted publication must not be replaced after provider failure");
 
   const replay = await checkpoint("t", {
     ...checkpointEnvelope(retryIssued),

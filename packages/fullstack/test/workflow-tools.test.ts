@@ -1566,6 +1566,7 @@ function registerToolsWithSessionSink(): {
   const sessionSwitches: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const sessionShutdowns: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const toolCalls: Array<(event: unknown, ctx: unknown) => unknown> = [];
+  let toolCallSequence = 0;
   const toolExecutionStarts: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const toolResults: Array<(event: unknown, ctx: unknown) => unknown> = [];
   const lifecycle: {
@@ -1677,7 +1678,8 @@ function registerToolsWithSessionSink(): {
     },
     fireToolCall: async (event, ctx) => {
       const normalized = hostContext(ctx);
-      return Promise.all(toolCalls.map(handler => handler(event, normalized)));
+      const sdkEvent = { toolCallId: `host-fixture-tool-${++toolCallSequence}`, ...event };
+      return Promise.all(toolCalls.map(handler => handler(sdkEvent, normalized)));
     },
     fireToolExecutionStart: async (event, ctx) => {
       const normalized = hostContext(ctx);

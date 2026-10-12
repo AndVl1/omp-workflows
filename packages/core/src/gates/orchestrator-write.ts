@@ -52,6 +52,8 @@ export function createTrustedOrchestratorWriteProof(artifactsDir: string): Trust
 
 interface ToolCallContext {
   cwd: string;
+  /** Actual tool cwd when this gate checks another authenticated policy root. */
+  executionCwd?: string;
   run_id?: string;
   cto_run_id?: string;
   hasUI?: boolean;
@@ -64,6 +66,7 @@ export function orchestratorWriteGate(
   ctx: ToolCallContext,
 ): { block?: boolean; reason?: string } | void {
   const actor = trustedActorOf(ctx);
+  const executionCwd = ctx.executionCwd ?? ctx.cwd;
   const policyActive = hasStrictOrchestratorState(ctx.cwd, ctx.run_id) || hasActiveCtoState(ctx.cwd, ctx.cto_run_id);
   if (event.toolName !== "write" && event.toolName !== "edit" && event.toolName !== "bash") return;
   // Registered lifecycle devices use the generic write transport, but only
@@ -81,13 +84,13 @@ export function orchestratorWriteGate(
   if (event.toolName === "bash") {
     const earlyBash = bashProofInput(event.input);
     if (earlyBash.valid) {
-      const canonical = bashMutationTargets(earlyBash.command).find((path) => isCanonicalStatePath(path, ctx.cwd));
+      const canonical = bashMutationTargets(earlyBash.command).find((path) => isCanonicalStatePath(path, ctx.cwd, executionCwd));
       if (canonical || looksLikeWorkflowStateMutation(earlyBash.command)) {
         return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused bash mutation${canonical ? ` '${canonical}'` : ""}` };
       }
     }
   } else {
-    const canonical = pathsFromInput(event.input).find((path) => isCanonicalStatePath(path, ctx.cwd));
+    const canonical = pathsFromInput(event.input).find((path) => isCanonicalStatePath(path, ctx.cwd, executionCwd));
     if (canonical) {
       return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused '${canonical}'` };
     }
@@ -109,7 +112,7 @@ export function orchestratorWriteGate(
   // remain blocked.
   const artifactsDir = trustedArtifactsDirOf(ctx, actor);
   if (event.toolName === "bash" && artifactsDir) {
-    if (!isAllowedAstIndexBash(event.input, ctx.cwd) && (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv))) {
+    if (!isAllowedAstIndexBash(event.input, executionCwd) && (!bashSnapshot?.valid || !isReadOnlyProofCommand(bashSnapshot.command, bashSnapshot.env, bashSnapshot.hasEnv))) {
       return { block: true, reason: "orchestrator policy: trusted host artifact proof permits allowlisted ast-index lookup/rebuild/update or sanitized read-only git inspection with GIT_OPTIONAL_LOCKS=0 git --no-pager -c core.fsmonitor=false: status, log (at most one -N, 1..100), diff, show, or branch --show-current; only diff/show require --no-ext-diff --no-textconv" };
     }
   }
@@ -120,11 +123,11 @@ export function orchestratorWriteGate(
   if (event.toolName === "bash") {
     const command = bashCommand;
     const targets = bashMutationTargets(command);
-    const canonical = targets.find((path) => isCanonicalStatePath(path, ctx.cwd));
+    const canonical = targets.find((path) => isCanonicalStatePath(path, ctx.cwd, executionCwd));
     if (canonical || looksLikeWorkflowStateMutation(command)) {
       return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused bash mutation${canonical ? ` '${canonical}'` : ""}` };
     }
-    const projectTarget = targets.find((path) => isProjectPath(path, ctx.cwd) && !isWorkStatePath(path, ctx.cwd));
+    const projectTarget = targets.find((path) => isProjectPath(path, ctx.cwd, executionCwd) && !isWorkStatePath(path, ctx.cwd, executionCwd));
     if (projectTarget && actor !== "worker") {
       return { block: true, reason: `orchestrator policy: source mutation via bash requires a trusted worker actor; got ${actor ?? "unknown"}` };
     }
@@ -138,7 +141,7 @@ export function orchestratorWriteGate(
   if (paths.length === 0) {
     return { block: true, reason: `orchestrator policy: ${actor ?? "unknown"} write/edit has no verifiable path` };
   }
-  const canonical = paths.find((path) => isCanonicalStatePath(path, ctx.cwd));
+  const canonical = paths.find((path) => isCanonicalStatePath(path, ctx.cwd, executionCwd));
   if (canonical) {
     return { block: true, reason: `orchestrator policy: canonical workflow state is engine-owned; refused '${canonical}'` };
   }
@@ -147,13 +150,13 @@ export function orchestratorWriteGate(
     return { block: true, reason: "orchestrator policy: trusted actor identity is required for source writes" };
   }
   if (artifactsDir) {
-    const invalid = paths.find((path) => !isArtifactPath(path, ctx.cwd, artifactsDir));
+    const invalid = paths.find((path) => !isArtifactPath(path, ctx.cwd, artifactsDir, executionCwd));
     if (invalid) {
       return { block: true, reason: `orchestrator policy: trusted host may write only under the selected artifacts directory; refused '${invalid}'` };
     }
     return;
   }
-  const invalid = paths.find((path) => !isWorkStatePath(path, ctx.cwd));
+  const invalid = paths.find((path) => !isWorkStatePath(path, ctx.cwd, executionCwd));
   if (invalid) {
     return { block: true, reason: `orchestrator policy: ${actor} may write only under .work-state; refused '${invalid}'` };
   }
@@ -344,8 +347,8 @@ function isTrustedHostServiceWrite(event: ToolCallEvent, ctx: ToolCallContext): 
   }
 }
 
-function isWorkStatePath(path: string, cwd: string): boolean {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+function isWorkStatePath(path: string, cwd: string, executionCwd = cwd): boolean {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(executionCwd, path);
   const workState = resolve(cwd, ".work-state");
   const rel = relative(workState, absolute);
   if (rel !== "" && (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel))) return false;
@@ -361,8 +364,8 @@ function isWorkStatePath(path: string, cwd: string): boolean {
   }
 }
 
-function isArtifactPath(path: string, cwd: string, artifactsDir: string): boolean {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+function isArtifactPath(path: string, cwd: string, artifactsDir: string, executionCwd = cwd): boolean {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(executionCwd, path);
   const root = resolve(artifactsDir);
   const lexical = relative(root, absolute);
   if (lexical === "" || lexical.startsWith(`..${sep}`) || lexical === ".." || isAbsolute(lexical)) return false;
@@ -413,8 +416,8 @@ function isArtifactPath(path: string, cwd: string, artifactsDir: string): boolea
     return false;
   }
 }
-function isCanonicalStatePath(path: string, cwd: string): boolean {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+function isCanonicalStatePath(path: string, cwd: string, executionCwd = cwd): boolean {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(executionCwd, path);
   const canonical = (rel: string): boolean =>
     rel === ".active-feature"
     || rel === "team-state.json"
@@ -483,9 +486,9 @@ function bashMutationTargets(command: string): string[] {
   return targets;
 }
 
-function isProjectPath(path: string, cwd: string): boolean {
+function isProjectPath(path: string, cwd: string, executionCwd = cwd): boolean {
   const root = resolve(cwd);
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(executionCwd, path);
   const rel = relative(root, absolute);
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }

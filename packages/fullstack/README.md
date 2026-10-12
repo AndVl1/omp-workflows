@@ -210,6 +210,14 @@ context is denied without releasing the controller or claim; genuine interactive
 re-entry via that manager follows the ordinary authenticated path. A different
 manager cannot substitute or release it.
 
+Для обычного `task` из подтверждённого интерактивного host без run/claim core
+отдельно проверяет фактическую SDK lineage дочерней сессии. Независимый headless
+child может выполнять generic `bash`/`write`/`edit` и вложенный обычный `task`,
+но не получает workflow/publication authority. Этот путь не расширяет bare
+idle-basic и не отменяет SDK spawns, read-only, safety или canonical/source gates.
+Родительское подтверждение перепроверяется; terminal, shutdown, identity drift и
+появление claim не позволяют старому child восстановить права через idle-basic.
+
 The three workflow entry points are registered directly; `/init-team`, `/interview`, `/omp-model-roles`, `/session-report`, and `/workflow-view` remain custom-TS modules copied into project-local `.omp/commands/`. Most commands return prompts and do not dispatch subagents directly. `/session-report` and `/workflow-view` are deterministic read-only renderers: they require canonical selectors, read persisted state/artifacts, and write only under `.work-state`.
 
 ### CTO canonical state authority

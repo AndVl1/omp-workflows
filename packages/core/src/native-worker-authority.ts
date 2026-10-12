@@ -32,7 +32,7 @@ type LegacyAuthorityResolver = (ctx: unknown, cwd: string, runId: string | undef
 
 
 const REGISTRY_SYMBOL = Symbol.for("omp-workflows.native-worker-authority");
-const REGISTRY_VERSION = 3 as const;
+const REGISTRY_VERSION = 4 as const;
 const LIFECYCLE_CHANNEL = "task:subagent:lifecycle";
 export class NativeWorkerRouteError extends Error {
   readonly code = "native_authority_route_denied" as const;
@@ -63,7 +63,7 @@ type SessionManagerLike = {
   getHeader?: () => SessionHeaderLike | undefined;
 };
 
-type SessionSnapshot = {
+export type SessionSnapshot = {
   manager: SessionManagerLike;
   sessionId: string;
   sessionFile: string;
@@ -202,6 +202,9 @@ type Registry = {
   settlements: Map<string, SettlementWitness>;
   generations: Map<string, number>;
   rootAuthorities?: Map<string, RootAuthorityEntry[]>;
+  /** Denial-only history: expired workflow grants never become idle authority. */
+  workflowSessionFiles: Set<string>;
+  workflowSessionManagers: WeakSet<object>;
 };
 
 type RegistrySlot = Record<PropertyKey, unknown>;
@@ -316,6 +319,7 @@ export type NativeWorkerAuthority = {
   rejectTaskPreflight(input: NativePreflightRejectionInput): Promise<NativePreflightRejectionResult>;
   resolve(ctx: unknown, cwd: string, selectedRunId?: string): NativeWorkerResolution | undefined;
   binding(ctx: unknown, cwd: string, selectedRunId?: string): NativeWorkerBinding | undefined;
+  hasWorkflowLineage(ctx: unknown): boolean;
   /** Internal host-only live root registration for cold-revive routing. */
   registerRootAuthority(input: NativeRootAuthorityRegistration): boolean;
   unregisterRootAuthority(input: { readonly cwd: string; readonly owner: object }): void;
@@ -342,7 +346,9 @@ function isRegistry(value: unknown): value is Registry {
     && candidate.grants instanceof Map
     && candidate.bindings instanceof Map
     && candidate.settlements instanceof Map
-    && candidate.generations instanceof Map;
+    && candidate.generations instanceof Map
+    && candidate.workflowSessionFiles instanceof Set
+    && candidate.workflowSessionManagers instanceof WeakSet;
 }
 
 /**
@@ -366,6 +372,8 @@ function getRegistry(create: boolean): Registry | undefined {
     settlements: new Map(),
     generations: new Map(),
     rootAuthorities: new Map(),
+    workflowSessionFiles: new Set(),
+    workflowSessionManagers: new WeakSet(),
   };
   try {
     Object.defineProperty(slot, REGISTRY_SYMBOL, {
@@ -418,7 +426,7 @@ function managerOf(ctx: unknown): SessionManagerLike | undefined {
   return value;
 }
 
-function readSnapshot(ctx: unknown): SessionSnapshot | undefined {
+export function readSnapshot(ctx: unknown): SessionSnapshot | undefined {
   const manager = managerOf(ctx);
   if (!manager) return undefined;
   try {
@@ -460,7 +468,7 @@ export function nativeReadonlyReplayLineage(
 }
 
 
-function snapshotStillCurrent(snapshot: SessionSnapshot): boolean {
+export function snapshotStillCurrent(snapshot: SessionSnapshot): boolean {
   try {
     const currentId = snapshot.manager.getSessionId!();
     const currentFile = snapshot.manager.getSessionFile!();
@@ -639,7 +647,7 @@ function configuredCtoAssignment(cwd: string, route: CtoTeamRoute, agent: string
 }
 
 
-function structuralShape(value: unknown, stack = new Set<object>()): string | undefined {
+export function structuralShape(value: unknown, stack = new Set<object>()): string | undefined {
   if (value === null) return "null";
   if (typeof value === "string") return `s:${JSON.stringify(value)}`;
   if (typeof value === "boolean") return value ? "b:1" : "b:0";
@@ -664,7 +672,7 @@ function structuralShape(value: unknown, stack = new Set<object>()): string | un
   return result;
 }
 
-function taskItems(input: unknown): TaskItem[] | undefined {
+export function taskItems(input: unknown): TaskItem[] | undefined {
   if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
   const object = input as Record<string, unknown>;
   if (Array.isArray(object.tasks)) {
@@ -1089,6 +1097,7 @@ export function createNativeWorkerAuthority(
       ...(candidate.dispatchOrigin ? { dispatchOrigin: candidate.dispatchOrigin } : {}),
     };
     registry.grants.set(grant.slotKey, grant);
+    registry.workflowSessionFiles.add(grant.sessionFile);
     ownerFor(registry, grant.owner)?.grants.add(grant);
     removeCandidate(registry, candidate);
   };
@@ -1667,6 +1676,20 @@ export function createNativeWorkerAuthority(
     },
 
 
+    hasWorkflowLineage(ctx) {
+      if (!registry) return true;
+      try {
+        const manager = ctx && typeof ctx === "object" ? (ctx as { sessionManager?: unknown }).sessionManager : undefined;
+        if (!manager || typeof manager !== "object") return false;
+        if (registry.workflowSessionManagers.has(manager)) return true;
+        const file = (manager as SessionManagerLike).getSessionFile?.();
+        if (typeof file !== "string" || !registry.workflowSessionFiles.has(resolve(file))) return false;
+        registry.workflowSessionManagers.add(manager);
+        return true;
+      } catch {
+        return false;
+      }
+    },
     resolve(ctx, cwd, selectedRunId) {
       if (!registry) return undefined;
       ownerState(registry, owner);
@@ -1720,6 +1743,7 @@ export function createNativeWorkerAuthority(
           cwd: current.cwd,
         };
         registry.bindings.set(binding.sessionFile, binding);
+        registry.workflowSessionManagers.add(current.manager);
         ownerFor(registry, owner)?.bindings.add(binding);
       }
       if (
@@ -1786,6 +1810,7 @@ export function createNativeWorkerAuthority(
     observeSessionStart(ctx) {
       if (!registry) return;
       ownerState(registry, owner);
+      authority.hasWorkflowLineage(ctx);
       const current = readSnapshot(ctx);
       if (!current) return;
       const value = ctx as { mode?: unknown; hasUI?: unknown };

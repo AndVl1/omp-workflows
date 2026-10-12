@@ -71,6 +71,26 @@ Admission требует отсутствия selected run, любых selection
 inactive), `execution_claim` и конфликтующей controller/CTO/native/legacy authority.
 Этот путь не даёт `task`, `ask`, typed workflow/native, CTO или bootstrap rights.
 
+Обычный `task` из аутентифицированного интерактивного host без selected run и
+execution claim создаёт отдельную внутреннюю lineage, а не workflow authority.
+Core связывает разрешённый вызов и его фактические аргументы с SDK lifecycle
+(`parentToolCallId`, исходный batch index, agent, session file) и собственным
+manager дочерней сессии. Поэтому независимый headless child и его обычные
+вложенные `task` могут использовать `bash`/`write`/`edit` вне `/do-work`.
+Idle-basic сам по себе не может стать корнем этой lineage.
+
+Подтверждение родительского host, controller и отсутствия claim перечитывается
+при каждом admission. Ошибка resolver/controller, смена SDK identity, появление
+workflow claim, shutdown или terminal отзывают lineage; отозванный ordinary/native
+manager не возвращает права через idle-basic. Async ACK сохраняет только точно
+подтверждённые pending/running slots; неоднозначные id/index отклоняются.
+Поздний SDK start из отозванного pending slot после shutdown также получает отказ.
+Новый `session_start` допускает новую делегацию, но не оживляет старые child/call id.
+Safety, SDK spawns, read-only и canonical/source gates остаются обязательными,
+включая относительные пути из изолированного child cwd к canonical state корня.
+Lineage живёт внутри процесса и не предоставляет `workflow_*`, publication,
+CTO или bootstrap credentials; `parentSession` не обязателен в свежем SDK header.
+
 Отказы содержат стабильный `[workflow_admission:<code>]`, объяснение,
 безопасное действие и состав репорта. Известный отказ адаптера, отсутствие
 результата, исключение и ошибка canonical state не должны интерпретироваться
@@ -459,6 +479,23 @@ npm run build
 npm run typecheck
 npm test
 ```
+
+Для `npm test` нужен Bun в `PATH`: установленный OMP SDK использует Bun API.
+CI и release checks устанавливают Bun 1.3.14. Отдельный запуск постоянной
+регрессии обычной делегации:
+
+```bash
+node --import tsx --test packages/core/test/ordinary-task-sdk-lineage.test.ts
+```
+
+Тест загружает исходный Core и настоящий установленный SDK, без предварительного
+`build`, и выполняет Root → child → grandchild вне `/do-work`. Реальные SDK
+инструменты проверяют запись, чтение, hashline-редактирование, `bash`, вложенный
+`task` и защиту canonical state. Подменяется только offline model transport;
+settings/auth, Git-конфигурация и session files изолированы в принадлежащем
+тесту временном каталоге, сеть запрещена. Завершение и SIGTERM используют
+настоящий SDK teardown; parent удаляет каталог также после принудительного
+завершения. Отсутствие Bun или отказ SDK — ошибка, а не skipped test.
 
 ## License
 
